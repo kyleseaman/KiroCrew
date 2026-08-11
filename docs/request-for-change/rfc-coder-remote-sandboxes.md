@@ -272,6 +272,8 @@ whose agent keeps running burns credits with no local signal.
 (`:904`) alongside it. Add a per-project/per-session profile that names the host
 kind plus, for Coder, the template and its `coder_parameter` values (size,
 image). This is what turns "sandboxes work" into "right-sizing works".
+**Designed in full in §4.4** — config shape, settings panel, per-session picker,
+and default resolution.
 
 **W6 — remote MCP (gates making remote the default).** `mcp_gateway/transport.py`
 serves `AF_UNIX` only (`serve`, `:412`); there is no `AF_INET` in the package,
@@ -320,6 +322,132 @@ workspace env var from the template. Verified in the POC (§5.2). Note it does
 
 Gotcha: `KIRO_HOME` does **not** relocate credentials; they resolve from
 `HOME` / `XDG_DATA_HOME` / `LOCALAPPDATA`.
+
+### 4.4 Sandbox profiles: configuration and selection
+
+The execution plane needs a user-facing surface. The proposal: **a library of
+named sandbox profiles, and a per-session picker that chooses one.** Each profile
+is a named binding of a template plus its parameter values; a session runs on
+exactly one profile (or locally). This is deliberately *not* multiple sandboxes
+per session — see the non-goal at the end.
+
+#### Credentials: store nothing, delegate to the `coder` CLI
+
+This follows the rule `src/kiro_crew/cloud/__init__.py` already states for AWS —
+*"Bring-your-own-AWS, store nothing. Every AWS call shells to the `aws` CLI …
+so credential resolution stays in the CLI's own provider chain. KiroCrew persists
+only a profile name, region, and stack name."*
+
+Apply it verbatim to Coder: shell every call to the `coder` CLI, and persist only
+coordinates. The operator runs `coder login <url>` once on the control plane; the
+CLI owns its own session store, and KiroCrew never reads, writes, or holds the
+token. `coder whoami` is then the read-only verification probe, exactly as
+`aws sts get-caller-identity` is for `cloud/` and `kiro-cli whoami` is for
+`kiro_prerequisite`.
+
+This is not merely tidy — it sidesteps a real constraint. The credential file is
+a **fixed allowlist** (`load_credentials` iterates `_CREDENTIAL_KEYS`), not a
+general dotenv, so a Coder token could not be dropped into `.env` without
+extending that list. Delegation avoids the question entirely, and matches the
+`instances/` registry, which likewise stores *"only connection coordinates"* and
+mints credentials at connect time.
+
+The one credential KiroCrew *does* have to convey is `KIRO_API_KEY`, for the agent
+inside the workspace. That is supplied as a template variable (`sensitive = true`)
+rather than a `coder_parameter` — parameter values are persisted in coderd's
+database and readable back through its API.
+
+#### Config: `sandbox_profiles.json`
+
+Mirror the v2 shape `src/kiro_crew/deploy/profiles.py` already uses —
+`{"version": 2, "profiles": [...], "default": "<name>"}` — so the loader, the
+default-resolution helper and the "unconfigured" state all have a working
+precedent to copy.
+
+```json
+{
+  "version": 2,
+  "default": "local",
+  "profiles": [
+    { "name": "local", "host": "local" },
+    { "name": "linux-small", "host": "coder",
+      "coder_url": "https://coder.example.com",
+      "template": "kirocrew-session",
+      "parameters": { "instance_size": "small" } },
+    { "name": "linux-build", "host": "coder",
+      "coder_url": "https://coder.example.com",
+      "template": "kirocrew-session",
+      "parameters": { "instance_size": "build" } },
+    { "name": "windows-dotnet", "host": "coder",
+      "coder_url": "https://coder.example.com",
+      "template": "kirocrew-session-windows",
+      "parameters": { "instance_size": "medium" } }
+  ]
+}
+```
+
+No secret appears in that file. `coder_url` is a coordinate; authentication is
+whatever `coder login` established for it.
+
+A feature flag `coder.enabled` (default `false`) gates the whole surface, matching
+how `instances.enabled` gates the Instances feature.
+
+#### Settings UI
+
+A `SandboxesPanel.tsx` in `website/src/pages/settings/`, alongside the existing
+`InstancesPanel.tsx` — which is the closest analogue, being the panel that manages
+named remote targets. Two parts:
+
+1. **Connection** — the coderd URL, current identity from `coder whoami`, and a
+   Verify button. When not logged in, show the exact `coder login <url>` command
+   for the operator to run rather than collecting a token in the UI.
+2. **Profiles** — list, add, edit, delete, and mark one default. Template and
+   parameter choices should be populated from coderd (`GET /api/v2/templates`
+   and the template's `coder_parameter` definitions) rather than free-typed, so a
+   profile cannot name a template or size that does not exist.
+
+#### Per-session selection
+
+A slot field plus an endpoint mirroring `api_chat_slot_model`
+(`src/kiro_crew/dashboard/chat_handlers.py:2406`), surfaced as a dropdown in the
+chat header next to the model picker. New sessions inherit the resolved default;
+the picker overrides it for that session.
+
+**One asymmetry to design around.** The model picker's docstring notes it
+*"prefers an in-place `session/set_model` on the running session and only resets
+when that is impossible."* A sandbox picker has **no in-place equivalent** — a
+live `kiro-cli` process cannot migrate between hosts, so changing profile means
+terminating the process and starting a new one elsewhere.
+
+That is survivable rather than destructive, because of the two-plane split: the
+gateway owns the transcript, and the POC confirmed the agent advertises
+`loadSession: true` (§5.2). So a mid-session switch is the *same machinery as a
+process restart* — tear down, spawn on the new host, resume. The decision to make
+explicitly is whether the picker is offered mid-session behind a "this restarts
+the agent" affordance, or only at session start. Recommendation: offer it
+mid-session, since restart-and-resume already exists and the alternative is a
+worse experience (start a new session and lose the thread).
+
+#### Default resolution
+
+Resolve in this order, mirroring how the deploy skill resolves its AWS profile:
+
+1. An explicit per-session pick.
+2. A per-project default (so "this repo always builds in the 8-CPU sandbox" is
+   configured once).
+3. The global `default` from `sandbox_profiles.json`.
+4. `local` — which is also the behaviour when `coder.enabled` is false, so
+   nothing changes for users who never configure it.
+
+Step 2 is the ergonomic win: the common case should require no picking at all.
+
+#### Non-goal: multiple sandboxes per session
+
+One session runs on one profile. Fanning a single session across several
+workspaces would mean breaking subagent runtime multiplexing (§4.2 W0) and
+multiplying cold starts, for a use case — heterogeneous verification within one
+session — better served later by an auxiliary exec target than by several agent
+hosts.
 
 ## 5. Proof of concept — measured results
 
@@ -524,9 +652,9 @@ and loses the entire KiroCrew capability layer — `spawn_run`, every `cron_*`
 tool, `artifact_*`, `learn_add`, `send_message`. Acceptable while proving a
 transport; a serious regression as a steady state.
 
-**P3 — profiles and heterogeneity.** A per-project execution profile mapping to a
-template plus `coder_parameter` values (§4.2 item 2); then Windows images.
-macOS stays a non-goal (§8).
+**P3 — profiles and heterogeneity.** The sandbox-profile library, settings panel
+and per-session picker as specified in §4.4; then Windows images. macOS stays a
+non-goal (§8).
 
 ## 10. Risks
 
