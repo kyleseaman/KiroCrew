@@ -4,7 +4,7 @@ status: draft
 author: kyleseaman
 created: 2026-08-11
 last-audited: 2026-08-11
-audited-at: 88e00ff6a
+audited-at: 8ee44d84f
 doc-pr:
 implementation-prs: []
 tracking-issues: []
@@ -189,7 +189,7 @@ not at the transport layer.
 
 ### 4.2 What must change inside Crew
 
-Anchors verified at `00aceb913`. Ordered by dependency; W1 and W2 are the same PR.
+Anchors verified at `8ee44d84f`. Ordered by dependency; W1 and W2 are the same PR.
 
 **W0 — what does NOT change.** Worth stating, because it bounds the work.
 The JSON-RPC layer is untouched (§5.2 proved a handshake with zero protocol
@@ -409,7 +409,7 @@ named remote targets. Two parts:
 #### Per-session selection
 
 A slot field plus an endpoint mirroring `api_chat_slot_model`
-(`src/kiro_crew/dashboard/chat_handlers.py:2406`), surfaced as a dropdown in the
+(`src/kiro_crew/dashboard/chat_handlers.py:2688`), surfaced as a dropdown in the
 chat header next to the model picker. New sessions inherit the resolved default;
 the picker overrides it for that session.
 
