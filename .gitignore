@@ -44,6 +44,14 @@ pyrightconfig.json
 .env.local
 .install-method
 
+# Credential-bearing scratch. `.env` alone does not cover a NAMED env file
+# (e.g. a POC's `coder-admin.env`), which is how a token reaches a public repo
+# by accident. Deliberately narrow: `*.pem` and `*credential*` are NOT listed
+# because both would shadow legitimately-tracked files (a public signing key
+# and channel test fixtures).
+*.env
+secrets/
+
 # Frontend
 node_modules/
 frontend/package-lock.json

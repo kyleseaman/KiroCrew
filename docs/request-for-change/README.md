@@ -37,6 +37,7 @@ not been re-audited since 2026-08-03.
 | [rfc-s3-backup.md](rfc-s3-backup.md) | `draft` | Nothing. Verified at `f4d3327a7`: `VALID_COMPONENTS` carries no session component and no code path writes crew state to a remote store |
 | [rfc-navigation-placement-seam.md](rfc-navigation-placement-seam.md) | `draft` | Nothing. Verified at `2a665e735`: `UISidebar` ships in the manifest and no frontend code reads `ui.sidebar`; `appNavTarget` still resolves `pages[0]` only, and `registerBuiltinSurface` is not one of the nine edition seams |
 | [rfc-append-only-session-transcript.md](rfc-append-only-session-transcript.md) | `draft` | Nothing. Verified at `2a665e735`: `_save_slot_to_history` still re-serializes the whole in-memory window on every flush, and `rewrite_session` / `sliding_window` still have no production caller |
+| [rfc-coder-remote-sandboxes.md](rfc-coder-remote-sandboxes.md) | `draft` | Nothing. Verified at `88e00ff6a`: `agent.sandbox` is still a global two-value enum, no `SessionHost` seam exists, and `KIRO_API_KEY` appears nowhere in the tree. A working POC harness sits at `docker/coder/` and validated the transport, auth mechanism and per-session ceilings out of tree |
 | [version-compliance-framework.md](version-compliance-framework.md) | `draft` | Nothing. Framework doc, not an RFC; premise is pre-fork and stale |
 
 Nothing in this directory is `implemented` or `superseded` today.
