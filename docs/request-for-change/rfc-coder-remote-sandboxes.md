@@ -18,6 +18,66 @@ superseded-by: []
   ceilings; the KiroCrew-side change is unwritten. The harness lives at
   `docker/coder/`.
 
+## Summary — the recommended architecture
+
+**Run the gateway as a long-lived container anywhere, and run every session's
+agent process in a Coder workspace instead of as a local child process.**
+
+```
+   CONTROL PLANE (long-lived, small)          EXECUTION PLANE (ephemeral, sized)
+ ┌───────────────────────────────────┐      ┌──────────────────────────────────┐
+ │ kirocrew gateway  (container)     │      │ Coder workspace  "session-a"     │
+ │  · owns ALL state:               │◄────►│  · kiro-cli acp                  │
+ │    memory, transcripts, artifacts │ ACP  │  · the repo / worktree           │
+ │  · is the ACP *client*            │ over │  · the project's toolchain       │
+ │  · persistent volume, ~4 GB       │ ssh  │  · its own CPU/RAM ceiling       │
+ │  · needs a Coder API token        │      │  · NO Crew state whatsoever      │
+ └───────────────────────────────────┘      └──────────────────────────────────┘
+        │  creates / stops / deletes                  ┌──────────────────────┐
+        └────────────── coderd REST ──────────────────│ workspace "session-b"│
+                                                      │  (different image,   │
+                                                      │   different size)    │
+                                                      └──────────────────────┘
+```
+
+Why this shape and not the alternatives:
+
+- **The gateway stays the ACP client**, which it already is. Transcripts, memory
+  and usage records never leave the control plane, so the memory flow-back
+  problem is *designed out* rather than solved (§7.5).
+- **The workspace holds no Crew state**, so there is nothing to merge, nothing to
+  sync, and a workspace can be destroyed at any time without loss.
+- **Each session gets its own kernel-enforced ceiling and its own image**, which
+  is the only way to deliver right-sizing and per-project toolchains at all.
+- **Co-locating the gateway with coderd makes the transport cost negligible.**
+  Measured per-frame overhead is ~0.3 ms (§5.1); a laptop gateway driving cloud
+  sandboxes would instead pay WAN RTT on *every* protocol frame.
+
+Two clarifications that are easy to get wrong:
+
+1. **Deploying the gateway into Coder does NOT give you sandboxes.** A gateway
+   running inside a workspace still spawns kiro-cli as a local child *of that
+   same workspace*, so every session shares one ceiling and one image. It
+   relocates the machine; it does not divide it. The two capabilities are
+   independent, and the sandbox half is the part that needs new code.
+2. **The gateway should NOT itself be a Coder workspace.** Coder workspaces are
+   modelled as ephemeral dev environments — stop/start, TTL, dormancy,
+   auto-delete. An always-on gateway fits that model badly and would be fighting
+   the platform's lifecycle to stay up. The gateway only needs to be a
+   long-lived container (Docker, ECS, a k8s Deployment, systemd) with network
+   reach to coderd's API and a token. **Workspaces are for sandboxes.**
+
+What this costs, honestly: the gateway container is **stateful** (persistent
+volume for the data home) with a ~4 GB floor until the embedding stack is
+offloaded (§7.1); it needs a **Coder API token** with workspace-create rights;
+and because every session becomes remote, **remote MCP stops being optional**
+(§7.4) — without it a session loses the whole KiroCrew capability layer.
+
+**Half of this already ships.** `docker/Dockerfile` is a working gateway image
+(`EXPOSE 5476`, healthcheck on `/api/health`, `CMD gateway`), and
+`docs/guides/docker.md` already recommends it for 24/7 use. The new work is the
+session backend, not the packaging.
+
 ## 1. Problem
 
 Kiro Crew assumes it owns a whole machine. The gateway, every agent process,
@@ -89,6 +149,11 @@ instance replacement, so prebuilds buy nothing there without `ignore_changes`.
 
 ### 4.1 The seam decision
 
+**Recommendation: option C — the gateway keeps the ACP client role and the agent
+process moves into a Coder workspace.** This is the "two-plane" model in the
+Summary. The alternatives are recorded because each looks reasonable until you
+follow it through.
+
 The question is *where kiro-cli runs*.
 
 **A. Whole agent remote, gateway unchanged.** The workspace owns the session,
@@ -152,6 +217,13 @@ Gotcha: `KIRO_HOME` does **not** relocate credentials; they resolve from
 Harness: `docker/coder/`. coderd v2.36.0 on loopback with telemetry disabled, a
 1.01 GB workspace image carrying kiro-cli, a template with a size parameter, two
 live workspaces.
+
+**Which plane this exercised.** The POC ran the gateway **on the host** and the
+agent process **in a workspace** — i.e. exactly the execution plane of the
+recommended architecture. The control plane was not containerised during the
+POC, because that half already ships (`docker/Dockerfile`); the workspace image
+deliberately contains **only kiro-cli**, no KiroCrew. So the results below speak
+to the session backend, not to gateway packaging.
 
 ### 5.1 The transport works, and is nearly free per frame
 
@@ -317,33 +389,51 @@ the agent is alive. Needs a remote-side idle guard.
 
 ## 9. Phases
 
-**P0 — prerequisites, independent of Coder.** The 429 classifier (§7.2), CPU
-admission control and cgroup-aware `-n auto` (§7.3).
+**Not a phase — gateway packaging.** `docker/Dockerfile` already builds a working
+gateway image and `docs/guides/docker.md` already recommends it for 24/7 use.
+Running the control plane as a long-lived container is a *deployment choice
+available today*, not work. It needs a persistent volume for the data home and a
+Coder API token; it should **not** be a Coder workspace (see Summary).
 
-**P1 — deployment target.** A reviewed template that runs Crew in a workspace
-with `coder_app` ingress and `KIRO_API_KEY` from a template variable. Delivers
-§2.1 and §2.2 with no core refactor.
+**P0 — prerequisites.** The `HTTP 429` misclassification (§7.2) is a hard
+requirement: it is rare at today's concurrency and routine once sessions fan out,
+and it currently kills a turn instead of retrying. Design the **env allowlist**
+(§7.7) in the same pass, since a remote spawn must not inherit the host's cloud
+credentials. CPU governance and cgroup-aware `-n auto` (§7.3) matter *less* under
+this architecture — agent-triggered work leaves the control plane entirely — but
+still apply to gateway-side Dev Fleet builds, which do not move.
 
-**P2 — remote session transport.** `SessionHost` with the local path as #1 and
-Coder as #2; allowlisted env; `mcpServers: []`. Completes the POC's §5.4 gap.
+**P1 — remote session transport.** The core of the proposal: a `SessionHost`
+seam with the local path as implementation #1 and a Coder workspace as #2,
+allowlisted env, and `mcpServers: []`. Completes the gap in §5.4. The POC already
+validated the transport, the auth mechanism and the ceilings this phase depends
+on, so P1 is implementation rather than discovery.
 
-**P3 — remote MCP** as HTTP + bearer token (§7.4).
+**P2 — remote MCP** as HTTP + a bearer token (§7.4). **This gates making remote
+the default.** With `mcpServers: []` a session keeps only the kiro-cli built-ins
+and loses the entire KiroCrew capability layer — `spawn_run`, every `cron_*`
+tool, `artifact_*`, `learn_add`, `send_message`. Acceptable while proving a
+transport; a serious regression as a steady state.
 
-**P4 — profiles and heterogeneity.** Per-project execution profiles; Windows.
+**P3 — profiles and heterogeneity.** A per-project execution profile mapping to a
+template plus `coder_parameter` values (§4.2 item 2); then Windows images.
+macOS stays a non-goal (§8).
 
 ## 10. Risks
 
 | Risk | Severity | Notes |
 |---|---|---|
+| **Remote MCP is a prerequisite, not an enhancement** | **High** | Under this architecture every session is remote, so `mcpServers: []` would permanently cost the KiroCrew capability layer. Client half exists; the broker needs a TCP listener and a token (§7.4, P2) |
 | Cold start makes sessions feel slow | High | Prebuilds are Premium *and* need `ignore_changes` on `user_data`; warm image measured 385 ms to agent-connect, cold image unmeasured |
-| Control plane cannot get small enough | Medium | 3.39 GB anonymous floor; embedding offload is the lever |
-| Remote MCP cost | Medium | Client half exists; broker needs a listener and a token |
-| One identity throttles the fleet | Medium | Fan-out gives cores, not throughput |
+| Control plane cannot get small enough | Medium | 3.39 GB anonymous floor; embedding offload is the lever (§7.1) |
+| Control plane is stateful | Medium | The gateway container owns memory, transcripts and artifacts, so it needs a persistent volume and a backup story. Losing the container is not a no-op |
+| Gateway needs a Coder API token | Medium | Workspace-create rights, held inside the control-plane container — a second credential-in-a-container alongside `KIRO_API_KEY` |
+| One identity throttles the fleet | Medium | Fan-out gives cores, not throughput (§7.6) |
 | Path mapping bugs | Medium | Two admission gates fail *silently* (§4.2) |
-| Dropped connection leaves a live remote agent | Medium | No local analogue; burns credits invisibly |
+| Dropped connection leaves a live remote agent | Medium | No local analogue; burns credits invisibly (§7.8) |
 | Credentials leaking to a remote host | Medium | Must allowlist env (§7.7) |
 | AGPL vs Premium cost | Medium | Prebuilds, quotas, dormancy, audit log all Premium |
-| Interactive latency per frame | Low | Measured ~0.3 ms steady-state; same-host caveat |
+| Interactive latency per frame | Low | Measured ~0.3 ms steady-state. **Co-locating the gateway with coderd keeps it there**; a laptop gateway driving cloud sandboxes would instead pay WAN RTT per frame |
 
 ## 11. Open questions
 
