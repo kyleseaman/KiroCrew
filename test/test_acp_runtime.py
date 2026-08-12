@@ -667,6 +667,7 @@ async def test_runtime_spawn_passes_installed_path_through_exact_wrappers(
     monkeypatch,
 ):
     import kiro_crew.acp.runtime as runtime_mod
+    import kiro_crew.acp.session_host as host_mod
 
     macos_dir = tmp_path / "Kiro CLI.app" / "Contents" / "MacOS"
     macos_dir.mkdir(parents=True)
@@ -697,9 +698,9 @@ async def test_runtime_spawn_passes_installed_path_through_exact_wrappers(
         "_resolve_kiro_bin_for_spawn",
         resolve_installed,
     )
-    monkeypatch.setattr(runtime_mod, "wrap_argv", capture_wrap)
+    monkeypatch.setattr(host_mod, "wrap_argv", capture_wrap)
     monkeypatch.setattr(
-        runtime_mod,
+        host_mod,
         "cgroup_scope_argv",
         lambda argv: ["/usr/bin/cgroup-wrapper", *argv],
     )
@@ -4852,6 +4853,7 @@ async def test_runtime_spawn_scrubs_channel_creds_on_default_auto(monkeypatch):
     _AGENT_DENIED_ENV_KEYS, so scrub_agent_denied_env must remove them.
     """
     import kiro_crew.acp.runtime as runtime_mod
+    import kiro_crew.acp.session_host as host_mod
 
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "0000:FAKE-telegram")
     monkeypatch.setenv("WECOM_BOT_ID", "FAKE-wecom-bot")
@@ -4879,11 +4881,11 @@ async def test_runtime_spawn_scrubs_channel_creds_on_default_auto(monkeypatch):
         resolve_kiro_bin,
     )
     monkeypatch.setattr(
-        runtime_mod,
+        host_mod,
         "wrap_argv",
         lambda argv, mode, strip_python_env=False, is_kiro_cli=None: (argv, None),
     )
-    monkeypatch.setattr(runtime_mod, "cgroup_scope_argv", lambda argv: argv)
+    monkeypatch.setattr(host_mod, "cgroup_scope_argv", lambda argv: argv)
     monkeypatch.setattr(runtime_mod, "augmented_path", lambda p: p)
     monkeypatch.setattr(runtime_mod, "resolve_krb5_ccname", lambda env: None)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)

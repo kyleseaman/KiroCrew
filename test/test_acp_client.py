@@ -15,6 +15,7 @@ import pytest
 from spawn_test_helpers import strip_spawn_shim
 
 import kiro_crew.acp.client as acp_client
+import kiro_crew.acp.session_host as acp_host
 from kiro_crew.acp.client import (
     _CLAUDE_ACP_PKG_ENTRY,
     _DRAIN_DURATION,
@@ -568,7 +569,7 @@ class TestAcpClientSessionKey:
         with (
             patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
             patch(
-                "kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
+                "kiro_crew.acp.session_host.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
             ),
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
             patch("kiro_crew.session._track_pid"),
@@ -594,7 +595,7 @@ class TestAcpClientSessionKey:
         with (
             patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
             patch(
-                "kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
+                "kiro_crew.acp.session_host.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
             ),
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
             patch("kiro_crew.session._track_pid"),
@@ -632,7 +633,7 @@ class TestAcpClientSessionKey:
                 return_value=["/usr/bin/node", "/x/acp.js"],
             ),
             patch(
-                "kiro_crew.acp.client.wrap_argv",
+                "kiro_crew.acp.session_host.wrap_argv",
                 return_value=(["/usr/bin/node", "/x/acp.js"], None),
             ),
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
@@ -661,7 +662,7 @@ class TestAcpClientSessionKey:
         with (
             patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
             patch(
-                "kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
+                "kiro_crew.acp.session_host.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
             ),
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
             patch("kiro_crew.session._track_pid"),
@@ -688,7 +689,7 @@ class TestAcpClientSessionKey:
         with (
             patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
             patch(
-                "kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
+                "kiro_crew.acp.session_host.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
             ),
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
             patch("kiro_crew.session._track_pid"),
@@ -716,7 +717,7 @@ class TestAcpClientSessionKey:
         with (
             patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
             patch(
-                "kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
+                "kiro_crew.acp.session_host.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
             ),
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
             patch("kiro_crew.session._track_pid"),
@@ -754,7 +755,7 @@ class TestSpawnStderrDrainCleanup:
         with (
             patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
             patch(
-                "kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
+                "kiro_crew.acp.session_host.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
             ),
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
             patch("kiro_crew.session._track_pid"),
@@ -783,7 +784,7 @@ class TestSpawnStderrDrainCleanup:
         with (
             patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
             patch(
-                "kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
+                "kiro_crew.acp.session_host.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
             ),
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
             patch("kiro_crew.session._track_pid"),
@@ -844,7 +845,7 @@ class TestAcpClientBackendSelection:
             ),
             patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
             patch(
-                "kiro_crew.acp.client.wrap_argv",
+                "kiro_crew.acp.session_host.wrap_argv",
                 side_effect=lambda argv, mode, **kwargs: (argv, None),
             ),
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
@@ -883,7 +884,7 @@ class TestAcpClientBackendSelection:
         with (
             patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
             patch(
-                "kiro_crew.acp.client.wrap_argv",
+                "kiro_crew.acp.session_host.wrap_argv",
                 side_effect=lambda argv, mode, **kwargs: (argv, None),
             ),
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
@@ -8104,6 +8105,7 @@ class TestResolveKiroBinEnvOverride:
     @pytest.mark.asyncio
     async def test_spawn_passes_installed_path_through_exact_wrappers(self, tmp_path):
         from kiro_crew.acp import client as client_module
+        from kiro_crew.acp import session_host as host_module
 
         fake = tmp_path / "kiro-cli"
         fake.write_bytes(b"#!/bin/sh\n")
@@ -8122,9 +8124,9 @@ class TestResolveKiroBinEnvOverride:
                 "_resolve_kiro_bin",
                 return_value=launch_path,
             ),
-            patch.object(client_module, "wrap_argv", side_effect=capture_wrap),
+            patch.object(host_module, "wrap_argv", side_effect=capture_wrap),
             patch.object(
-                client_module,
+                host_module,
                 "cgroup_scope_argv",
                 side_effect=lambda argv: ["/usr/bin/cgroup-wrapper", *argv],
             ),
@@ -9495,11 +9497,11 @@ class TestSpawnEnvChannelCredentialScrub:
 
         monkeypatch.setattr(acp_client, "_resolve_kiro_bin", lambda: "/fake/kiro")
         monkeypatch.setattr(
-            acp_client,
+            acp_host,
             "wrap_argv",
             lambda argv, mode, strip_python_env=False, is_kiro_cli=None: (argv, None),
         )
-        monkeypatch.setattr(acp_client, "cgroup_scope_argv", lambda argv: argv)
+        monkeypatch.setattr(acp_host, "cgroup_scope_argv", lambda argv: argv)
         monkeypatch.setattr(acp_client, "augmented_path", lambda p: p)
         monkeypatch.setattr(acp_client, "resolve_krb5_ccname", lambda env: None)
         monkeypatch.setattr(acp_client, "_resolve_ssh_auth_sock", lambda env: None)

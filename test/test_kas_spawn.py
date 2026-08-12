@@ -168,7 +168,7 @@ class TestSandboxClassification:
             sandbox_mode="off",
             acp_backend=ACP_BACKEND_KAS,
         )
-        with patch("kiro_crew.acp.runtime.wrap_argv", side_effect=fake_wrap):
+        with patch("kiro_crew.acp.session_host.wrap_argv", side_effect=fake_wrap):
             with pytest.raises(self._Abort):
                 await runtime.spawn()
         assert captured["is_kiro_cli"] is False
@@ -192,7 +192,7 @@ class TestSandboxClassification:
             "kiro_crew.acp.runtime.ensure_agent_materialized", lambda _agent: None
         )
         runtime = AcpRuntime(work_dir=tmp_path / "sbx2", sandbox_mode="off")
-        with patch("kiro_crew.acp.runtime.wrap_argv", side_effect=fake_wrap):
+        with patch("kiro_crew.acp.session_host.wrap_argv", side_effect=fake_wrap):
             with pytest.raises(self._Abort):
                 await runtime.spawn()
         assert captured["is_kiro_cli"] is True

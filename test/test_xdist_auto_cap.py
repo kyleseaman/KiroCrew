@@ -142,7 +142,7 @@ async def test_spawn_env_carries_xdist_cap(tmp_path, monkeypatch) -> None:
     with (
         patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
         patch(
-            "kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
+            "kiro_crew.acp.session_host.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
         ),
         patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
         patch("kiro_crew.session._track_pid"),
@@ -174,7 +174,7 @@ async def test_spawn_env_leaves_preset_xdist_cap_alone(tmp_path, monkeypatch) ->
     with (
         patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
         patch(
-            "kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
+            "kiro_crew.acp.session_host.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
         ),
         patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
         patch("kiro_crew.session._track_pid"),

@@ -44,6 +44,7 @@ from kiro_crew.acp._dispatch import (
 )
 from kiro_crew.acp.liveness import VERDICT_UNKNOWN, VERDICT_WORKING, LivenessOracle
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
+from kiro_crew.acp.session_host import SessionHost, default_session_host
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_KIRO,
@@ -120,12 +121,8 @@ from kiro_crew.mcp_gateway.claim import schedule_claim
 from kiro_crew.mcp_gateway.session_servers import pooled_session_servers
 from kiro_crew.resource_status import inject_xdist_auto_cap
 from kiro_crew.sandbox import (
-    RLIMIT_PROFILE_SESSION_HOST,
     apply_windows_resource_ceiling,
-    cgroup_scope_argv,
-    create_subprocess_limited,
     scrub_agent_denied_env,
-    wrap_argv,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -2031,6 +2028,7 @@ class AcpClient:
         mcp_gateway_settings_mcp_json: str | Path | None = None,
         mcp_gateway_socket: str | Path | None = None,
         permission_mode: str | None = None,
+        session_host: SessionHost | None = None,
     ):
         if work_dir:
             self._work_dir = Path(work_dir)
@@ -2047,6 +2045,7 @@ class AcpClient:
         self._model = model or DEFAULT_MODEL
         self._agent = agent
         self._sandbox_mode = sandbox_mode
+        self._session_host = session_host or default_session_host()
         self._acp_backend = acp_backend
         # Claude backend permission mode (Auto-mode / permission-UI parity).
         # Inert on the kiro-cli path and unused by the public core; a companion
@@ -2643,8 +2642,10 @@ class AcpClient:
         a Claude backend reuses this same client over the seam.
         """
         # Off-loop: mkdir is a blocking syscall and the parent dirs may live on
-        # slow storage; the loop must never wait on the kernel here.
-        await asyncio.to_thread(self._work_dir.mkdir, parents=True, exist_ok=True)
+        # slow storage; the loop must never wait on the kernel here. The host
+        # owns how that offload happens, since a remote host does not touch the
+        # gateway's filesystem at all.
+        await self._session_host.prepare_work_dir(self._work_dir)
 
         if self._is_claude:
             # Dormant seam — see method docstring. Binary resolution only; the
@@ -2694,32 +2695,18 @@ class AcpClient:
                 logger.warning("pre-spawn agent materialization failed", exc_info=True)
             argv = [kiro_bin, KIRO_CLI_SUBCMD, "--agent", self._agent]
 
-        # OS-level sandbox: wrap the command to hide sensitive paths.
-        # strip_python_env keeps the host PYTHONPATH/PYTHONHOME out of kiro-cli's
-        # foreign MCP subprocesses (which bundle their own interpreter + deps).
+        # Argv wrapping (OS sandbox, cgroup scope) and the spawn itself belong to
+        # the session host: all three depend on where the agent runs, and the host
+        # owns the leak window between the sandbox wrap and the exec.
+        #
         # is_kiro_cli is membership in ACP_BACKENDS_INTERNAL_SANDBOX
         # (harness-parity H7), not "not claude": the flag makes wrap_argv SKIP
         # Crew's seatbelt on macOS in favour of the harness's own internal
         # sandbox, so a harness without one must never be granted it by the
         # absence of another harness.
-        argv, self._sandbox_cleanup = wrap_argv(
-            argv,
-            mode=self._sandbox_mode,
-            strip_python_env=True,
-            is_kiro_cli=self.backend in ACP_BACKENDS_INTERNAL_SANDBOX,
-        )
-        # cgroup v2 scope (OUTERMOST): bound this agent + all its MCP-server /
-        # tool descendants with pids.max (fork bomb) + memory.max (RSS balloon).
-        # No-op + loud warning where cgroup delegation is unavailable. --scope
-        # execs into the target, so self._pid below is still the real child.
-        # Off-loop: first call probes /proc + /sys and the config read touches
-        # the config dir (mkdir + file read) — blocking syscalls that must not
-        # run on the loop. Guarded: wrap_argv above allocated the sandbox temp
-        # file, so a cancellation here must not orphan it.
-        argv = await self._to_thread_guarding_sandbox(cgroup_scope_argv, argv)
 
-        # Build the child environment (process-group isolation flags are set on
-        # the spawn kwargs below, per-platform).
+        # Build the child environment. Process-group isolation flags are set by
+        # the host at launch, per-platform.
         env = {**os.environ}
         if self._extra_env:
             env.update(self._extra_env)
@@ -2797,26 +2784,21 @@ class AcpClient:
         # stops an inherited Ctrl-C propagating into the gateway. The flag comes
         # from platform_compat (getattr) so referencing it doesn't fail mypy's
         # [attr-defined] check on Linux where subprocess.* lacks it.
-        self._process = await create_subprocess_limited(
-            *argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(self._work_dir),
-            limit=_STDOUT_BUFFER_LIMIT,
-            env=env,
-            start_new_session=platform_compat.IS_POSIX,
-            creationflags=(
-                platform_compat.CREATE_NEW_PROCESS_GROUP
-                | platform_compat._SUBPROCESS_NO_WINDOW
-                | platform_compat.CREATE_SUSPENDED
-            ),
-            profile=RLIMIT_PROFILE_SESSION_HOST,
-        )
-        self._pid = self._process.pid
         _spawn_label = (
             "claude-agent-acp" if self._is_claude else f"{KIRO_CLI_BIN} {KIRO_CLI_SUBCMD}"
         )
+        launched = await self._session_host.launch(
+            argv,
+            work_dir=self._work_dir,
+            env=env,
+            sandbox_mode=self._sandbox_mode,
+            is_kiro_cli=self.backend in ACP_BACKENDS_INTERNAL_SANDBOX,
+            stdout_limit=_STDOUT_BUFFER_LIMIT,
+            label=_spawn_label,
+        )
+        self._process = launched.process
+        self._sandbox_cleanup = launched.sandbox_cleanup
+        self._pid = self._process.pid
         # Windows resource ceiling, applied while the child is still SUSPENDED,
         # then resumed. No-op on POSIX (CREATE_SUSPENDED is 0 there). OFFLOADED
         # because the Windows path reads the config file and walks the process
@@ -3153,7 +3135,7 @@ class AcpClient:
         the internal companion, not the public core.
         """
         new_params: dict = {
-            "cwd": str(self._work_dir),
+            "cwd": self._session_host.protocol_cwd(self._work_dir),
             # kiro-cli loads servers from --agent; claude-agent-acp must be
             # told here -- it does not read kirocrew.mcp.json on its own. The
             # Default hook returns [] (kiro-cli path unchanged); an internal
@@ -3268,7 +3250,7 @@ class AcpClient:
                 try:
                     load_params: dict = {
                         "sessionId": resume_sid,
-                        "cwd": str(self._work_dir),
+                        "cwd": self._session_host.protocol_cwd(self._work_dir),
                         # kiro-cli gets its servers via --agent; the claude
                         # backend must receive them here (it does not read
                         # kirocrew.mcp.json itself). Default [] leaves kiro-cli
@@ -3396,7 +3378,7 @@ class AcpClient:
         a process's cwd is bound to the inode, not the path.
         """
         if not self._work_dir_ready:
-            await asyncio.to_thread(self._work_dir.mkdir, parents=True, exist_ok=True)
+            await self._session_host.prepare_work_dir(self._work_dir)
             self._work_dir_ready = True
         if self._process and self._process.returncode is None and self._session_id:
             return

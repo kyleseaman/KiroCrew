@@ -34,6 +34,7 @@ import pytest
 
 import kiro_crew.acp.client as client_mod
 import kiro_crew.acp.runtime as runtime_mod
+import kiro_crew.acp.session_host as host_mod
 from kiro_crew.acp.client import AcpClient, _resolve_spawn_env
 from kiro_crew.acp.runtime import AcpRuntime
 
@@ -98,7 +99,7 @@ class TestClientSpawnOffLoop:
             patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
             patch.object(client_mod, "ensure_agent_materialized"),
             patch(
-                "kiro_crew.acp.client.wrap_argv",
+                "kiro_crew.acp.session_host.wrap_argv",
                 return_value=(["/usr/bin/kiro-cli", "acp"], None),
             ),
             patch(
@@ -127,7 +128,7 @@ class TestClientSpawnOffLoop:
             # config (mkdir + file IO) — record its thread directly so the
             # assertion does not depend on this host's cgroup delegation.
             patch.object(
-                client_mod,
+                host_mod,
                 "cgroup_scope_argv",
                 side_effect=lambda argv: (
                     cgroup_threads.append(threading.current_thread()),
@@ -190,7 +191,7 @@ class TestClientSpawnPidTrackingOffLoop:
             patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
             patch.object(client_mod, "ensure_agent_materialized"),
             patch(
-                "kiro_crew.acp.client.wrap_argv",
+                "kiro_crew.acp.session_host.wrap_argv",
                 return_value=(["/usr/bin/kiro-cli", "acp"], None),
             ),
             patch(
@@ -277,9 +278,9 @@ class TestRuntimeSpawnOffLoop:
         monkeypatch.setattr(runtime_mod, "_resolve_kiro_bin_for_spawn", resolve_bin)
         monkeypatch.setattr(runtime_mod, "ensure_agent_materialized", lambda agent: None)
         monkeypatch.setattr(
-            runtime_mod, "wrap_argv", lambda argv, mode, **kw: (list(argv), None)
+            host_mod, "wrap_argv", lambda argv, mode, **kw: (list(argv), None)
         )
-        monkeypatch.setattr(runtime_mod, "cgroup_scope_argv", _rec_cgroup)
+        monkeypatch.setattr(host_mod, "cgroup_scope_argv", _rec_cgroup)
         monkeypatch.setattr(
             runtime_mod,
             "inject_xdist_auto_cap",
@@ -323,10 +324,18 @@ class TestSpawnCancellationSandboxCleanup:
         return str(f)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("raise_in", ["cgroup", "env"])
+    @pytest.mark.parametrize("raise_in", ["cgroup", "spawn"])
     async def test_client_spawn_cancel_unlinks_sandbox_file(
         self, tmp_path, raise_in
     ) -> None:
+        """A cancellation between the sandbox wrap and the exec must not orphan it.
+
+        Both suspension points inside that window are covered: the off-loop cgroup
+        call and the subprocess creation itself. Env resolution is deliberately
+        NOT a case here -- the session host allocates the sandbox file inside
+        ``launch``, which runs after the caller has built the env, so a
+        cancellation during env resolution has nothing to orphan yet.
+        """
         sandbox_file = self._sandbox_file(tmp_path)
         client = AcpClient(work_dir=tmp_path / "workspace", session_key="k")
 
@@ -335,18 +344,18 @@ class TestSpawnCancellationSandboxCleanup:
                 raise asyncio.CancelledError()
             return argv
 
-        def _env(env, **_kwargs):
+        async def _spawn_fail(*_args, **_kwargs):
             raise asyncio.CancelledError()
 
         with (
             patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
             patch.object(client_mod, "ensure_agent_materialized"),
             patch(
-                "kiro_crew.acp.client.wrap_argv",
+                "kiro_crew.acp.session_host.wrap_argv",
                 return_value=(["/usr/bin/kiro-cli", "acp"], sandbox_file),
             ),
-            patch.object(client_mod, "cgroup_scope_argv", side_effect=_cgroup),
-            patch.object(client_mod, "_resolve_spawn_env", side_effect=_env),
+            patch.object(host_mod, "cgroup_scope_argv", side_effect=_cgroup),
+            patch.object(host_mod, "create_subprocess_limited", side_effect=_spawn_fail),
             pytest.raises(asyncio.CancelledError),
         ):
             await client._spawn()
@@ -355,10 +364,11 @@ class TestSpawnCancellationSandboxCleanup:
         assert client._sandbox_cleanup is None
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("raise_in", ["cgroup", "krb5"])
+    @pytest.mark.parametrize("raise_in", ["cgroup", "spawn"])
     async def test_runtime_spawn_cancel_unlinks_sandbox_file(
         self, tmp_path, monkeypatch, raise_in
     ) -> None:
+        """Runtime twin of the client case; same window, same two suspension points."""
         sandbox_file = self._sandbox_file(tmp_path)
 
         async def resolve_bin() -> str:
@@ -369,18 +379,18 @@ class TestSpawnCancellationSandboxCleanup:
                 raise asyncio.CancelledError()
             return argv
 
-        def _krb5(env):
+        async def _spawn_fail(*_args, **_kwargs):
             raise asyncio.CancelledError()
 
         monkeypatch.setattr(runtime_mod, "_resolve_kiro_bin_for_spawn", resolve_bin)
         monkeypatch.setattr(runtime_mod, "ensure_agent_materialized", lambda agent: None)
         monkeypatch.setattr(
-            runtime_mod,
+            host_mod,
             "wrap_argv",
             lambda argv, mode, **kw: (list(argv), sandbox_file),
         )
-        monkeypatch.setattr(runtime_mod, "cgroup_scope_argv", _cgroup)
-        monkeypatch.setattr(runtime_mod, "resolve_krb5_ccname", _krb5)
+        monkeypatch.setattr(host_mod, "cgroup_scope_argv", _cgroup)
+        monkeypatch.setattr(host_mod, "create_subprocess_limited", _spawn_fail)
 
         runtime = AcpRuntime(work_dir=tmp_path / "workspace")
         with pytest.raises(asyncio.CancelledError):

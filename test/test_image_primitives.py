@@ -51,7 +51,7 @@ class TestRuntimeModelParam:
                 new_callable=AsyncMock,
                 return_value="/bin/kiro-cli",
             ),
-            patch("kiro_crew.acp.runtime.wrap_argv", side_effect=_capture),
+            patch("kiro_crew.acp.session_host.wrap_argv", side_effect=_capture),
         ):
             with pytest.raises(RuntimeError, match="abort-after-capture"):
                 asyncio.get_event_loop().run_until_complete(rt.spawn())

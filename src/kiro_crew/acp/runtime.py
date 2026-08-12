@@ -67,6 +67,7 @@ from kiro_crew.acp.session_handle import (
     AcpSessionHandle,
     _load_watchdog_settings,
 )
+from kiro_crew.acp.session_host import SessionHost, default_session_host
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
@@ -96,13 +97,7 @@ from kiro_crew.env import augmented_path, resolve_krb5_ccname
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.mcp_gateway.session_servers import pooled_session_servers
 from kiro_crew.resource_status import inject_xdist_auto_cap
-from kiro_crew.sandbox import (
-    RLIMIT_PROFILE_SESSION_HOST,
-    cgroup_scope_argv,
-    create_subprocess_limited,
-    scrub_agent_denied_env,
-    wrap_argv,
-)
+from kiro_crew.sandbox import scrub_agent_denied_env
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.session_pid import (
     _track_pid,
@@ -610,6 +605,7 @@ class AcpRuntime:
         expect_mcp_reports: bool = True,
         acp_backend: str = ACP_BACKEND_KIRO,
         crew_agent: str = "",
+        session_host: SessionHost | None = None,
     ):
         if work_dir:
             self._work_dir = Path(work_dir)
@@ -635,6 +631,7 @@ class AcpRuntime:
                 )
         self._model = model
         self._sandbox_mode = sandbox_mode
+        self._session_host = session_host or default_session_host()
         self._extra_env = extra_env or {}
         self._mcp_gateway_overlay = str(mcp_gateway_overlay) if mcp_gateway_overlay else None
         self._mcp_gateway_settings_mcp_json = (
@@ -921,8 +918,10 @@ class AcpRuntime:
             raise AcpRuntimeError("Runtime already spawned")
 
         # Off-loop: mkdir is a blocking syscall and the parent dirs may live on
-        # slow storage; the loop must never wait on the kernel here.
-        await asyncio.to_thread(self._work_dir.mkdir, parents=True, exist_ok=True)
+        # slow storage; the loop must never wait on the kernel here. The host
+        # owns how that offload happens, since a remote host does not touch the
+        # gateway's filesystem at all.
+        await self._session_host.prepare_work_dir(self._work_dir)
 
         try:
             argv = await self._resolve_spawn_argv()
@@ -931,12 +930,14 @@ class AcpRuntime:
         except KasAssetsMissing as exc:
             raise AcpRuntimeError(str(exc)) from exc
 
-        # OSS sandbox.wrap_argv supports (argv, mode, strip_python_env). The
+        # Argv wrapping (OS sandbox, cgroup scope) and the launch itself belong
+        # to the session host, since both depend on where the agent runs. The
         # MCP-gateway overlay is NOT delivered through the sandbox: its broker
         # stubs are injected at ACP session/new (see new_session), so pooling
-        # needs no bind-mount and works with sandbox mode "off". strip_python_env
-        # IS applied to keep the host PYTHONPATH/PYTHONHOME out of kiro-cli's
-        # foreign MCP subprocesses (which bundle their own interpreter + deps).
+        # needs no bind-mount and works with sandbox mode "off". Argv wrapping
+        # and the spawn belong to the session host, which owns the leak window
+        # between the sandbox wrap and the exec.
+        #
         # is_kiro_cli drives a macOS-only delegation: when kiro's internal
         # sandbox is enabled, wrap_argv skips its own seatbelt because the two
         # cannot nest (kernel EPERM). Granted by membership in
@@ -945,21 +946,6 @@ class AcpRuntime:
         # have Crew's seatbelt skipped in favour of an internal sandbox that never
         # starts. KAS is a Node process with no internal sandbox, so it takes
         # Crew's seatbelt directly, and so does every harness added later.
-        argv, self._sandbox_cleanup = wrap_argv(
-            argv,
-            mode=self._sandbox_mode,
-            strip_python_env=True,
-            is_kiro_cli=self._acp_backend in ACP_BACKENDS_INTERNAL_SANDBOX,
-        )
-        # cgroup v2 scope (OUTERMOST): bound this agent + all its MCP-server /
-        # tool descendants with pids.max (fork bomb) + memory.max (RSS balloon).
-        # No-op + loud warning where cgroup delegation is unavailable. --scope
-        # execs into the target, so self._pid below is still the real child.
-        # Off-loop: first call probes /proc + /sys and the config read touches
-        # the config dir (mkdir + file read) — blocking syscalls that must not
-        # run on the loop. Guarded: wrap_argv above allocated the sandbox temp
-        # file, so a cancellation here must not orphan it.
-        argv = await self._to_thread_guarding_sandbox(cgroup_scope_argv, argv)
 
         env = {**os.environ}
         if self._extra_env:
@@ -1014,28 +1000,17 @@ class AcpRuntime:
         # file is live, so a cancellation here must not orphan it.
         await self._to_thread_guarding_sandbox(inject_xdist_auto_cap, env)
 
-        self._process = await create_subprocess_limited(
-            *argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(self._work_dir),
-            limit=_STDOUT_BUFFER_LIMIT,
-            # POSIX: setsid so kill() can killpg the whole tree. Windows:
-            # start_new_session is silently ignored; CREATE_NEW_PROCESS_GROUP
-            # makes the child tree taskkill /T-reapable (see platform_compat
-            # spawn-isolation note). CREATE_NO_WINDOW suppresses the console
-            # window Windows would otherwise pop for this console child spawned
-            # from the windowless gateway (0 on POSIX, so no effect there).
-            start_new_session=platform_compat.IS_POSIX,
-            creationflags=(
-                platform_compat.CREATE_NEW_PROCESS_GROUP
-                | platform_compat._SUBPROCESS_NO_WINDOW
-                | platform_compat.CREATE_SUSPENDED
-            ),
+        launched = await self._session_host.launch(
+            argv,
+            work_dir=self._work_dir,
             env=env,
-            profile=RLIMIT_PROFILE_SESSION_HOST,
+            sandbox_mode=self._sandbox_mode,
+            is_kiro_cli=self._acp_backend in ACP_BACKENDS_INTERNAL_SANDBOX,
+            stdout_limit=_STDOUT_BUFFER_LIMIT,
+            label=f"{KIRO_CLI_BIN} acp",
         )
+        self._process = launched.process
+        self._sandbox_cleanup = launched.sandbox_cleanup
         self._pid = self._process.pid
         # Windows resource ceiling, applied while the child is still SUSPENDED,
         # then resumed. No-op on POSIX (CREATE_SUSPENDED is 0 there). This shared
@@ -2513,7 +2488,7 @@ class AcpRuntime:
         )
         load_params: dict[str, Any] = {
             "sessionId": resume_sid,
-            "cwd": str(cwd if cwd else self._work_dir),
+            "cwd": self._session_host.protocol_cwd(Path(cwd) if cwd else self._work_dir),
             "mcpServers": mcp_servers,
         }
         if session_file:
