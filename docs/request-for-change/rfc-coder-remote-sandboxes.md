@@ -193,6 +193,11 @@ Docker harness in `docker/coder/`.
   tile lands authenticated. `share` defaults to `owner`.
 - **`coder stat cpu|mem|disk` as `coder_agent` metadata** surfaces live usage on
   the workspace page — directly useful given the CPU asymmetry in §7.3.
+- **Headless agent auth via a per-user Coder secret**, added in `e6a65370c`
+  (2026-08-12). This is the mechanism §4.3 now recommends, and it is a better
+  answer than the template variable this RFC proposed before reading it.
+
+Read at `e6a65370c`.
 
 
 
@@ -369,9 +374,36 @@ changes for existing users. That is enough to close §5.4.
 
 ### 4.3 Auth
 
-Use **`KIRO_API_KEY`**, the documented portable credential, injected as a
-workspace env var from the template. Verified in the POC (§5.2). Note it does
-**not appear anywhere in this repo today** — nothing plumbs it.
+Use **`KIRO_API_KEY`**, the documented portable credential. Verified in the POC
+(§5.2). Note it does **not appear anywhere in this repo today** — nothing plumbs
+it.
+
+**Deliver it as a per-user Coder secret, not from the template.**
+`coder secret create <name> --env KIRO_API_KEY` stores the value in coderd and
+injects it into the workspace agent's environment at start. Verified present in
+`coder` v2.36.0, the version this POC ran:
+
+```bash
+printf %s "$YOUR_KIRO_API_KEY" | coder secret create kiro-api-key \
+  --description "Kiro CLI headless auth" --env KIRO_API_KEY
+```
+
+This is better than any template-side mechanism on three counts, and it changes
+the shape of the env problem in §7.7. It keeps the value out of Terraform state.
+It is **per-user**, which matches Kiro's per-user key model, so agent activity is
+attributed to that user and honours their governance policies rather than a
+single shared service identity. And because Coder puts the key in the workspace
+directly, **the gateway never has to forward it over the transport at all** — the
+credential does not transit the control plane, which removes the most sensitive
+entry from the allowlist rather than protecting it.
+
+Operational caveats, from the module documenting this (§3.1):
+
+- API keys need a Kiro Pro/Pro+/Pro Max/Power subscription; on enterprise-managed
+  accounts an admin must enable API-key generation.
+- Enable coderd database encryption so secret values are encrypted at rest.
+- Deleting or rotating the Coder secret does **not** revoke the Kiro key — rotate
+  it in the Kiro portal. Either way the change lands on the next workspace start.
 
 Gotcha: `KIRO_HOME` does **not** relocate credentials; they resolve from
 `HOME` / `XDG_DATA_HOME` / `LOCALAPPDATA`.
@@ -405,10 +437,12 @@ extending that list. Delegation avoids the question entirely, and matches the
 `instances/` registry, which likewise stores *"only connection coordinates"* and
 mints credentials at connect time.
 
-The one credential KiroCrew *does* have to convey is `KIRO_API_KEY`, for the agent
-inside the workspace. That is supplied as a template variable (`sensitive = true`)
-rather than a `coder_parameter` — parameter values are persisted in coderd's
-database and readable back through its API.
+The one credential a sandbox needs is `KIRO_API_KEY`, for the agent inside the
+workspace — and Crew does not have to convey it. It is supplied as a **per-user
+Coder secret** targeting that env var (§4.3), so coderd injects it into the
+workspace and the value never enters Terraform state, a `coder_parameter`
+(parameter values persist in coderd's database and read back through its API), or
+Crew's own config. A profile therefore stores no secret at all.
 
 #### Config: `sandbox_profiles.json`
 
@@ -646,6 +680,12 @@ those, and these spawns do not call it), alongside `SSH_AUTH_SOCK`,
 `KRB5CCNAME`, `PYTHONPATH` and other host-local paths. Locally this is
 deliberate — the standard sandbox tier intentionally leaves AWS env alone.
 Copying it to *another host* is not. Remote spawns must **allowlist**.
+
+What the allowlist does **not** need to carry is `KIRO_API_KEY`. Under §4.3 the
+workspace gets it from a per-user Coder secret, so it is already in the remote
+environment before the gateway connects. The allowlist forwards session wiring
+(`KIROCREW_SESSION_KEY`, `KIROCREW_CHANNEL_ID`, model/agent selection), not
+credentials.
 
 Incidental: a comment in `src/kiro_crew/dashboard/server.py` claims
 `KIROCREW_INTERNAL_SECRET` is "stripped from agent env"; no such strip exists in
