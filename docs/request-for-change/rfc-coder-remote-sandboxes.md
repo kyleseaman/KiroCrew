@@ -466,17 +466,21 @@ to the session backend, not to gateway packaging.
 
 `coder ssh <ws> <cmd>` gives the gateway a **local subprocess whose stdin/stdout
 are the remote process's stdio** — exactly the shape `AcpClient`/`AcpRuntime`
-already consume. Five JSON frames round-tripped bidirectionally.
+already consume. JSON frames round-trip bidirectionally.
 
-| Path | First frame | Steady-state median |
+Across three runs:
+
+| Path | Connect (first frame) | Steady-state median |
 |---|---|---|
-| `coder ssh <ws> cat` | 155.1 ms | **0.3 ms** |
-| local `cat` (control) | 0.3 ms | 0.0 ms |
+| `coder ssh <ws> cat` | 155–410 ms | **0.29–0.57 ms** |
+| local `cat` (control) | ~0.3 ms | ~0.04 ms |
 
-Cost is a one-time ~155 ms connection setup, not a per-frame tax. Caveat: the
-workspace is a container on the same host, so per-frame cost on a genuinely
-remote box will be dominated by real RTT. What this establishes is that the
-protocol layer adds nothing.
+Cost is a **one-time connection setup of a few hundred milliseconds**, after
+which per-frame overhead is sub-millisecond. Caveat: the workspace is a container
+on the same host, so per-frame cost on a genuinely remote box will be dominated
+by real RTT. What this establishes is that the *protocol layer* adds nothing.
+
+Re-derive any number in this section with `python3 docker/coder/verify.py`.
 
 ### 5.2 The ACP handshake completes over the remote transport
 

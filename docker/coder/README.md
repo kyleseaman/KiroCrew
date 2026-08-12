@@ -93,6 +93,21 @@ suppress the prompt for a parameter with no default, and the build dies with
 
 ## Verify
 
+Run the whole evidence chain — sizing ceilings, transport latency, credential
+delivery, and the ACP handshake — in one go:
+
+```bash
+python3 docker/coder/verify.py
+python3 docker/coder/verify.py --workspace ws-small --workspace ws-build
+```
+
+It exits non-zero on the number of failed checks, prints nothing secret, and
+*skips* rather than fails the ACP handshake when no credential is available
+(`kiro-cli acp` refuses to start without one). Supply a key by exporting
+`KIRO_API_KEY`, or point at a different variable with `--api-key-env`.
+
+To check individual pieces by hand instead:
+
 Sizes are `small` (2 vCPU / 2 GiB), `medium` (4/4), `build` (8/8). Confirm the
 ceiling actually binds, from both sides:
 
