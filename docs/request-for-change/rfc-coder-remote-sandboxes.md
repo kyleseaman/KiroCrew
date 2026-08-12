@@ -60,12 +60,17 @@ Two clarifications that are easy to get wrong:
    same workspace*, so every session shares one ceiling and one image. It
    relocates the machine; it does not divide it. The two capabilities are
    independent, and the sandbox half is the part that needs new code.
-2. **The gateway should NOT itself be a Coder workspace.** Coder workspaces are
-   modelled as ephemeral dev environments — stop/start, TTL, dormancy,
-   auto-delete. An always-on gateway fits that model badly and would be fighting
-   the platform's lifecycle to stay up. The gateway only needs to be a
-   long-lived container (Docker, ECS, a k8s Deployment, systemd) with network
-   reach to coderd's API and a token. **Workspaces are for sandboxes.**
+2. **A gateway inside Coder is viable, but it is a different capability.** The
+   gateway does not *have* to be a Coder workspace, and does not have to be one
+   to get sandboxes — those are separate questions. Running it as a plain
+   long-lived container (Docker, ECS, a k8s Deployment, systemd) is the simplest
+   path and is available today. But a workspace-hosted gateway also works, and
+   has been built: see §3.1. The lifecycle objection (workspaces are modelled as
+   ephemeral dev environments — stop/start, TTL, dormancy, auto-delete) is
+   answered by a persistent volume for the data home, which is exactly what that
+   template does. What a workspace-hosted gateway does *not* buy you is the
+   sandbox half, per clarification 1. **Either host works for the control plane;
+   workspaces are what make sandboxes.**
 
 What this costs, honestly: the gateway container is **stateful** (persistent
 volume for the data home) with a ~4 GB floor until the embedding stack is
@@ -145,6 +150,52 @@ prebuild *claiming* re-runs `terraform apply` with a new owner/name, which for
 AWS `user_data` — where the Windows starter template puts `init_script` — forces
 instance replacement, so prebuilds buy nothing there without `ignore_changes`.
 
+### 3.1 Prior art: a gateway-in-workspace template already exists
+
+`greg-the-coder/partner-demo-gitops`, template `kiro-crew-prototype-a` (pushed
+2026-08-11), runs the **entire Kiro Crew gateway inside one Coder workspace** on
+Kubernetes. A sibling `awshp-k8s-base-kirocrew` template exists in the same repo.
+Read at 355 lines of `main.tf` plus a 199-line startup script and a self-contained
+`modules/kirocrew` (232 + 255 lines). Not executed here, so the notes below are
+from source, not from a run.
+
+It installs kiro-cli and Crew from the public installers
+(`cli.kiro.dev/install`, `download.crew.kiro.dev/cli.sh`), starts
+`kirocrew gateway` as a `coder_script`, and publishes the dashboard as a
+subdomain `coder_app` with a healthcheck. A PVC at `/home/coder` (10–50 GiB)
+persists the data home; CPU 2–8 and memory 4–16 GiB come from
+`coder_parameter` values applied as Kubernetes `limits`.
+
+**How it relates to this RFC.** It delivers the *control-plane* half — §2.1
+(deploy on customer infrastructure behind Coder's ingress/egress controls) and
+§2.2 (always-on Crew) — and it is further along on dashboard exposure than
+anything here. It does **not** deliver §2.3 (per-session right-sizing and
+per-project image), because each session's kiro-cli is still a local child of
+that one workspace, sharing its ceiling and its image. That is clarification 1 in
+the Summary, demonstrated. The two compose: that template is a *host* for the
+work in §4.2, and a Coder-native one, which makes it a better target than the
+Docker harness in `docker/coder/`.
+
+**Findings worth reusing, all of them traps this RFC otherwise misses:**
+
+- **The dashboard needs the Coder proxy host trusted explicitly.** The template
+  sets `KIROCREW_CORS_ORIGINS` and runs `config set dashboard.url`, or the
+  gateway answers "Host header not allowed." through Coder's proxy, and token
+  cookies are scoped to the wrong origin.
+- **`unset PYTHONPATH PYTHONHOME` before installing.** Inherited from the Coder
+  agent environment, pip treats foreign packages as already satisfied and
+  silently skips Crew's dependencies, producing a venv that fails at first
+  gateway start. This is the same hazard `wrap_argv(strip_python_env=True)`
+  guards against for MCP subprocesses (§4.2), reached from the opposite
+  direction.
+- **Self-authenticating app tile.** A loopback-bound (`127.0.0.1`) redirector
+  mints a short-lived dashboard token and 302s the browser to the app URL, so the
+  tile lands authenticated. `share` defaults to `owner`.
+- **`coder stat cpu|mem|disk` as `coder_agent` metadata** surfaces live usage on
+  the workspace page — directly useful given the CPU asymmetry in §7.3.
+
+
+
 ## 4. Architecture
 
 ### 4.1 The seam decision
@@ -189,7 +240,9 @@ not at the transport layer.
 
 ### 4.2 What must change inside Crew
 
-Anchors verified at `8ee44d84f`. Ordered by dependency; W1 and W2 are the same PR.
+Anchors verified at `8ee44d84f`. Ordered by dependency. W1 was originally planned
+as one PR with W2; it shipped separately, because a pure extraction can be proven
+behaviour-neutral by the existing tests while W2 cannot.
 
 **W0 — what does NOT change.** Worth stating, because it bounds the work.
 The JSON-RPC layer is untouched (§5.2 proved a handshake with zero protocol
@@ -634,7 +687,8 @@ the agent is alive. Needs a remote-side idle guard.
 gateway image and `docs/guides/docker.md` already recommends it for 24/7 use.
 Running the control plane as a long-lived container is a *deployment choice
 available today*, not work. It needs a persistent volume for the data home and a
-Coder API token; it should **not** be a Coder workspace (see Summary).
+Coder API token. Hosting it inside a Coder workspace instead is also a deployment
+choice, and one already built (§3.1) — neither host changes the work below.
 
 **P0 — prerequisites.** The `HTTP 429` misclassification (§7.2) is a hard
 requirement: it is rare at today's concurrency and routine once sessions fan out,
