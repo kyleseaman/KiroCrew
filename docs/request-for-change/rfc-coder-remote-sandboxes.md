@@ -3,8 +3,8 @@ title: Coder-backed remote session sandboxes
 status: draft
 author: kyleseaman
 created: 2026-08-11
-last-audited: 2026-08-11
-audited-at: 8ee44d84f
+last-audited: 2026-08-13
+audited-at: 609b53160
 doc-pr:
 implementation-prs: []
 tracking-issues: []
@@ -245,7 +245,7 @@ not at the transport layer.
 
 ### 4.2 What must change inside Crew
 
-Anchors verified at `8ee44d84f`. Ordered by dependency. W1 was originally planned
+Anchors verified at `609b53160`. Ordered by dependency. W1 was originally planned
 as one PR with W2; it shipped separately, because a pure extraction can be proven
 behaviour-neutral by the existing tests while W2 cannot.
 
@@ -254,7 +254,7 @@ The JSON-RPC layer is untouched (§5.2 proved a handshake with zero protocol
 changes). Gateway packaging is untouched (`docker/Dockerfile` already ships).
 Subagents need no separate work — they multiplex onto the parent's runtime
 rather than spawning their own process, so covering `AcpRuntime` covers them.
-`create_subprocess_limited` (`src/kiro_crew/sandbox.py:4152`) needs no change
+`create_subprocess_limited` (`src/kiro_crew/sandbox.py:4306`) needs no change
 either: it forwards all kwargs untouched and returns a real
 `asyncio.subprocess.Process`, and a remote session is *still a local
 subprocess* (`coder ssh`), so the return contract already fits.
@@ -263,7 +263,7 @@ subprocess* (`coder ssh`), so the return contract already fits.
 
 | Step | `AcpClient` | `AcpRuntime` |
 |---|---|---|
-| method | `_spawn`, `acp/client.py:2282` | `spawn`, `acp/runtime.py:647` |
+| method | `_spawn`, `acp/client.py:2457` | `spawn`, `acp/runtime.py:692` |
 | sandbox wrap | `:2344` `wrap_argv(...)` | `:686` |
 | cgroup wrap | `:2354` `cgroup_scope_argv(argv)` | `:696` |
 | launch | `:2424` | `:723` |
@@ -278,13 +278,13 @@ cannot be disabled by accident.
 
 Note the two paths do **not** share a transport model and must not be collapsed:
 `AcpClient` is pull-based with no reader task (`_read_message`,
-`acp/client.py:3120`), while `AcpRuntime` owns an exclusive `_reader_loop`
-(`acp/runtime.py:959`). `SessionHost` abstracts *spawning*, not *reading*.
+`acp/client.py:3311`), while `AcpRuntime` owns an exclusive `_reader_loop`
+(`acp/runtime.py:1019`). `SessionHost` abstracts *spawning*, not *reading*.
 
 **W2 — env becomes an allowlist (security, ships with W1).** Both paths do
-`env = {**os.environ}` (`client.py:2358`, `runtime.py:698`) and then call
-`scrub_agent_denied_env` (`sandbox.py:3322`), which covers channel tokens only —
-**not** the AWS prefixes handled by `scrub_env` (`sandbox.py:3300`). Locally that
+`env = {**os.environ}` (`client.py:2539`, `runtime.py:749`) and then call
+`scrub_agent_denied_env` (`sandbox.py:3476`), which covers channel tokens only —
+**not** the AWS prefixes handled by `scrub_env` (`sandbox.py:3454`). Locally that
 is deliberate; shipping it to another host is not (§7.7). Add an allowlist path
 used only by remote hosts. Drop by default; carry only what the remote agent
 needs (`KIRO_API_KEY`, `KIROCREW_SESSION_KEY`, model/agent selection). Explicitly
@@ -294,14 +294,17 @@ exclude every host-local path and socket: `PATH`, `SSH_AUTH_SOCK`, `KRB5CCNAME`,
 `TMPDIR`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`.
 
 **W3 — two cwds.** The gateway currently creates the work dir and passes it as
-the process cwd: `_work_dir.mkdir(...)` at `client.py:2291`, again at
-`client.py:2998` on *every* `ensure_ready()`, and `runtime.py:652`; then
-`cwd=str(self._work_dir)` at `client.py:2429` / `runtime.py:728`. For a remote
+the process cwd. All three sites now run the mkdir **off the event loop** as
+`await asyncio.to_thread(self._work_dir.mkdir, ...)` — `client.py:2468`, again
+at `client.py:3188` on *every* `ensure_ready()`, and `runtime.py:699`. A host's
+work-dir preparation must therefore be **async**, or the extraction reintroduces
+a blocking filesystem call on the loop. Then
+`cwd=str(self._work_dir)` at `client.py:2616` / `runtime.py:787`. For a remote
 host these are two different values — the local spawn cwd is irrelevant, and the
 **protocol** cwd must be the remote path. The protocol side is already
 permissive: cwd crosses ACP as a bare `str()` with no validation
-(`acp/_dispatch.py`), used in `session/new` (`client.py:2763`) and
-`session/load` (`client.py:2878`), plus `runtime.py:1408` / `:1521`.
+(`acp/_dispatch.py`), used in `session/new` (`client.py:2945`) and
+`session/load` (`client.py:3060`), plus `runtime.py:1468` / `:1583`.
 
 Two hazards. First, `providers/acp.py` writes `<work_dir>/.kiro/settings/cli.json`
 before every (re)spawn (`_write_cli_overlay` and the Tool Search overlay) — those
@@ -314,7 +317,7 @@ learn about remote paths or be bypassed for remote sessions.
 
 **W4 — lifecycle moves from PID tree to workspace.** Everything after launch
 assumes a local child: `_track_pid` / `_track_session_pid`
-(`session_pid.py:877` / `:151`), `_get_child_pids` (`client.py:1490`), the
+(`session_pid.py:914` / `:152`), `_get_child_pids` (`client.py:1621`), the
 killpg escalation, the `KIROCREW_SPAWNED` orphan sweep, the `LivenessOracle`
 (`acp/liveness.py`), and the RSS watchdog. Over SSH these all describe the ssh
 client (§7.8). Replace them for remote hosts with workspace-level operations:
@@ -325,7 +328,7 @@ end-to-end liveness. **Add a remote-side idle guard**: a dropped connection
 whose agent keeps running burns credits with no local signal.
 
 **W5 — a per-session execution profile.** None exists. `agent.sandbox`
-(`config/loader.py:878`) is a global `["auto","off"]` enum, with
+(`config/loader.py:1091`) is a global `["auto","off"]` enum, with
 `sandbox_allow_no_isolation` (`:893`) and `sandbox_allow_unsandboxed_exec`
 (`:904`) alongside it. Add a per-project/per-session profile that names the host
 kind plus, for Coder, the template and its `coder_parameter` values (size,
@@ -343,7 +346,7 @@ half already exists — kiro-cli advertises `mcpCapabilities.http: true` (§5.2)
 KiroCrew already emits HTTP MCP entries for apps.
 
 **W7 — independent prerequisites.** Neither is Coder-specific.
-`_RE_5XX_STATUS` (`acp/client.py:890`) matches only `50[0234]|529`, and
+`_RE_5XX_STATUS` (`acp/client.py:999`) matches only `50[0234]|529`, and
 `_RE_THROTTLE_NAMED` (`:878`) keys on exception names, so a bare `HTTP 429`
 falls through `_is_transient_raw_error` (`:1012`) and is treated as terminal.
 Add 429 and honour `Retry-After`. Separately, `inject_xdist_auto_cap`
@@ -357,7 +360,7 @@ forget until a session fails oddly.
 repo URL + ref with a clone in the startup script, or rsync over
 `coder config-ssh`. There is no `coder cp`.
 
-*Artifact and outbox return.* `outbox_dir()` (`config/loader.py:428`) and the
+*Artifact and outbox return.* `outbox_dir()` (`config/loader.py:457`) and the
 `file_send` path write the **gateway's** disk. A remote agent producing a file
 has to get it back across the boundary, or `file_send` silently delivers
 nothing. Simplest: have the remote write to a known path and pull it over the
@@ -496,7 +499,7 @@ named remote targets. Two parts:
 #### Per-session selection
 
 A slot field plus an endpoint mirroring `api_chat_slot_model`
-(`src/kiro_crew/dashboard/chat_handlers.py:2688`), surfaced as a dropdown in the
+(`src/kiro_crew/dashboard/chat_handlers.py:2853`), surfaced as a dropdown in the
 chat header next to the model picker. New sessions inherit the resolved default;
 the picker overrides it for that session.
 
