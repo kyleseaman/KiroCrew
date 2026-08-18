@@ -196,6 +196,263 @@ class LocalSessionHost(SessionHost):
 _LOCAL_HOST = LocalSessionHost()
 
 
+class CoderWorkspaceHostError(RuntimeError):
+    """The Coder host could not be used, with a reason worth showing a user."""
+
+
+#: Stdout ceiling for the short bookkeeping commands (mkdir and friends). Their
+#: output is only ever a diagnostic message, so a small cap is enough and keeps a
+#: misbehaving transport from buffering without bound.
+_SHORT_OUTPUT_LIMIT = 64 * 1024
+
+
+#: Environment names a remote spawn may carry. Deny-by-default: the gateway's own
+#: environment holds host-local paths and cloud credentials, and
+#: ``scrub_agent_denied_env`` (which the ACP paths call) does NOT drop
+#: ``AWS_SECRET_ACCESS_KEY`` or ``AWS_SESSION_TOKEN`` -- only ``scrub_env`` does.
+#: Copying the gateway env to another machine would therefore ship live
+#: credentials off-box, so a remote host forwards this list and nothing else.
+#:
+#: Credentials are absent on purpose. The agent's own key reaches the workspace
+#: from a per-user Coder secret that coderd injects at workspace start, so it
+#: never transits the gateway or this transport.
+REMOTE_ENV_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "KIROCREW_SESSION_KEY",
+        "KIROCREW_CHANNEL_ID",
+    }
+)
+
+
+class CoderWorkspaceSessionHost(SessionHost):
+    """Runs the agent inside a Coder workspace, reached over ``coder ssh``.
+
+    The gateway still speaks ACP: ``coder ssh <ws> -- <cmd>`` gives a local
+    subprocess whose stdin/stdout ARE the remote process's stdio, which is
+    exactly the shape the JSON-RPC layer already consumes.
+
+    Two measured constraints shape this class.
+
+    ``coder ssh <ws> -- <cmd>`` joins the remote arguments into ONE string before
+    the remote shell sees them (RFC 4254 section 6.5), so inner quoting is lost
+    and any token containing whitespace is re-split on the far side. Rather than
+    mis-launch, :meth:`_check_tokens` refuses such a token up front.
+
+    ``coder ssh -e VAR=value`` silently drops some names (measured: the agent key
+    is dropped with exit 0 and no warning), so forwarded variables are passed as
+    an ``env`` prefix on the remote command instead, which was measured to work.
+    Values in a remote command are visible in that workspace's process list, so
+    only the non-secret session wiring in :data:`REMOTE_ENV_ALLOWLIST` travels.
+    """
+
+    name = "coder"
+    is_remote = True
+
+    def __init__(self, workspace: str, *, remote_work_dir: str = "~/workspace") -> None:
+        if not workspace or not workspace.strip():
+            raise CoderWorkspaceHostError("Coder host requires a workspace name")
+        self._workspace = workspace.strip()
+        self._remote_work_dir = remote_work_dir.rstrip("/") or "~/workspace"
+        self._check_tokens(self._workspace, self._remote_work_dir)
+
+    @staticmethod
+    def _check_tokens(*tokens: str) -> None:
+        """Refuse a token the transport cannot carry intact.
+
+        The remote arguments are re-split on whitespace, so a value containing a
+        space would silently arrive as two arguments. Failing here names the
+        problem instead of producing a launch that fails at the handshake with
+        nothing explaining why.
+        """
+        for tok in tokens:
+            if any(c.isspace() for c in tok):
+                raise CoderWorkspaceHostError(
+                    f"coder ssh cannot carry an argument containing whitespace: {tok!r}"
+                )
+
+    def _coder_bin(self) -> str:
+        # Resolved from root-owned directories rather than PATH: the gateway's
+        # PATH can lead with agent-writable dirs, and this is the binary that
+        # reaches another machine.
+        found = platform_compat.trusted_system_bin("coder")
+        if not found:
+            raise CoderWorkspaceHostError(
+                "the 'coder' CLI was not found in a trusted system directory"
+            )
+        return found
+
+    def _remote_path(self, work_dir: Path) -> str:
+        """Map a gateway-side work dir onto its path inside the workspace.
+
+        Only the final component carries over: the gateway's absolute path is
+        meaningless in the workspace, and the session's directory name is what
+        distinguishes one session's tree from another's.
+        """
+        return f"{self._remote_work_dir}/{work_dir.name}"
+
+    def protocol_cwd(self, work_dir: Path) -> str:
+        # The agent resolves this, not the gateway, so it must be the remote path.
+        return self._remote_path(work_dir)
+
+    async def _spawn_transport(
+        self,
+        remote_argv: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        sandbox_mode: str,
+        is_kiro_cli: bool,
+        stdout_limit: int,
+        stdin: int,
+        stderr: int,
+    ) -> tuple[asyncio.subprocess.Process, str | None]:
+        """Start one ``coder ssh`` transport process.
+
+        Every spawn this host makes goes through here, so the sandbox wrap, the
+        cgroup scope and the spawn stay in one function -- both for the
+        spawn-audit chokepoint and because the sandbox temp file must be
+        discarded if anything between the wrap and the exec fails.
+
+        The agent itself is confined by the workspace, which is a stronger
+        boundary than Crew's OS sandbox. What runs locally is the coder client,
+        and that is still a local spawn carrying agent-influenced arguments, so it
+        is wrapped and scoped like any other.
+
+        UNVERIFIED: whether the OS sandbox permits the outbound connection this
+        client needs has not been measured against a live coderd. If it does not,
+        this host needs sandbox mode "off", which would be a documented
+        constraint rather than a silent failure.
+        """
+        self._check_tokens(*remote_argv)
+        transport_argv = [
+            self._coder_bin(),
+            "ssh",
+            self._workspace,
+            "--",
+            *remote_argv,
+        ]
+        transport_argv, sandbox_cleanup = wrap_argv(
+            transport_argv,
+            mode=sandbox_mode,
+            strip_python_env=True,
+            is_kiro_cli=is_kiro_cli,
+        )
+        try:
+            # Bounds the local coder client, not the agent -- the workspace's own
+            # CPU and memory ceilings bound the agent, which is the point of
+            # running it there. A runaway client is still worth capping.
+            transport_argv = await asyncio.to_thread(cgroup_scope_argv, transport_argv)
+            process = await create_subprocess_limited(
+                *transport_argv,
+                stdin=stdin,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=stderr,
+                cwd=str(cwd),
+                limit=stdout_limit,
+                env=env,
+                start_new_session=platform_compat.IS_POSIX,
+                creationflags=(
+                    platform_compat.CREATE_NEW_PROCESS_GROUP
+                    | platform_compat._SUBPROCESS_NO_WINDOW
+                    | platform_compat.CREATE_SUSPENDED
+                ),
+                profile=RLIMIT_PROFILE_SESSION_HOST,
+            )
+        except BaseException:
+            LocalSessionHost._discard_sandbox_file(sandbox_cleanup)
+            raise
+        return process, sandbox_cleanup
+
+    async def _run_remote(self, *remote_argv: str) -> tuple[int, str]:
+        """Run one short command in the workspace and collect its output."""
+        process, sandbox_cleanup = await self._spawn_transport(
+            list(remote_argv),
+            cwd=Path.cwd(),
+            env=dict(os.environ),
+            sandbox_mode="auto",
+            is_kiro_cli=False,
+            stdout_limit=_SHORT_OUTPUT_LIMIT,
+            stdin=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            out, _ = await process.communicate()
+        finally:
+            LocalSessionHost._discard_sandbox_file(sandbox_cleanup)
+        return process.returncode or 0, out.decode("utf-8", "replace")
+
+    async def prepare_work_dir(self, work_dir: Path) -> None:
+        # The directory that matters is the one in the workspace; the gateway's
+        # own copy is never the agent's cwd on this host.
+        remote = self._remote_path(work_dir)
+        rc, out = await self._run_remote("mkdir", "-p", remote)
+        if rc != 0:
+            raise CoderWorkspaceHostError(
+                f"could not create {remote} in workspace {self._workspace}: {out.strip()[:200]}"
+            )
+
+    @staticmethod
+    def _forwarded_env(env: dict[str, str]) -> list[str]:
+        """Return ``NAME=value`` tokens for the allowlisted variables present."""
+        forwarded = []
+        for name in sorted(REMOTE_ENV_ALLOWLIST):
+            value = env.get(name)
+            if value:
+                forwarded.append(f"{name}={value}")
+        return forwarded
+
+    async def launch(
+        self,
+        argv: list[str],
+        *,
+        work_dir: Path,
+        env: dict[str, str],
+        sandbox_mode: str,
+        is_kiro_cli: bool,
+        stdout_limit: int,
+        label: str,
+    ) -> LaunchedProcess:
+        remote_env = self._forwarded_env(env)
+        # `cd <dir> && exec` is not available: the arguments are re-joined, so a
+        # shell operator would have to survive that round trip. env(1) takes the
+        # working directory with --chdir and then execs, which needs no shell.
+        remote_argv = [
+            "env",
+            f"--chdir={self._remote_path(work_dir)}",
+            *remote_env,
+            *argv,
+        ]
+        process, sandbox_cleanup = await self._spawn_transport(
+            remote_argv,
+            cwd=work_dir,
+            env=env,
+            sandbox_mode=sandbox_mode,
+            is_kiro_cli=is_kiro_cli,
+            stdout_limit=stdout_limit,
+            stdin=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        return LaunchedProcess(process, sandbox_cleanup)
+
+
+#: Preview gate. Selecting a remote host changes where every session's code runs,
+#: so it is opt-in through the environment rather than defaulted from config while
+#: the remaining workstreams (remote MCP, lifecycle) are unbuilt: a session on
+#: this host today starts, but has no KiroCrew tool layer and no working
+#: descendant or RSS accounting.
+_HOST_ENV = "KIROCREW_SESSION_HOST"
+_CODER_WORKSPACE_ENV = "KIROCREW_CODER_WORKSPACE"
+_CODER_REMOTE_DIR_ENV = "KIROCREW_CODER_REMOTE_WORKDIR"
+
+
 def default_session_host() -> SessionHost:
     """Return the host to use when a caller has no explicit preference."""
-    return _LOCAL_HOST
+    if os.environ.get(_HOST_ENV, "").strip().lower() != "coder":
+        return _LOCAL_HOST
+    workspace = os.environ.get(_CODER_WORKSPACE_ENV, "").strip()
+    if not workspace:
+        raise CoderWorkspaceHostError(
+            f"{_HOST_ENV}=coder requires {_CODER_WORKSPACE_ENV} to name a workspace"
+        )
+    remote_dir = os.environ.get(_CODER_REMOTE_DIR_ENV, "").strip() or "~/workspace"
+    return CoderWorkspaceSessionHost(workspace, remote_work_dir=remote_dir)
