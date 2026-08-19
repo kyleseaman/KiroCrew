@@ -661,13 +661,59 @@ empty). Surviving tools are the kiro-cli built-ins — `execute_bash`, `fs_read`
 remote execution with real tool use. Lost: the KiroCrew capability layer.
 
 ### 7.5 The remote must hold no Crew state
-
 Under option C this is automatic. Recorded so nobody reintroduces it:
 `snapshot`/`restore` staging is an allowlist that never includes `sessions/` or
 `lessons.jsonl`; the memory merge is `INSERT OR IGNORE`, keeping the local row
 and discarding the incoming one; deletions do not propagate; the consolidation
 offset is tied to a rotation generation; the gateway lock is per-home, so the
 anti-clobber invariant does not exist across hosts.
+
+### 7.5.1 Where memory and history actually live
+
+The question this section answers is the one every reader asks first: *does a
+remote session's memory and transcript come back to the main machine?* Nothing
+comes back, because nothing leaves.
+
+The gateway is the ACP client on both hosts. `coder ssh <ws> -- <cmd>` hands back
+a local subprocess whose stdin/stdout ARE the remote process's stdio, so every
+JSON-RPC frame in both directions still passes through the gateway. It therefore
+sees the whole conversation **by construction**, and writes it where it always
+did: `ConversationLog` in `src/kiro_crew/history.py`, in the gateway's data home.
+Memory, lessons, preferences and the vector store are gateway-side for the same
+reason. The workspace holds no Crew state, so §7.5's merge hazards never arise —
+there is nothing on the far side to merge.
+
+Two consequences are worth stating plainly, because both were found by reading
+the code rather than by reasoning about the design.
+
+**The agent's own transcript store is a different thing from Crew's, and it does
+move.** kiro-cli keeps a private store next to itself, and the resume path stats
+it before issuing `session/load`. On a remote host that store is on the far side,
+so a gateway-side stat answers about the wrong filesystem: it always misses,
+`should_load` is always False, and every resume silently rebuilds the session.
+Nothing is lost — the fall-through path replays Crew's own history, which is the
+authoritative copy — but the cost is a full cold start per resume, and the agent
+loses its own continuity. The fix is to take the branch KAS already takes
+(attempt the load, let failure fall through) whenever the host is remote, keyed
+on the host's own declared remoteness rather than duck-typed at the call site.
+
+**A remote session cannot write memory at all until remote MCP exists.** The
+memory tools are MCP tools, and the broker binds `AF_UNIX` only (§7.4), so
+`learn_add`, `memory_search`, cron management and artifacts are unreachable from
+a workspace. The store stays safe and local; the session simply cannot reach it.
+This is why remote MCP is a prerequisite rather than a follow-up: without it a
+remote session starts, converses and is transcribed correctly, but learns nothing
+and can schedule nothing.
+
+**Reachability, measured.** The broker does not need to be exposed on a network
+interface. `coder ssh` supports `-R remote_port:local_address:local_port`
+(verified in `coder` v2.36.0; `coder port-forward --help` names it as the reverse
+direction), so the workspace can reach a **loopback-only** broker on the gateway
+through the transport that already exists. That keeps the listener off every
+network interface and makes the exposure question "who is inside this workspace"
+rather than "who is on this network". A loopback listener plus a per-session
+bearer token is still a real security-boundary change to the component that
+grants Crew's whole tool layer, and should be reviewed as one.
 
 ### 7.6 One identity for all sandboxes
 
