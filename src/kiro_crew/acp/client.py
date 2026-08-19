@@ -2224,6 +2224,16 @@ class AcpClient:
         return getattr(self, "_acp_backend", "")
 
     @property
+    def session_host_is_remote(self) -> bool:
+        """True when the agent process does not share the gateway's filesystem.
+
+        Callers use this to skip local-only bookkeeping. In particular the agent's
+        own transcript store lives on the far side, so a gateway-side stat of it
+        answers about the wrong machine.
+        """
+        return self._session_host.is_remote
+
+    @property
     def _is_claude(self) -> bool:
         return self.backend == ACP_BACKEND_CLAUDE
 

@@ -452,6 +452,11 @@ class AcpProvider(LLMProvider):
         return self._client.backend == ACP_BACKEND_KAS
 
     @property
+    def has_remote_session_host(self) -> bool:
+        """True when the agent runs on a host that is not this filesystem."""
+        return self._client.session_host_is_remote
+
+    @property
     def is_kiro_backend(self) -> bool:
         """True when this ACP provider talks to kiro-cli.
 
@@ -742,11 +747,13 @@ class AcpProvider(LLMProvider):
             handle = None
             resumed = False
             if resume_sid:
-                if self.is_kas_backend:
-                    # KAS locates the transcript itself from sessionId, and in
-                    # remote-session mode there are no local files to stat at
-                    # all. Attempt the load and let failure fall through to a
-                    # fresh session/new with history replay.
+                if self.is_kas_backend or self.has_remote_session_host:
+                    # Two cases with the same shape. KAS locates the transcript
+                    # itself from sessionId. And when the agent runs on a remote
+                    # host, its transcript store is on THAT machine, so a
+                    # gateway-side stat answers about the wrong filesystem and
+                    # would refuse every resume. Attempt the load and let failure
+                    # fall through to a fresh session/new with history replay.
                     session_file = None
                     should_load = True
                 else:
