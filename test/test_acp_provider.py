@@ -15,6 +15,7 @@ import pytest
 
 from kiro_crew.acp.client import AcpAuthRequired
 from kiro_crew.acp.session_handle import AcpSessionHandle
+from kiro_crew.acp.session_host import CoderWorkspaceSessionHost
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, AcpEvent, TurnUsage
 from kiro_crew.providers.acp import AcpProvider
@@ -728,6 +729,34 @@ class TestStartKiroRuntimeResume:
         _handle, runtime = await self._run_start(provider, "", file_exists=True)
         runtime.load_session.assert_not_awaited()
         runtime.create_session.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_threads_session_host_into_runtime(self):
+        host = CoderWorkspaceSessionHost(
+            workspace="crew-dogfood",
+            remote_cwd="/home/coder/workspace",
+            coder_bin="/opt/coder",
+        )
+        provider = self._kiro_provider()
+        provider._session_host = host
+        provider._client._resume_session_id = ""
+        handle = MagicMock(session_id="kiro-sess-1")
+        handle.set_model = AsyncMock()
+        runtime = MagicMock(pid=4321)
+        runtime.spawn = AsyncMock()
+        runtime.create_session = AsyncMock(return_value=handle)
+        runtime_class = MagicMock(return_value=runtime)
+
+        with (
+            patch("kiro_crew.providers.acp.AcpRuntime", runtime_class),
+            patch(
+                "kiro_crew.providers.acp.AcpSessionProvider",
+                return_value=MagicMock(resumed=False),
+            ),
+        ):
+            await provider._start_kiro_runtime()
+
+        assert runtime_class.call_args.kwargs["session_host"] is host
 
     @pytest.mark.asyncio
     async def test_failed_load_falls_back_to_create_session(self):

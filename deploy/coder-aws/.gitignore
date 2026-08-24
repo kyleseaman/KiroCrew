@@ -1,0 +1,7 @@
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfplan
+**/.terraform.tfstate.lock.info
+__pycache__/
+*.py[cod]

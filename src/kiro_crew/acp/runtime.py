@@ -50,6 +50,7 @@ from kiro_crew.acp.client import (
 from kiro_crew.acp.kas_agents import (
     KasAgentTranslationError,
     build_kas_custom_agents,
+    resolve_prompt,
 )
 from kiro_crew.acp.kas_assets import (
     KasAssetsMissing,
@@ -67,6 +68,11 @@ from kiro_crew.acp.session_handle import (
     AcpRuntimeProtocol,
     AcpSessionHandle,
     _load_watchdog_settings,
+)
+from kiro_crew.acp.session_host import (
+    CoderWorkspaceSessionHost,
+    LocalSessionHost,
+    project_remote_agent_spec,
 )
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
@@ -622,6 +628,7 @@ class AcpRuntime:
         expect_mcp_reports: bool = True,
         acp_backend: str = ACP_BACKEND_KIRO,
         crew_agent: str = "",
+        session_host: LocalSessionHost | CoderWorkspaceSessionHost | None = None,
     ):
         if work_dir:
             self._work_dir = Path(work_dir)
@@ -631,6 +638,7 @@ class AcpRuntime:
             from kiro_crew.config.paths import config_dir
 
             self._work_dir = config_dir() / "workspace"
+        self._session_host = session_host or LocalSessionHost(self._work_dir)
         self._agent = agent
         # Canonical Kiro Crew agent identity (a cfg.agents key) resolved by the
         # surface that created this runtime — a DIFFERENT namespace from
@@ -665,6 +673,10 @@ class AcpRuntime:
         # endpointing) don't pay a full ceiling wait that can never be armed.
         self._expect_mcp_reports = expect_mcp_reports
         self._sandbox_cleanup: str | None = None
+        # Local spawning may allocate an owned scratch directory. Remote
+        # transports deliberately skip that host-local setup, but the shared
+        # post-spawn bookkeeping still needs the same explicit empty state.
+        self._scratch_dir: Path | None = None
 
         # Recycling thresholds — see _is_stale(). Long-lived multiplexed
         # runtimes (e.g. the kirocrew-lite background runtime) have no
@@ -958,15 +970,53 @@ class AcpRuntime:
             argv += ["--model", self._model]
         return argv
 
-    async def spawn(self) -> None:
-        """Start the kiro-cli acp subprocess and complete protocol handshake."""
-        if self._process is not None:
-            raise AcpRuntimeError("Runtime already spawned")
+    async def _prepare_remote_spawn(self) -> tuple[list[str], dict[str, str]]:
+        """Prepare an MCP-free Kiro agent and its Coder SSH transport."""
+        if self._acp_backend == ACP_BACKEND_KIRO:
+            pass
+        else:
+            raise AcpRuntimeError("Coder session hosting is available only for kiro-cli")
+        host = self._session_host
+        if not isinstance(host, CoderWorkspaceSessionHost):
+            raise AcpRuntimeError("remote session host has an unsupported implementation")
 
-        # Off-loop: mkdir is a blocking syscall and the parent dirs may live on
-        # slow storage; the loop must never wait on the kernel here.
-        await asyncio.to_thread(self._work_dir.mkdir, parents=True, exist_ok=True)
+        def _project_agent() -> dict[str, object]:
+            ensure_agent_materialized(self._agent)
+            path = kiro_agents_dir() / f"{self._agent}.json"
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise AcpRuntimeError(
+                    f"cannot read the remote agent projection for {self._agent!r}"
+                ) from exc
+            if not isinstance(raw, dict):
+                raise AcpRuntimeError(
+                    f"remote agent projection for {self._agent!r} is not an object"
+                )
+            try:
+                raw["prompt"] = resolve_prompt(
+                    raw,
+                    agent_id=self._agent,
+                    agents_dir=path.parent,
+                )
+                return project_remote_agent_spec(raw)
+            except (KasAgentTranslationError, ValueError) as exc:
+                raise AcpRuntimeError(str(exc)) from exc
 
+        projected = await asyncio.to_thread(_project_agent)
+        await host.prepare(
+            agent=self._agent,
+            projected_spec=projected,
+            environ=os.environ,
+            local_cwd=self._work_dir,
+        )
+        return (
+            host.spawn_argv(agent=self._agent, model=self._model or ""),
+            host.transport_env(os.environ),
+        )
+
+    async def _prepare_local_spawn(self) -> tuple[list[str], dict[str, str]]:
+        """Build the existing local argv, confinement wrappers, and child env."""
         try:
             argv = await self._resolve_spawn_argv()
         except _KiroExecutableTrustError as exc:
@@ -1008,7 +1058,6 @@ class AcpRuntime:
         env = {**os.environ}
         if self._extra_env:
             env.update(self._extra_env)
-
         env["PATH"] = augmented_path(env.get("PATH", ""))
 
         def _resolve_env_off_loop() -> None:
@@ -1072,6 +1121,21 @@ class AcpRuntime:
         # syscalls that must not run on the loop. Guarded: the sandbox temp
         # file is live, so a cancellation here must not orphan it.
         await self._to_thread_guarding_sandbox(inject_xdist_auto_cap, env)
+        return argv, env
+
+    async def spawn(self) -> None:
+        """Start the kiro-cli acp subprocess and complete protocol handshake."""
+        if self._process is not None:
+            raise AcpRuntimeError("Runtime already spawned")
+
+        # Off-loop: mkdir is a blocking syscall and the parent dirs may live on
+        # slow storage; the loop must never wait on the kernel here.
+        await asyncio.to_thread(self._work_dir.mkdir, parents=True, exist_ok=True)
+
+        if self._session_host.is_remote:
+            argv, env = await self._prepare_remote_spawn()
+        else:
+            argv, env = await self._prepare_local_spawn()
 
         self._process = await create_subprocess_limited(
             *argv,
@@ -2582,7 +2646,13 @@ class AcpRuntime:
         # explicit list. A session-injected server outranks the same-named entry
         # in the agent spec, so this is what actually pools the servers — no file
         # is written anywhere. Empty when the gateway is disabled.
-        if mcp_servers is None:
+        if self._session_host.is_remote:
+            # The POC remote host deliberately carries no gateway MCP transport.
+            # Empty means the workspace gets only the Kiro built-ins projected
+            # into its agent spec; making this additive would reintroduce local
+            # command paths and credentials that cannot exist remotely.
+            mcp_servers = []
+        elif mcp_servers is None:
             # Resolve the overlay off the event loop: the lookup stats/reads
             # files, and blocking the loop stalls every other session's I/O.
             mcp_servers = await asyncio.to_thread(
@@ -2597,8 +2667,13 @@ class AcpRuntime:
         # so the kiro construction path gains no conditional, no new required
         # argument, and no new failure mode (harness-parity H13).
         kas_agents = await self._kas_custom_agents(active_agent)
+        protocol_cwd = (
+            self._session_host.protocol_cwd
+            if self._session_host.is_remote
+            else cwd if cwd else self._work_dir
+        )
         params = build_session_new_params(
-            cwd if cwd else self._work_dir,
+            protocol_cwd,
             mcp_servers=mcp_servers,
             kas_custom_agents=kas_agents,
         )

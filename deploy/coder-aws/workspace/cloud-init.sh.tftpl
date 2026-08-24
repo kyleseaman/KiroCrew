@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+dnf install -y ca-certificates dnf-plugins-core git jq unzip
+command -v aws >/dev/null
+dnf config-manager --add-repo \
+  https://pkgs.tailscale.com/stable/amazon-linux/2023/tailscale.repo
+dnf install -y tailscale
+systemctl enable --now tailscaled
+
+TAILSCALE_KEY="$(aws ssm get-parameter \
+  --region "${region}" \
+  --name "${tailscale_auth_parameter}" \
+  --with-decryption \
+  --query Parameter.Value \
+  --output text)"
+tailscale up \
+  --auth-key="$TAILSCALE_KEY" \
+  --hostname="${tailscale_workspace_hostname}" \
+  --accept-dns=true
+unset TAILSCALE_KEY
+
+id coder >/dev/null 2>&1 || useradd --create-home --shell /bin/bash coder
+install -d -o coder -g coder /home/coder/workspace
+
+# Amazon Linux 2023 does not meet the aarch64 GNU artifact's glibc floor, so
+# select the static musl package from Kiro's signed release manifest.
+KIRO_ARCH="aarch64"
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://desktop-release.q.us-east-1.amazonaws.com/latest/manifest.json \
+  -o /tmp/kirocli-manifest.json
+readarray -t KIRO_PACKAGE < <(python3 - <<'PY'
+import json
+
+with open("/tmp/kirocli-manifest.json", encoding="utf-8") as handle:
+    manifest = json.load(handle)
+package = next(
+    package
+    for package in manifest["packages"]
+    if package["fileType"] == "zip"
+    and package["architecture"] == "aarch64"
+    and "musl" in package["download"]
+)
+print(package["download"])
+print(package["sha256"])
+PY
+)
+curl --proto '=https' --tlsv1.2 -fsSL \
+  "https://desktop-release.q.us-east-1.amazonaws.com/$${KIRO_PACKAGE[0]}" \
+  -o /tmp/kirocli.zip
+printf '%s  %s\n' "$${KIRO_PACKAGE[1]}" /tmp/kirocli.zip | sha256sum -c -
+unzip -q /tmp/kirocli.zip -d /tmp
+Q_INSTALL_GLOBAL=1 Q_SKIP_SETUP=1 /tmp/kirocli/install.sh
+rm -rf /tmp/kirocli /tmp/kirocli.zip /tmp/kirocli-manifest.json
+kiro-cli --version
+
+aws ssm get-parameter \
+  --region "${region}" \
+  --name "${kiro_api_key_parameter}" \
+  --with-decryption \
+  --query Parameter.Value \
+  --output text \
+  | base64 -w0 > /etc/kiro-api-key.b64
+chmod 600 /etc/kiro-api-key.b64
+chown coder:coder /etc/kiro-api-key.b64
+
+printf '%s' '${coder_init_script_b64}' | base64 -d > /usr/local/libexec/coder-agent-init
+chmod 700 /usr/local/libexec/coder-agent-init
+chown coder:coder /usr/local/libexec/coder-agent-init
+
+printf '%s' '${coder_agent_token_b64}' | base64 -d > /etc/coder-agent-token
+chmod 600 /etc/coder-agent-token
+chown coder:coder /etc/coder-agent-token
+
+cat > /usr/local/libexec/coder-agent-start <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+KIRO_API_KEY="$(base64 -d /etc/kiro-api-key.b64)"
+export KIRO_API_KEY
+export CODER_AGENT_TOKEN_FILE=/etc/coder-agent-token
+exec /usr/local/libexec/coder-agent-init
+EOF
+chmod 700 /usr/local/libexec/coder-agent-start
+chown coder:coder /usr/local/libexec/coder-agent-start
+
+cat > /etc/systemd/system/coder-agent.service <<'EOF'
+[Unit]
+Description=Coder workspace agent
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=coder
+Group=coder
+Environment=HOME=/home/coder
+WorkingDirectory=/home/coder/workspace
+ExecStart=/usr/local/libexec/coder-agent-start
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now coder-agent.service

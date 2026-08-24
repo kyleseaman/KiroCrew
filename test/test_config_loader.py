@@ -101,12 +101,15 @@ def _load_absent_config() -> KiroCrewConfig:
     with tempfile.TemporaryDirectory() as d:
         missing = Path(d) / "config.json"
         missing_local = Path(d) / "config.local.json"
-        with unittest.mock.patch(
-            "kiro_crew.config.loader.config_path",
-            return_value=missing,
-        ), unittest.mock.patch(
-            "kiro_crew.config.loader.config_local_path",
-            return_value=missing_local,
+        with (
+            unittest.mock.patch(
+                "kiro_crew.config.loader.config_path",
+                return_value=missing,
+            ),
+            unittest.mock.patch(
+                "kiro_crew.config.loader.config_local_path",
+                return_value=missing_local,
+            ),
         ):
             return KiroCrewConfig.load()
 
@@ -3690,6 +3693,32 @@ class TestOrchestratorWatchdogThemeAreParsed:
         factory("k4", agent="pr-reviewer-kiro", crew_agent="")  # explicit no-crew
 
         assert [c["crew_agent"] for c in captured] == ["pr-reviewer", "pr-reviewer", "", ""]
+
+    def test_factory_limits_coder_host_to_main_interactive_agent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kiro_crew.acp.session_host as host_mod
+        import kiro_crew.providers.acp as acp_mod
+
+        captured: list[dict] = []
+
+        class _FakeProvider:
+            def __init__(self, **kwargs: object) -> None:
+                captured.append(kwargs)
+
+        monkeypatch.setattr(acp_mod, "AcpProvider", _FakeProvider)
+        monkeypatch.setattr(host_mod.shutil, "which", lambda command, path=None: "/opt/coder")
+        monkeypatch.setenv("KIROCREW_CODER_WORKSPACE", "crew-dogfood")
+        monkeypatch.setenv("CODER_URL", "https://coder.tail.example")
+        monkeypatch.setenv("CODER_SESSION_TOKEN", "coder-token")
+        cfg = _load_from_dict({})
+        factory = cfg.create_provider_factory()
+
+        factory("main", agent="kirocrew")
+        factory("background", agent="kirocrew-lite")
+
+        assert isinstance(captured[0]["session_host"], host_mod.CoderWorkspaceSessionHost)
+        assert captured[1]["session_host"] is None
 
     def test_dashboard_theme_fields_are_parsed(self) -> None:
         cfg = _load_from_dict(

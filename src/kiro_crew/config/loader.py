@@ -8028,6 +8028,7 @@ class KiroCrewConfig:
         the kiro-cli backend. The factory accepts an optional ``session_key`` to
         create a per-session subdirectory under ``workspace_root()``.
         """
+        from kiro_crew.acp.session_host import session_host_from_env
         from kiro_crew.providers.acp import (
             AcpProvider,  # circular: acp -> client -> session -> config.loader
         )
@@ -8132,6 +8133,7 @@ class KiroCrewConfig:
             _eff = reasoning_effort_override or base_effort
             if m and _eff and is_valid_effort(_eff) and model_supports_effort(m):
                 _eff_per_model[m] = _eff
+            session_host = session_host_from_env(wdir) if not agent or agent == "kirocrew" else None
             return AcpProvider(
                 work_dir=wdir,
                 model=m,
@@ -8149,6 +8151,7 @@ class KiroCrewConfig:
                 mcp_gateway_overlay=_gw_overlay,
                 mcp_gateway_settings_mcp_json=_gw_settings,
                 mcp_gateway_socket=_gw_socket,
+                session_host=session_host,
             )
 
         return _acp

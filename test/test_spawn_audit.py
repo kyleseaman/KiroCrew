@@ -199,6 +199,21 @@ PREEXEC_EXEMPT: frozenset[str] = frozenset(
 BENIGN_SPAWNS: frozenset[str] = frozenset(
     {
         "acp/runtime.py::_get_rss_mb",
+        # The shared spawn site selects one of two already-reviewed transport
+        # preparations. The local arm routes the kiro-cli argv through
+        # wrap_argv in _prepare_local_spawn. The opt-in remote arm launches the
+        # fixed kiro-cli ACP command through an operator-configured Coder
+        # workspace, which is itself the filesystem/resource boundary; its
+        # workspace, agent, model, cwd, and binary inputs are validated or
+        # operator-owned rather than prompt-selected.
+        "acp/runtime.py::spawn",
+        # Remote preparation runs one fixed `coder ssh` transport command. The
+        # workspace and cwd are operator configuration, while the agent name is
+        # regex-validated and passed as a positional shell argument. The only
+        # stdin is the MCP-free projected agent JSON; the workspace remains the
+        # isolation boundary, so applying the gateway host sandbox would bind
+        # paths for the control node rather than the remote process.
+        "acp/session_host.py::prepare",
         # The userns probe child: ONE fixed argv, `sys.executable -I -S -c <shim>`,
         # no shell, no cwd, stdin/stdout are the two handshake pipes. Nothing is
         # agent-influenced -- the shim is a module-level string constant and takes

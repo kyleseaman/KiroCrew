@@ -37,6 +37,197 @@ Four parts, in the order you will need them:
   CPU-intensive tool calls and parallel subagent execution.
 - **Architecture**: x86_64 or arm64.
 
+### AWS + Coder Graviton dogfood POC
+
+The repository includes a deliberately small, single-user POC under
+`deploy/coder-aws/`. It keeps the Kiro Crew gateway and Coder control plane on
+one always-on `t4g.medium`, while the CPU-heavier `kiro-cli` ACP process runs in
+a Coder workspace that can stop when idle. The default workspace is a
+`c8g.large` (2 vCPU / 4 GiB); `c8g.xlarge` (4 / 8 GiB) and `m8g.large` (2 / 8
+GiB) are selectable when measurements show CPU or memory pressure.
+
+Both instances are ARM Amazon Linux 2023 with encrypted 30 GiB gp3 roots. They
+sit in a public subnet to avoid a NAT Gateway's fixed hourly charge, but their
+security groups have no ingress rules: HTTPS and administrative SSH reach the
+control node through Tailscale, and Coder's agent connection is outbound. A
+public IPv4 address is therefore an egress route, not an exposed service.
+
+This is a cost experiment, not a production or multi-user topology. Coder uses
+its built-in PostgreSQL database on the control node. The stopped workspace's
+root disk and the control node remain billable. In this POC only the main
+interactive Kiro Crew agent runs remotely; background agents, cron work, and
+subagents remain on the control node. The remote agent projection is MCP-free:
+hooks and `@server` tools are omitted, while ordinary tool names and the
+resolved text prompt are copied into the workspace. The workspace receives no
+Kiro Crew state, operator AWS credentials, or SSH credentials. It has only its
+narrow EC2 instance role, its Kiro API key, and the Coder agent token.
+
+#### 1. Create the two SSM secrets
+
+Prerequisites are Terraform 1.5+, an AWS CLI authenticated to your account, a
+Tailscale tailnet with MagicDNS and HTTPS enabled, and a reusable tagged
+Tailscale auth key. The POC defaults to `us-east-2`.
+
+Store the two credentials as `SecureString` parameters without putting their
+values in shell history:
+
+```bash
+read -rsp "Tailscale auth key: " CREW_TS_KEY && printf '\n'
+aws ssm put-parameter --region us-east-2 --type SecureString --overwrite \
+  --name /kirocrew/poc/tailscale-auth-key --value "$CREW_TS_KEY"
+unset CREW_TS_KEY
+
+read -rsp "Kiro API key: " CREW_KIRO_KEY && printf '\n'
+aws ssm put-parameter --region us-east-2 --type SecureString --overwrite \
+  --name /kirocrew/poc/kiro-api-key --value "$CREW_KIRO_KEY"
+unset CREW_KIRO_KEY
+```
+
+Use a reusable, tagged Tailscale key because both the control node and each
+workspace consume it. Apply a tailnet policy that permits your identity to use
+Tailscale SSH as `ec2-user` on the tagged control node. The AWS security group
+still exposes no port 22.
+
+#### 2. Provision the control node
+
+Replace `example.ts.net` with the DNS suffix shown in your Tailscale admin
+console:
+
+```bash
+terraform -chdir=deploy/coder-aws/control-plane init
+terraform -chdir=deploy/coder-aws/control-plane apply \
+  -var tailscale_auth_parameter=/kirocrew/poc/tailscale-auth-key \
+  -var kiro_api_key_parameter=/kirocrew/poc/kiro-api-key \
+  -var tailnet_dns_name=example.ts.net
+
+terraform -chdir=deploy/coder-aws/control-plane output coder_url
+terraform -chdir=deploy/coder-aws/control-plane output crew_url
+```
+
+Open the Coder URL while connected to Tailscale and create the single owner
+account. The server is pinned to a checksummed ARM RPM and listens only on
+loopback behind Tailscale Serve. Its database lives under the persistent
+`coder` user's home, so back that volume up before treating the POC as durable.
+
+#### 3. Push the workspace template
+
+Install the Coder CLI locally, then authenticate it against the output URL:
+
+```bash
+coder login https://kirocrew-coder.example.ts.net
+
+CREW_TEMPLATE_VALUES="$(
+  terraform -chdir=deploy/coder-aws/control-plane \
+    output -json workspace_template_values
+)"
+coder templates push kirocrew-arm --yes --directory deploy/coder-aws/workspace \
+  --var "region=$(jq -r .region <<<"$CREW_TEMPLATE_VALUES")" \
+  --var "subnet_id=$(jq -r .subnet_id <<<"$CREW_TEMPLATE_VALUES")" \
+  --var "security_group_id=$(jq -r .security_group_id <<<"$CREW_TEMPLATE_VALUES")" \
+  --var "instance_profile_name=$(jq -r .instance_profile_name <<<"$CREW_TEMPLATE_VALUES")" \
+  --var "tailscale_auth_parameter=$(jq -r .tailscale_auth_parameter <<<"$CREW_TEMPLATE_VALUES")" \
+  --var "kiro_api_key_parameter=$(jq -r .kiro_api_key_parameter <<<"$CREW_TEMPLATE_VALUES")"
+unset CREW_TEMPLATE_VALUES
+
+coder create crew-dogfood --template kirocrew-arm \
+  --parameter instance_type=c8g.large \
+  --parameter volume_gb=30 --yes
+```
+
+The first start installs the verified aarch64 musl Kiro CLI build. Stopping the
+workspace preserves its full root disk:
+
+```bash
+coder stop crew-dogfood --yes
+coder start crew-dogfood --yes
+```
+
+#### 4. Install this Kiro Crew build on the control node
+
+Build the dashboard and wheel in this checkout, then copy the wheel over the
+tailnet. Tailscale SSH must permit the `ec2-user` login for these commands:
+
+```bash
+(cd website && npm ci && npm run build)
+cp -R website/dist src/kiro_crew/static/dist
+python -m build --wheel
+
+scp dist/kirocrew-*.whl ec2-user@kirocrew-coder:/tmp/
+ssh ec2-user@kirocrew-coder <<'EOF'
+sudo -u coder python3.11 -m venv /home/coder/kirocrew-venv
+sudo -u coder env HOME=/home/coder \
+  /home/coder/kirocrew-venv/bin/pip install /tmp/kirocrew-*.whl
+sudo -u coder env HOME=/home/coder /bin/sh -c \
+  'cd /home/coder && exec /home/coder/kirocrew-venv/bin/kirocrew setup --agent-only'
+EOF
+```
+
+The control node permits an owner to create an automation token with a one-year
+lifetime. Create it with `coder tokens create --name crew-control --lifetime
+1y`. Then append it to the gateway's owner-only `.env` file that the bootstrap
+seeded with `KIRO_API_KEY`; do not replace that file or put the token in
+`/etc/kirocrew/kirocrew.env`, which is readable by other local users. The
+following one-time setup keeps the token out of shell history:
+
+```bash
+read -rsp "Coder automation token: " CREW_CODER_TOKEN && printf '\n'
+{
+  printf '%s\n' \
+    'KIROCREW_CODER_WORKSPACE=crew-dogfood' \
+    'KIROCREW_CODER_REMOTE_CWD=/home/coder/workspace' \
+    'CODER_URL=http://127.0.0.1:3000'
+  printf 'CODER_SESSION_TOKEN=%s\n' "$CREW_CODER_TOKEN"
+} | ssh ec2-user@kirocrew-coder \
+  'sudo -u coder install -d -m 700 /home/coder/.kiro/crew &&
+   sudo -u coder tee -a /home/coder/.kiro/crew/.env >/dev/null &&
+   sudo chmod 600 /home/coder/.kiro/crew/.env'
+unset CREW_CODER_TOKEN
+```
+
+Set the external dashboard URL and install the gateway service as the `coder`
+user:
+
+```bash
+ssh -t ec2-user@kirocrew-coder \
+  "sudo -u coder env HOME=/home/coder /bin/sh -c \
+   'cd /home/coder && /home/coder/kirocrew-venv/bin/kirocrew config set \
+   dashboard.url https://kirocrew-coder.example.ts.net:8443'"
+ssh -t ec2-user@kirocrew-coder \
+  'sudo env SUDO_USER=coder USER=coder LOGNAME=coder HOME=/home/coder \
+   /home/coder/kirocrew-venv/bin/kirocrew service install'
+```
+
+Open the Crew URL from the Terraform output and use it normally. A missing or
+expired Coder token fails the remote session closed; rotate it according to the
+token lifetime configured on your Coder server and restart the gateway after
+updating `.env`.
+
+#### 5. Measure, resize, and tear down
+
+The verification harness checks ARM architecture, Kiro CLI availability, ACP
+initialization, workspace start time, steady SSH frame latency, and current AWS
+Pricing API estimates without printing credentials:
+
+```bash
+python deploy/coder-aws/verify.py crew-dogfood --start --stop-after
+```
+
+Keep `c8g.large` until CPU measurements justify a resize. The report separates
+workspace active compute from the fixed monthly control-node plus gp3 estimate,
+which is the useful number for this dogfood experiment.
+
+To remove the POC, delete the Coder workspace first so its EC2 instance is
+terminated, then destroy the control stack. Confirm the targets in the Coder UI
+and Terraform plan before proceeding:
+
+```bash
+coder delete crew-dogfood
+terraform -chdir=deploy/coder-aws/control-plane destroy \
+  -var tailscale_auth_parameter=/kirocrew/poc/tailscale-auth-key \
+  -var kiro_api_key_parameter=/kirocrew/poc/kiro-api-key \
+  -var tailnet_dns_name=example.ts.net
+```
+
 ### Install the basics
 
 ```bash

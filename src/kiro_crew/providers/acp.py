@@ -21,6 +21,7 @@ from kiro_crew.acp.client import (
 )
 from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeError
 from kiro_crew.acp.session_handle import AcpSessionHandle
+from kiro_crew.acp.session_host import CoderWorkspaceSessionHost, LocalSessionHost
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
@@ -295,6 +296,7 @@ class AcpProvider(LLMProvider):
         mcp_gateway_socket: str | Path | None = None,
         permission_mode: str | None = None,
         crew_agent: str | None = None,
+        session_host: LocalSessionHost | CoderWorkspaceSessionHost | None = None,
     ) -> None:
         # An unrecognized backend would pass every ``_is_<backend>`` check and
         # spawn kiro-cli, so a typo'd config would drive the wrong agent with no
@@ -323,6 +325,7 @@ class AcpProvider(LLMProvider):
         if agent:
             kwargs["agent"] = agent
         self._client = AcpClient(**kwargs)
+        self._session_host = session_host
         # Consumer opt-in for the low-fidelity child permission downgrade
         # (see child_fidelity_aware property). Set by fidelity-aware
         # consumers (dashboard chat) BEFORE startup; re-applied when
@@ -720,6 +723,7 @@ class AcpProvider(LLMProvider):
             mcp_gateway_socket=mcp_gateway_socket,
             acp_backend=self._client.backend,
             crew_agent=self._crew_agent,
+            session_host=self._session_host,
         )
         _t_spawn = time.monotonic()
         try:
@@ -820,6 +824,7 @@ class AcpProvider(LLMProvider):
                         mcp_gateway_socket=mcp_gateway_socket,
                         acp_backend=self._client.backend,
                         crew_agent=self._crew_agent,
+                        session_host=self._session_host,
                     )
                     try:
                         await runtime.spawn()

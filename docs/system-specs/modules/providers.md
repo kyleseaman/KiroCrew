@@ -73,7 +73,8 @@ Provider-agnostic event dataclass (aliased from `AcpEvent`):
 
 ### AcpProvider (`providers/acp.py`)
 
-The sole provider. Spawns a long-lived `kiro-cli acp --agent <name>` subprocess
+The sole provider. Spawns a long-lived `kiro-cli acp --agent <name>` subprocess,
+locally by default or through the opt-in Coder session host described below,
 and speaks JSON-RPC 2.0 over stdio.
 
 **Dormant backend seam:** `AcpProvider`/`AcpClient` retain an `acp_backend`
@@ -106,7 +107,39 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
 - **claude backend** — no-op. Tool Search is a kiro-cli feature; `_apply_tool_search_overlay` returns early for the claude backend and when no toggle value was threaded in (`tool_search is None`).
 
 - **Resume guard:** `session/load` (resume) is only attempted when the prior session transcript exists on disk (`~/.kiro/sessions/cli/<sid>.json`). A stale persisted sid with no transcript falls back to `session/new`, preventing a fresh conversation from replaying old turns (which inflated base context).
-- **Working dir:** `AcpProvider.cwd` overrides the `LLMProvider` ABC default so `session_map` persists the real workspace path. AcpProvider's work_dir lives on the inner client (`_client._work_dir`), so the prior `getattr(provider, "_work_dir", "")` persisted `""` for all ACP sessions — `provider.cwd` fixes resume-cwd-override.
+- **Working dir:** `AcpProvider.cwd` overrides the `LLMProvider` ABC default so `session_map` persists the real workspace path. AcpProvider's work_dir lives on the inner client (`_client._work_dir`), so the prior `getattr(provider, "_work_dir", "")` persisted `""` for all ACP sessions — `provider.cwd` fixes resume-cwd-override. A remote session still persists this control-plane path, while its ACP `session/new.cwd` is the session host's normalized POSIX path.
+
+#### Session execution host (Coder POC)
+
+`acp/session_host.py` makes the process location an explicit runtime boundary.
+`LocalSessionHost` preserves the existing local spawn path. Setting
+`KIROCREW_CODER_WORKSPACE` opts only the main interactive `kirocrew` agent into
+`CoderWorkspaceSessionHost`; background, cron, custom-agent, and subagent
+factories remain local. The opt-in also requires `CODER_URL` and
+`CODER_SESSION_TOKEN`. `KIROCREW_CODER_BIN` selects the local transport binary
+and `KIROCREW_CODER_REMOTE_CWD` defaults to `/home/coder/workspace`.
+
+The runtime invokes exactly `coder ssh <workspace> -- kiro-cli acp --agent
+<name>` (plus the selected model) and preserves ACP JSON-RPC stdio end to end.
+Only Coder URL/token, PATH, certificate, and proxy variables reach the transport
+process; AWS, SSH, channel, Kiro API-key, and Kiro Crew variables are not copied
+from the gateway. Workspace and agent names use a strict identifier grammar,
+and the remote cwd must be an absolute normalized POSIX path.
+
+Before spawn, the host materializes the local agent, resolves a `file://` prompt
+through the existing sensitive-path-aware resolver, and streams an owner-only
+projection to `~/.kiro/agents/<name>.json` in the workspace. The projection
+keeps `name`, `description`, `model`, `prompt`, and ordinary `tools` /
+`allowedTools`; it drops unknown fields and hooks, filters every `@server` tool,
+and forces `mcpServers` to `{}`. `session/new` also sends an empty MCP server
+list and the remote cwd. This POC therefore does not bridge the local MCP
+gateway, hooks, or Kiro Crew state into the workspace.
+
+Remote hosting is positively limited to `ACP_BACKEND_KIRO`; another harness
+fails before spawn. The SSH client itself is not wrapped in Kiro Crew's local
+agent sandbox or cgroup because the Coder workspace is the execution boundary.
+Preparation errors expose only the operation and exit code, not remote stderr,
+which may contain credential-bearing diagnostics.
 
 ### Config (`config/loader.py`)
 
@@ -120,7 +153,7 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
 ```
 
 - `agent.provider` is fixed to `"acp"` (enum `["acp"]`); there is no provider to choose.
-- `create_provider_factory()` returns a `Callable` that creates the kiro-cli `AcpProvider`.
+- `create_provider_factory()` returns a `Callable` that creates the kiro-cli `AcpProvider`; for the main interactive agent it also resolves the session host environment described above.
 
 An agent spec's model is consumed by kiro-cli before Kiro Crew reaches
 `session/new`, so the live-session entitlement guard cannot diagnose a wrong
@@ -175,15 +208,15 @@ on `PATH`, and run `kiro-cli login`. `kirocrew doctor` reports its status.
 
 `AcpProvider.start()` branches on the backend:
 
-- **kiro (`is_claude_backend` False)** → `_start_kiro_runtime()`. This spawns an
-  `AcpRuntime` (carrying the provider's sandbox mode, extra env, and MCP-gateway
-  overlay/socket), resumes via `runtime.load_session()` when a prior transcript
+- **Runtime-backed harness** → `_start_kiro_runtime()`. This spawns an
+  `AcpRuntime` (carrying the provider's sandbox mode, extra env, session host,
+  and MCP-gateway overlay/socket), resumes via `runtime.load_session()` when a prior transcript
   exists or otherwise `runtime.create_session()`, applies the configured model,
   and replaces `self._client` with an `AcpSessionProvider` (which implements the
   same interface as `AcpClient`, so downstream callers are unchanged). Any
   failure after `spawn()` kills the runtime so a half-initialised session never
   leaks an orphaned `kiro-cli`.
-- **Alternate ACP backend (`is_claude_backend` True)** → legacy `AcpClient.ensure_ready()`.
+- **Legacy per-session harness** → `AcpClient.ensure_ready()`.
 
 `AcpProvider.is_session_sharing_eligible` is membership in
 `ACP_BACKENDS_SESSION_SHARING` (harness-parity H6), not `not is_claude_backend`:
