@@ -154,14 +154,18 @@ class CoderClient:
         )
 
     async def probe(self, *, template: str, preset: str) -> dict[str, str]:
-        owner_bytes = await self._call("whoami")
+        owner_bytes = await self._call("whoami", "--output", "json")
         if len(owner_bytes) > 1024:
             raise CoderClientError("Coder identity response is too large")
-        try:
-            owner = owner_bytes.decode("utf-8").strip()
-        except UnicodeDecodeError as exc:
-            raise CoderClientError("Coder identity response is invalid") from exc
-        if not owner or any(char.isspace() for char in owner):
+        identity = self._json(owner_bytes, "identity query")
+        if not isinstance(identity, list) or len(identity) != 1:
+            raise CoderClientError("Coder identity response is invalid")
+        record = identity[0]
+        if not isinstance(record, dict):
+            raise CoderClientError("Coder identity response is invalid")
+        owner = record.get("username")
+        owner_id = record.get("user_id")
+        if not isinstance(owner, str) or not owner or not isinstance(owner_id, str) or not owner_id:
             raise CoderClientError("Coder identity response is invalid")
         raw = self._json(
             await self._call("templates", "list", "--output", "json"),

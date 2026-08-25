@@ -94,7 +94,14 @@ async def test_probe_verifies_identity_and_template_without_creating_compute(
     async def run(argv: list[str], env: dict[str, str], cwd: Path) -> bytes:
         calls.append(argv)
         if argv[1] == "whoami":
-            return b"kyleseaman\n"
+            return json.dumps(
+                [
+                    {
+                        "user_id": "0d5bd32b-20ba-4937-9f89-a6726be46ba1",
+                        "username": "kyleseaman",
+                    }
+                ]
+            ).encode()
         if argv[1:3] == ["templates", "list"]:
             return json.dumps([{"name": "kirocrew-arm"}]).encode()
         raise AssertionError(argv)
@@ -105,6 +112,7 @@ async def test_probe_verifies_identity_and_template_without_creating_compute(
         "owner": "kyleseaman",
         "template": "kirocrew-arm",
     }
+    assert calls[0] == ["/opt/coder", "whoami", "--output", "json"]
     assert all("create" not in call for call in calls)
 
 
