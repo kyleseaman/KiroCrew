@@ -234,7 +234,6 @@ src/kiro_crew/dashboard/handlers/hooks.py
 src/kiro_crew/dashboard/handlers/kiro_usage_api.py
 src/kiro_crew/dashboard/handlers/knowledge.py
 src/kiro_crew/dashboard/handlers/link_meta.py
-src/kiro_crew/dashboard/handlers/mcp.py
 src/kiro_crew/dashboard/handlers/mcp_apps.py
 src/kiro_crew/dashboard/handlers/mcp_custom.py
 src/kiro_crew/dashboard/handlers/memory.py
@@ -818,7 +817,6 @@ test/test_handler_link_intercept.py
 test/test_handlers_channel_clear_context.py
 test/test_handlers_channel_presets.py
 test/test_handlers_files_upload.py
-test/test_handlers_mcp_coverage.py
 test/test_handlers_memory_coverage.py
 test/test_handlers_taskrunner_coverage.py
 test/test_heartbeat_atomic_merge.py

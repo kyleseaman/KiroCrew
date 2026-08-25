@@ -131,6 +131,57 @@ from the live `kirocrew` binary, strips stale remote-transport fields (`url`,
 gateway is actually running under while preserving the user's own env keys.
 User customizations such as `autoApprove` are preserved.
 
+### Coder remote-session proxy
+
+A Coder-hosted ACP runtime does not receive the merged MCP definitions above.
+For every enabled, well-formed stdio entry, the gateway resolves the executable
+and sanitizes its declared environment locally, then stores that fixed target
+behind an in-memory capability bound to one logical session and one server. A
+loopback-only TCP proxy starts the target through the ordinary sandbox helpers,
+injects the authoritative `KIROCREW_SESSION_KEY` after environment scrubbing,
+and copies MCP bytes with backpressure. Authentication accepts only a version
+and bearer; it accepts no server name, command, argv, cwd, environment, URL, or
+caller identity from the workspace.
+
+The raw bearer exists only in an owner-only file under the remote runtime
+directory. Agent JSON and ACP relay entries contain only the copied stdlib relay
+path, workspace-loopback reverse-forward port, and capability-file path. The
+gateway registry retains a SHA-256 digest rather than the bearer. A grant allows
+one live connection; revocation cancels an active connection, prevents replay,
+and terminates its gateway-side process tree. Closing a runtime revokes all of
+its grants before removing the remote directory best-effort.
+
+Enabled URL entries use the same session capability, but the target is an
+opaque gateway-side `RemoteHttpMcpTarget`. The gateway uses the official MCP
+Python SDK for Streamable HTTP and attempts its legacy SSE client only when the
+initial modern `initialize` POST returns exactly 404 or 405. Authentication,
+TLS, timeouts, malformed responses, and every other HTTP status fail without
+fallback. Configured headers are injected only at the exact modern resource URL
+(or same-origin legacy SSE endpoints), credential-bearing cross-origin
+redirects are refused, and actual redirect chains are capped at three. Relay
+JSON lines and non-streaming response bodies are capped at 8 MiB.
+
+For URL entries without a configured `Authorization` header, the gateway also
+owns the SDK OAuth provider. One provider per canonical resource URL and client
+identity serializes discovery, dynamic registration, authorization, and refresh
+across sessions. Access tokens, refresh tokens, and dynamic client records are
+encrypted in `SecretVault`; vault names contain only a versioned SHA-256 identity
+digest. Authorization attempts are one-shot, bounded, and completed through the
+fixed `/api/mcp/oauth/callback` route. Its origin comes only from the configured
+HTTPS dashboard URL, the startup-validated Tailscale host, or exact loopback --
+never from request `Host`. The callback's high-entropy state authenticates its
+GET, while normal Host validation remains active.
+
+OAuth prompts and terminal outcomes reuse the dashboard's existing MCP OAuth
+banner and route to the visible parent slot for dashboard, linked channel, cron,
+and subagent sessions. Ending a session revokes its transport capability but
+retains the encrypted integration grant. Removing the stored integration
+deletes tokens and client registration locally and, when discovered metadata
+advertises a revocation endpoint, attempts RFC 7009 revocation without restoring
+local material after a remote failure. The workspace never receives a URL,
+configured header, OAuth metadata, authorization code, PKCE verifier, token, or
+client secret.
+
 An entry may also carry a **`spec_gate`** — a predicate consulted at spec
 EMISSION time. `kirocrew-computer` is the one row that has one, and the
 distinction it draws is the difference between a capability that advertises no

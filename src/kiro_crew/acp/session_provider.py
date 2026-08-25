@@ -101,10 +101,17 @@ class AcpSessionProvider(LLMProvider):
         # Create the fresh session BEFORE destroying the old one so a failure
         # leaves the provider still pointing at a usable handle (no window where
         # self._handle references a terminated session).
-        new_handle = await self._runtime.create_session(
-            cwd=self._runtime._work_dir,
-            agent=self._runtime._agent or None,
-        )
+        if self._session_key:
+            new_handle = await self._runtime.create_session(
+                cwd=self._runtime._work_dir,
+                agent=self._runtime._agent or None,
+                session_key=self._session_key,
+            )
+        else:
+            new_handle = await self._runtime.create_session(
+                cwd=self._runtime._work_dir,
+                agent=self._runtime._agent or None,
+            )
         # Re-apply the configured non-default model to the fresh session. A new
         # session/new reverts to the agent-config default model, so a warm worker
         # configured with a non-default model (via the cold-start set_model in

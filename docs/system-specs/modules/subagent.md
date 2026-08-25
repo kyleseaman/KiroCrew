@@ -593,14 +593,15 @@ Decision + lifecycle:
 
 - `SubagentManager._should_use_session_sharing(info)` gates the path: config flag
   on, parent session eligible (`SessionManager.is_session_sharing_eligible`), and
-  no backend-specific overrides (`model` / `allowed_tools` / `bare`).
+  no explicit agent, model, effort, allowed-tools, or bare-mode override.
 - `_create_shared_session()` resolves the parent's `AcpRuntime` via
   `_get_parent_runtime()` (falling back to `SessionManager.get_subagent_runtime()`
   — a companion runtime), calls `runtime.create_session()`, and wraps the handle
   in `AcpSessionProvider`. `SubagentInfo._session_sharing` / `_shared_provider`
   record the shared path.
-- On any failure the code falls back transparently to the legacy
-  per-process path (`get_or_create`).
+- On any failure the code falls back to the dedicated per-process path
+  (`get_or_create`). For a Coder parent, that request carries a freshly cloned
+  Coder host, so failure cannot move the child onto the gateway machine.
 - Cleanup (`_run` finally + `_force_reap`) calls `_shared_provider.shutdown()` to
   tear down only the session — it never kills the shared runtime, which other
   subagents may still use. The runtime is killed when the parent session ends
@@ -608,3 +609,10 @@ Decision + lifecycle:
 
 Non-kiro (alternate ACP backend) parents are never eligible and always use the
 legacy `AcpClient` per-process path regardless of the flag.
+
+Remote affinity is transitive only within the live session tree. Shared children
+pass their own `subagent:<id>` key into the parent's remote `AcpRuntime`, giving
+each child separate MCP grants and caller attribution. Dedicated children clone
+only the parent host configuration and start a new SSH/ACP runtime in the same
+workspace; capability state is minted independently and never serialized into
+the child request.

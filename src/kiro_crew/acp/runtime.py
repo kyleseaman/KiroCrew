@@ -70,9 +70,13 @@ from kiro_crew.acp.session_handle import (
     _load_watchdog_settings,
 )
 from kiro_crew.acp.session_host import (
+    _REMOTE_RUNTIME_MARKER,
     CoderWorkspaceSessionHost,
     LocalSessionHost,
     project_remote_agent_spec,
+    remote_mcp_unsupported_entry,
+    resolve_remote_mcp_targets,
+    unsupported_remote_mcp_names,
 )
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
@@ -677,6 +681,8 @@ class AcpRuntime:
         # transports deliberately skip that host-local setup, but the shared
         # post-spawn bookkeeping still needs the same explicit empty state.
         self._scratch_dir: Path | None = None
+        self._remote_agent_spec: dict[str, object] | None = None
+        self._remote_session_keys: dict[str, str] = {}
 
         # Recycling thresholds — see _is_stale(). Long-lived multiplexed
         # runtimes (e.g. the kirocrew-lite background runtime) have no
@@ -980,7 +986,7 @@ class AcpRuntime:
         if not isinstance(host, CoderWorkspaceSessionHost):
             raise AcpRuntimeError("remote session host has an unsupported implementation")
 
-        def _project_agent() -> dict[str, object]:
+        def _project_agent() -> tuple[dict[str, object], dict[str, object]]:
             ensure_agent_materialized(self._agent)
             path = kiro_agents_dir() / f"{self._agent}.json"
             try:
@@ -999,11 +1005,41 @@ class AcpRuntime:
                     agent_id=self._agent,
                     agents_dir=path.parent,
                 )
-                return project_remote_agent_spec(raw)
+                targets = resolve_remote_mcp_targets(
+                    raw,
+                    local_cwd=self._work_dir,
+                    session_key="runtime-preflight",
+                )
+                raw_servers = raw.get("mcpServers")
+                server_specs = raw_servers if isinstance(raw_servers, dict) else {}
+                relay_path = f"{_REMOTE_RUNTIME_MARKER}/remote_mcp_relay.py"
+                relay_entries: dict[str, dict[str, object]] = {}
+                for name in targets:
+                    original = server_specs.get(name)
+                    policy = original if isinstance(original, dict) else {}
+                    relay_entries[name] = remote_mcp_unsupported_entry(
+                        policy,
+                        relay_path=relay_path,
+                        code="remote_mcp_session_capability_unavailable",
+                    )
+                for name in unsupported_remote_mcp_names(raw):
+                    original = server_specs.get(name)
+                    policy = original if isinstance(original, dict) else {}
+                    relay_entries[name] = remote_mcp_unsupported_entry(
+                        policy,
+                        relay_path=relay_path,
+                        code="remote_mcp_http_unavailable",
+                    )
+                return (
+                    project_remote_agent_spec(raw, relay_entries=relay_entries),
+                    raw,
+                )
             except (KasAgentTranslationError, ValueError) as exc:
                 raise AcpRuntimeError(str(exc)) from exc
 
-        projected = await asyncio.to_thread(_project_agent)
+        projected, raw_spec = await asyncio.to_thread(_project_agent)
+        self._remote_agent_spec = raw_spec
+        await host.start_bridge()
         await host.prepare(
             agent=self._agent,
             projected_spec=projected,
@@ -1132,33 +1168,52 @@ class AcpRuntime:
         # slow storage; the loop must never wait on the kernel here.
         await asyncio.to_thread(self._work_dir.mkdir, parents=True, exist_ok=True)
 
-        if self._session_host.is_remote:
-            argv, env = await self._prepare_remote_spawn()
-        else:
-            argv, env = await self._prepare_local_spawn()
-
-        self._process = await create_subprocess_limited(
-            *argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(self._work_dir),
-            limit=_STDOUT_BUFFER_LIMIT,
-            # POSIX: setsid so kill() can killpg the whole tree. Windows:
-            # start_new_session is silently ignored; CREATE_NEW_PROCESS_GROUP
-            # makes the child tree taskkill /T-reapable (see platform_compat
-            # spawn-isolation note). CREATE_NO_WINDOW suppresses the console
-            # window Windows would otherwise pop for this console child spawned
-            # from the windowless gateway (0 on POSIX, so no effect there).
-            start_new_session=platform_compat.IS_POSIX,
-            creationflags=(
-                platform_compat.CREATE_NEW_PROCESS_GROUP
-                | platform_compat._SUBPROCESS_NO_WINDOW
-                | platform_compat.CREATE_SUSPENDED
-            ),
-            env=env,
-            profile=RLIMIT_PROFILE_SESSION_HOST,
+        remote_host = (
+            self._session_host
+            if isinstance(self._session_host, CoderWorkspaceSessionHost)
+            else None
         )
+        try:
+            if self._session_host.is_remote:
+                argv, env = await self._prepare_remote_spawn()
+            else:
+                argv, env = await self._prepare_local_spawn()
+
+            self._process = await create_subprocess_limited(
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(self._work_dir),
+                limit=_STDOUT_BUFFER_LIMIT,
+                # POSIX: setsid so kill() can killpg the whole tree. Windows:
+                # start_new_session is silently ignored; CREATE_NEW_PROCESS_GROUP
+                # makes the child tree taskkill /T-reapable (see platform_compat
+                # spawn-isolation note). CREATE_NO_WINDOW suppresses the console
+                # window Windows would otherwise pop for this console child spawned
+                # from the windowless gateway (0 on POSIX, so no effect there).
+                start_new_session=platform_compat.IS_POSIX,
+                creationflags=(
+                    platform_compat.CREATE_NEW_PROCESS_GROUP
+                    | platform_compat._SUBPROCESS_NO_WINDOW
+                    | platform_compat.CREATE_SUSPENDED
+                ),
+                env=env,
+                profile=RLIMIT_PROFILE_SESSION_HOST,
+            )
+        except BaseException:
+            if remote_host is not None:
+                try:
+                    await remote_host.close(
+                        environ=os.environ,
+                        local_cwd=self._work_dir,
+                    )
+                except Exception:
+                    logger.debug(
+                        "AcpRuntime: remote host cleanup after failed spawn failed",
+                        exc_info=True,
+                    )
+            raise
         self._pid = self._process.pid
         # Windows resource ceiling, applied while the child is still SUSPENDED,
         # then resumed. No-op on POSIX (CREATE_SUSPENDED is 0 there). This shared
@@ -1367,6 +1422,15 @@ class AcpRuntime:
                     logger.debug("AcpRuntime: PID untracking failed for %s", pid, exc_info=True)
 
         self._discard_sandbox_cleanup()
+        remote_session_keys = getattr(self, "_remote_session_keys", None)
+        if remote_session_keys is not None:
+            remote_session_keys.clear()
+        session_host = getattr(self, "_session_host", None)
+        if isinstance(session_host, CoderWorkspaceSessionHost):
+            await session_host.close(
+                environ=os.environ,
+                local_cwd=self._work_dir,
+            )
 
     # ── Reader Task (single owner of stdout) ──
 
@@ -2415,6 +2479,9 @@ class AcpRuntime:
                         exc_info=True,
                     )
         finally:
+            remote_key = self._remote_session_keys.pop(session_id, None)
+            if remote_key and isinstance(self._session_host, CoderWorkspaceSessionHost):
+                self._session_host.revoke_session_grants(remote_key)
             self.unregister_session(session_id)
 
     def _session_teardown_method(self) -> str:
@@ -2633,6 +2700,7 @@ class AcpRuntime:
         agent: str | None = None,
         mcp_servers: list[dict[str, Any]] | None = None,
         crew_agent: str | None = None,
+        session_key: str | None = None,
     ) -> AcpSessionHandle:
         """Create a new ACP session on this runtime. Returns a session handle.
 
@@ -2647,11 +2715,19 @@ class AcpRuntime:
         # in the agent spec, so this is what actually pools the servers — no file
         # is written anywhere. Empty when the gateway is disabled.
         if self._session_host.is_remote:
-            # The POC remote host deliberately carries no gateway MCP transport.
-            # Empty means the workspace gets only the Kiro built-ins projected
-            # into its agent spec; making this additive would reintroduce local
-            # command paths and credentials that cannot exist remotely.
-            mcp_servers = []
+            if not session_key:
+                raise AcpRuntimeError("remote MCP session creation requires a logical session key")
+            host = self._session_host
+            if not isinstance(host, CoderWorkspaceSessionHost):
+                raise AcpRuntimeError("remote session host is unsupported")
+            if self._remote_agent_spec is None:
+                raise AcpRuntimeError("remote agent bridge is not prepared")
+            mcp_servers = await host.prepare_session_capabilities(
+                agent_spec=self._remote_agent_spec,
+                session_key=session_key,
+                environ=os.environ,
+                local_cwd=self._work_dir,
+            )
         elif mcp_servers is None:
             # Resolve the overlay off the event loop: the lookup stats/reads
             # files, and blocking the loop stalls every other session's I/O.
@@ -2690,9 +2766,18 @@ class AcpRuntime:
                 raise AcpRuntimeError(f"session/new did not return sessionId: {resp}")
         except AcpRequestTimeout as exc:
             # Read the staged MCP reports before the finally below clears them.
+            if session_key and isinstance(self._session_host, CoderWorkspaceSessionHost):
+                self._session_host.revoke_session_grants(session_key)
             raise self._session_start_stalled(exc, METHOD_SESSION_NEW, mcp_servers) from exc
+        except BaseException:
+            if session_key and isinstance(self._session_host, CoderWorkspaceSessionHost):
+                self._session_host.revoke_session_grants(session_key)
+            raise
         finally:
             buffered_init = self._finish_session_init(session_id)
+
+        if session_key and self._session_host.is_remote:
+            self._remote_session_keys[session_id] = session_key
 
         # Register session queue
         queue: asyncio.Queue[JsonRpcMessage | None] = asyncio.Queue()
@@ -2792,6 +2877,7 @@ class AcpRuntime:
         cwd: str | Path | None = None,
         agent: str | None = None,
         crew_agent: str | None = None,
+        session_key: str | None = None,
     ) -> AcpSessionHandle:
         """Resume a prior session via session/load — mirrors AcpClient.
 
@@ -2818,12 +2904,32 @@ class AcpRuntime:
         # the event loop — the overlay lookup stats and reads files. Empty when
         # the shared gateway is disabled, so non-pooled installs still send [].
         active_agent = agent or self._agent
-        mcp_servers = await asyncio.to_thread(
-            pooled_session_servers, self._mcp_gateway_overlay, active_agent
-        )
+        if self._session_host.is_remote:
+            if not session_key:
+                raise AcpRuntimeError("remote MCP session resume requires a logical session key")
+            host = self._session_host
+            if not isinstance(host, CoderWorkspaceSessionHost):
+                raise AcpRuntimeError("remote session host is unsupported")
+            if self._remote_agent_spec is None:
+                raise AcpRuntimeError("remote agent bridge is not prepared")
+            mcp_servers = await host.prepare_session_capabilities(
+                agent_spec=self._remote_agent_spec,
+                session_key=session_key,
+                environ=os.environ,
+                local_cwd=self._work_dir,
+            )
+            session_file = host.remote_session_file(resume_sid)
+        else:
+            mcp_servers = await asyncio.to_thread(
+                pooled_session_servers, self._mcp_gateway_overlay, active_agent
+            )
         load_params: dict[str, Any] = {
             "sessionId": resume_sid,
-            "cwd": str(cwd if cwd else self._work_dir),
+            "cwd": (
+                self._session_host.protocol_cwd
+                if self._session_host.is_remote
+                else str(cwd if cwd else self._work_dir)
+            ),
             "mcpServers": mcp_servers,
         }
         if session_file:
@@ -2878,9 +2984,18 @@ class AcpRuntime:
             loaded_session_id = resume_sid
         except AcpRequestTimeout as exc:
             # Read the staged MCP reports before the finally below clears them.
+            if session_key and isinstance(self._session_host, CoderWorkspaceSessionHost):
+                self._session_host.revoke_session_grants(session_key)
             raise self._session_start_stalled(exc, METHOD_SESSION_LOAD, mcp_servers) from exc
+        except BaseException:
+            if session_key and isinstance(self._session_host, CoderWorkspaceSessionHost):
+                self._session_host.revoke_session_grants(session_key)
+            raise
         finally:
             buffered_init = self._finish_session_init(loaded_session_id)
+
+        if session_key and self._session_host.is_remote:
+            self._remote_session_keys[resume_sid] = session_key
 
         # Register the queue AFTER _send_and_await returns. During session/load
         # kiro-cli replays the full prior transcript on stdout; without a

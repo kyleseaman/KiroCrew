@@ -22,6 +22,10 @@ from kiro_crew.dashboard.handlers.mcp_discover import (
     api_mcp_discover_detail,
     api_mcp_discover_install,
 )
+from kiro_crew.dashboard.handlers.remote_mcp_oauth import (
+    REMOTE_MCP_OAUTH_CALLBACK_PATH,
+    api_remote_mcp_oauth_callback,
+)
 
 
 def register(app: web.Application) -> None:
@@ -75,6 +79,10 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/mcp/toggle-all", handlers.api_mcp_toggle_all)
     app.router.add_post("/api/mcp/remove", handlers.api_mcp_remove)
     app.router.add_post("/api/mcp/oauth/relay", handlers.api_mcp_oauth_relay)
+    app.router.add_get(
+        REMOTE_MCP_OAUTH_CALLBACK_PATH,
+        api_remote_mcp_oauth_callback,
+    )
     app.router.add_post("/api/connections/mint", handlers.api_connections_mint)
     app.router.add_get("/api/connections/mint", handlers.api_connections_mint_state)
     app.router.add_get("/api/connections/status", handlers.api_connections_status)

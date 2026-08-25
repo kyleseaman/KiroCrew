@@ -183,16 +183,12 @@ class TestToggleServer:
     ) -> None:
         """A server configured only in another scope still records its state here."""
         _known(monkeypatch, "elsewhere")
-        resp = await mcp_mod.api_mcp_toggle(
-            _request({"name": "elsewhere", "enabled": False})
-        )
+        resp = await mcp_mod.api_mcp_toggle(_request({"name": "elsewhere", "enabled": False}))
         assert resp.status == 200
         assert _read_global(sandbox)["elsewhere"] == {"disabled": True}
 
     @pytest.mark.asyncio
-    async def test_string_spec_is_coerced_to_a_command_dict(
-        self, sandbox: SimpleNamespace
-    ) -> None:
+    async def test_string_spec_is_coerced_to_a_command_dict(self, sandbox: SimpleNamespace) -> None:
         _write_global(sandbox, {"srv": "run-me"})
         resp = await mcp_mod.api_mcp_toggle(_request({"name": "srv", "enabled": False}))
         assert resp.status == 200
@@ -249,9 +245,7 @@ class TestToggleTool:
         "body",
         [{"tool": "ReadFile"}, {"server": "srv"}, {}],
     )
-    async def test_missing_fields_are_400(
-        self, sandbox: SimpleNamespace, body: dict
-    ) -> None:
+    async def test_missing_fields_are_400(self, sandbox: SimpleNamespace, body: dict) -> None:
         resp = await mcp_mod.api_mcp_toggle_tool(_request(body))
         assert resp.status == 400
         assert "server and tool are required" in _payload(resp)["error"]
@@ -259,9 +253,7 @@ class TestToggleTool:
     @pytest.mark.asyncio
     async def test_corrupt_global_config_is_500(self, sandbox: SimpleNamespace) -> None:
         sandbox.global_json.write_text("nope", encoding="utf-8")
-        resp = await mcp_mod.api_mcp_toggle_tool(
-            _request({"server": "srv", "tool": "T"})
-        )
+        resp = await mcp_mod.api_mcp_toggle_tool(_request({"server": "srv", "tool": "T"}))
         assert resp.status == 500
 
     @pytest.mark.asyncio
@@ -269,15 +261,11 @@ class TestToggleTool:
         self, sandbox: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _known(monkeypatch)
-        resp = await mcp_mod.api_mcp_toggle_tool(
-            _request({"server": "ghost", "tool": "T"})
-        )
+        resp = await mcp_mod.api_mcp_toggle_tool(_request({"server": "ghost", "tool": "T"}))
         assert resp.status == 404
 
     @pytest.mark.asyncio
-    async def test_disable_then_reenable_round_trips(
-        self, sandbox: SimpleNamespace
-    ) -> None:
+    async def test_disable_then_reenable_round_trips(self, sandbox: SimpleNamespace) -> None:
         _write_global(sandbox, {"srv": {"command": "x"}})
 
         resp = await mcp_mod.api_mcp_toggle_tool(
@@ -327,9 +315,7 @@ class TestToggleTool:
     @pytest.mark.asyncio
     async def test_non_mapping_spec_is_500(self, sandbox: SimpleNamespace) -> None:
         _write_global(sandbox, {"srv": 7})
-        resp = await mcp_mod.api_mcp_toggle_tool(
-            _request({"server": "srv", "tool": "T"})
-        )
+        resp = await mcp_mod.api_mcp_toggle_tool(_request({"server": "srv", "tool": "T"}))
         assert resp.status == 500
         assert "invalid config type: int" in _payload(resp)["error"]
 
@@ -369,9 +355,7 @@ class TestToggleAll:
     async def test_disables_every_mapping_spec_and_skips_others(
         self, sandbox: SimpleNamespace
     ) -> None:
-        _write_global(
-            sandbox, {"a": {"command": "x"}, "b": {"command": "y"}, "junk": "str-spec"}
-        )
+        _write_global(sandbox, {"a": {"command": "x"}, "b": {"command": "y"}, "junk": "str-spec"})
         resp = await mcp_mod.api_mcp_toggle_all(_request({"enabled": False}))
         assert resp.status == 200
         assert _payload(resp) == {"ok": True, "enabled": False, "count": 3}
@@ -391,9 +375,7 @@ class TestToggleAll:
         assert sandbox.batched == [(["a"], True)]
 
     @pytest.mark.asyncio
-    async def test_missing_global_file_reports_zero_servers(
-        self, sandbox: SimpleNamespace
-    ) -> None:
+    async def test_missing_global_file_reports_zero_servers(self, sandbox: SimpleNamespace) -> None:
         """No mcp.json yet: the handler starts from an empty document, not a 500."""
         sandbox.global_json.unlink(missing_ok=True)
         resp = await mcp_mod.api_mcp_toggle_all(_request({"enabled": False}))
@@ -453,6 +435,30 @@ class TestRemove:
         assert sandbox.synced == [("srv", False, True)]
 
     @pytest.mark.asyncio
+    async def test_remove_deletes_gateway_oauth_grant_from_stored_target(
+        self, sandbox: SimpleNamespace, no_capability_manager: MagicMock
+    ) -> None:
+        manager = SimpleNamespace(disconnect=AsyncMock())
+        state = SimpleNamespace(remote_mcp_oauth_manager=manager)
+        _write_global(
+            sandbox,
+            {
+                "srv": {
+                    "url": "https://mcp.example.test/mcp",
+                    "headers": {"X-Tenant": "one"},
+                    "disabled": True,
+                }
+            },
+        )
+
+        response = await mcp_mod.api_mcp_remove(_request({"name": "srv"}, state=state))
+
+        assert response.status == 200
+        target = manager.disconnect.await_args.args[0]
+        assert target.server_name == "srv"
+        assert target.url == "https://mcp.example.test/mcp"
+
+    @pytest.mark.asyncio
     async def test_absent_entry_reports_removed_false(
         self, sandbox: SimpleNamespace, no_capability_manager: MagicMock
     ) -> None:
@@ -489,9 +495,7 @@ class TestRemove:
 
         mgr = MagicMock()
         mgr.available.return_value = True
-        mgr.uninstall_mcp = AsyncMock(
-            return_value=SimpleNamespace(ok=True, message="gone")
-        )
+        mgr.uninstall_mcp = AsyncMock(return_value=SimpleNamespace(ok=True, message="gone"))
         monkeypatch.setattr(_shared, "_capability_manager", lambda: mgr)
 
         _write_global(sandbox, {"srv": {"command": "x"}})
@@ -542,9 +546,25 @@ class TestServerDetail:
         assert "srv" not in _read_global(sandbox)
 
     @pytest.mark.asyncio
-    async def test_delete_tolerates_a_corrupt_global_config(
-        self, sandbox: SimpleNamespace
-    ) -> None:
+    async def test_delete_deletes_gateway_oauth_grant(self, sandbox: SimpleNamespace) -> None:
+        manager = SimpleNamespace(disconnect=AsyncMock())
+        state = SimpleNamespace(remote_mcp_oauth_manager=manager)
+        _write_global(sandbox, {"srv": {"url": "https://mcp.example.test/mcp"}})
+
+        response = await mcp_mod.api_mcp_server_detail(
+            _request(
+                None,
+                state=state,
+                match_info={"name": "srv"},
+                method="DELETE",
+            )
+        )
+
+        assert response.status == 200
+        manager.disconnect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_delete_tolerates_a_corrupt_global_config(self, sandbox: SimpleNamespace) -> None:
         """An unparseable mcp.json is treated as empty — a 404, never a 500."""
         sandbox.global_json.write_text("]]]", encoding="utf-8")
         resp = await mcp_mod.api_mcp_server_detail(
@@ -724,9 +744,7 @@ class TestActive:
         )
         _write_global(sandbox, {"on": {"command": "x"}})
         _known(monkeypatch, "on")
-        resp = await mcp_mod.api_mcp_active(
-            _request(query={"agent": "default"})
-        )
+        resp = await mcp_mod.api_mcp_active(_request(query={"agent": "default"}))
         assert {r["name"] for r in _payload(resp)} >= {"on", "kirocrew-core"}
 
     @pytest.mark.asyncio
@@ -1193,9 +1211,7 @@ class TestGatewayEnableErrors:
         assert _payload(resp)["error"] == "invalid JSON"
 
     @pytest.mark.asyncio
-    async def test_corrupt_config_json_is_500(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_corrupt_config_json_is_500(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from kiro_crew.config.loader import config_path
 
         monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
@@ -1205,17 +1221,13 @@ class TestGatewayEnableErrors:
         path.write_text("{ nope", encoding="utf-8")
         apply_cb = AsyncMock()
         state = SimpleNamespace(_mcp_gateway_apply=apply_cb)
-        resp = await mcp_mod.api_mcp_gateway_enable(
-            _request({"enabled": True}, state=state)
-        )
+        resp = await mcp_mod.api_mcp_gateway_enable(_request({"enabled": True}, state=state))
         assert resp.status == 500
         assert "corrupt" in _payload(resp)["error"]
         apply_cb.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_non_object_section_is_500(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_non_object_section_is_500(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from kiro_crew.config.loader import config_path
 
         monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
@@ -1224,25 +1236,19 @@ class TestGatewayEnableErrors:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"mcp_gateway": "on"}), encoding="utf-8")
         state = SimpleNamespace(_mcp_gateway_apply=AsyncMock())
-        resp = await mcp_mod.api_mcp_gateway_enable(
-            _request({"enabled": True}, state=state)
-        )
+        resp = await mcp_mod.api_mcp_gateway_enable(_request({"enabled": True}, state=state))
         assert resp.status == 500
         assert "not an object" in _payload(resp)["error"]
 
     @pytest.mark.asyncio
-    async def test_apply_failure_is_500_and_audited(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_apply_failure_is_500_and_audited(self, monkeypatch: pytest.MonkeyPatch) -> None:
         sel = MagicMock()
         monkeypatch.setattr(mcp_mod, "sel", lambda: sel)
         monkeypatch.setattr(mcp_mod, "is_gateway_supported", lambda: True)
         state = SimpleNamespace(
             _mcp_gateway_apply=AsyncMock(side_effect=RuntimeError("broker died"))
         )
-        resp = await mcp_mod.api_mcp_gateway_enable(
-            _request({"enabled": True}, state=state)
-        )
+        resp = await mcp_mod.api_mcp_gateway_enable(_request({"enabled": True}, state=state))
         assert resp.status == 500
         assert "broker died" in _payload(resp)["error"]
         outcomes = [c.kwargs.get("outcome") for c in sel.log_api_access.call_args_list]
@@ -1257,7 +1263,9 @@ def routed_allowlist(monkeypatch: pytest.MonkeyPatch):
     """Pin ``KiroCrewConfig.load().mcp_gateway.stub_servers``."""
     import kiro_crew.config.loader as loader
 
-    def _set(names: list[str], *, enabled: bool = False, forward_declared_env: bool = False) -> None:
+    def _set(
+        names: list[str], *, enabled: bool = False, forward_declared_env: bool = False
+    ) -> None:
         # ``socket_path`` is part of the real ``McpGatewayConfig`` and the
         # handler reads it to locate the observed-hazard ledger. A double that
         # omitted it would make the row builder raise on a field production
@@ -1408,9 +1416,9 @@ class TestGatewayServers:
             _request({"names": ["a-mcp"], "stub": True, "resolve_eligibility": True})
         )
         assert resp.status == 200
-        assert seen["forward"] is False, (
-            "the batch must use the effective value the rewriter sees, not the base"
-        )
+        assert (
+            seen["forward"] is False
+        ), "the batch must use the effective value the rewriter sees, not the base"
 
     @pytest.mark.asyncio
     async def test_unstubbing_never_asks_the_evidence_for_permission(
@@ -1465,9 +1473,7 @@ class TestGatewayServers:
                 )
             ),
         )
-        resp = await mcp_mod.api_mcp_gateway_set_stub(
-            _request({"name": "a-mcp", "stub": True})
-        )
+        resp = await mcp_mod.api_mcp_gateway_set_stub(_request({"name": "a-mcp", "stub": True}))
         assert resp.status == 200
         assert json.loads(cfg_path.read_text())["mcp_gateway"]["stub_servers"] == ["a-mcp"]
 
@@ -1643,19 +1649,28 @@ class TestGatewayServers:
         )
 
         routed_allowlist([], enabled=True)
-        rows = {r["name"]: r for r in _payload(await mcp_mod.api_mcp_gateway_servers(_request()))["servers"]}
+        rows = {
+            r["name"]: r
+            for r in _payload(await mcp_mod.api_mcp_gateway_servers(_request()))["servers"]
+        }
         assert rows["declares-env"]["pooling_blocked_by_env"] is True
         assert rows["no-env"]["pooling_blocked_by_env"] is False
 
         # Same config, sharing off: nothing is pooled, so nothing is withheld.
         routed_allowlist([], enabled=False)
-        rows = {r["name"]: r for r in _payload(await mcp_mod.api_mcp_gateway_servers(_request()))["servers"]}
+        rows = {
+            r["name"]: r
+            for r in _payload(await mcp_mod.api_mcp_gateway_servers(_request()))["servers"]
+        }
         assert rows["declares-env"]["pooling_blocked_by_env"] is False
 
         # Forwarding on: only the rotating-secret and credential classes are
         # withheld, so an ordinary declared key stops blocking.
         routed_allowlist([], enabled=True, forward_declared_env=True)
-        rows = {r["name"]: r for r in _payload(await mcp_mod.api_mcp_gateway_servers(_request()))["servers"]}
+        rows = {
+            r["name"]: r
+            for r in _payload(await mcp_mod.api_mcp_gateway_servers(_request()))["servers"]
+        }
         assert rows["declares-env"]["pooling_blocked_by_env"] is False
 
     @pytest.mark.asyncio
@@ -1733,7 +1748,8 @@ class TestGatewayServers:
             encoding="utf-8",
         )
         rows = {
-            r["name"]: r for r in _payload(await mcp_mod.api_mcp_gateway_servers(_request()))["servers"]
+            r["name"]: r
+            for r in _payload(await mcp_mod.api_mcp_gateway_servers(_request()))["servers"]
         }
         assert rows["never-mcp"]["denylisted"] is True
         assert rows["never-mcp"]["stub"] is False
@@ -1854,16 +1870,12 @@ class TestGatewaySetStub:
         self, monkeypatch: pytest.MonkeyPatch, body: dict, expected: str
     ) -> None:
         monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        resp = await mcp_mod.api_mcp_gateway_set_stub(
-            _request(body, state=SimpleNamespace())
-        )
+        resp = await mcp_mod.api_mcp_gateway_set_stub(_request(body, state=SimpleNamespace()))
         assert resp.status == 400
         assert expected in _payload(resp)["error"]
 
     @pytest.mark.asyncio
-    async def test_corrupt_config_json_is_500(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_corrupt_config_json_is_500(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from kiro_crew.config.loader import config_path
 
         monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
@@ -1877,9 +1889,7 @@ class TestGatewaySetStub:
         assert "corrupt" in _payload(resp)["error"]
 
     @pytest.mark.asyncio
-    async def test_non_object_section_is_500(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_non_object_section_is_500(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from kiro_crew.config.loader import config_path
 
         monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
@@ -2010,9 +2020,7 @@ class TestGatewaySetStub:
         path = config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps(
-                {"mcp_gateway": {"stub_servers": ["b-mcp", "a-mcp", "a-mcp", 7]}}
-            ),
+            json.dumps({"mcp_gateway": {"stub_servers": ["b-mcp", "a-mcp", "a-mcp", 7]}}),
             encoding="utf-8",
         )
         resp = await mcp_mod.api_mcp_gateway_set_stub(
@@ -2037,9 +2045,7 @@ class TestGatewaySetStub:
         apply_cb.assert_awaited_once_with()
 
     @pytest.mark.asyncio
-    async def test_apply_failure_is_500_and_audited(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_apply_failure_is_500_and_audited(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from kiro_crew.config.loader import config_path
 
         sel = MagicMock()
@@ -2084,16 +2090,12 @@ class TestGatewaySetStubBatch:
         self, monkeypatch: pytest.MonkeyPatch, body: dict, expected: str
     ) -> None:
         monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        resp = await mcp_mod.api_mcp_gateway_set_stub(
-            _request(body, state=SimpleNamespace())
-        )
+        resp = await mcp_mod.api_mcp_gateway_set_stub(_request(body, state=SimpleNamespace()))
         assert resp.status == 400
         assert expected in _payload(resp)["error"]
 
     @pytest.mark.asyncio
-    async def test_oversized_batch_is_400(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_oversized_batch_is_400(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
         names = [f"srv{i}-mcp" for i in range(mcp_mod._MAX_STUB_BATCH + 1)]
         resp = await mcp_mod.api_mcp_gateway_set_stub(
@@ -2103,20 +2105,14 @@ class TestGatewaySetStubBatch:
         assert "at most" in _payload(resp)["error"]
 
     @pytest.mark.asyncio
-    async def test_non_object_body_is_400(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_non_object_body_is_400(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
-        resp = await mcp_mod.api_mcp_gateway_set_stub(
-            _request(["a-mcp"], state=SimpleNamespace())
-        )
+        resp = await mcp_mod.api_mcp_gateway_set_stub(_request(["a-mcp"], state=SimpleNamespace()))
         assert resp.status == 400
         assert "object" in _payload(resp)["error"]
 
     @pytest.mark.asyncio
-    async def test_adds_every_name_in_one_write(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_adds_every_name_in_one_write(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from kiro_crew.config.loader import config_path
 
         monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
@@ -2158,9 +2154,7 @@ class TestGatewaySetStubBatch:
         path = config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps(
-                {"mcp_gateway": {"stub_servers": ["a-mcp", "b-mcp", "kept-mcp", 7]}}
-            ),
+            json.dumps({"mcp_gateway": {"stub_servers": ["a-mcp", "b-mcp", "kept-mcp", 7]}}),
             encoding="utf-8",
         )
         resp = await mcp_mod.api_mcp_gateway_set_stub(
@@ -2218,9 +2212,7 @@ class TestGatewaySetStubBatch:
 
 
 class TestSyncFileLock:
-    def test_creates_the_lock_sidecar_and_releases_it(
-        self, sandbox: SimpleNamespace
-    ) -> None:
+    def test_creates_the_lock_sidecar_and_releases_it(self, sandbox: SimpleNamespace) -> None:
         """The sweep's lock must be re-entrant across sequential acquires."""
         lock_path = mcp_mod._MCP_LOCK_PATH
         assert not lock_path.exists()
@@ -2231,9 +2223,7 @@ class TestSyncFileLock:
             assert lock_path.exists()
 
     @pytest.mark.asyncio
-    async def test_async_lock_shares_the_same_sidecar(
-        self, sandbox: SimpleNamespace
-    ) -> None:
+    async def test_async_lock_shares_the_same_sidecar(self, sandbox: SimpleNamespace) -> None:
         async with mcp_mod._get_mcp_lock():
             assert mcp_mod._MCP_LOCK_PATH.exists()
         with mcp_mod._get_mcp_lock_sync():
@@ -2293,9 +2283,7 @@ class TestMeasureProgressPayload:
         monkeypatch.setattr(mcp_mod, "_bg_measure_all", _noop)
 
         state = _State()
-        body = _payload(
-            await mcp_mod.api_mcp_measure_start(_request(method="POST", state=state))
-        )
+        body = _payload(await mcp_mod.api_mcp_measure_start(_request(method="POST", state=state)))
         assert body["ok"] is True and body["running"] is True
         assert body["measured"] == 0, body
         assert body["done"] == 0, body
@@ -2321,9 +2309,7 @@ class TestMeasureProgressPayload:
                 mcp_mod._measure_progress.update(prior)
 
         with _running():
-            body = _payload(
-                await mcp_mod.api_mcp_measure_start(_request(method="POST"))
-            )
+            body = _payload(await mcp_mod.api_mcp_measure_start(_request(method="POST")))
         assert body["ok"] is False and body["running"] is True
         # The in-flight pass's own numbers, not a reset: the operator pressing a
         # second time is still watching the first pass.
@@ -2525,9 +2511,7 @@ class TestStubEligibility:
             seen[name] = kw["observed_hazards"]
             return SimpleNamespace(recommend_stub=False, recommend_share=False)
 
-        monkeypatch.setattr(
-            mcp_mod, "_assess_server", _capture
-        )
+        monkeypatch.setattr(mcp_mod, "_assess_server", _capture)
         monkeypatch.setattr(
             mcp_mod.hazards,
             "load_ledger",

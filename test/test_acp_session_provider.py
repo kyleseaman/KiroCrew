@@ -1012,6 +1012,21 @@ class TestNewConversation:
         assert provider.session_id == "fresh-session-2"
 
     @pytest.mark.asyncio
+    async def test_preserves_bound_session_identity_on_fresh_remote_session(self):
+        old = _make_handle(session_id="old-session-1")
+        runtime, _ = self._runtime_with_new_session()
+        provider = AcpSessionProvider(old, runtime)
+        provider._session_key = "dashboard:slot9"
+
+        await provider.new_conversation()
+
+        runtime.create_session.assert_awaited_once_with(
+            cwd="/tmp/ws",
+            agent="kirocrew",
+            session_key="dashboard:slot9",
+        )
+
+    @pytest.mark.asyncio
     async def test_destroys_old_session_to_free_context(self):
         old = _make_handle(session_id="old-session-1")
         runtime, _ = self._runtime_with_new_session()

@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -211,6 +211,29 @@ def _write_mcp_json(data: dict) -> None:
     """Atomically write global mcp.json to prevent partial reads."""
     _GLOBAL_MCP_JSON.parent.mkdir(parents=True, exist_ok=True)
     _atomic_json_write(_GLOBAL_MCP_JSON, data)
+
+
+def _remote_http_target_for_disconnect(name: str, spec: object):
+    """Resolve a removed stored entry without trusting request-supplied endpoint data."""
+    if not isinstance(spec, Mapping):
+        return None
+    from kiro_crew.acp.session_host import resolve_remote_http_mcp_targets
+
+    enabled_spec = dict(spec)
+    enabled_spec.pop("disabled", None)
+    return resolve_remote_http_mcp_targets(
+        {"mcpServers": {name: enabled_spec}},
+        session_key="oauth-disconnect",
+    ).get(name)
+
+
+async def _disconnect_remote_http_oauth(request: web.Request, target: object) -> None:
+    if target is None:
+        return
+    state = request.app.get("state")
+    manager = getattr(state, "remote_mcp_oauth_manager", None)
+    if manager is not None:
+        await manager.disconnect(target)
 
 
 # ── MCP Servers ──
@@ -1246,7 +1269,11 @@ async def api_mcp_remove(request: web.Request) -> web.Response:
             data = json.loads(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError):
             data = {"mcpServers": {}}
-        removed = data.get("mcpServers", {}).pop(name, None) is not None
+        servers = data.get("mcpServers", {})
+        removed_spec = servers.get(name)
+        disconnect_target = _remote_http_target_for_disconnect(name, removed_spec)
+        servers.pop(name, None)
+        removed = removed_spec is not None
         if removed:
             _write_mcp_json(data)
             logger.info("MCP remove: removed %s from global mcp.json", name)
@@ -1258,6 +1285,9 @@ async def api_mcp_remove(request: web.Request) -> web.Response:
 
         async with _get_config_lock():
             await asyncio.to_thread(lambda: _sync_mcp_to_agent(name, False, remove=True))
+
+    if removed:
+        await _disconnect_remote_http_oauth(request, disconnect_target)
 
     return web.json_response({"ok": True, "name": name, "removed": removed})
 
@@ -1291,7 +1321,11 @@ async def api_mcp_server_detail(request: web.Request) -> web.Response:
                 data = json.loads(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"))
             except (FileNotFoundError, json.JSONDecodeError):
                 data = {"mcpServers": {}}
-            removed = data.get("mcpServers", {}).pop(name, None) is not None
+            servers = data.get("mcpServers", {})
+            removed_spec = servers.get(name)
+            disconnect_target = _remote_http_target_for_disconnect(name, removed_spec)
+            servers.pop(name, None)
+            removed = removed_spec is not None
             if removed:
                 _write_mcp_json(data)
         from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
@@ -1302,6 +1336,8 @@ async def api_mcp_server_detail(request: web.Request) -> web.Response:
         # the other's change (the event loop used to serialize this for free).
         async with _get_config_lock():
             await asyncio.to_thread(lambda: _sync_mcp_to_agent(name, False, remove=True))
+        if removed:
+            await _disconnect_remote_http_oauth(request, disconnect_target)
         sel().log_api_access(
             caller="dashboard",
             operation="mcp_server_remove",
@@ -1950,7 +1986,9 @@ async def _do_mcp_apply(request: web.Request) -> web.Response:
                     # Config removal is the LAST mutation (package-then-config
                     # ordering); _purge_server_config strips every scope + agent
                     # file idempotently.
-                    outcome["actions"].update(await _offload_config_write(_purge_server_config, name))
+                    outcome["actions"].update(
+                        await _offload_config_write(_purge_server_config, name)
+                    )
                     purged_names.add(name)
                     # Companion package removal already ran in Phase 1 (before the
                     # lock); merge its recorded result here.
@@ -2046,7 +2084,9 @@ async def _do_mcp_apply(request: web.Request) -> web.Response:
                             resources=f"{name}:{','.join(rejected)[:128]}",
                         )
                     if sanitized:
-                        changed_tools = await _offload_config_write(_set_tool_overrides, name, sanitized)
+                        changed_tools = await _offload_config_write(
+                            _set_tool_overrides, name, sanitized
+                        )
                         if changed_tools:
                             outcome["actions"]["tools"] = changed_tools
 
@@ -2755,9 +2795,7 @@ async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
                     # result here would tell the operator it is safe to share a
                     # backend nobody ran. Same invariant the cache-side check
                     # applies, enforced at the other place the information exists.
-                    preflight=(
-                        preflights.get(name) if len(row["launch_ids"]) <= 1 else None
-                    ),
+                    preflight=(preflights.get(name) if len(row["launch_ids"]) <= 1 else None),
                     identity_keys=identity_keys,
                 ).to_dict(),
             }
@@ -2765,9 +2803,7 @@ async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
     return web.json_response({"servers": result})
 
 
-def _load_shareability_state() -> tuple[
-    dict[str, tuple[str, ...]], dict[str, tuple[bool, bool]]
-]:
+def _load_shareability_state() -> tuple[dict[str, tuple[str, ...]], dict[str, tuple[bool, bool]]]:
     """Read both shareability records for one response. BLOCKING — call off-loop.
 
     Returns ``(hazards_by_name, preflight_by_name)`` where the preflight value is
@@ -2889,9 +2925,7 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
     stub = body.get("stub")
     batch = raw_names is not None
     if batch:
-        if not isinstance(raw_names, list) or not all(
-            isinstance(n, str) for n in raw_names
-        ):
+        if not isinstance(raw_names, list) or not all(isinstance(n, str) for n in raw_names):
             return web.json_response(
                 {
                     "error": "names must be a list of strings",

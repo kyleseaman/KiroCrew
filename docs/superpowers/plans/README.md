@@ -2,3 +2,5 @@
 
 - [2026-08-22-durable-run-coordinator.md](2026-08-22-durable-run-coordinator.md)
   — additive durable run coordinator and subagent lifecycle extraction.
+- [2026-08-24-coder-gateway-mcp-proxy.md](2026-08-24-coder-gateway-mcp-proxy.md)
+  — conservative gateway proxy for Coder-hosted MCP, memory, resume, and subagents.

@@ -4598,6 +4598,7 @@ class DashboardState:
         self._mcp_gateway_apply: Any = None  # async (enabled: bool) -> dict
         self._mcp_gateway_apply_stub: Any = None  # async () -> dict
         self._mcp_resolve_refresh: Any = None  # async () -> dict
+        self.remote_mcp_oauth_manager: Any = None
         # Secretary subsystem removed; kept as permanent None for apps/routes.py
         # builtin-service restart lookup (getattr-based, no-op when None).
         self._secretary_restart: Any = None  # restart callback (always None — service removed)
@@ -6296,6 +6297,47 @@ class DashboardState:
     def get_slot(self, name: str) -> _ChatSlot | None:
         """Look up a slot by name without creating it. Returns None if absent."""
         return self._slots.get(name)
+
+    async def publish_remote_mcp_oauth_event(self, event: Any) -> None:
+        """Route a gateway-owned OAuth prompt to its existing visible chat slot."""
+        from kiro_crew.dashboard.chat_runner import (
+            _emit_mcp_oauth_request,
+            _mark_mcp_oauth_completed,
+        )
+        from kiro_crew.dashboard.chat_utils import dashboard_slot_key
+
+        session_key = str(event.session_key)
+        if session_key.startswith("subagent:") and self.subagents is not None:
+            info = self.subagents.get(session_key.removeprefix("subagent:"))
+            parent_key = getattr(info, "parent_session_key", "") if info is not None else ""
+            if parent_key:
+                session_key = parent_key
+
+        slot = self.get_linked_slot(session_key)
+        if slot is None:
+            slot_key = dashboard_slot_key(session_key)
+            if not slot_key and session_key.startswith("dashboard:"):
+                slot_key = session_key.removeprefix("dashboard:")
+            slot = self.get_slot(slot_key) if slot_key else None
+        if slot is None:
+            return
+
+        if event.outcome == "required":
+            _emit_mcp_oauth_request(
+                self,
+                slot,
+                event.server_name,
+                event.authorization_url,
+            )
+        else:
+            _mark_mcp_oauth_completed(
+                self,
+                slot,
+                event.server_name,
+                event.outcome == "completed",
+                event.code,
+            )
+        self.push_slots_update()
 
     def running_session_keys(self) -> frozenset[str]:
         """Session keys with a turn in flight right now.

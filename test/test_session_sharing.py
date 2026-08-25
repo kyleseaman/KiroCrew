@@ -216,6 +216,27 @@ class TestSessionSharingDecision:
         assert result is False
 
     @pytest.mark.asyncio
+    async def test_explicit_agent_uses_a_dedicated_runtime(self):
+        sessions = _mock_sessions(sharing_eligible=True)
+        manager = SubagentManager(
+            sessions=sessions,
+            ctx_builder=_mock_ctx_builder_auto(),
+            is_yolo=lambda: True,
+        )
+
+        from kiro_crew.subagent import SubagentInfo
+
+        info = SubagentInfo(
+            id="test-agent",
+            task="hello",
+            parent_session_key="dashboard:slot1",
+            agent="reviewer",
+        )
+        with _cfg_patch(session_sharing=True):
+            result = manager._should_use_session_sharing(info)
+        assert result is False
+
+    @pytest.mark.asyncio
     async def test_session_sharing_skipped_no_parent(self):
         """Session sharing is NOT used when there's no parent session key."""
         sessions = _mock_sessions(sharing_eligible=True)
@@ -329,6 +350,25 @@ class TestSessionSharingSpawn:
         sessions.get_or_create.assert_awaited()
         sessions.get_subagent_runtime.assert_not_awaited()
         assert info._session_sharing is False
+
+    @pytest.mark.asyncio
+    async def test_dedicated_child_inherits_remote_parent_host(self):
+        sessions = _mock_sessions(sharing_eligible=True)
+        remote_host = MagicMock(is_remote=True)
+        sessions.subagent_session_host = MagicMock(return_value=remote_host)
+        manager = SubagentManager(
+            sessions=sessions,
+            ctx_builder=_mock_ctx_builder_auto(),
+            is_yolo=lambda: True,
+        )
+
+        with _cfg_patch(session_sharing=False), \
+             patch("kiro_crew.subagent.Stats"), \
+             patch("kiro_crew.subagent.sel"):
+            info = manager.spawn("test task", parent_session_key="dashboard:slot1")
+            await _wait_until_done(info)
+
+        assert sessions.get_or_create.await_args.kwargs["session_host_override"] is remote_host
 
 
 class TestSessionSharingFallback:

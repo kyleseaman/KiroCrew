@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -609,6 +610,7 @@ class AcpProvider(LLMProvider):
         resume_sid: str,
         work_dir: str | Path | None,
         agent: str | None,
+        session_key: str = "",
     ) -> AcpSessionHandle | None:
         """Resume via session/load, retrying past a stale native session lock.
 
@@ -633,6 +635,7 @@ class AcpProvider(LLMProvider):
                     resume_sid,
                     cwd=work_dir,
                     agent=agent or None,
+                    session_key=session_key or None,
                 )
                 if attempt:
                     logger.info(
@@ -706,6 +709,7 @@ class AcpProvider(LLMProvider):
 
         # Check for session resume
         resume_sid = getattr(self._client, "_resume_session_id", "")
+        session_key = getattr(self._client, "_session_key", "") or ""
 
         # Preserve the configured model so we can re-apply it once the session
         # is live. AcpClient sends session/set_model in its handshake; the runtime
@@ -766,6 +770,13 @@ class AcpProvider(LLMProvider):
                     # fresh session/new with history replay.
                     session_file = None
                     should_load = True
+                elif isinstance(self._session_host, CoderWorkspaceSessionHost):
+                    session_file = None
+                    should_load = await self._session_host.session_file_exists(
+                        resume_sid,
+                        environ=os.environ,
+                        local_cwd=work_dir or runtime._work_dir,
+                    )
                 else:
                     session_file = kiro_sessions_dir() / f"{resume_sid}.json"
                     should_load = session_file.exists()
@@ -785,6 +796,7 @@ class AcpProvider(LLMProvider):
                             resume_sid,
                             work_dir,
                             agent,
+                            session_key,
                         )
                     finally:
                         phases["session_load"] = (time.monotonic() - _t_load) * 1000.0
@@ -836,6 +848,7 @@ class AcpProvider(LLMProvider):
                     handle = await runtime.create_session(
                         cwd=work_dir,
                         agent=agent or None,
+                        session_key=session_key or None,
                     )
                 except AcpRuntimeError as exc:
                     if runtime.saw_not_logged_in():

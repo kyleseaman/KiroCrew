@@ -213,7 +213,7 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # stdin is the MCP-free projected agent JSON; the workspace remains the
         # isolation boundary, so applying the gateway host sandbox would bind
         # paths for the control node rather than the remote process.
-        "acp/session_host.py::prepare",
+        "acp/session_host.py::_run_remote_python",
         # The userns probe child: ONE fixed argv, `sys.executable -I -S -c <shim>`,
         # no shell, no cwd, stdin/stdout are the two handshake pipes. Nothing is
         # agent-influenced -- the shim is a module-level string constant and takes
@@ -1196,6 +1196,11 @@ FIRST_PARTY_SPAWNS: frozenset[str] = frozenset(
         # managed command/args/env compare unequal, pass False, and keep the
         # full fail-close + opt-in behavior.
         "mcp_discovery.py::probe_server",
+        # The proxy sets this flag only after `_is_first_party_managed_argv`
+        # proves the command, args, and env equal the package-derived managed
+        # MCP invocation. Customized and third-party entries keep the flag
+        # false and therefore retain the sandbox's fail-closed behavior.
+        "mcp_gateway/remote_proxy.py::_spawn",
     }
 )
 

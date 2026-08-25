@@ -487,6 +487,35 @@ class TestParentRuntimeKwargs:
         _register(mgr, "d1", provider=provider)
         assert mgr._parent_runtime_kwargs("d1") == {"sandbox_mode": "off"}
 
+    def test_dedicated_child_clones_the_parent_coder_host(self, mgr) -> None:
+        from kiro_crew.acp.session_host import CoderWorkspaceSessionHost
+
+        parent_host = CoderWorkspaceSessionHost(
+            workspace="crew-dogfood",
+            remote_cwd="/home/coder/workspace",
+            coder_bin="/opt/coder",
+        )
+        client = SimpleNamespace(
+            _runtime=SimpleNamespace(_session_host=parent_host),
+        )
+        _register(mgr, "d1", provider=_stub_provider(client=client))
+
+        child_host = mgr.subagent_session_host("d1")
+
+        assert isinstance(child_host, CoderWorkspaceSessionHost)
+        assert child_host is not parent_host
+        assert child_host.protocol_cwd == parent_host.protocol_cwd
+
+    def test_local_parent_needs_no_child_host_override(self, mgr) -> None:
+        from kiro_crew.acp.session_host import LocalSessionHost
+
+        client = SimpleNamespace(
+            _runtime=SimpleNamespace(_session_host=LocalSessionHost("/tmp/work")),
+        )
+        _register(mgr, "d1", provider=_stub_provider(client=client))
+
+        assert mgr.subagent_session_host("d1") is None
+
 
 class TestSessionSharingEligible:
     def test_unknown_parent_is_ineligible(self, mgr) -> None:

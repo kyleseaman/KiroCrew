@@ -585,6 +585,16 @@ applies in the dashboard and vice versa. The Markdown layers
 per-workspace-directory, so those ARE isolated when channels are configured onto
 different workspaces.
 
+Coder-hosted ACP sessions keep this same gateway-owned memory path. Prompt recall
+still comes from `ContextBuilder`; immediate `learn_add`, lesson removal, and
+memory queries use the session-scoped `kirocrew-core` stdio relay back to the
+gateway. The proxy injects the logical parent or `subagent:<id>` key into the
+gateway MCP process, so strict caller resolution and attribution are identical
+to a local session. No memory database, Kiro Crew data home, gateway API secret,
+or MCP target environment is synchronized into the workspace. User kiro-cli
+script hooks remain excluded from the remote projection until the separate hook
+relay is implemented.
+
 What differs per channel is what gets *recorded* and what reaches the model:
 
 | Surface | Activation | What lands in the `ChannelHistory` buffer | Consolidation | Episodic extraction |

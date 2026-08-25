@@ -106,21 +106,27 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
 - Writing both `true` and `false` makes the KiroCrew toggle authoritative over any value in the user's global `~/.kiro/settings/cli.json`. The write is merge-safe with the effort `chat.modelDefaults` keys in the same file.
 - **claude backend** — no-op. Tool Search is a kiro-cli feature; `_apply_tool_search_overlay` returns early for the claude backend and when no toggle value was threaded in (`tool_search is None`).
 
-- **Resume guard:** `session/load` (resume) is only attempted when the prior session transcript exists on disk (`~/.kiro/sessions/cli/<sid>.json`). A stale persisted sid with no transcript falls back to `session/new`, preventing a fresh conversation from replaying old turns (which inflated base context).
+- **Resume guard:** `session/load` is attempted only when the session host confirms the prior transcript. Local hosting checks its local Kiro session path; Coder hosting probes the validated id in the workspace and sends the derived remote path. A stale persisted sid falls back to `session/new`.
 - **Working dir:** `AcpProvider.cwd` overrides the `LLMProvider` ABC default so `session_map` persists the real workspace path. AcpProvider's work_dir lives on the inner client (`_client._work_dir`), so the prior `getattr(provider, "_work_dir", "")` persisted `""` for all ACP sessions — `provider.cwd` fixes resume-cwd-override. A remote session still persists this control-plane path, while its ACP `session/new.cwd` is the session host's normalized POSIX path.
 
-#### Session execution host (Coder POC)
+#### Session execution host (Coder)
 
 `acp/session_host.py` makes the process location an explicit runtime boundary.
 `LocalSessionHost` preserves the existing local spawn path. Setting
-`KIROCREW_CODER_WORKSPACE` opts only the main interactive `kirocrew` agent into
-`CoderWorkspaceSessionHost`; background, cron, custom-agent, and subagent
-factories remain local. The opt-in also requires `CODER_URL` and
+`KIROCREW_CODER_WORKSPACE` opts the main interactive `kirocrew` agent into
+`CoderWorkspaceSessionHost`. Unrelated background and maintenance factories
+remain local. Descendant subagents inherit the live parent's host explicitly:
+shared children open another session on the remote runtime, while children with
+an explicit agent, model, effort, tool set, or bare mode clone the host into a
+dedicated runtime in the same workspace. The opt-in also requires `CODER_URL` and
 `CODER_SESSION_TOKEN`. `KIROCREW_CODER_BIN` selects the local transport binary
 and `KIROCREW_CODER_REMOTE_CWD` defaults to `/home/coder/workspace`.
 
-The runtime invokes exactly `coder ssh <workspace> -- kiro-cli acp --agent
+The runtime invokes `coder ssh <workspace> --remote-forward
+<workspace-port>:127.0.0.1:<gateway-loopback-port> -- kiro-cli acp --agent
 <name>` (plus the selected model) and preserves ACP JSON-RPC stdio end to end.
+Preparation probes a bounded random set of high workspace-loopback ports; a
+forwarding failure aborts startup rather than falling back to local ACP.
 Only Coder URL/token, PATH, certificate, and proxy variables reach the transport
 process; AWS, SSH, channel, Kiro API-key, and Kiro Crew variables are not copied
 from the gateway. Workspace and agent names use a strict identifier grammar,
@@ -129,11 +135,24 @@ and the remote cwd must be an absolute normalized POSIX path.
 Before spawn, the host materializes the local agent, resolves a `file://` prompt
 through the existing sensitive-path-aware resolver, and streams an owner-only
 projection to `~/.kiro/agents/<name>.json` in the workspace. The projection
-keeps `name`, `description`, `model`, `prompt`, and ordinary `tools` /
-`allowedTools`; it drops unknown fields and hooks, filters every `@server` tool,
-and forces `mcpServers` to `{}`. `session/new` also sends an empty MCP server
-list and the remote cwd. This POC therefore does not bridge the local MCP
-gateway, hooks, or Kiro Crew state into the workspace.
+keeps `name`, `description`, `model`, `prompt`, ordinary workspace tools, and
+only those `@server` references backed by a gateway relay. Original MCP
+commands, args, env, URLs, headers, hooks, unknown fields, and gateway paths are
+dropped. `session/new` and `session/load` inject per-session relay entries whose
+argv contains only a copied stdlib relay, a workspace loopback port, and an
+owner-only capability-file path. Gateway-side target resolution and environment
+sanitization happen before minting; the remote peer cannot select a command,
+server, caller, or credential.
+
+Enabled stdio MCP servers, including `kirocrew-core`, execute on the gateway and
+receive the strict logical `KIROCREW_SESSION_KEY`, restoring immediate memory
+updates and user stdio MCP without copying Kiro Crew state into Coder. URL-based
+servers use the same relay while the gateway runs the official MCP SDK's
+Streamable HTTP or narrow legacy-SSE transport. OAuth discovery, PKCE, callback,
+encrypted grants, refresh, and integration disconnect remain gateway-owned; no
+URL, configured header, OAuth material, or callback ownership crosses the
+boundary. Kiro-cli script hooks are still omitted pending a separate gateway
+hook relay.
 
 Remote hosting is positively limited to `ACP_BACKEND_KIRO`; another harness
 fails before spawn. The SSH client itself is not wrapped in Kiro Crew's local
@@ -153,7 +172,7 @@ which may contain credential-bearing diagnostics.
 ```
 
 - `agent.provider` is fixed to `"acp"` (enum `["acp"]`); there is no provider to choose.
-- `create_provider_factory()` returns a `Callable` that creates the kiro-cli `AcpProvider`; for the main interactive agent it also resolves the session host environment described above.
+- `create_provider_factory()` returns a `Callable` that creates the kiro-cli `AcpProvider`; for the main interactive agent it resolves the session-host environment. An explicit inherited host override wins for dedicated descendants so remote affinity cannot degrade to local placement.
 
 An agent spec's model is consumed by kiro-cli before Kiro Crew reaches
 `session/new`, so the live-session entitlement guard cannot diagnose a wrong

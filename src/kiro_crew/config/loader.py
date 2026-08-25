@@ -25,7 +25,7 @@ from collections.abc import Callable, Iterable, MutableMapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlsplit as _urlsplit
 
 from kiro_crew import __version__, model_registry, platform_compat
@@ -8073,6 +8073,7 @@ class KiroCrewConfig:
             extra_env: dict[str, str] | None = None,
             reasoning_effort_override: str | None = None,
             crew_agent: str | None = None,
+            session_host_override: Any = None,
             **_kwargs: object,
         ) -> AcpProvider:
             wdir = Path(cwd) if cwd else _session_work_dir(session_key)
@@ -8133,7 +8134,12 @@ class KiroCrewConfig:
             _eff = reasoning_effort_override or base_effort
             if m and _eff and is_valid_effort(_eff) and model_supports_effort(m):
                 _eff_per_model[m] = _eff
-            session_host = session_host_from_env(wdir) if not agent or agent == "kirocrew" else None
+            if session_host_override is not None:
+                session_host = session_host_override
+            else:
+                session_host = (
+                    session_host_from_env(wdir) if not agent or agent == "kirocrew" else None
+                )
             return AcpProvider(
                 work_dir=wdir,
                 model=m,

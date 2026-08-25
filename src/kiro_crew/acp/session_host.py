@@ -6,15 +6,27 @@ import asyncio
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 
 from kiro_crew import platform_compat
+from kiro_crew.acp import remote_mcp_relay
+from kiro_crew.env import mcp_search_path, sanitize_spec_env, spec_path_key
+from kiro_crew.mcp_gateway.remote_proxy import (
+    RemoteHttpMcpTarget,
+    RemoteMcpProxy,
+    RemoteMcpServiceTarget,
+    RemoteMcpTarget,
+)
+from kiro_crew.mcp_utils import kiro_entry_client_id, kiro_entry_scopes
 from kiro_crew.sandbox import RLIMIT_PROFILE_SESSION_HOST, create_subprocess_limited
 
 _WORKSPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _TRANSPORT_ENV_KEYS = (
     "CODER_URL",
     "CODER_SESSION_TOKEN",
@@ -28,11 +40,85 @@ _TRANSPORT_ENV_KEYS = (
 )
 _REMOTE_AGENT_TEXT_KEYS = ("name", "description", "model", "prompt")
 _DEFAULT_REMOTE_CWD = "/home/coder/workspace"
-_REMOTE_PREPARE_SCRIPT = (
-    'set -eu; umask 077; mkdir -p "$HOME/.kiro/agents" "$2"; '
-    'cat > "$HOME/.kiro/agents/$1.json"; '
-    'chmod 600 "$HOME/.kiro/agents/$1.json"'
-)
+_REMOTE_RUNTIME_MARKER = "__KIROCREW_REMOTE_RUNTIME__"
+_REMOTE_FORWARD_PORT_MIN = 30000
+_REMOTE_FORWARD_PORT_SPAN = 20000
+_REMOTE_FORWARD_PORT_ATTEMPTS = 8
+_REMOTE_MCP_POLICY_LIST_KEYS = ("autoApprove", "disabledTools")
+_REMOTE_MCP_POLICY_INT_KEYS = ("timeout",)
+_REMOTE_MCP_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_HTTP_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_REMOTE_HTTP_URL_MAX_BYTES = 4 * 1024
+_REMOTE_HTTP_HEADER_MAX_COUNT = 32
+_REMOTE_HTTP_HEADER_NAME_MAX_BYTES = 256
+_REMOTE_HTTP_HEADER_VALUE_MAX_BYTES = 8 * 1024
+_REMOTE_HTTP_HEADERS_MAX_BYTES = 64 * 1024
+_REMOTE_HTTP_CLIENT_ID_MAX_BYTES = 4 * 1024
+_REMOTE_HTTP_LOOPBACK_HOSTS = frozenset(("localhost", "127.0.0.1", "::1"))
+_REMOTE_PREPARE_SCRIPT = r"""
+import json, os, pathlib, socket, sys
+runtime_id, agent, work_dir, marker, raw_ports = sys.argv[1:]
+ports = [int(value) for value in raw_ports.split(",")]
+selected_port = None
+for candidate in ports:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", candidate))
+    except OSError:
+        pass
+    else:
+        selected_port = candidate
+        break
+    finally:
+        probe.close()
+if selected_port is None:
+    raise SystemExit(3)
+home = pathlib.Path.home()
+runtime_dir = home / ".kiro" / "crew" / "remote-runtimes" / runtime_id
+agents_dir = runtime_dir.parents[2] / "agents"
+runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+agents_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+os.chmod(runtime_dir, 0o700)
+payload = json.load(sys.stdin)
+def expand(value):
+    if isinstance(value, str):
+        return value.replace(marker, str(runtime_dir))
+    if isinstance(value, list):
+        return [expand(item) for item in value]
+    if isinstance(value, dict):
+        return {key: expand(item) for key, item in value.items()}
+    return value
+relay_path = runtime_dir / "remote_mcp_relay.py"
+agent_path = agents_dir / (agent + ".json")
+relay_path.write_text(payload["relay"], encoding="utf-8")
+agent_path.write_text(json.dumps(expand(payload["agent"]), separators=(",", ":")) + "\n", encoding="utf-8")
+os.chmod(relay_path, 0o600)
+os.chmod(agent_path, 0o600)
+pathlib.Path(work_dir).mkdir(parents=True, exist_ok=True)
+print(json.dumps({"runtime_dir": str(runtime_dir), "port": selected_port}, separators=(",", ":")))
+""".strip()
+_REMOTE_CAPABILITY_SCRIPT = r"""
+import json, os, pathlib, re, sys
+runtime_dir = pathlib.Path(sys.argv[1])
+payload = json.load(sys.stdin)
+for capability_id, token in payload.items():
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", capability_id):
+        raise SystemExit(2)
+    path = runtime_dir / ("cap-" + capability_id)
+    path.write_text(token + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+""".strip()
+_REMOTE_CLEANUP_SCRIPT = r"""
+import pathlib, shutil, sys
+path = pathlib.Path(sys.argv[1])
+expected = pathlib.Path.home() / ".kiro" / "crew" / "remote-runtimes"
+if path.parent == expected:
+    shutil.rmtree(path, ignore_errors=False)
+""".strip()
+_REMOTE_FILE_EXISTS_SCRIPT = r"""
+import pathlib, sys
+print("1" if pathlib.Path(sys.argv[1]).is_file() else "0")
+""".strip()
 
 
 class SessionHostError(RuntimeError):
@@ -66,6 +152,17 @@ class CoderWorkspaceSessionHost:
         self._workspace = workspace
         self._remote_cwd = str(path)
         self._coder_bin = coder_bin
+        self._runtime_id = secrets.token_urlsafe(18)
+        candidates: list[int] = []
+        while len(candidates) < _REMOTE_FORWARD_PORT_ATTEMPTS:
+            candidate = _REMOTE_FORWARD_PORT_MIN + secrets.randbelow(_REMOTE_FORWARD_PORT_SPAN)
+            if candidate not in candidates:
+                candidates.append(candidate)
+        self._remote_port_candidates = tuple(candidates)
+        self._remote_port = candidates[0]
+        self._proxy = RemoteMcpProxy()
+        self._remote_runtime_dir: str | None = None
+        self._grant_ids_by_session: dict[str, list[str]] = {}
 
     @property
     def is_remote(self) -> bool:
@@ -75,11 +172,33 @@ class CoderWorkspaceSessionHost:
     def protocol_cwd(self) -> str:
         return self._remote_cwd
 
+    @property
+    def remote_port(self) -> int:
+        return self._remote_port
+
+    @property
+    def remote_runtime_dir(self) -> str | None:
+        return self._remote_runtime_dir
+
+    async def start_bridge(self) -> None:
+        await self._proxy.start()
+
+    def clone(self) -> "CoderWorkspaceSessionHost":
+        """Return an unstarted host for a dedicated descendant runtime."""
+        return CoderWorkspaceSessionHost(
+            workspace=self._workspace,
+            remote_cwd=self._remote_cwd,
+            coder_bin=self._coder_bin,
+        )
+
     def spawn_argv(self, *, agent: str, model: str) -> list[str]:
+        forward = f"{self._remote_port}:127.0.0.1:{self._proxy.local_port}"
         argv = [
             self._coder_bin,
             "ssh",
             self._workspace,
+            "--remote-forward",
+            forward,
             "--",
             "kiro-cli",
             "acp",
@@ -98,27 +217,33 @@ class CoderWorkspaceSessionHost:
             raise ValueError("agent must be one safe Kiro agent name")
         remote_command = shlex.join(
             [
-                "sh",
+                "python3",
                 "-c",
                 _REMOTE_PREPARE_SCRIPT,
-                "kirocrew-prepare",
+                self._runtime_id,
                 agent,
                 self._remote_cwd,
+                _REMOTE_RUNTIME_MARKER,
+                ",".join(str(port) for port in self._remote_port_candidates),
             ]
         )
         return [self._coder_bin, "ssh", self._workspace, "--", remote_command]
 
-    async def prepare(
+    def _remote_python_argv(self, script: str, *args: str) -> list[str]:
+        command = shlex.join(["python3", "-c", script, *args])
+        return [self._coder_bin, "ssh", self._workspace, "--", command]
+
+    async def _run_remote_python(
         self,
         *,
-        agent: str,
-        projected_spec: Mapping[str, object],
+        argv: list[str],
+        payload: bytes | None,
         environ: Mapping[str, str],
         local_cwd: str | Path,
-    ) -> None:
-        payload = (json.dumps(projected_spec, separators=(",", ":")) + "\n").encode()
+        operation: str,
+    ) -> bytes:
         process = await create_subprocess_limited(
-            *self.prepare_argv(agent=agent),
+            *argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -130,19 +255,284 @@ class CoderWorkspaceSessionHost:
             ),
             profile=RLIMIT_PROFILE_SESSION_HOST,
         )
-        await process.communicate(input=payload)
+        stdout, _stderr = await process.communicate(input=payload)
         if process.returncode:
-            # Remote stderr can echo environment values or secret-bearing command
-            # failures. The detailed line remains available from a manual
-            # `coder ssh`; the gateway error exposes only the bounded operation.
             raise SessionHostError(
-                f"Coder workspace preparation failed (exit {process.returncode})"
+                f"Coder workspace {operation} failed (exit {process.returncode})"
             )
+        return stdout
+
+    async def prepare(
+        self,
+        *,
+        agent: str,
+        projected_spec: Mapping[str, object],
+        environ: Mapping[str, str],
+        local_cwd: str | Path,
+    ) -> None:
+        await self.start_bridge()
+        relay_source = await asyncio.to_thread(
+            Path(remote_mcp_relay.__file__).read_text,
+            encoding="utf-8",
+        )
+        payload = (
+            json.dumps(
+                {"agent": projected_spec, "relay": relay_source},
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+        stdout = await self._run_remote_python(
+            argv=self.prepare_argv(agent=agent),
+            payload=payload,
+            environ=environ,
+            local_cwd=local_cwd,
+            operation="preparation",
+        )
+        try:
+            result = json.loads(stdout)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise SessionHostError("Coder workspace preparation returned invalid data") from exc
+        if not isinstance(result, dict):
+            raise SessionHostError("Coder workspace preparation returned invalid data")
+        runtime_dir = result.get("runtime_dir")
+        remote_port = result.get("port")
+        if not isinstance(runtime_dir, str) or remote_port not in self._remote_port_candidates:
+            raise SessionHostError("Coder workspace preparation returned invalid data")
+        path = PurePosixPath(runtime_dir)
+        if not path.is_absolute() or path.name != self._runtime_id:
+            raise SessionHostError("Coder workspace preparation returned an invalid path")
+        self._remote_runtime_dir = str(path)
+        self._remote_port = remote_port
+
+    async def prepare_session_capabilities(
+        self,
+        *,
+        agent_spec: Mapping[str, object],
+        session_key: str,
+        environ: Mapping[str, str],
+        local_cwd: str | Path,
+    ) -> list[dict[str, object]]:
+        runtime_dir = self._remote_runtime_dir
+        if runtime_dir is None:
+            raise SessionHostError("Coder workspace bridge is not prepared")
+        self.revoke_session_grants(session_key)
+        targets = await asyncio.to_thread(
+            resolve_remote_mcp_targets,
+            agent_spec,
+            local_cwd=local_cwd,
+            session_key=session_key,
+        )
+        http_targets = await asyncio.to_thread(
+            resolve_remote_http_mcp_targets,
+            agent_spec,
+            session_key=session_key,
+        )
+        service_targets: dict[str, RemoteMcpServiceTarget] = {
+            **targets,
+            **http_targets,
+        }
+        raw_servers = agent_spec.get("mcpServers")
+        server_specs = raw_servers if isinstance(raw_servers, Mapping) else {}
+        relay_path = f"{runtime_dir}/remote_mcp_relay.py"
+        token_payload: dict[str, str] = {}
+        entries: list[dict[str, object]] = []
+        grant_ids: list[str] = []
+        try:
+            for name, target in sorted(service_targets.items()):
+                grant = self._proxy.mint(session_key, target)
+                grant_ids.append(grant.grant_id)
+                token_payload[grant.capability_id] = grant.token
+                original = server_specs.get(name)
+                policy = original if isinstance(original, Mapping) else {}
+                entry = remote_mcp_relay_entry(
+                    policy,
+                    relay_path=relay_path,
+                    port=self._remote_port,
+                    capability_file=f"{runtime_dir}/cap-{grant.capability_id}",
+                )
+                entries.append(_acp_remote_server_entry(name, entry))
+
+            for name in sorted(
+                unsupported_remote_mcp_names(
+                    agent_spec,
+                    resolved_http_names=frozenset(http_targets),
+                )
+            ):
+                original = server_specs.get(name)
+                policy = original if isinstance(original, Mapping) else {}
+                entry = remote_mcp_unsupported_entry(
+                    policy,
+                    relay_path=relay_path,
+                    code="remote_mcp_http_unavailable",
+                )
+                entries.append(_acp_remote_server_entry(name, entry))
+
+            if token_payload:
+                payload = (json.dumps(token_payload, separators=(",", ":")) + "\n").encode()
+                await self._run_remote_python(
+                    argv=self._remote_python_argv(
+                        _REMOTE_CAPABILITY_SCRIPT,
+                        runtime_dir,
+                    ),
+                    payload=payload,
+                    environ=environ,
+                    local_cwd=local_cwd,
+                    operation="capability preparation",
+                )
+        except BaseException:
+            for grant_id in grant_ids:
+                self._proxy.revoke_grant(grant_id)
+            raise
+        self._grant_ids_by_session[session_key] = grant_ids
+        return sorted(entries, key=lambda item: str(item["name"]))
+
+    def revoke_session_grants(self, session_key: str) -> None:
+        for grant_id in self._grant_ids_by_session.pop(session_key, []):
+            self._proxy.revoke_grant(grant_id)
+
+    def remote_session_file(self, session_id: str) -> str:
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            raise SessionHostError("remote session id is invalid")
+        if self._remote_runtime_dir is None:
+            raise SessionHostError("Coder workspace bridge is not prepared")
+        kiro_home = PurePosixPath(self._remote_runtime_dir).parents[2]
+        return str(kiro_home / "sessions" / f"{session_id}.json")
+
+    async def session_file_exists(
+        self,
+        session_id: str,
+        *,
+        environ: Mapping[str, str],
+        local_cwd: str | Path,
+    ) -> bool:
+        session_file = self.remote_session_file(session_id)
+        stdout = await self._run_remote_python(
+            argv=self._remote_python_argv(
+                _REMOTE_FILE_EXISTS_SCRIPT,
+                session_file,
+            ),
+            payload=None,
+            environ=environ,
+            local_cwd=local_cwd,
+            operation="session probe",
+        )
+        return stdout.strip() == b"1"
+
+    async def close(
+        self,
+        *,
+        environ: Mapping[str, str] | None = None,
+        local_cwd: str | Path | None = None,
+    ) -> None:
+        await self._proxy.close()
+        self._grant_ids_by_session.clear()
+        runtime_dir = self._remote_runtime_dir
+        self._remote_runtime_dir = None
+        if runtime_dir is None or environ is None or local_cwd is None:
+            return
+        try:
+            await self._run_remote_python(
+                argv=self._remote_python_argv(_REMOTE_CLEANUP_SCRIPT, runtime_dir),
+                payload=None,
+                environ=environ,
+                local_cwd=local_cwd,
+                operation="cleanup",
+            )
+        except Exception:
+            pass
 
 
-def project_remote_agent_spec(spec: Mapping[str, object]) -> dict[str, object]:
-    """Return the MCP-free subset of an agent spec safe for a POC workspace."""
+def _remote_mcp_policy_fields(spec: Mapping[str, object]) -> dict[str, object]:
+    fields: dict[str, object] = {}
+    for key in _REMOTE_MCP_POLICY_LIST_KEYS:
+        value = spec.get(key)
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            fields[key] = list(value)
+    for key in _REMOTE_MCP_POLICY_INT_KEYS:
+        value = spec.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            fields[key] = value
+    return fields
+
+
+def remote_mcp_relay_entry(
+    spec: Mapping[str, object],
+    *,
+    relay_path: str,
+    port: int,
+    capability_file: str,
+) -> dict[str, object]:
+    """Build a remote entry containing no gateway target or bearer details."""
+    entry = _remote_mcp_policy_fields(spec)
+    entry.update(
+        {
+            "command": "python3",
+            "args": [
+                relay_path,
+                "--port",
+                str(port),
+                "--cap-file",
+                capability_file,
+            ],
+            "env": {},
+        }
+    )
+    return entry
+
+
+def remote_mcp_unsupported_entry(
+    spec: Mapping[str, object],
+    *,
+    relay_path: str,
+    code: str,
+) -> dict[str, object]:
+    """Build a local fail-closed entry for an unsupported remote transport."""
+    entry = _remote_mcp_policy_fields(spec)
+    entry.update(
+        {
+            "command": "python3",
+            "args": [relay_path, "--unsupported-code", code],
+            "env": {},
+        }
+    )
+    return entry
+
+
+def _acp_remote_server_entry(
+    name: str,
+    entry: Mapping[str, object],
+) -> dict[str, object]:
+    raw_args = entry.get("args")
+    args = list(raw_args) if isinstance(raw_args, list) else []
+    shaped = {key: value for key, value in entry.items() if key not in {"command", "args", "env"}}
+    shaped.update(
+        {
+            "name": name,
+            "command": entry["command"],
+            "args": args,
+            "env": [],
+        }
+    )
+    return shaped
+
+
+def _remote_mcp_reference_available(ref: str, names: frozenset[str]) -> bool:
+    if not ref.startswith("@"):
+        return True
+    server_name = ref[1:].split("/", 1)[0]
+    return bool(server_name) and server_name in names
+
+
+def project_remote_agent_spec(
+    spec: Mapping[str, object],
+    *,
+    relay_entries: Mapping[str, Mapping[str, object]] | None = None,
+) -> dict[str, object]:
+    """Return the credential-free subset of an agent spec safe for a workspace."""
     projected: dict[str, object] = {}
+    safe_entries = relay_entries or {}
+    available_names = frozenset(safe_entries)
     for key in _REMOTE_AGENT_TEXT_KEYS:
         value = spec.get(key)
         if value is None and key in ("description", "model"):
@@ -155,10 +545,235 @@ def project_remote_agent_spec(spec: Mapping[str, object]) -> dict[str, object]:
         value = spec.get(key, [])
         if not isinstance(value, list):
             raise ValueError(f"remote agent {key} must be a list")
-        projected[key] = [ref for ref in value if isinstance(ref, str) and not ref.startswith("@")]
+        projected[key] = [
+            ref
+            for ref in value
+            if isinstance(ref, str) and _remote_mcp_reference_available(ref, available_names)
+        ]
 
-    projected["mcpServers"] = {}
+    projected["mcpServers"] = {name: dict(entry) for name, entry in safe_entries.items()}
     return projected
+
+
+def _is_remote_http_spec(spec: object) -> bool:
+    return (
+        isinstance(spec, Mapping)
+        and spec.get("disabled") is not True
+        and isinstance(spec.get("url"), str)
+        and bool(str(spec.get("url")).strip())
+        and not spec.get("command")
+    )
+
+
+def unsupported_remote_mcp_names(
+    spec: Mapping[str, object],
+    *,
+    resolved_http_names: frozenset[str] = frozenset(),
+) -> frozenset[str]:
+    """Return enabled HTTP/SSE names that must receive a fail-closed relay."""
+    raw_servers = spec.get("mcpServers")
+    if not isinstance(raw_servers, Mapping):
+        return frozenset()
+    return frozenset(
+        name
+        for name, server_spec in raw_servers.items()
+        if (
+            isinstance(name, str)
+            and name not in resolved_http_names
+            and _is_remote_http_spec(server_spec)
+        )
+    )
+
+
+def _bounded_text(value: str, limit: int) -> bool:
+    return len(value.encode("utf-8")) <= limit and not any(
+        ord(character) < 32 or ord(character) == 127 for character in value
+    )
+
+
+def _remote_http_url_is_trusted(url: str) -> bool:
+    if not url or not _bounded_text(url, _REMOTE_HTTP_URL_MAX_BYTES):
+        return False
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError:
+        return False
+    if (
+        hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    if parsed.scheme == "https":
+        return True
+    return parsed.scheme == "http" and hostname in _REMOTE_HTTP_LOOPBACK_HOSTS
+
+
+def _remote_http_headers(raw: object) -> dict[str, str] | None:
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping) or len(raw) > _REMOTE_HTTP_HEADER_MAX_COUNT:
+        return None
+    headers: dict[str, str] = {}
+    total_bytes = 0
+    for name, value in raw.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            return None
+        if (
+            not _HTTP_HEADER_NAME_RE.fullmatch(name)
+            or not _bounded_text(name, _REMOTE_HTTP_HEADER_NAME_MAX_BYTES)
+            or not _bounded_text(value, _REMOTE_HTTP_HEADER_VALUE_MAX_BYTES)
+        ):
+            return None
+        total_bytes += len(name.encode("utf-8")) + len(value.encode("utf-8"))
+        if total_bytes > _REMOTE_HTTP_HEADERS_MAX_BYTES:
+            return None
+        headers[name] = value
+    return headers
+
+
+def _remote_http_oauth_hints(
+    raw_spec: Mapping[str, object],
+    *,
+    server_name: str,
+) -> tuple[tuple[str, ...], str] | None:
+    raw_scopes = raw_spec.get("scopes", raw_spec.get("oauthScopes"))
+    oauth = raw_spec.get("oauth")
+    if raw_scopes is None and isinstance(oauth, Mapping):
+        raw_scopes = oauth.get("oauthScopes")
+    if raw_scopes is not None and (
+        not isinstance(raw_scopes, list)
+        or not all(isinstance(scope, str) and scope.strip() for scope in raw_scopes)
+    ):
+        return None
+
+    if "clientId" in raw_spec:
+        raw_client_id = raw_spec.get("clientId")
+    elif isinstance(oauth, Mapping) and "clientId" in oauth:
+        raw_client_id = oauth.get("clientId")
+    else:
+        raw_client_id = None
+    if raw_client_id is not None and (
+        not isinstance(raw_client_id, str)
+        or not raw_client_id.strip()
+        or not _bounded_text(raw_client_id, _REMOTE_HTTP_CLIENT_ID_MAX_BYTES)
+    ):
+        return None
+
+    typed_spec = dict(raw_spec)
+    return (
+        tuple(kiro_entry_scopes(typed_spec, server=server_name)),
+        kiro_entry_client_id(typed_spec),
+    )
+
+
+def resolve_remote_http_mcp_targets(
+    spec: Mapping[str, object],
+    *,
+    session_key: str,
+) -> dict[str, RemoteHttpMcpTarget]:
+    """Resolve strict HTTP entries to gateway-only service targets."""
+    if not session_key:
+        raise ValueError("remote MCP targets require a logical session key")
+    raw_servers = spec.get("mcpServers")
+    if not isinstance(raw_servers, Mapping):
+        return {}
+
+    targets: dict[str, RemoteHttpMcpTarget] = {}
+    for name, raw_spec in raw_servers.items():
+        if (
+            not isinstance(name, str)
+            or not _REMOTE_MCP_SERVER_NAME_RE.fullmatch(name)
+            or not isinstance(raw_spec, Mapping)
+            or raw_spec.get("disabled") is True
+            or "command" in raw_spec
+        ):
+            continue
+        url = raw_spec.get("url")
+        if not isinstance(url, str) or not _remote_http_url_is_trusted(url):
+            continue
+        headers = _remote_http_headers(raw_spec.get("headers"))
+        oauth_hints = _remote_http_oauth_hints(raw_spec, server_name=name)
+        if headers is None or oauth_hints is None:
+            continue
+        scopes, client_id = oauth_hints
+        targets[name] = RemoteHttpMcpTarget(
+            server_name=name,
+            url=url,
+            headers=headers,
+            scopes=scopes,
+            client_id=client_id,
+        )
+    return targets
+
+
+def resolve_remote_mcp_targets(
+    spec: Mapping[str, object],
+    *,
+    local_cwd: str | Path,
+    session_key: str,
+) -> dict[str, RemoteMcpTarget]:
+    """Resolve strict stdio entries to gateway-only process targets."""
+    if not session_key:
+        raise ValueError("remote MCP targets require a logical session key")
+    raw_servers = spec.get("mcpServers")
+    if not isinstance(raw_servers, Mapping):
+        return {}
+
+    targets: dict[str, RemoteMcpTarget] = {}
+    for name, raw_spec in raw_servers.items():
+        if not isinstance(name, str) or not isinstance(raw_spec, Mapping):
+            continue
+        if raw_spec.get("disabled") is True or "url" in raw_spec:
+            continue
+        command = raw_spec.get("command")
+        args = raw_spec.get("args", [])
+        declared_env = raw_spec.get("env", {})
+        if not isinstance(command, str) or not command.strip():
+            continue
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            continue
+        if not isinstance(declared_env, Mapping) or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in declared_env.items()
+        ):
+            continue
+
+        typed_env: dict[str, str] = dict(declared_env)
+        path_key = spec_path_key(typed_env)
+        declared_path = typed_env.get(path_key, "") if path_key else ""
+        env = dict(os.environ)
+        env["PATH"] = mcp_search_path(declared_path)
+        env.update(
+            sanitize_spec_env((key, value) for key, value in typed_env.items() if key != path_key)
+        )
+        resolved = shutil.which(command, path=env["PATH"])
+        if not resolved:
+            continue
+
+        first_party = False
+        try:
+            from kiro_crew.mcp_discovery import _is_first_party_managed_argv
+
+            first_party = _is_first_party_managed_argv(
+                name,
+                command,
+                list(args),
+                typed_env,
+            )
+        except Exception:
+            first_party = False
+        targets[name] = RemoteMcpTarget(
+            command=resolved,
+            args=tuple(args),
+            env=env,
+            cwd=str(local_cwd),
+            first_party=first_party,
+        )
+    return targets
 
 
 def session_host_from_env(

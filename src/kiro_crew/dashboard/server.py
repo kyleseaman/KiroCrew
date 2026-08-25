@@ -12,7 +12,7 @@ import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from aiohttp import web
 
@@ -140,6 +140,7 @@ from kiro_crew.dashboard.token_auth import (
     token_embed_parent_port,
     warm_auth_singletons,
 )
+from kiro_crew.dashboard.urls import dashboard_origin
 from kiro_crew.deploy import _register_core_skills as _register_deploy_skills
 from kiro_crew.deploy.handlers import register_routes as _register_deploy_routes
 from kiro_crew.executors import subprocess_executor
@@ -2414,6 +2415,56 @@ def _pending_skill_notification(info: dict) -> tuple[str, str, str, list[dict[st
     return title, body, review_url, actions
 
 
+def _install_remote_mcp_oauth(
+    app: web.Application,
+    state: DashboardState,
+    *,
+    port: int,
+    tailnet_host: str,
+    dashboard_url: str = "",
+) -> None:
+    """Install one gateway-owned OAuth broker with a startup-trusted callback origin."""
+    from kiro_crew.mcp_gateway.oauth import (
+        RemoteMcpOAuthManager,
+        configure_runtime_oauth_manager,
+        runtime_oauth_manager,
+    )
+    from kiro_crew.secrets.vault import SecretVault
+
+    configured_origin = dashboard_origin(dashboard_url) if dashboard_url else ""
+    parsed_origin = urlsplit(configured_origin)
+    if not (
+        parsed_origin.scheme == "https"
+        or (
+            parsed_origin.scheme == "http"
+            and parsed_origin.hostname in ("localhost", "127.0.0.1", "::1")
+        )
+    ):
+        configured_origin = ""
+    callback_origin = (
+        configured_origin
+        or (f"https://{tailnet_host}" if tailnet_host else "")
+        or f"http://127.0.0.1:{port}"
+    )
+    manager = RemoteMcpOAuthManager(
+        SecretVault(data_home()),
+        callback_origin,
+        event_sink=state.publish_remote_mcp_oauth_event,
+    )
+    state.remote_mcp_oauth_manager = manager
+    app["remote_mcp_oauth_manager"] = manager
+    app["remote_mcp_oauth_broker"] = manager.broker
+    configure_runtime_oauth_manager(manager)
+
+    async def _shutdown(app_: web.Application) -> None:
+        del app_
+        if runtime_oauth_manager() is manager:
+            configure_runtime_oauth_manager(None)
+        await manager.close()
+
+    app.on_cleanup.append(_shutdown)
+
+
 async def start_dashboard(
     sessions: SessionManager,
     crons: CronService,
@@ -3107,6 +3158,14 @@ async def start_dashboard(
     # the browser and gateway are co-located on localhost.
     app["local_only"] = local_only
 
+    _install_remote_mcp_oauth(
+        app,
+        state,
+        port=port,
+        tailnet_host=_tailnet_host,
+        dashboard_url=dashboard_url,
+    )
+
     # DNS-rebinding defense-in-depth — shared factory (single source of truth
     # for the barrier AND the PROBE_PATHS exemption; see
     # _make_host_validation_middleware).
@@ -3786,6 +3845,13 @@ async def start_api_server(
     app["tailnet_trust"] = _tailnet_trust
     app["local_only"] = local_only
 
+    _install_remote_mcp_oauth(
+        app,
+        state,
+        port=port,
+        tailnet_host=_tailnet_host,
+    )
+
     # Per-session internal secret for machine-to-machine (mcp-core, cron) auth.
     # Deferred file write (and parent mkdir) until after the port binds (mirrors
     # start_dashboard): both live in _write_secret_file, offloaded below, so a
@@ -3865,6 +3931,9 @@ async def start_api_server(
     ]
 
     _register_mcp_routes(app)
+    from kiro_crew.dashboard.handlers.remote_mcp_oauth import api_remote_mcp_oauth_callback
+
+    app.router.add_get("/api/mcp/oauth/callback", api_remote_mcp_oauth_callback)
 
     # Probe parity with the full dashboard server. Headless gateways are often
     # the instances most likely to sit behind an orchestrator, so they must

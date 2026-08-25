@@ -500,12 +500,18 @@ TEAMS_WEBHOOK_PATH = "/api/messaging/teams"
 #: up exempt from one control and not the other.
 AGENT_HOOK_PATH = "/api/hooks/agent"
 
+# The authorization server redirects the browser here without a dashboard
+# cookie. The one-shot OAuth state is checked by the handler, and only GET is
+# exempt so no future write route at the same literal path inherits the bypass.
+REMOTE_MCP_OAUTH_CALLBACK_PATH = "/api/mcp/oauth/callback"
+
 #: Method scope shared by every self-authenticating external webhook entry: POST
 #: is the only method whose handler carries its own credential check.
 _SELF_AUTH_WEBHOOK_METHODS = frozenset({"POST"})
 
 _BYPASS_EXACT_METHODS: dict[str, frozenset[str]] = {
     AGENT_HOOK_PATH: _SELF_AUTH_WEBHOOK_METHODS,
+    REMOTE_MCP_OAUTH_CALLBACK_PATH: frozenset({"GET"}),
     TEAMS_WEBHOOK_PATH: _SELF_AUTH_WEBHOOK_METHODS,
 }
 

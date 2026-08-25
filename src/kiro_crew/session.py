@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from kiro_crew.acp.runtime import AcpRuntime, AcpSessionHandle
+    from kiro_crew.acp.session_host import CoderWorkspaceSessionHost
     from kiro_crew.acp.types import AcpEvent
 
 from kiro_crew import model_registry, platform_compat, shutdown_event
@@ -1714,7 +1715,11 @@ class SessionManager:
         # I/O (get_subagent_runtime spawn + create_session) is kept OUTSIDE the
         # global lock to avoid pinning it across subprocess/RPC work.
         runtime = await self._get_or_bootstrap_run_runtime(parent_session_key, agent=agent, cwd=cwd)
-        handle = await runtime.create_session(cwd=cwd or None, agent=agent or None)
+        handle = await runtime.create_session(
+            cwd=cwd or None,
+            agent=agent or None,
+            session_key=key,
+        )
         provider = AcpSessionProvider(handle, runtime)
 
         dup: LLMProvider | None = None
@@ -1815,6 +1820,20 @@ class SessionManager:
             if val is not None:
                 kwargs[key] = val
         return kwargs
+
+    def subagent_session_host(self, parent_session_key: str) -> "CoderWorkspaceSessionHost | None":
+        """Clone a remote parent's execution host for a dedicated child."""
+        from kiro_crew.acp.session_host import CoderWorkspaceSessionHost
+
+        provider = self.get_provider(parent_session_key)
+        if provider is None:
+            return None
+        client = getattr(provider, "client", None) or getattr(provider, "_client", None)
+        runtime = getattr(client, "_runtime", None)
+        host = getattr(runtime, "_session_host", None)
+        if isinstance(host, CoderWorkspaceSessionHost):
+            return host.clone()
+        return None
 
     def is_session_sharing_eligible(self, parent_session_key: str) -> bool:
         """Check if a parent session can host multiplexed subagent sessions.

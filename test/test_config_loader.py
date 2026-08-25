@@ -3720,6 +3720,30 @@ class TestOrchestratorWatchdogThemeAreParsed:
         assert isinstance(captured[0]["session_host"], host_mod.CoderWorkspaceSessionHost)
         assert captured[1]["session_host"] is None
 
+    def test_factory_prefers_explicit_inherited_session_host(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kiro_crew.providers.acp as acp_mod
+
+        captured: list[dict] = []
+
+        class _FakeProvider:
+            def __init__(self, **kwargs: object) -> None:
+                captured.append(kwargs)
+
+        monkeypatch.setattr(acp_mod, "AcpProvider", _FakeProvider)
+        cfg = _load_from_dict({})
+        factory = cfg.create_provider_factory()
+        inherited_host = object()
+
+        factory(
+            "subagent:child",
+            agent="kirocrew-lite",
+            session_host_override=inherited_host,
+        )
+
+        assert captured[0]["session_host"] is inherited_host
+
     def test_dashboard_theme_fields_are_parsed(self) -> None:
         cfg = _load_from_dict(
             {

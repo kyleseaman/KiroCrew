@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -15,35 +17,49 @@ from kiro_crew.acp.session_host import (
     CoderWorkspaceSessionHost,
     LocalSessionHost,
     project_remote_agent_spec,
+    remote_mcp_relay_entry,
+    remote_mcp_unsupported_entry,
+    resolve_remote_http_mcp_targets,
+    resolve_remote_mcp_targets,
 )
+from kiro_crew.mcp_gateway.remote_proxy import RemoteHttpMcpTarget
 
 
 class TestCoderWorkspaceSessionHost:
-    def test_builds_exact_ssh_transport_without_forwarding_gateway_env(self) -> None:
+    @pytest.mark.asyncio
+    async def test_builds_exact_ssh_transport_with_loopback_reverse_forward(self) -> None:
         host = CoderWorkspaceSessionHost(
             workspace="crew-dogfood",
             remote_cwd="/home/coder/workspace",
             coder_bin="/opt/coder",
         )
 
-        argv = host.spawn_argv(
-            agent="kirocrew",
-            model="auto",
-        )
+        await host.start_bridge()
+        try:
+            argv = host.spawn_argv(
+                agent="kirocrew",
+                model="auto",
+            )
 
-        assert argv == [
-            "/opt/coder",
-            "ssh",
-            "crew-dogfood",
-            "--",
-            "kiro-cli",
-            "acp",
-            "--agent",
-            "kirocrew",
-            "--model",
-            "auto",
-        ]
-        assert "env" not in argv
+            assert argv[:5] == [
+                "/opt/coder",
+                "ssh",
+                "crew-dogfood",
+                "--remote-forward",
+                f"{host.remote_port}:127.0.0.1:{host._proxy.local_port}",
+            ]
+            assert argv[5:] == [
+                "--",
+                "kiro-cli",
+                "acp",
+                "--agent",
+                "kirocrew",
+                "--model",
+                "auto",
+            ]
+            assert "env" not in argv
+        finally:
+            await host.close()
 
     def test_transport_env_is_a_small_allowlist(self) -> None:
         host = CoderWorkspaceSessionHost(
@@ -105,7 +121,7 @@ class TestCoderWorkspaceSessionHost:
 
         assert host.protocol_cwd == "/home/coder/workspace"
 
-    def test_prepare_argv_uses_positional_shell_arguments(self) -> None:
+    def test_prepare_argv_uses_positional_python_arguments(self) -> None:
         host = CoderWorkspaceSessionHost(
             workspace="crew-dogfood",
             remote_cwd="/home/coder/workspace",
@@ -122,13 +138,17 @@ class TestCoderWorkspaceSessionHost:
         ]
         assert len(argv) == 5
         assert shlex.split(argv[4]) == [
-            "sh",
+            "python3",
             "-c",
             host_mod._REMOTE_PREPARE_SCRIPT,
-            "kirocrew-prepare",
+            host._runtime_id,
             "kirocrew",
             "/home/coder/workspace",
+            host_mod._REMOTE_RUNTIME_MARKER,
+            ",".join(str(port) for port in host._remote_port_candidates),
         ]
+        assert len(host._remote_port_candidates) == host_mod._REMOTE_FORWARD_PORT_ATTEMPTS
+        assert len(set(host._remote_port_candidates)) == len(host._remote_port_candidates)
 
     @pytest.mark.asyncio
     async def test_prepare_sends_only_projected_json_to_bounded_subprocess(
@@ -143,7 +163,14 @@ class TestCoderWorkspaceSessionHost:
         )
         process = MagicMock()
         process.returncode = 0
-        process.communicate = AsyncMock(return_value=(b"", b""))
+        remote_runtime = f"/home/coder/.kiro/crew/remote-runtimes/{host._runtime_id}"
+        selected_port = host._remote_port_candidates[-1]
+        process.communicate = AsyncMock(
+            return_value=(
+                json.dumps({"runtime_dir": remote_runtime, "port": selected_port}).encode(),
+                b"",
+            )
+        )
         spawned: dict[str, object] = {}
 
         async def fake_spawn(*argv, **kwargs):
@@ -175,6 +202,9 @@ class TestCoderWorkspaceSessionHost:
         )
 
         assert spawned["argv"] == tuple(host.prepare_argv(agent="kirocrew"))
+        remote_command = spawned["argv"][-1]
+        assert remote_command.count(host._remote_cwd) == 1
+        assert remote_command.count(host._runtime_id) == 1
         kwargs = spawned["kwargs"]
         assert isinstance(kwargs, dict)
         assert kwargs["cwd"] == str(tmp_path)
@@ -184,8 +214,13 @@ class TestCoderWorkspaceSessionHost:
             "PATH": "/usr/bin",
         }
         payload = process.communicate.await_args.kwargs["input"]
-        assert json.loads(payload) == spec
+        decoded = json.loads(payload)
+        assert decoded["agent"] == spec
+        assert "def main" in decoded["relay"]
         assert b"must-not-cross" not in payload
+        assert host.remote_runtime_dir == remote_runtime
+        assert host.remote_port == selected_port
+        await host.close()
 
     @pytest.mark.asyncio
     async def test_prepare_surfaces_sanitized_remote_failure(
@@ -209,25 +244,90 @@ class TestCoderWorkspaceSessionHost:
             AsyncMock(return_value=process),
         )
 
-        with pytest.raises(RuntimeError) as caught:
-            await host.prepare(
-                agent="kirocrew",
-                projected_spec={
-                    "name": "kirocrew",
-                    "prompt": "Dogfood Crew.",
-                    "tools": [],
-                    "allowedTools": [],
-                    "mcpServers": {},
-                },
-                environ={
-                    "CODER_URL": "https://coder.tail.example",
-                    "CODER_SESSION_TOKEN": "coder-token",
-                },
-                local_cwd=tmp_path,
-            )
+        try:
+            with pytest.raises(RuntimeError) as caught:
+                await host.prepare(
+                    agent="kirocrew",
+                    projected_spec={
+                        "name": "kirocrew",
+                        "prompt": "Dogfood Crew.",
+                        "tools": [],
+                        "allowedTools": [],
+                        "mcpServers": {},
+                    },
+                    environ={
+                        "CODER_URL": "https://coder.tail.example",
+                        "CODER_SESSION_TOKEN": "coder-token",
+                    },
+                    local_cwd=tmp_path,
+                )
+        finally:
+            await host.close()
 
         assert "secret-value" not in str(caught.value)
         assert "workspace preparation failed" in str(caught.value)
+
+    @pytest.mark.asyncio
+    async def test_session_capability_upload_exposes_only_relay_metadata(
+        self,
+        tmp_path,
+        monkeypatch,
+    ) -> None:
+        host = CoderWorkspaceSessionHost(
+            workspace="crew-dogfood",
+            remote_cwd="/home/coder/workspace",
+            coder_bin="/opt/coder",
+        )
+        host._remote_runtime_dir = f"/home/coder/.kiro/crew/remote-runtimes/{host._runtime_id}"
+        await host.start_bridge()
+        calls: list[dict[str, object]] = []
+
+        async def capture_remote(**kwargs):
+            calls.append(kwargs)
+            return b""
+
+        monkeypatch.setattr(host, "_run_remote_python", capture_remote)
+        secret = "gateway-target-secret-canary"
+        spec = {
+            "mcpServers": {
+                "kirocrew-core": {
+                    "command": sys.executable,
+                    "args": ["-m", "kiro_crew.mcp_core"],
+                    "env": {"SERVICE_TOKEN": secret},
+                    "autoApprove": ["learn_list"],
+                },
+                "remote-http": {
+                    "url": "https://mcp.example.test/private",
+                    "headers": {"Authorization": "Bearer remote-secret"},
+                },
+            }
+        }
+        try:
+            entries = await host.prepare_session_capabilities(
+                agent_spec=spec,
+                session_key="dashboard:one",
+                environ={"CODER_URL": "https://coder.example", "CODER_SESSION_TOKEN": "x"},
+                local_cwd=tmp_path,
+            )
+
+            serialized = json.dumps(entries)
+            assert [entry["name"] for entry in entries] == [
+                "kirocrew-core",
+                "remote-http",
+            ]
+            assert secret not in serialized
+            assert sys.executable not in serialized
+            assert "mcp.example.test" not in serialized
+            assert "Authorization" not in serialized
+            assert calls
+            cap_call = calls[0]
+            argv_text = " ".join(cap_call["argv"])
+            payload = cap_call["payload"]
+            assert isinstance(payload, bytes)
+            for token in json.loads(payload).values():
+                assert token not in argv_text
+        finally:
+            await host.close()
 
 
 def test_local_host_keeps_local_protocol_path(tmp_path) -> None:
@@ -266,7 +366,7 @@ def test_session_host_from_env_builds_authenticated_coder_host(
 
     assert isinstance(host, CoderWorkspaceSessionHost)
     assert host.protocol_cwd == "/home/coder/project"
-    assert host.spawn_argv(agent="kirocrew", model="auto")[0] == "/opt/coder"
+    assert host.prepare_argv(agent="kirocrew")[0] == "/opt/coder"
 
 
 @pytest.mark.parametrize("missing", ["CODER_URL", "CODER_SESSION_TOKEN"])
@@ -301,36 +401,211 @@ def test_session_host_from_env_requires_coder_cli(tmp_path, monkeypatch) -> None
         )
 
 
-def test_remote_agent_projection_keeps_builtin_tools_and_removes_mcp() -> None:
+def test_remote_agent_projection_keeps_only_bridge_backed_mcp() -> None:
+    relay_path = "/home/coder/.kiro/crew/remote-runtimes/run/relay.py"
     local = {
         "name": "kirocrew",
         "description": "Personal agent",
         "model": "auto",
         "prompt": "You are Kiro Crew.",
-        "tools": ["fs_read", "execute_bash", "@kirocrew-core", "@github/search"],
-        "allowedTools": ["fs_read", "@kirocrew-core"],
+        "tools": [
+            "fs_read",
+            "execute_bash",
+            "@kirocrew-core",
+            "@github/search",
+            "@remote-http",
+            "@missing/tool",
+        ],
+        "allowedTools": ["fs_read", "@kirocrew-core", "@missing/tool"],
         "mcpServers": {
             "kirocrew-core": {
                 "command": "/gateway/kirocrew",
                 "env": {"AWS_SECRET_ACCESS_KEY": "not-for-the-workspace"},
-            }
+                "autoApprove": ["learn_list"],
+                "disabledTools": ["dangerous"],
+                "timeout": 9000,
+            },
+            "remote-http": {
+                "url": "https://mcp.example.test/secret-path",
+                "headers": {"Authorization": "Bearer not-for-the-workspace"},
+            },
         },
         "hooks": {"preToolUse": [{"command": "/gateway/kirocrew hook"}]},
         "toolAliases": {"github": "@github/search"},
         "unknownExtension": {"gatewayPath": "/gateway/private"},
     }
 
-    projected = project_remote_agent_spec(local)
+    relay_entries = {
+        "kirocrew-core": remote_mcp_relay_entry(
+            local["mcpServers"]["kirocrew-core"],
+            relay_path=relay_path,
+            port=43123,
+            capability_file="/home/coder/.kiro/crew/remote-runtimes/run/cap-opaque",
+        ),
+        "remote-http": remote_mcp_unsupported_entry(
+            local["mcpServers"]["remote-http"],
+            relay_path=relay_path,
+            code="remote_mcp_http_unavailable",
+        ),
+    }
+
+    projected = project_remote_agent_spec(local, relay_entries=relay_entries)
 
     assert projected == {
         "name": "kirocrew",
         "description": "Personal agent",
         "model": "auto",
         "prompt": "You are Kiro Crew.",
-        "tools": ["fs_read", "execute_bash"],
-        "allowedTools": ["fs_read"],
-        "mcpServers": {},
+        "tools": [
+            "fs_read",
+            "execute_bash",
+            "@kirocrew-core",
+            "@remote-http",
+        ],
+        "allowedTools": ["fs_read", "@kirocrew-core"],
+        "mcpServers": relay_entries,
     }
+    serialized = json.dumps(projected)
+    assert "/gateway/kirocrew" not in serialized
+    assert "not-for-the-workspace" not in serialized
+    assert "mcp.example.test" not in serialized
+    assert "Authorization" not in serialized
+
+
+def test_remote_mcp_target_resolution_is_strict_and_gateway_local(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    secret = "gateway-only-secret-canary"
+    spec = {
+        "mcpServers": {
+            "kirocrew-core": {
+                "command": sys.executable,
+                "args": ["-m", "kiro_crew.mcp_core"],
+                "env": {"SERVICE_TOKEN": secret},
+            },
+            "user-stdio": {"command": sys.executable, "args": ["server.py"]},
+            "disabled": {"command": sys.executable, "disabled": True},
+            "remote-http": {"url": "https://mcp.example.test"},
+            "mixed": {"command": sys.executable, "url": "https://example.test"},
+            "bad-args": {"command": sys.executable, "args": [7]},
+            "bad-env": {"command": sys.executable, "env": {"X": 7}},
+            "missing": {"command": "definitely-not-installed-kirocrew-test"},
+        }
+    }
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    targets = resolve_remote_mcp_targets(
+        spec,
+        local_cwd=tmp_path,
+        session_key="dashboard:one",
+    )
+
+    assert set(targets) == {"kirocrew-core", "user-stdio"}
+    assert targets["kirocrew-core"].command == sys.executable
+    assert targets["kirocrew-core"].args == ("-m", "kiro_crew.mcp_core")
+    assert targets["kirocrew-core"].env["SERVICE_TOKEN"] == secret
+    assert targets["kirocrew-core"].cwd == str(tmp_path)
+
+
+def test_remote_http_mcp_target_resolution_is_strict_and_gateway_only() -> None:
+    secret = "gateway-only-canary"
+    spec = {
+        "mcpServers": {
+            "linear": {
+                "url": "https://mcp.linear.example/mcp",
+                "headers": {"X-Workspace": secret},
+                "scopes": ["read", "write"],
+                "clientId": "kiro-crew",
+            },
+            "loopback-v4": {"url": "http://127.0.0.1:43123/mcp"},
+            "loopback-v6": {"url": "http://[::1]:43124/mcp"},
+            "loopback-name": {"url": "http://localhost:43125/mcp"},
+            "insecure": {"url": "http://mcp.example.test/mcp"},
+            "userinfo": {"url": "https://user:pass@mcp.example.test/mcp"},
+            "query": {"url": "https://mcp.example.test/mcp?token=secret"},
+            "fragment": {"url": "https://mcp.example.test/mcp#secret"},
+            "mixed": {"url": "https://mcp.example.test/mcp", "command": "server"},
+            "bad-headers": {
+                "url": "https://mcp.example.test/mcp",
+                "headers": {"X-Test": 7},
+            },
+            "bad-header-name": {
+                "url": "https://mcp.example.test/mcp",
+                "headers": {"X-Test\nInjected": "value"},
+            },
+            "bad-scopes": {
+                "url": "https://mcp.example.test/mcp",
+                "scopes": ["read", 7],
+            },
+            "bad-client": {
+                "url": "https://mcp.example.test/mcp",
+                "clientId": 7,
+            },
+            "disabled": {
+                "url": "https://mcp.example.test/mcp",
+                "disabled": True,
+            },
+            "bad/name": {"url": "https://mcp.example.test/mcp"},
+        }
+    }
+
+    targets = resolve_remote_http_mcp_targets(spec, session_key="dashboard:one")
+
+    assert targets == {
+        "linear": RemoteHttpMcpTarget(
+            server_name="linear",
+            url="https://mcp.linear.example/mcp",
+            headers={"X-Workspace": secret},
+            scopes=("read", "write"),
+            client_id="kiro-crew",
+        ),
+        "loopback-v4": RemoteHttpMcpTarget(
+            server_name="loopback-v4",
+            url="http://127.0.0.1:43123/mcp",
+            headers={},
+        ),
+        "loopback-v6": RemoteHttpMcpTarget(
+            server_name="loopback-v6",
+            url="http://[::1]:43124/mcp",
+            headers={},
+        ),
+        "loopback-name": RemoteHttpMcpTarget(
+            server_name="loopback-name",
+            url="http://localhost:43125/mcp",
+            headers={},
+        ),
+    }
+
+
+def test_remote_http_mcp_target_resolution_enforces_global_bounds() -> None:
+    servers = {
+        "long-url": {"url": "https://mcp.example.test/" + "x" * 4_096},
+        "many-headers": {
+            "url": "https://mcp.example.test/mcp",
+            "headers": {f"X-{index}": "v" for index in range(33)},
+        },
+        "long-header-name": {
+            "url": "https://mcp.example.test/mcp",
+            "headers": {"X" * 257: "v"},
+        },
+        "long-header-value": {
+            "url": "https://mcp.example.test/mcp",
+            "headers": {"X-Test": "v" * (8 * 1_024 + 1)},
+        },
+        "large-headers": {
+            "url": "https://mcp.example.test/mcp",
+            "headers": {f"X-{index}": "v" * 2_100 for index in range(32)},
+        },
+    }
+
+    assert (
+        resolve_remote_http_mcp_targets(
+            {"mcpServers": servers},
+            session_key="dashboard:one",
+        )
+        == {}
+    )
 
 
 def test_remote_agent_projection_rejects_wrong_field_types() -> None:
@@ -415,10 +690,29 @@ async def test_runtime_remote_spawn_skips_local_confinement_and_gateway_env(
         session_host=host,
     )
 
-    with pytest.raises(StopSpawn):
-        await runtime.spawn()
+    try:
+        with pytest.raises(StopSpawn):
+            await runtime.spawn()
 
-    assert captured["argv"] == tuple(host.spawn_argv(agent="kirocrew", model="auto"))
+        argv = captured["argv"]
+        assert isinstance(argv, tuple)
+        assert argv[:4] == ("/opt/coder", "ssh", "crew-dogfood", "--remote-forward")
+        assert argv[5:] == (
+            "--",
+            "kiro-cli",
+            "acp",
+            "--agent",
+            "kirocrew",
+            "--model",
+            "auto",
+        )
+        remote_port, loopback, local_port = str(argv[4]).split(":")
+        assert int(remote_port) == host.remote_port
+        assert loopback == "127.0.0.1"
+        assert 1 <= int(local_port) <= 65535
+    finally:
+        await host.close()
+
     kwargs = captured["kwargs"]
     assert isinstance(kwargs, dict)
     assert kwargs["cwd"] == str(tmp_path / "gateway-workspace")
@@ -470,6 +764,8 @@ async def test_runtime_remote_spawn_inlines_file_prompt(tmp_path, monkeypatch) -
         agent="kirocrew",
         session_host=host,
     )
+    close = AsyncMock(wraps=host.close)
+    monkeypatch.setattr(host, "close", close)
 
     with pytest.raises(RuntimeError, match="stop after remote preparation"):
         await runtime.spawn()
@@ -477,10 +773,17 @@ async def test_runtime_remote_spawn_inlines_file_prompt(tmp_path, monkeypatch) -
     projected = prepare.await_args.kwargs["projected_spec"]
     assert projected["prompt"] == "Dogfood Crew from the remote workspace."
     assert not projected["prompt"].startswith("file://")
+    close.assert_awaited_once_with(
+        environ=os.environ,
+        local_cwd=tmp_path / "gateway-workspace",
+    )
 
 
 @pytest.mark.asyncio
-async def test_runtime_remote_session_uses_remote_cwd_and_empty_mcp(tmp_path) -> None:
+async def test_runtime_remote_session_uses_remote_cwd_and_gateway_relays(
+    tmp_path,
+    monkeypatch,
+) -> None:
     host = CoderWorkspaceSessionHost(
         workspace="crew-dogfood",
         remote_cwd="/home/coder/workspace",
@@ -492,6 +795,23 @@ async def test_runtime_remote_session_uses_remote_cwd_and_empty_mcp(tmp_path) ->
         session_host=host,
     )
     runtime._initialized = True
+    runtime._remote_agent_spec = {"mcpServers": {}}
+    relays = [
+        {
+            "name": "kirocrew-core",
+            "command": "python3",
+            "args": ["/remote/relay.py"],
+            "env": [],
+        }
+    ]
+    prepare_capabilities = AsyncMock(return_value=relays)
+    monkeypatch.setattr(
+        host,
+        "prepare_session_capabilities",
+        prepare_capabilities,
+    )
+    revoke = MagicMock(wraps=host.revoke_session_grants)
+    monkeypatch.setattr(host, "revoke_session_grants", revoke)
 
     class StopSession(Exception):
         pass
@@ -500,8 +820,70 @@ async def test_runtime_remote_session_uses_remote_cwd_and_empty_mcp(tmp_path) ->
     runtime._send_and_await = send
 
     with pytest.raises(StopSession):
-        await runtime.create_session(cwd=tmp_path / "caller-local-path")
+        await runtime.create_session(
+            cwd=tmp_path / "caller-local-path",
+            session_key="dashboard:one",
+        )
 
     params = send.await_args.args[1]
     assert params["cwd"] == "/home/coder/workspace"
-    assert params["mcpServers"] == []
+    assert params["mcpServers"] == relays
+    prepare_capabilities.assert_awaited_once()
+    revoke.assert_called_once_with("dashboard:one")
+
+
+@pytest.mark.asyncio
+async def test_runtime_remote_resume_uses_workspace_transcript_and_rotated_relays(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    host = CoderWorkspaceSessionHost(
+        workspace="crew-dogfood",
+        remote_cwd="/home/coder/workspace",
+        coder_bin="/opt/coder",
+    )
+    host._remote_runtime_dir = f"/home/coder/.kiro/crew/remote-runtimes/{host._runtime_id}"
+    runtime = AcpRuntime(
+        work_dir=tmp_path / "gateway-workspace",
+        agent="kirocrew",
+        session_host=host,
+        expect_mcp_reports=False,
+    )
+    runtime._initialized = True
+    runtime._can_load_session = True
+    runtime._remote_agent_spec = {"mcpServers": {}}
+    relays = [
+        {
+            "name": "kirocrew-core",
+            "command": "python3",
+            "args": ["/remote/relay.py"],
+            "env": [],
+        }
+    ]
+    prepare_capabilities = AsyncMock(return_value=relays)
+    monkeypatch.setattr(host, "prepare_session_capabilities", prepare_capabilities)
+    revoke = MagicMock(wraps=host.revoke_session_grants)
+    monkeypatch.setattr(host, "revoke_session_grants", revoke)
+    send = AsyncMock(return_value={"modes": []})
+    runtime._send_and_await = send
+
+    handle = await runtime.load_session(
+        "/gateway/.kiro/sessions/sid-remote.json",
+        "sid-remote",
+        cwd=tmp_path / "caller-local-path",
+        session_key="dashboard:one",
+    )
+
+    assert handle.session_id == "sid-remote"
+    params = send.await_args.args[1]
+    assert params["cwd"] == "/home/coder/workspace"
+    assert params["mcpServers"] == relays
+    assert params["_meta"] == {
+        "_kiro.dev/session_file": "/home/coder/.kiro/sessions/sid-remote.json"
+    }
+    assert "/gateway" not in json.dumps(params)
+    assert runtime._remote_session_keys == {"sid-remote": "dashboard:one"}
+
+    await runtime.terminate_session("sid-remote")
+    assert runtime._remote_session_keys == {}
+    revoke.assert_called_once_with("dashboard:one")

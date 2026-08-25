@@ -326,6 +326,14 @@ parent snapshot + accumulated side history.
 - `close_all()`: saves all active mappings before killing processes.
 - `start_pool()`: prunes stale entries (files deleted by kiro-cli GC).
 
+For a Coder-hosted session, transcript existence and path derivation belong to
+`CoderWorkspaceSessionHost`: it accepts only the validated native session id,
+probes file metadata remotely without returning content, and supplies the
+workspace `~/.kiro/sessions/<sid>.json` path to `session/load`. The gateway does
+not stat its own Kiro session directory for that case. Resume rotates the
+session's MCP capabilities before loading; teardown revokes them, and a gateway
+restart invalidates the in-memory registry by construction.
+
 ### Load Recovery (stale native session lock — F2)
 
 On restart / Make-Live cutover the previous gateway's kiro-cli is killed. If it
@@ -868,6 +876,11 @@ PID in `kiro_session_pids.txt` at spawn. These two runtime kinds live outside
 `self._sessions`, so before this union the sweep saw their live PIDs as
 untracked orphans and SIGKILLed them mid-chat (surfacing as
 `process exited (rc=-9)`).
+
+`subagent_session_host(parent_key)` is the live execution-affinity query for a
+dedicated descendant. It clones a Coder host's non-secret workspace, remote cwd,
+and transport-binary selection, but never its capability registry or bearers.
+A local parent returns no override and keeps the ordinary provider-factory path.
 
 ### Cross-platform process management (platform_compat)
 

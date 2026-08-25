@@ -2,7 +2,7 @@
 
 ## Overview
 
-The ACP layer spans **six** modules: the legacy per-session client (`acp/client.py`, one subprocess per session), the multiplexed runtime (`acp/runtime.py`, one subprocess fanned out to N sessions), the execution-host boundary (`acp/session_host.py`, local by default with an opt-in Coder workspace transport), the per-session handle (`acp/session_handle.py`, one `sessionId` + queue + prompt/approve/reject loop), a shared dispatch parser (`acp/_dispatch.py`, pure frame-shaping/redaction helpers all paths route through), and the session provider (`acp/session_provider.py`, `AcpSessionProvider` adapting an `AcpSessionHandle` to the `LLMProvider` ABC so runtime-backed sessions are interchangeable with `AcpClient`). All are JSON-RPC 2.0 over stdio for `kiro-cli acp` or `claude-agent-acp`, managing subprocess lifecycle, session initialization, prompt streaming, and tool permissions. All protocol constants in `acp/types.py`.
+The ACP layer spans **seven** modules: the legacy per-session client (`acp/client.py`, one subprocess per session), the multiplexed runtime (`acp/runtime.py`, one subprocess fanned out to N sessions), the execution-host boundary (`acp/session_host.py`, local by default with an opt-in Coder workspace transport), the standalone workspace MCP relay (`acp/remote_mcp_relay.py`, stdlib-only JSON-RPC transport copied into Coder), the per-session handle (`acp/session_handle.py`, one `sessionId` + queue + prompt/approve/reject loop), a shared dispatch parser (`acp/_dispatch.py`, pure frame-shaping/redaction helpers all paths route through), and the session provider (`acp/session_provider.py`, `AcpSessionProvider` adapting an `AcpSessionHandle` to the `LLMProvider` ABC so runtime-backed sessions are interchangeable with `AcpClient`). All are JSON-RPC 2.0 over stdio for `kiro-cli acp` or `claude-agent-acp`, managing subprocess lifecycle, session initialization, prompt streaming, and tool permissions. All protocol constants in `acp/types.py`.
 
 ## Backend Selection
 
@@ -16,13 +16,29 @@ The ACP layer spans **six** modules: the legacy per-session client (`acp/client.
 `AcpRuntime` accepts a session host. The default `LocalSessionHost` leaves every
 existing resolution, environment, sandbox, cgroup, cwd, and spawn behavior
 unchanged. `CoderWorkspaceSessionHost` is an explicitly configured Kiro-only
-POC path: it projects an MCP-free agent spec, prepares a normalized remote cwd,
-and launches `kiro-cli acp` behind `coder ssh` while retaining JSON-RPC stdio.
-The Coder process receives a strict transport environment allowlist instead of
-the gateway environment. Its ACP session uses the remote cwd and an empty MCP
-server list; the SSH process is not wrapped in the local agent sandbox because
-the workspace is the isolation and resource boundary. See
-[`providers.md`](providers.md) for selection, projection, and scope.
+path. It projects a credential-free agent spec, prepares a normalized remote
+cwd, and launches `kiro-cli acp` behind `coder ssh` while retaining JSON-RPC
+stdio. The same SSH process carries a loopback reverse forward to a gateway MCP
+proxy. Each `session/new` and `session/load` receives freshly minted relay
+entries bound to its logical Kiro Crew session key; failed creation, session
+termination, runtime death, and gateway restart revoke them. The Coder process
+receives a strict transport environment allowlist instead of the gateway
+environment and is not wrapped in the gateway's local sandbox because the
+workspace is the execution boundary. See [`providers.md`](providers.md) and
+[`../../architecture/mcp.md`](../../architecture/mcp.md).
+
+The relay surface covers gateway stdio targets plus gateway-owned Streamable
+HTTP, legacy SSE, and OAuth targets. HTTP selection, configured headers,
+discovery, browser authorization, encrypted token storage, and refresh stay on
+the gateway; the workspace-side process always sees the same stdio JSON-RPC
+channel. Legacy SSE is selected only after an initial modern 404/405, and no
+remote transport failure can move URL or credential handling into Coder.
+
+Remote resume is host-aware. The provider asks the Coder host for a bounded
+existence probe of the validated session id, and `session/load` receives the
+derived workspace `~/.kiro/sessions/<sid>.json` path. It never stats or sends a
+gateway transcript path. Capability relays are rotated before every load so a
+resumed session cannot reuse a bearer from its previous runtime.
 
 **Kiro executable resolution at spawn.** Trust is "the CLI runs": any resolvable
 executable Kiro CLI launches for ACP, regardless of install source, owner, or

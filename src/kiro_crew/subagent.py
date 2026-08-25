@@ -10,6 +10,7 @@ No spawn recursion: subagents cannot spawn other subagents.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
 import os
@@ -5442,6 +5443,15 @@ class SubagentManager:
         # model/effort would silently no-op on the default (session-sharing) path.
         if eff_model or eff_effort:
             use_session_sharing = False
+
+        def _pin_dedicated_host() -> None:
+            resolver = getattr(self._sessions, "subagent_session_host", None)
+            if not callable(resolver) or inspect.iscoroutinefunction(resolver):
+                return
+            child_host = resolver(info.parent_session_key)
+            if getattr(child_host, "is_remote", False) is True:
+                extra_kwargs["session_host_override"] = child_host
+
         if use_session_sharing:
             try:
                 client = await self._create_shared_session(info, session_key, agent)
@@ -5456,6 +5466,7 @@ class SubagentManager:
                 info._session_sharing = False
                 info._shared_provider = None
                 use_session_sharing = False
+                _pin_dedicated_host()
                 client, is_new, _resumed = await self._sessions.get_or_create(
                     session_key,
                     agent=agent or None,
@@ -5468,6 +5479,7 @@ class SubagentManager:
                 _resumed = False
                 is_cc = False
         else:
+            _pin_dedicated_host()
             client, is_new, _resumed = await self._sessions.get_or_create(
                 session_key,
                 agent=agent or None,
@@ -6213,7 +6225,8 @@ class SubagentManager:
         """Decide whether a subagent should use the shared-runtime path.
 
         All must hold: session_sharing config True; parent session exists and
-        is ACP/kiro-backed (not CC); not a CC-specific spawn (model/allowed_tools/bare).
+        is ACP/kiro-backed (not CC); no explicit agent, model, tool, or bare-mode
+        override that requires its own process configuration.
         """
         try:
             cfg = KiroCrewConfig.load()
@@ -6221,7 +6234,7 @@ class SubagentManager:
                 return False
         except Exception:
             return False
-        if info.model or info.allowed_tools or info.bare:
+        if info.agent or info.model or info.allowed_tools or info.bare:
             return False
         if not info.parent_session_key:
             return False
@@ -6247,6 +6260,7 @@ class SubagentManager:
         handle = await runtime.create_session(
             cwd=cwd or None,
             agent=agent or None,
+            session_key=session_key,
         )
         provider = AcpSessionProvider(handle, runtime)
         # This consumer implements the low-fidelity child downgrade (interactive
