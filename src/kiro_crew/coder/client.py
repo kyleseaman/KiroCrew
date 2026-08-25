@@ -173,11 +173,15 @@ class CoderClient:
         )
         if not isinstance(raw, list):
             raise CoderClientError("Coder template query returned an invalid shape")
-        names = {
-            value.get("name")
-            for value in raw
-            if isinstance(value, dict) and isinstance(value.get("name"), str)
-        }
+        names: set[str] = set()
+        for value in raw:
+            if not isinstance(value, dict):
+                continue
+            # Coder's table renderer wraps current JSON records under the
+            # display-column label; older releases returned the record itself.
+            record = value.get("Template", value)
+            if isinstance(record, dict) and isinstance(record.get("name"), str):
+                names.add(record["name"])
         if template not in names:
             raise CoderClientError("Coder template is unavailable")
         # Presets are applied by the create command. Coder deployments that do

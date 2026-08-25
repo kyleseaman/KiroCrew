@@ -103,7 +103,7 @@ async def test_probe_verifies_identity_and_template_without_creating_compute(
                 ]
             ).encode()
         if argv[1:3] == ["templates", "list"]:
-            return json.dumps([{"name": "kirocrew-arm"}]).encode()
+            return json.dumps([{"Template": {"name": "kirocrew-arm"}}]).encode()
         raise AssertionError(argv)
 
     client = CoderClient("/opt/coder", "https://coder.example", "token", tmp_path, run)
