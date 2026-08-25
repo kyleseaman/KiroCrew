@@ -1,6 +1,8 @@
-import { useContext } from 'react'
-import { QueryClient, QueryClientContext, useQuery, skipToken } from '@tanstack/react-query'
+import { useContext, useMemo, useSyncExternalStore } from 'react'
+import { QueryClient, QueryClientContext } from '@tanstack/react-query'
 import type { KiroPrerequisiteStatus } from '../api/client'
+
+const PREREQUISITE_QUERY_KEY = ['kiro-prerequisite'] as const
 
 /** What the gateway host is, for copy that names an OS feature by its real name. */
 export type GatewayPlatform = 'darwin' | 'windows' | 'other'
@@ -35,10 +37,46 @@ export function classifyPlatform(raw: string | undefined | null): GatewayPlatfor
  * Mochi's Electron windows and the popout frames mount with a bare `createRoot`,
  * and `useQuery` throws "No QueryClient set" there — which would turn a component
  * that merely wants to word a label correctly into one that cannot render at all.
- * This cache stays empty and the query below never fetches, so a caller in such a
+ * This cache stays empty and the subscription below never fetches, so a caller in such a
  * tree resolves to `'other'`: the same generic wording an unreadable platform gets.
  */
 const ORPHAN_TREE_CACHE = new QueryClient()
+
+function platformFromQuery(queryClient: QueryClient): string | undefined {
+  return queryClient.getQueryData<KiroPrerequisiteStatus>(PREREQUISITE_QUERY_KEY)?.platform
+}
+
+/** Observe one cache entry without registering another query observer. */
+function platformCacheStore(queryClient: QueryClient) {
+  let platform = platformFromQuery(queryClient)
+
+  return {
+    subscribe(onStoreChange: () => void) {
+      const unsubscribe = queryClient.getQueryCache().subscribe((event) => {
+        const key = event.query.queryKey
+        if (key.length !== 1 || key[0] !== PREREQUISITE_QUERY_KEY[0]) return
+
+        // Read the event's query rather than looking it up again. A cache with a
+        // zero gcTime can remove an unobserved entry immediately after updating
+        // it, but the update still carries the platform this reader needs.
+        const next = (event.query.state.data as KiroPrerequisiteStatus | undefined)?.platform
+        if (next === platform) return
+        platform = next
+        onStoreChange()
+      })
+
+      // Close the render-to-subscribe race in the same way useSyncExternalStore
+      // expects: re-read once after the listener is attached.
+      const current = platformFromQuery(queryClient)
+      if (current !== platform) {
+        platform = current
+        onStoreChange()
+      }
+      return unsubscribe
+    },
+    getSnapshot: () => platform,
+  }
+}
 
 /**
  * The platform of the GATEWAY host, not of the browser.
@@ -48,18 +86,18 @@ const ORPHAN_TREE_CACHE = new QueryClient()
  * against a Linux gateway must not name Finder. The install command has the same
  * property and is resolved server-side for the same reason.
  *
- * A pure reader — `skipToken` means this hook never fetches. The prerequisite
- * gate wraps the whole dashboard and owns that query, so the value is cached
- * before any page mounts, and this subscription re-renders when the gate
- * refreshes it.
+ * A pure reader. The prerequisite gate wraps the whole dashboard and owns that
+ * query, so the value is cached before any page mounts, and this subscription
+ * re-renders when the gate refreshes it. Reading through the cache subscription
+ * is important: a second useQuery observer with skipToken can replace the owning
+ * query's fetch options while React Strict Mode remounts the tree.
  *
  * See `classifyPlatform` for why anything unrecognised is generic wording.
  */
 export function useGatewayPlatform(): GatewayPlatform {
   const provided = useContext(QueryClientContext)
-  const { data } = useQuery<KiroPrerequisiteStatus>(
-    { queryKey: ['kiro-prerequisite'], queryFn: skipToken },
-    provided ?? ORPHAN_TREE_CACHE,
-  )
-  return classifyPlatform(data?.platform)
+  const queryClient = provided ?? ORPHAN_TREE_CACHE
+  const store = useMemo(() => platformCacheStore(queryClient), [queryClient])
+  const platform = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot)
+  return classifyPlatform(platform)
 }

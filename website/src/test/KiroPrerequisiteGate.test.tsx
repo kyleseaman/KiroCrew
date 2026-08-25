@@ -1,4 +1,5 @@
 import { fireEvent, screen, waitFor } from '@testing-library/react'
+import { StrictMode } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { KiroPrerequisiteStatus } from '../api/client'
 import KiroPrerequisiteGate, {
@@ -6,6 +7,7 @@ import KiroPrerequisiteGate, {
   kiroPrerequisiteIsBlocking,
   kiroPrerequisiteRefetchInterval,
 } from '../components/KiroPrerequisiteGate'
+import { useGatewayPlatform } from '../hooks/useGatewayPlatform'
 import { renderWithProviders } from './helpers'
 
 vi.mock('../utils/clipboard', () => ({
@@ -123,6 +125,36 @@ describe('KiroPrerequisiteGate', () => {
     await waitFor(() => expect(
       vi.mocked(api.kiroPrerequisite).mock.calls.some(([refresh]) => refresh === 'explicit'),
     ).toBe(true))
+  })
+
+  it('keeps refresh working while dashboard children observe the cached platform', async () => {
+    function PlatformReader() {
+      return <div>Gateway platform: {useGatewayPlatform()}</div>
+    }
+    vi.mocked(api.kiroPrerequisite)
+      .mockResolvedValueOnce(status({
+        platform: 'linux',
+        installed: true,
+        authenticated: true,
+        ready: true,
+        initial_setup_complete: true,
+      }))
+      .mockResolvedValue(status({
+        platform: 'darwin',
+        installed: true,
+        authenticated: true,
+        ready: true,
+        initial_setup_complete: true,
+      }))
+
+    const rendered = renderWithProviders(
+      <KiroPrerequisiteGate><PlatformReader /></KiroPrerequisiteGate>,
+    )
+
+    expect(await screen.findByText('Gateway platform: other')).toBeInTheDocument()
+    await rendered.queryClient.invalidateQueries({ queryKey: ['kiro-prerequisite'] })
+
+    expect(await screen.findByText('Gateway platform: darwin')).toBeInTheDocument()
   })
 
   it('lifts the gate as soon as detection reports a signed-in CLI', async () => {
@@ -746,6 +778,34 @@ describe('KiroPrerequisiteGate', () => {
     expect(screen.getByText(/Probe failed/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Try again' })).toBeEnabled()
     expect(screen.queryByText('Dashboard loaded')).not.toBeInTheDocument()
+  })
+
+  it('preserves the gateway error while a cold dashboard reads the cached platform', async () => {
+    function PlatformReader() {
+      return <div>Gateway platform: {useGatewayPlatform()}</div>
+    }
+    let rejectInitialProbe: (error: ApiError) => void = () => {}
+    vi.mocked(api.kiroPrerequisite)
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => {
+        rejectInitialProbe = reject
+      }))
+      .mockRejectedValue(new ApiError(401, 'Token required'))
+
+    renderWithProviders(
+      <StrictMode>
+        <KiroPrerequisiteGate><PlatformReader /></KiroPrerequisiteGate>
+      </StrictMode>,
+      { queryDefaults: { retry: 1, retryDelay: 0 } },
+    )
+
+    expect(await screen.findByText('Gateway platform: other')).toBeInTheDocument()
+    rejectInitialProbe(new ApiError(401, 'Token required'))
+    expect(
+      await screen.findByText(
+        'Token required. Retry the gateway check before starting a session.',
+      ),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/Missing queryFn/)).not.toBeInTheDocument()
   })
 
   it('terminates an unpunctuated gateway error before the next sentence', async () => {
