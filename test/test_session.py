@@ -6,6 +6,7 @@ import asyncio
 import logging
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -480,6 +481,20 @@ class TestWarmPool:
         await mgr._expire_idle(1)
 
         assert key in mgr._sessions
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_managed_coder_runtime_uses_shorter_warm_timeout(self, cfg):
+        """An idle remote ACP SSH connection is released before Coder autostop."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("dashboard:coder")
+        mgr.release("dashboard:coder")
+        provider._session_host = SimpleNamespace(runtime_warm_seconds=300)
+        mgr._sessions["dashboard:coder"].last_used = time.monotonic() - 301
+
+        await mgr._expire_idle(9999)
+
+        assert "dashboard:coder" not in mgr._sessions
         await mgr.close_all()
 
     @pytest.mark.asyncio
@@ -1545,6 +1560,28 @@ class TestRecordSuccessFailure:
         provider, _, _ = await mgr.get_or_create("k1")
         mgr.release("k1")
         assert mgr.get_provider("k1") is provider
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_execution_location_comes_from_live_coder_host(self, cfg):
+        """Location metadata follows the registered provider, never config defaults."""
+        from kiro_crew.acp.session_host import CoderWorkspaceSessionHost
+
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("dashboard:remote")
+        mgr.release("dashboard:remote")
+        provider._session_host = CoderWorkspaceSessionHost(
+            workspace="crew-dogfood",
+            remote_cwd="/home/coder/workspace",
+            coder_bin="/usr/bin/coder",
+        )
+
+        assert mgr.execution_location("dashboard:remote") == {
+            "kind": "coder",
+            "workspace": "crew-dogfood",
+            "remote_cwd": "/home/coder/workspace",
+        }
+        assert mgr.execution_location("dashboard:missing") is None
         await mgr.close_all()
 
     def test_get_provider_missing_returns_none(self, cfg):

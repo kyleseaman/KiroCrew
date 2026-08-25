@@ -214,6 +214,23 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # isolation boundary, so applying the gateway host sandbox would bind
         # paths for the control node rather than the remote process.
         "acp/session_host.py::_run_remote_python",
+        # Settings connection test: the operator supplies Coder coordinates and
+        # the token stays in the gateway vault; all three values pass the same
+        # validators used by real remote sessions. The spawned argv is a fixed
+        # `coder ssh <validated-workspace> -- python3 -c <literal>` probe with a
+        # bounded timeout and an operator-owned local cwd. It must reach the
+        # local Coder CLI's credential/config surface, so host sandboxing would
+        # remove the authority the probe is specifically testing.
+        "acp/session_host.py::probe_coder_connection",
+        # Managed Coder lifecycle calls are gateway control-plane operations.
+        # The executable path, URL, token, template, preset, and local cwd are
+        # operator configuration; workspace names are generated and validated
+        # by Crew; every argv tail is a fixed Coder subcommand shape. The child
+        # receives a minimal allowlisted environment and a process/resource
+        # ceiling. It deliberately needs the gateway's Coder credential and
+        # network authority, so routing it through the agent sandbox would hide
+        # the exact control-plane capability this adapter exists to exercise.
+        "coder/client.py::_run",
         # The userns probe child: ONE fixed argv, `sys.executable -I -S -c <shim>`,
         # no shell, no cwd, stdin/stdout are the two handshake pipes. Nothing is
         # agent-influenced -- the shim is a module-level string constant and takes

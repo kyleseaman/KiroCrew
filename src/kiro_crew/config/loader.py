@@ -102,6 +102,14 @@ from kiro_crew.config.validation import (  # noqa: F401
     _mask_value,
 )
 from kiro_crew.config.validation import validate_config_data as _validate_config_data  # noqa: F401
+from kiro_crew.constants import (
+    CODER_DEFAULT_DELETE_AFTER_DAYS,
+    CODER_DEFAULT_MAX_RUNNING,
+    CODER_DEFAULT_REMOTE_CWD,
+    CODER_DEFAULT_RUNTIME_WARM_MINUTES,
+    CODER_DEFAULT_STOP_AFTER_MINUTES,
+    CODER_DEFAULT_WORKSPACE_PREFIX,
+)
 from kiro_crew.effort import EFFORT_LEVELS, is_valid_effort, model_supports_effort
 from kiro_crew.instances.constants import CONNECT_TIMEOUT_CEILING_SECS as _CONNECT_TIMEOUT_CEILING
 from kiro_crew.instances.constants import DEFAULT_CONNECT_TIMEOUT_SECS as _DEFAULT_CONNECT_TIMEOUT
@@ -1889,6 +1897,66 @@ class AgentConfig:
 
 
 @dataclass
+class CoderSessionConfig:
+    """Gateway-owned defaults for running interactive sessions in Coder.
+
+    ``enabled=None`` is the compatibility sentinel: an installation that has
+    not saved this Settings panel yet may still use the legacy environment
+    variables. Once the operator saves either True or False, persisted config
+    is authoritative and stale service environment cannot override it.
+    """
+
+    enabled: bool | None = field(
+        default=None,
+        metadata=_meta(
+            "Use Coder for New Sessions",
+            "Run newly started parent chat and cron sessions in the configured "
+            "Coder workspace created for that parent. Existing sessions keep their current location.",
+            nullable=True,
+        ),
+    )
+    url: str = field(
+        default="",
+        metadata=_meta("Coder URL", "Base URL of the gateway's Coder deployment."),
+    )
+    template: str = field(
+        default="",
+        metadata=_meta("Coder Template", "Template used to create each parent workspace."),
+    )
+    preset: str = field(
+        default="",
+        metadata=_meta("Coder Preset", "Optional template preset for new workspaces."),
+    )
+    remote_cwd: str = field(
+        default=CODER_DEFAULT_REMOTE_CWD,
+        metadata=_meta(
+            "Remote Working Directory",
+            "Absolute POSIX directory used as the session working directory in Coder.",
+        ),
+    )
+    runtime_warm_minutes: int = field(
+        default=CODER_DEFAULT_RUNTIME_WARM_MINUTES,
+        metadata=_meta("Runtime Warm Minutes", "Minutes to keep an idle remote ACP runtime warm."),
+    )
+    stop_after_minutes: int = field(
+        default=CODER_DEFAULT_STOP_AFTER_MINUTES,
+        metadata=_meta("Stop After Minutes", "Coder activity-aware autostop target."),
+    )
+    delete_after_days: int = field(
+        default=CODER_DEFAULT_DELETE_AFTER_DAYS,
+        metadata=_meta("Delete After Days", "Stopped workspace retention after activity."),
+    )
+    max_running: int = field(
+        default=CODER_DEFAULT_MAX_RUNNING,
+        metadata=_meta("Maximum Running Workspaces", "Managed cost guard for running workspaces."),
+    )
+    workspace_prefix: str = field(
+        default=CODER_DEFAULT_WORKSPACE_PREFIX,
+        metadata=_meta("Workspace Prefix", "Safe prefix for opaque managed workspace names."),
+    )
+
+
+@dataclass
 class SessionConfig:
     timeout_secs: int = field(
         default=DEFAULT_SESSION_TIMEOUT,
@@ -1957,6 +2025,13 @@ class SessionConfig:
             "Recycle a session when its process tree resident memory exceeds "
             "this many MiB. 0 disables (default). Busy sessions (turn in "
             "flight) are never recycled.",
+        ),
+    )
+    coder: CoderSessionConfig = field(
+        default_factory=CoderSessionConfig,
+        metadata=_meta(
+            "Coder",
+            "Gateway-owned Coder workspace defaults for newly started sessions.",
         ),
     )
 
@@ -6725,6 +6800,11 @@ class KiroCrewConfig:
         session_data = data.get("session", {})
         if not isinstance(session_data, dict):
             session_data = {}
+        coder_data = session_data.get("coder", {})
+        if not isinstance(coder_data, dict):
+            coder_data = {}
+        raw_coder_enabled = coder_data.get("enabled")
+        coder_enabled = raw_coder_enabled if isinstance(raw_coder_enabled, bool) else None
         taskrunner_data = data.get("taskrunner", {})
         if not isinstance(taskrunner_data, dict):
             taskrunner_data = {}
@@ -7045,6 +7125,60 @@ class KiroCrewConfig:
                 eager_spawn=bool(session_data.get("eager_spawn", True)),
                 archive_retention_days=_archive_retention_days(session_data),
                 watchdog_rss_max_mb=_safe_int(session_data.get("watchdog_rss_max_mb", 0), 0),
+                coder=CoderSessionConfig(
+                    enabled=coder_enabled,
+                    url=(
+                        coder_data.get("url", "")
+                        if isinstance(coder_data.get("url", ""), str)
+                        else ""
+                    ),
+                    template=(
+                        coder_data.get("template", "")
+                        if isinstance(coder_data.get("template", ""), str)
+                        else ""
+                    ),
+                    preset=(
+                        coder_data.get("preset", "")
+                        if isinstance(coder_data.get("preset", ""), str)
+                        else ""
+                    ),
+                    remote_cwd=(
+                        coder_data.get("remote_cwd", CODER_DEFAULT_REMOTE_CWD)
+                        if isinstance(coder_data.get("remote_cwd", CODER_DEFAULT_REMOTE_CWD), str)
+                        else CODER_DEFAULT_REMOTE_CWD
+                    ),
+                    runtime_warm_minutes=_safe_int(
+                        coder_data.get("runtime_warm_minutes", CODER_DEFAULT_RUNTIME_WARM_MINUTES),
+                        CODER_DEFAULT_RUNTIME_WARM_MINUTES,
+                        0,
+                        1440,
+                    ),
+                    stop_after_minutes=_safe_int(
+                        coder_data.get("stop_after_minutes", CODER_DEFAULT_STOP_AFTER_MINUTES),
+                        CODER_DEFAULT_STOP_AFTER_MINUTES,
+                        1,
+                        10080,
+                    ),
+                    delete_after_days=_safe_int(
+                        coder_data.get("delete_after_days", CODER_DEFAULT_DELETE_AFTER_DAYS),
+                        CODER_DEFAULT_DELETE_AFTER_DAYS,
+                        1,
+                        3650,
+                    ),
+                    max_running=_safe_int(
+                        coder_data.get("max_running", CODER_DEFAULT_MAX_RUNNING),
+                        CODER_DEFAULT_MAX_RUNNING,
+                        1,
+                        100,
+                    ),
+                    workspace_prefix=(
+                        coder_data.get("workspace_prefix", CODER_DEFAULT_WORKSPACE_PREFIX)
+                        if isinstance(
+                            coder_data.get("workspace_prefix", CODER_DEFAULT_WORKSPACE_PREFIX), str
+                        )
+                        else CODER_DEFAULT_WORKSPACE_PREFIX
+                    ),
+                ),
             ),
             taskrunner=TaskRunnerConfig(
                 max_parallel_steps=taskrunner_data.get(
@@ -8028,10 +8162,17 @@ class KiroCrewConfig:
         the kiro-cli backend. The factory accepts an optional ``session_key`` to
         create a per-session subdirectory under ``workspace_root()``.
         """
-        from kiro_crew.acp.session_host import session_host_from_env
+        from kiro_crew.acp.session_host import (
+            CODER_SESSION_TOKEN_SECRET,
+            ManagedCoderWorkspaceSessionHost,
+            managed_coder_manager_from_config,
+            session_host_from_config,
+            session_host_from_env,
+        )
         from kiro_crew.providers.acp import (
             AcpProvider,  # circular: acp -> client -> session -> config.loader
         )
+        from kiro_crew.secrets import SecretVault
 
         model = self.agent.model
         if model == DEFAULT_MODEL:
@@ -8046,6 +8187,36 @@ class KiroCrewConfig:
         # has never touched the effort control still starts at the user's
         # configured default instead of the provider/model default.
         default_effort = self.agent.reasoning_effort
+
+        # A persisted Coder choice is authoritative over the legacy service
+        # environment. The bearer is snapshotted into the provider factory from
+        # the agent-inaccessible vault and is used only as the local coder CLI's
+        # transport environment. An old env token remains a compatibility source
+        # until the Settings save migrates it into the vault.
+        coder_cfg = self.session.coder
+        coder_token = ""
+        coder_manager = None
+        coder_bin = ""
+        if coder_cfg.enabled is True:
+            try:
+                secret = SecretVault(config_dir()).get(CODER_SESSION_TOKEN_SECRET)
+                coder_token = secret.reveal() if secret is not None else ""
+            except Exception:
+                logger.warning("Coder session token could not be read from the vault")
+            if not coder_token:
+                coder_token = os.environ.get("CODER_SESSION_TOKEN", "")
+            coder_manager, coder_bin = managed_coder_manager_from_config(
+                url=coder_cfg.url,
+                token=coder_token,
+                template=coder_cfg.template,
+                preset=coder_cfg.preset,
+                remote_cwd=coder_cfg.remote_cwd,
+                workspace_prefix=coder_cfg.workspace_prefix,
+                stop_after_minutes=coder_cfg.stop_after_minutes,
+                delete_after_days=coder_cfg.delete_after_days,
+                max_running=coder_cfg.max_running,
+                local_cwd=config_dir(),
+            )
 
         # MCP gateway: resolve overlay + socket once, iff some server is stubbed
         # through the gateway. Routing is what puts a stub in the path, and the
@@ -8136,10 +8307,43 @@ class KiroCrewConfig:
                 _eff_per_model[m] = _eff
             if session_host_override is not None:
                 session_host = session_host_override
+            elif (session_key or "").startswith("subagent:") or agent in (
+                "kirocrew-lite",
+                "kirocrew-heartbeat",
+            ):
+                # Dedicated subagents receive the live parent's host through
+                # session_host_override. Without one their parent is local, so
+                # applying the global default here would split the family
+                # across hosts. Gateway maintenance/background agents are
+                # intentionally local regardless of the session default.
+                session_host = None
             else:
-                session_host = (
-                    session_host_from_env(wdir) if not agent or agent == "kirocrew" else None
-                )
+                # Parent sessions include named-agent chat and cron runs. The
+                # configured location is a session default, not an agent-name
+                # default, so selecting a custom agent must not move it local.
+                if coder_cfg.enabled is None:
+                    session_host = session_host_from_env(wdir)
+                elif coder_cfg.enabled is True:
+                    if coder_manager is None:  # pragma: no cover - built with enabled config
+                        raise RuntimeError("managed Coder workspace manager is unavailable")
+                    session_host = ManagedCoderWorkspaceSessionHost(
+                        session_key=session_key or "main",
+                        manager=coder_manager,
+                        remote_cwd=coder_cfg.remote_cwd,
+                        coder_bin=coder_bin,
+                        coder_url=coder_cfg.url,
+                        session_token=coder_token,
+                        runtime_warm_minutes=coder_cfg.runtime_warm_minutes,
+                    )
+                else:
+                    session_host = session_host_from_config(
+                        wdir,
+                        enabled=coder_cfg.enabled,
+                        url=coder_cfg.url,
+                        workspace="",
+                        remote_cwd=coder_cfg.remote_cwd,
+                        session_token=coder_token,
+                    )
             return AcpProvider(
                 work_dir=wdir,
                 model=m,
@@ -8160,6 +8364,7 @@ class KiroCrewConfig:
                 session_host=session_host,
             )
 
+        setattr(_acp, "_coder_manager", coder_manager)
         return _acp
 
 

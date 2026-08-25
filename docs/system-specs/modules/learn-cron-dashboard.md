@@ -65,6 +65,15 @@ session-scoped stdio proxy as other managed MCP servers, so mutations still run
 against the gateway `CronService` with strict caller ownership. Scheduler
 housekeeping and unrelated background work are not moved into the workspace.
 
+The gateway also owns the managed-Coder lifecycle reconciler. It obtains the
+currently configured workspace manager from `SessionManager` on every pass and
+runs at the shorter of one hour or one third of the configured autostop window.
+An active Kiro Crew systemd user scope renews the Coder shutdown deadline;
+retention evaluates only stopped workspaces present in Kiro Crew's owner-only
+binding registry. Configuration refreshes therefore affect the next pass
+without restarting the gateway, while disabled Coder placement leaves no
+reconciler target.
+
 Gateway-owned remote MCP OAuth reuses the dashboard's existing `mcp_oauth`
 banner. The broker resolves a direct dashboard, linked channel, cron, or
 subagent-parent session to an already-visible slot; it never creates a tab. The

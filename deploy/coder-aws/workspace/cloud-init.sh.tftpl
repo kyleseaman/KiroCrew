@@ -22,7 +22,14 @@ tailscale up \
 unset TAILSCALE_KEY
 
 id coder >/dev/null 2>&1 || useradd --create-home --shell /bin/bash coder
-install -d -o coder -g coder /home/coder/workspace
+install -d -m 0700 -o coder -g coder /home/coder/workspace
+coder_uid="$(id -u coder)"
+loginctl enable-linger coder
+systemctl start "user@$${coder_uid}.service"
+runuser -u coder -- env \
+  XDG_RUNTIME_DIR="/run/user/$${coder_uid}" \
+  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$${coder_uid}/bus" \
+  systemd-run --user --scope --quiet --wait /usr/bin/true
 
 # Amazon Linux 2023 does not meet the aarch64 GNU artifact's glibc floor, so
 # select the static musl package from Kiro's signed release manifest.

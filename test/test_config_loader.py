@@ -3694,7 +3694,7 @@ class TestOrchestratorWatchdogThemeAreParsed:
 
         assert [c["crew_agent"] for c in captured] == ["pr-reviewer", "pr-reviewer", "", ""]
 
-    def test_factory_limits_coder_host_to_main_interactive_agent(
+    def test_factory_uses_coder_for_parent_chat_and_cron_but_not_background(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import kiro_crew.acp.session_host as host_mod
@@ -3715,10 +3715,127 @@ class TestOrchestratorWatchdogThemeAreParsed:
         factory = cfg.create_provider_factory()
 
         factory("main", agent="kirocrew")
+        factory("cron:daily", agent="kirocrew")
+        factory("dashboard:named", agent="reviewer")
+        factory("cron:daily:reviewer", agent="reviewer")
+        factory("subagent:local-parent-child", agent="reviewer")
         factory("background", agent="kirocrew-lite")
 
         assert isinstance(captured[0]["session_host"], host_mod.CoderWorkspaceSessionHost)
-        assert captured[1]["session_host"] is None
+        assert isinstance(captured[1]["session_host"], host_mod.CoderWorkspaceSessionHost)
+        assert isinstance(captured[2]["session_host"], host_mod.CoderWorkspaceSessionHost)
+        assert isinstance(captured[3]["session_host"], host_mod.CoderWorkspaceSessionHost)
+        assert captured[4]["session_host"] is None
+        assert captured[5]["session_host"] is None
+
+    def test_factory_prefers_persisted_coder_settings_over_legacy_environment(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A saved Settings choice must be authoritative over stale service env.
+
+        This catches the production mutation where the provider factory keeps
+        calling the legacy env-only host resolver: turning Coder off in Settings
+        would still launch remotely whenever an old systemd environment remains.
+        """
+        import kiro_crew.acp.session_host as host_mod
+        import kiro_crew.config.loader as loader_mod
+        import kiro_crew.providers.acp as acp_mod
+
+        captured: list[dict] = []
+
+        class _FakeProvider:
+            def __init__(self, **kwargs: object) -> None:
+                captured.append(kwargs)
+
+        monkeypatch.setattr(acp_mod, "AcpProvider", _FakeProvider)
+        monkeypatch.setattr(loader_mod, "config_dir", lambda: tmp_path)
+        monkeypatch.setenv("KIROCREW_CODER_WORKSPACE", "legacy-workspace")
+        monkeypatch.setenv("CODER_URL", "https://legacy-coder.example")
+        monkeypatch.setenv("CODER_SESSION_TOKEN", "legacy-token")
+        cfg = _load_from_dict({"session": {"coder": {"enabled": False}}})
+
+        cfg.create_provider_factory()("main", agent="kirocrew")
+
+        assert isinstance(captured[0]["session_host"], host_mod.LocalSessionHost)
+
+    def test_factory_uses_vault_token_for_persisted_coder_settings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The remote transport gets its token from the gateway vault, not config.
+
+        This catches either ignoring ``session.coder`` entirely or serializing the
+        token into normal config/environment state that the workspace can inspect.
+        """
+        import kiro_crew.acp.session_host as host_mod
+        import kiro_crew.config.loader as loader_mod
+        import kiro_crew.providers.acp as acp_mod
+        from kiro_crew.secrets import SecretVault
+
+        captured: list[dict] = []
+
+        class _FakeProvider:
+            def __init__(self, **kwargs: object) -> None:
+                captured.append(kwargs)
+
+        monkeypatch.setattr(acp_mod, "AcpProvider", _FakeProvider)
+        monkeypatch.setattr(loader_mod, "config_dir", lambda: tmp_path)
+        monkeypatch.setattr(host_mod.shutil, "which", lambda command, path=None: "/opt/coder")
+        SecretVault(tmp_path)._set_sync(host_mod.CODER_SESSION_TOKEN_SECRET, "vault-token")
+        cfg = _load_from_dict(
+            {
+                "session": {
+                    "coder": {
+                        "enabled": True,
+                        "url": "https://coder.example",
+                        "template": "kirocrew-arm",
+                        "preset": "arm-small",
+                        "remote_cwd": "/home/coder/project",
+                    }
+                }
+            }
+        )
+
+        cfg.create_provider_factory()("main", agent="kirocrew")
+
+        host = captured[0]["session_host"]
+        assert isinstance(host, host_mod.ManagedCoderWorkspaceSessionHost)
+        assert host.execution_location == {
+            "kind": "coder",
+            "workspace": "",
+            "remote_cwd": "/home/coder/project",
+            "state": "allocating",
+        }
+        assert host.transport_env({"PATH": "/usr/bin"}) == {
+            "CODER_URL": "https://coder.example",
+            "CODER_SESSION_TOKEN": "vault-token",
+            "PATH": "/usr/bin",
+        }
+
+    def test_factory_fails_closed_when_enabled_coder_has_no_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A half-configured remote default must never fall back to local ACP."""
+        import kiro_crew.acp.session_host as host_mod
+        import kiro_crew.config.loader as loader_mod
+
+        monkeypatch.setattr(loader_mod, "config_dir", lambda: tmp_path)
+        monkeypatch.setattr(host_mod.shutil, "which", lambda command, path=None: "/opt/coder")
+        monkeypatch.delenv("CODER_SESSION_TOKEN", raising=False)
+        cfg = _load_from_dict(
+            {
+                "session": {
+                    "coder": {
+                        "enabled": True,
+                        "url": "https://coder.example",
+                        "template": "kirocrew-arm",
+                        "remote_cwd": "/home/coder/project",
+                    }
+                }
+            }
+        )
+
+        with pytest.raises(host_mod.SessionHostError, match="session token"):
+            cfg.create_provider_factory()("main", agent="kirocrew")
 
     def test_factory_prefers_explicit_inherited_session_host(
         self, monkeypatch: pytest.MonkeyPatch

@@ -41,8 +41,8 @@ Four parts, in the order you will need them:
 
 The repository includes a deliberately small, single-user POC under
 `deploy/coder-aws/`. It keeps the Kiro Crew gateway and Coder control plane on
-one always-on `t4g.medium`, while the CPU-heavier `kiro-cli` ACP process runs in
-a Coder workspace that can stop when idle. The default workspace is a
+one always-on `t4g.medium`, while CPU-heavier `kiro-cli` ACP processes run in
+per-parent-session Coder workspaces that can stop when idle. The default workspace is a
 `c8g.large` (2 vCPU / 4 GiB); `c8g.xlarge` (4 / 8 GiB) and `m8g.large` (2 / 8
 GiB) are selectable when measurements show CPU or memory pressure.
 
@@ -54,13 +54,16 @@ public IPv4 address is therefore an egress route, not an exposed service.
 
 This is a cost experiment, not a production or multi-user topology. Coder uses
 its built-in PostgreSQL database on the control node. The stopped workspace's
-root disk and the control node remain billable. In this POC only the main
-interactive Kiro Crew agent runs remotely; background agents, cron work, and
-subagents remain on the control node. The remote agent projection is MCP-free:
-hooks and `@server` tools are omitted, while ordinary tool names and the
-resolved text prompt are copied into the workspace. The workspace receives no
-Kiro Crew state, operator AWS credentials, or SSH credentials. It has only its
-narrow EC2 instance role, its Kiro API key, and the Coder agent token.
+root disk and the control node remain billable. New parent chat and cron
+sessions each receive a dedicated workspace from the configured template;
+subagents inherit the live parent and run beside it. Gateway maintenance and
+lightweight background work remain
+on the control node. MCP tools, including memory updates and recall, are relayed
+back to the gateway over per-session loopback capabilities. Streamable HTTP,
+legacy SSE, OAuth discovery, tokens, refresh, and callbacks also remain
+gateway-owned. The workspace receives no Kiro Crew state, Coder bearer,
+operator AWS credentials, or SSH credentials. It has only its narrow EC2
+instance role and the Kiro credential required by its local CLI.
 
 #### 1. Create the two SSM secrets
 
@@ -164,25 +167,7 @@ EOF
 
 The control node permits an owner to create an automation token with a one-year
 lifetime. Create it with `coder tokens create --name crew-control --lifetime
-1y`. Then append it to the gateway's owner-only `.env` file that the bootstrap
-seeded with `KIRO_API_KEY`; do not replace that file or put the token in
-`/etc/kirocrew/kirocrew.env`, which is readable by other local users. The
-following one-time setup keeps the token out of shell history:
-
-```bash
-read -rsp "Coder automation token: " CREW_CODER_TOKEN && printf '\n'
-{
-  printf '%s\n' \
-    'KIROCREW_CODER_WORKSPACE=crew-dogfood' \
-    'KIROCREW_CODER_REMOTE_CWD=/home/coder/workspace' \
-    'CODER_URL=http://127.0.0.1:3000'
-  printf 'CODER_SESSION_TOKEN=%s\n' "$CREW_CODER_TOKEN"
-} | ssh ec2-user@kirocrew-coder \
-  'sudo -u coder install -d -m 700 /home/coder/.kiro/crew &&
-   sudo -u coder tee -a /home/coder/.kiro/crew/.env >/dev/null &&
-   sudo chmod 600 /home/coder/.kiro/crew/.env'
-unset CREW_CODER_TOKEN
-```
+1y`. Do not add it to a systemd environment file or copy it into the workspace.
 
 Set the external dashboard URL and install the gateway service as the `coder`
 user:
@@ -197,10 +182,34 @@ ssh -t ec2-user@kirocrew-coder \
    /home/coder/kirocrew-venv/bin/kirocrew service install'
 ```
 
-Open the Crew URL from the Terraform output and use it normally. A missing or
-expired Coder token fails the remote session closed; rotate it according to the
-token lifetime configured on your Coder server and restart the gateway after
-updating `.env`.
+Open the Crew URL from the Terraform output, then open **Settings → Coder**.
+Enter the internal Coder URL (`http://127.0.0.1:3000` for this combined control
+node), template (`kirocrew-arm`), optional preset (blank for the template
+defaults), remote directory (`/home/coder/workspace`), and automation token.
+The POC defaults keep a remote runtime warm for 5 minutes, request Coder
+autostop after 30 minutes, retain an inactive stopped workspace for 30 days,
+allow three running parent workspaces, and use the opaque `crew` name prefix.
+Use **Test connection**, then save and enable the default. The probe authenticates
+and checks template visibility but does not create or start a workspace. The
+bearer is written only to the gateway's
+encrypted vault; later GETs return presence, not value. Active sessions keep
+their current location, so reset or restart an existing chat to adopt the new
+default. The chat header shows `Coder workspace · <opaque-name>` only after the
+live provider has actually connected remotely.
+
+Each durable parent chat or cron session receives its own generated workspace;
+its subagents share that workspace. The bootstrap `crew-dogfood` workspace is a
+manual verification target and stays unmanaged: Kiro Crew will not stop or
+delete it. Managed workspaces remain visible in Coder while stopped, so many
+retained rows do not imply many billable EC2 instances. A later turn starts the
+same binding and resumes its native Kiro conversation. Only stopped,
+registry-owned workspaces can age into the 30-day retention deletion path.
+
+A missing or expired token fails new remote sessions closed. Rotate it in
+Settings according to the lifetime configured on your Coder server. The legacy
+`KIROCREW_CODER_*`, `CODER_URL`, and `CODER_SESSION_TOKEN` environment variables
+remain a migration fallback for installs that have never saved the panel; once
+the panel is saved, its enabled/disabled value is authoritative.
 
 #### 5. Measure, resize, and tear down
 

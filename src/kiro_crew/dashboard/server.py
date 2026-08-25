@@ -37,6 +37,8 @@ from kiro_crew.config.loader import (
     refresh_config_meta_stamp,
     refresh_materialized_agents,
 )
+from kiro_crew.coder.manager import CoderWorkspaceManager
+from kiro_crew.constants import CODER_RECONCILE_INTERVAL_SECONDS
 from kiro_crew.dashboard import (
     cautious_boot,
     channel_slots,
@@ -101,6 +103,7 @@ from kiro_crew.dashboard.handlers.artifacts import (
     api_remote_artifacts_clone,
     api_remote_artifacts_fork,
 )
+from kiro_crew.dashboard.handlers.coder import setup_coder_routes
 from kiro_crew.dashboard.handlers.feedback import setup_feedback_routes
 from kiro_crew.dashboard.handlers.knowledge import setup_knowledge_routes
 from kiro_crew.dashboard.handlers.link_meta import setup_link_meta_routes
@@ -2062,6 +2065,44 @@ def _register_browser_view_cleanup(app: web.Application) -> None:
     app.on_cleanup.append(_browser_view_shutdown)
 
 
+def _register_coder_lifecycle(app: web.Application, state: DashboardState) -> None:
+    """Reconcile only integrity-bound managed workspaces while the gateway runs."""
+
+    async def _loop() -> None:
+        while True:
+            manager_getter = getattr(state.sessions, "coder_workspace_manager", None)
+            manager = manager_getter() if callable(manager_getter) else None
+            interval = CODER_RECONCILE_INTERVAL_SECONDS
+            # Test doubles and optional integrations can synthesize arbitrary
+            # attributes via ``__getattr__``.  Only the concrete gateway-owned
+            # manager is authorized to drive workspace lifecycle mutations.
+            if isinstance(manager, CoderWorkspaceManager):
+                try:
+                    await manager.reconcile_active_scopes()
+                    await manager.reconcile_retention()
+                except Exception:  # noqa: BLE001 - lifecycle outage must not stop gateway
+                    logger.warning("Managed Coder lifecycle reconciliation failed", exc_info=True)
+                interval = min(interval, manager.scope_reconcile_interval_seconds)
+            await asyncio.sleep(interval)
+
+    async def _startup(_app: web.Application) -> None:
+        state._coder_lifecycle_task = asyncio.create_task(_loop())
+
+    async def _shutdown(_app: web.Application) -> None:
+        task = state._coder_lifecycle_task
+        if task is None:
+            return
+        state._coder_lifecycle_task = None
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    app.on_startup.append(_startup)
+    app.on_cleanup.append(_shutdown)
+
+
 def _register_instances_hooks(app: web.Application, state: DashboardState, port: int) -> None:
     """Register the opt-in Instances (multi-instance) startup/cleanup hooks.
 
@@ -2776,6 +2817,7 @@ async def start_dashboard(
         client_max_size=60 * 1024 * 1024
     )  # 60 MB: covers 50 MB upload + multipart overhead
     app["state"] = state
+    _register_coder_lifecycle(app, state)
     # Bind the serving loop once, here: this runs ON that loop, so every
     # surface that later hands work in from a foreign thread -- slots
     # coalescing, an off-loop websocket send, the log handler's fan-out --
@@ -2948,6 +2990,7 @@ async def start_dashboard(
     setup_knowledge_routes(app)
     setup_weixin_routes(app)
     setup_feedback_routes(app)
+    setup_coder_routes(app)
     setup_secrets_routes(app)
     setup_whatsapp_routes(app)
 
@@ -3778,6 +3821,7 @@ async def start_api_server(
         client_max_size=60 * 1024 * 1024
     )  # 60 MB: covers 50 MB upload + multipart overhead
     app["state"] = state
+    _register_coder_lifecycle(app, state)
     # Bind the serving loop once, here: this runs ON that loop, so every
     # surface that later hands work in from a foreign thread -- slots
     # coalescing, an off-loop websocket send, the log handler's fan-out --

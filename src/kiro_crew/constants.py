@@ -23,6 +23,17 @@ KIROCREW_SPAWNED_VALUE = "1"
 # security toggle (e.g. KIROCREW_NO_JAIL) is a silent-bypass footgun.
 ENV_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
+# Default project directory inside a Coder workspace. This is shared by the
+# persisted Settings schema, its API, and the legacy environment adapter so a
+# fresh configuration cannot present one path and launch sessions in another.
+CODER_DEFAULT_REMOTE_CWD = "/home/coder/workspace"
+CODER_DEFAULT_RUNTIME_WARM_MINUTES = 5
+CODER_DEFAULT_STOP_AFTER_MINUTES = 30
+CODER_DEFAULT_DELETE_AFTER_DAYS = 30
+CODER_DEFAULT_MAX_RUNNING = 3
+CODER_DEFAULT_WORKSPACE_PREFIX = "crew"
+CODER_RECONCILE_INTERVAL_SECONDS = 60 * 60
+
 
 # Minimum supported Node.js MAJOR version for every Python-side check
 # (``kirocrew doctor``, the frontend-build probe in ``cli.py``, the TUI

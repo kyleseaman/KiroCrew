@@ -112,15 +112,39 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
 #### Session execution host (Coder)
 
 `acp/session_host.py` makes the process location an explicit runtime boundary.
-`LocalSessionHost` preserves the existing local spawn path. Setting
-`KIROCREW_CODER_WORKSPACE` opts the main interactive `kirocrew` agent into
-`CoderWorkspaceSessionHost`. Unrelated background and maintenance factories
-remain local. Descendant subagents inherit the live parent's host explicitly:
+`LocalSessionHost` preserves the existing local spawn path. An explicit
+`session.coder.enabled=true` opts newly constructed parent providers into a
+`ManagedCoderWorkspaceSessionHost`; URL, template, optional preset, remote cwd,
+warm/autostop/retention limits, capacity, and an opaque name prefix live in
+`config.json`, while the session token lives only in the gateway secret vault.
+An explicit false is authoritative even when a stale service environment still
+contains the legacy variables. Installations that have never saved this setting
+may still use `KIROCREW_CODER_WORKSPACE`, `CODER_URL`,
+`CODER_SESSION_TOKEN`, and `KIROCREW_CODER_REMOTE_CWD` as a migration fallback.
+This applies equally to default and named-agent chat/cron parents; selecting a
+named agent does not move the session back to the gateway. Background and
+maintenance factories remain local. Descendant
+subagents inherit the live parent's host explicitly:
 shared children open another session on the remote runtime, while children with
 an explicit agent, model, effort, tool set, or bare mode clone the host into a
-dedicated runtime in the same workspace. The opt-in also requires `CODER_URL` and
-`CODER_SESSION_TOKEN`. `KIROCREW_CODER_BIN` selects the local transport binary
-and `KIROCREW_CODER_REMOTE_CWD` defaults to `/home/coder/workspace`.
+dedicated runtime in the same workspace. `KIROCREW_CODER_BIN` selects the local
+transport binary and the remote cwd defaults to `/home/coder/workspace`.
+
+Settings GET returns only token presence. PUT splits the bearer into vault
+storage and coordinates into config, refreshes the factory/warm pool for new
+sessions, and leaves active providers untouched. The chat slot serializer asks
+the live provider for `execution_location`, so a local session is never labeled
+remote merely because the default changed. The owner-only test endpoint probes
+candidate coordinates and bearer without saving or returning them.
+
+The managed host binds each durable parent session key to one generated Coder
+workspace in an owner-only registry. It creates the workspace from the selected
+template/preset on first use, starts a stopped binding on resume, and refuses a
+new parent when the configured running-workspace cap is reached. Descendant
+subagents inherit the concrete parent host and stay in that same workspace.
+The static environment path remains a migration fallback only; a manually
+created bootstrap workspace such as `crew-dogfood` is never enrolled in managed
+retention unless it is present in the binding registry.
 
 The runtime invokes `coder ssh <workspace> --remote-forward
 <workspace-port>:127.0.0.1:<gateway-loopback-port> -- kiro-cli acp --agent
@@ -159,6 +183,20 @@ fails before spawn. The SSH client itself is not wrapped in Kiro Crew's local
 agent sandbox or cgroup because the Coder workspace is the execution boundary.
 Preparation errors expose only the operation and exit code, not remote stderr,
 which may contain credential-bearing diagnostics.
+
+Managed ACP transports have their own short warm timeout. Once the session is
+idle and its semaphore is unlocked, the gateway closes the SSH/ACP runtime but
+keeps both the Kiro session map and Coder disk. Coder's own autostop then removes
+compute. Managed runtimes and their ordinary descendants run in a named
+transient systemd user scope. While that exact scope remains active, the
+reconciler renews Coder's shutdown deadline at no more than one third of the
+configured autostop window; it never treats generic CPU or the permanent Coder
+agent as activity. The same bounded loop considers only stopped,
+registry-owned bindings for retention. After the configured inactivity period
+it records a durable delete intent, re-fetches and re-validates exact identity,
+deletes the workspace, and records the tombstone. Active or starting
+workspaces, unbound workspaces, and a parent with an in-flight foreground turn
+are never retention targets.
 
 ### Config (`config/loader.py`)
 

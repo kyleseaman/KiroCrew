@@ -20,6 +20,8 @@ const IRREGULAR_TAB_LABEL_KEYS: Record<string, string> = {
   'computer-use': 'settings.tabs.computerUse.label',
   // Owned by the privacy disclosure copy, not the settings tab block.
   privacy: 'privacyDisclosure.settingsLabel',
+  // Coder owns one top-level catalog shared by its tab and panel.
+  coder: 'coder.tab_label',
 }
 
 /** Catalog key holding a tab's display name. */

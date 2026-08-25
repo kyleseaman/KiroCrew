@@ -80,6 +80,12 @@ def test_workspace_bootstrap_verifies_kiro_and_reads_secrets_from_ssm() -> None:
     assert "chown coder:coder /etc/kiro-api-key.b64" in bootstrap
 
 
+def test_workspace_bootstrap_makes_working_directory_traversable() -> None:
+    bootstrap = _read("workspace/cloud-init.sh.tftpl")
+
+    assert "install -d -m 0700 -o coder -g coder /home/coder/workspace" in bootstrap
+
+
 def test_control_bootstrap_pins_coder_and_serves_only_over_tailscale() -> None:
     bootstrap = _read("control-plane/cloud-init.sh.tftpl")
 

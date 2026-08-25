@@ -15,6 +15,10 @@ from urllib.parse import urlsplit
 
 from kiro_crew import platform_compat
 from kiro_crew.acp import remote_mcp_relay
+from kiro_crew.coder.client import CoderClient
+from kiro_crew.coder.manager import CoderWorkspaceManager, ManagedWorkspacePolicy
+from kiro_crew.coder.registry import WorkspaceBindingRegistry
+from kiro_crew.constants import CODER_DEFAULT_REMOTE_CWD
 from kiro_crew.env import mcp_search_path, sanitize_spec_env, spec_path_key
 from kiro_crew.mcp_gateway.remote_proxy import (
     RemoteHttpMcpTarget,
@@ -38,8 +42,10 @@ _TRANSPORT_ENV_KEYS = (
     "NO_PROXY",
     "ALL_PROXY",
 )
+CODER_SESSION_TOKEN_SECRET = "coder.session_token.v1"
 _REMOTE_AGENT_TEXT_KEYS = ("name", "description", "model", "prompt")
-_DEFAULT_REMOTE_CWD = "/home/coder/workspace"
+_CODER_URL_MAX_BYTES = 4 * 1024
+_CODER_CONNECTION_TIMEOUT_SECS = 30.0
 _REMOTE_RUNTIME_MARKER = "__KIROCREW_REMOTE_RUNTIME__"
 _REMOTE_FORWARD_PORT_MIN = 30000
 _REMOTE_FORWARD_PORT_SPAN = 20000
@@ -143,15 +149,35 @@ class LocalSessionHost:
 class CoderWorkspaceSessionHost:
     """A kiro-cli process reached through a Coder workspace SSH channel."""
 
-    def __init__(self, *, workspace: str, remote_cwd: str, coder_bin: str) -> None:
+    def __init__(
+        self,
+        *,
+        workspace: str,
+        remote_cwd: str,
+        coder_bin: str,
+        coder_url: str = "",
+        session_token: str = "",
+        workload_scope_prefix: str = "",
+    ) -> None:
         if not _WORKSPACE_RE.fullmatch(workspace):
             raise ValueError("workspace must be one safe Coder name")
         path = PurePosixPath(remote_cwd)
         if not path.is_absolute() or ".." in path.parts:
             raise ValueError("remote_cwd must be an absolute normalized POSIX path")
         self._workspace = workspace
+        if workload_scope_prefix and not _WORKSPACE_RE.fullmatch(workload_scope_prefix):
+            raise ValueError("workload_scope_prefix must be one safe Coder name")
+        self._workload_scope_prefix = workload_scope_prefix
         self._remote_cwd = str(path)
         self._coder_bin = coder_bin
+        self._transport_credentials = {
+            key: value
+            for key, value in (
+                ("CODER_URL", coder_url),
+                ("CODER_SESSION_TOKEN", session_token),
+            )
+            if value
+        }
         self._runtime_id = secrets.token_urlsafe(18)
         candidates: list[int] = []
         while len(candidates) < _REMOTE_FORWARD_PORT_ATTEMPTS:
@@ -173,6 +199,15 @@ class CoderWorkspaceSessionHost:
         return self._remote_cwd
 
     @property
+    def execution_location(self) -> dict[str, str]:
+        """Return the non-secret location descriptor safe for dashboard clients."""
+        return {
+            "kind": "coder",
+            "workspace": self._workspace,
+            "remote_cwd": self._remote_cwd,
+        }
+
+    @property
     def remote_port(self) -> int:
         return self._remote_port
 
@@ -189,28 +224,46 @@ class CoderWorkspaceSessionHost:
             workspace=self._workspace,
             remote_cwd=self._remote_cwd,
             coder_bin=self._coder_bin,
+            coder_url=self._transport_credentials.get("CODER_URL", ""),
+            session_token=self._transport_credentials.get("CODER_SESSION_TOKEN", ""),
+            workload_scope_prefix=self._workload_scope_prefix,
         )
 
     def spawn_argv(self, *, agent: str, model: str) -> list[str]:
         forward = f"{self._remote_port}:127.0.0.1:{self._proxy.local_port}"
-        argv = [
-            self._coder_bin,
-            "ssh",
-            self._workspace,
-            "--remote-forward",
-            forward,
-            "--",
+        remote_argv = [
             "kiro-cli",
             "acp",
             "--agent",
             agent,
         ]
         if model:
-            argv.extend(("--model", model))
-        return argv
+            remote_argv.extend(("--model", model))
+        if self._workload_scope_prefix:
+            unit = f"kirocrew-{self._workload_scope_prefix}-{self._runtime_id}"
+            remote_argv = [
+                "systemd-run",
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                f"--unit={unit}",
+                *remote_argv,
+            ]
+        return [
+            self._coder_bin,
+            "ssh",
+            self._workspace,
+            "--remote-forward",
+            forward,
+            "--",
+            *remote_argv,
+        ]
 
     def transport_env(self, environ: Mapping[str, str]) -> dict[str, str]:
-        return {key: environ[key] for key in _TRANSPORT_ENV_KEYS if environ.get(key)}
+        transport = {key: environ[key] for key in _TRANSPORT_ENV_KEYS if environ.get(key)}
+        transport.update(self._transport_credentials)
+        return transport
 
     def prepare_argv(self, *, agent: str) -> list[str]:
         if not _WORKSPACE_RE.fullmatch(agent):
@@ -441,6 +494,76 @@ class CoderWorkspaceSessionHost:
             )
         except Exception:
             pass
+
+
+class ManagedCoderWorkspaceSessionHost(CoderWorkspaceSessionHost):
+    """Lazy parent host whose verified workspace is supplied by the gateway manager."""
+
+    def __init__(
+        self,
+        *,
+        session_key: str,
+        manager: CoderWorkspaceManager,
+        remote_cwd: str,
+        coder_bin: str,
+        coder_url: str,
+        session_token: str,
+        runtime_warm_minutes: int = 5,
+    ) -> None:
+        super().__init__(
+            workspace="crew-pending",
+            remote_cwd=remote_cwd,
+            coder_bin=coder_bin,
+            coder_url=coder_url,
+            session_token=session_token,
+        )
+        self._parent_session_key = session_key
+        self._manager = manager
+        self._managed_ready = False
+        self.runtime_warm_seconds = max(0, runtime_warm_minutes) * 60
+
+    @property
+    def execution_location(self) -> dict[str, str]:
+        if not self._managed_ready:
+            return {
+                "kind": "coder",
+                "workspace": "",
+                "remote_cwd": self._remote_cwd,
+                "state": "allocating",
+            }
+        location = super().execution_location
+        location["state"] = "running"
+        return location
+
+    async def prepare(
+        self,
+        *,
+        agent: str,
+        projected_spec: Mapping[str, object],
+        environ: Mapping[str, str],
+        local_cwd: str | Path,
+    ) -> None:
+        workspace = await self._manager.ensure_ready(self._parent_session_key)
+        if not _WORKSPACE_RE.fullmatch(workspace.name):
+            raise SessionHostError("Managed Coder workspace returned an invalid name")
+        self._workspace = workspace.name
+        self._workload_scope_prefix = workspace.name
+        self._managed_ready = True
+        try:
+            await super().prepare(
+                agent=agent,
+                projected_spec=projected_spec,
+                environ=environ,
+                local_cwd=local_cwd,
+            )
+        except BaseException:
+            self._managed_ready = False
+            raise
+
+    def clone(self) -> CoderWorkspaceSessionHost:
+        if not self._managed_ready:
+            raise SessionHostError("Managed Coder parent workspace is not ready")
+        return super().clone()
 
 
 def _remote_mcp_policy_fields(spec: Mapping[str, object]) -> dict[str, object]:
@@ -776,6 +899,173 @@ def resolve_remote_mcp_targets(
     return targets
 
 
+def validate_coder_url(value: str) -> str:
+    """Return a normalized Coder base URL or raise a bounded validation error."""
+    url = value.strip().rstrip("/")
+    if not url or len(url.encode("utf-8")) > _CODER_URL_MAX_BYTES:
+        raise ValueError("Coder URL is required")
+    try:
+        parsed = urlsplit(url)
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("Coder URL is invalid") from exc
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("Coder URL must be an HTTP(S) base URL without credentials")
+    return url
+
+
+def validate_coder_workspace(value: str) -> str:
+    workspace = value.strip()
+    if not _WORKSPACE_RE.fullmatch(workspace):
+        raise ValueError("workspace must be one safe Coder name")
+    return workspace
+
+
+def validate_coder_remote_cwd(value: str) -> str:
+    raw = value.strip()
+    path = PurePosixPath(raw)
+    if not raw or not path.is_absolute() or ".." in path.parts:
+        raise ValueError("remote_cwd must be an absolute normalized POSIX path")
+    return str(path)
+
+
+def session_host_from_config(
+    work_dir: str | Path,
+    *,
+    enabled: bool,
+    url: str,
+    workspace: str,
+    remote_cwd: str,
+    session_token: str,
+    environ: Mapping[str, str] | None = None,
+) -> LocalSessionHost | CoderWorkspaceSessionHost:
+    """Build the persisted Coder host, failing closed when enabled is incomplete."""
+    if not enabled:
+        return LocalSessionHost(work_dir)
+    if not session_token:
+        raise SessionHostError("Coder session hosting requires a session token")
+    try:
+        coder_url = validate_coder_url(url)
+        coder_workspace = validate_coder_workspace(workspace)
+        coder_remote_cwd = validate_coder_remote_cwd(remote_cwd)
+    except ValueError as exc:
+        raise SessionHostError(str(exc)) from exc
+
+    env = os.environ if environ is None else environ
+    requested_bin = env.get("KIROCREW_CODER_BIN", "coder")
+    coder_bin = shutil.which(requested_bin, path=env.get("PATH"))
+    if not coder_bin:
+        raise SessionHostError(f"Coder CLI is not executable: {requested_bin}")
+    return CoderWorkspaceSessionHost(
+        workspace=coder_workspace,
+        remote_cwd=coder_remote_cwd,
+        coder_bin=coder_bin,
+        coder_url=coder_url,
+        session_token=session_token,
+    )
+
+
+def managed_coder_manager_from_config(
+    *,
+    url: str,
+    token: str,
+    template: str,
+    preset: str,
+    remote_cwd: str,
+    workspace_prefix: str,
+    stop_after_minutes: int,
+    delete_after_days: int,
+    max_running: int,
+    local_cwd: Path,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[CoderWorkspaceManager, str]:
+    """Build one gateway manager shared by every parent from a provider factory."""
+    if not token:
+        raise SessionHostError("Coder session hosting requires a session token")
+    try:
+        coder_url = validate_coder_url(url)
+        coder_template = validate_coder_workspace(template)
+        coder_preset = validate_coder_workspace(preset) if preset else ""
+        validate_coder_remote_cwd(remote_cwd)
+        coder_prefix = validate_coder_workspace(workspace_prefix)
+    except ValueError as exc:
+        raise SessionHostError(str(exc)) from exc
+    env = os.environ if environ is None else environ
+    requested_bin = env.get("KIROCREW_CODER_BIN", "coder")
+    coder_bin = shutil.which(requested_bin, path=env.get("PATH"))
+    if not coder_bin:
+        raise SessionHostError(f"Coder CLI is not executable: {requested_bin}")
+    manager = CoderWorkspaceManager(
+        registry=WorkspaceBindingRegistry(local_cwd / "coder_workspaces.json"),
+        client=CoderClient(coder_bin, coder_url, token, local_cwd),
+        policy=ManagedWorkspacePolicy(
+            template=coder_template,
+            preset=coder_preset,
+            prefix=coder_prefix,
+            stop_after_minutes=stop_after_minutes,
+            delete_after_days=delete_after_days,
+            max_running=max_running,
+        ),
+    )
+    return manager, coder_bin
+
+
+async def probe_coder_connection(
+    *,
+    url: str,
+    token: str,
+    workspace: str,
+    remote_cwd: str,
+    local_cwd: str | Path,
+    environ: Mapping[str, str] | None = None,
+) -> None:
+    """Verify that the gateway can execute a bounded command in the workspace."""
+    env = os.environ if environ is None else environ
+    host = session_host_from_config(
+        local_cwd,
+        enabled=True,
+        url=url,
+        workspace=workspace,
+        remote_cwd=remote_cwd,
+        session_token=token,
+        environ=env,
+    )
+    if not isinstance(host, CoderWorkspaceSessionHost):  # pragma: no cover - enabled=True
+        raise SessionHostError("Coder connection test is not configured")
+    argv = host._remote_python_argv("print('ok')")
+    process = await create_subprocess_limited(
+        *argv,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(local_cwd),
+        env=host.transport_env(env),
+        start_new_session=platform_compat.IS_POSIX,
+        creationflags=(
+            platform_compat.CREATE_NEW_PROCESS_GROUP | platform_compat._SUBPROCESS_NO_WINDOW
+        ),
+        profile=RLIMIT_PROFILE_SESSION_HOST,
+    )
+    try:
+        stdout, _stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=_CODER_CONNECTION_TIMEOUT_SECS,
+        )
+    except asyncio.TimeoutError as exc:
+        platform_compat.kill_process_tree(process.pid, platform_compat.SIGKILL)
+        await process.wait()
+        raise SessionHostError("Coder connection test timed out") from exc
+    if process.returncode or stdout.strip() != b"ok":
+        raise SessionHostError("Coder connection test failed")
+
+
 def session_host_from_env(
     work_dir: str | Path,
     environ: Mapping[str, str] | None = None,
@@ -790,13 +1080,12 @@ def session_host_from_env(
     if missing:
         raise SessionHostError("Coder session hosting requires " + ", ".join(missing))
 
-    requested_bin = env.get("KIROCREW_CODER_BIN", "coder")
-    coder_bin = shutil.which(requested_bin, path=env.get("PATH"))
-    if not coder_bin:
-        raise SessionHostError(f"Coder CLI is not executable: {requested_bin}")
-
-    return CoderWorkspaceSessionHost(
+    return session_host_from_config(
+        work_dir,
+        enabled=True,
+        url=env.get("CODER_URL", ""),
         workspace=workspace,
-        remote_cwd=env.get("KIROCREW_CODER_REMOTE_CWD", _DEFAULT_REMOTE_CWD),
-        coder_bin=coder_bin,
+        remote_cwd=env.get("KIROCREW_CODER_REMOTE_CWD", CODER_DEFAULT_REMOTE_CWD),
+        session_token=env.get("CODER_SESSION_TOKEN", ""),
+        environ=env,
     )

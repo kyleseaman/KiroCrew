@@ -4826,6 +4826,7 @@ class DashboardState:
         # (slack:<ts>, discord:…) as chat slots. Held to prevent GC.
         self._channel_slot_reconciler: asyncio.Task | None = None  # type: ignore[type-arg]
         self._loop_heartbeat: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._coder_lifecycle_task: asyncio.Task[None] | None = None
         # Off-loop event-loop stall watchdog; armed under the real gateway
         # entrypoint (faulthandler enabled) and stopped on shutdown. Annotated
         # here so the assignment in start_dashboard type-checks under mypy strict.
@@ -7736,6 +7737,17 @@ class DashboardState:
                 "slack_thread_ts": slack_thread_ts,
             }
         )
+        location_resolver = getattr(self.sessions, "execution_location", None)
+        execution_location = (
+            location_resolver(f"dashboard:{slot.key}") if callable(location_resolver) else None
+        )
+        if (
+            isinstance(execution_location, dict)
+            and execution_location.get("kind") == "coder"
+            and isinstance(execution_location.get("workspace"), str)
+            and isinstance(execution_location.get("remote_cwd"), str)
+        ):
+            payload["execution_location"] = execution_location
         return payload
 
     def serialize_slots(self, *, include_check_status: bool = False) -> list:

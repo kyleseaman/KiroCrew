@@ -804,6 +804,108 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "coder.autostop-after-inactive-minutes",
+    "label": "Autostop after inactive minutes",
+    "labelKey": "coder.stop_after_label",
+    "tab": "coder",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "session.coder.stop_after_minutes"
+  },
+  {
+    "id": "coder.coder-session-token",
+    "label": "Coder session token",
+    "labelKey": "coder.token_label",
+    "tab": "coder",
+    "type": "input",
+    "occurrence": 1
+  },
+  {
+    "id": "coder.coder-url",
+    "label": "Coder URL",
+    "labelKey": "coder.url_label",
+    "description": "Base URL the gateway uses to reach your Coder deployment.",
+    "tab": "coder",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "session.coder.url"
+  },
+  {
+    "id": "coder.delete-after-inactive-days",
+    "label": "Delete after inactive days",
+    "labelKey": "coder.delete_after_label",
+    "tab": "coder",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "session.coder.delete_after_days"
+  },
+  {
+    "id": "coder.maximum-running-workspaces",
+    "label": "Maximum running workspaces",
+    "labelKey": "coder.max_running_label",
+    "tab": "coder",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "session.coder.max_running"
+  },
+  {
+    "id": "coder.remote-working-directory",
+    "label": "Remote working directory",
+    "labelKey": "coder.cwd_label",
+    "description": "Absolute POSIX directory used for new remote sessions.",
+    "tab": "coder",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "session.coder.remote_cwd"
+  },
+  {
+    "id": "coder.runtime-warm-minutes",
+    "label": "Runtime warm minutes",
+    "labelKey": "coder.runtime_warm_label",
+    "tab": "coder",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "session.coder.runtime_warm_minutes"
+  },
+  {
+    "id": "coder.template-preset",
+    "label": "Template preset",
+    "labelKey": "coder.preset_label",
+    "tab": "coder",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "session.coder.preset"
+  },
+  {
+    "id": "coder.use-coder-for-new-sessions",
+    "label": "Use Coder for new sessions",
+    "labelKey": "coder.enable_label",
+    "description": "Give each new parent chat and cron session its own Coder workspace. Active sessions do not migrate.",
+    "tab": "coder",
+    "type": "toggle",
+    "occurrence": 1,
+    "configKey": "session.coder.enabled"
+  },
+  {
+    "id": "coder.workspace-name-prefix",
+    "label": "Workspace name prefix",
+    "labelKey": "coder.workspace_label",
+    "description": "Safe visible prefix for opaque managed workspace names.",
+    "tab": "coder",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "session.coder.workspace_prefix"
+  },
+  {
+    "id": "coder.workspace-template",
+    "label": "Workspace template",
+    "labelKey": "coder.workspace_template",
+    "tab": "coder",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "session.coder.template"
+  },
+  {
     "id": "computer-use.attach-screenshots",
     "label": "Attach screenshots",
     "labelKey": "pages.settings.computerUsePanel.attach_screenshots",

@@ -1,0 +1,250 @@
+"""Credential-safe Coder CLI adapter returning bounded structured records."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import shlex
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from kiro_crew import platform_compat
+from kiro_crew.sandbox import RLIMIT_PROFILE_SESSION_HOST, create_subprocess_limited
+
+_COMMAND_TIMEOUT_SECS = 600.0
+_OUTPUT_MAX_BYTES = 4 * 1024 * 1024
+_WORKSPACE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_CODER_DEADLINE_EXTENSION_MINUTES_MIN = 30
+
+
+class CoderClientError(RuntimeError):
+    """A bounded Coder lifecycle operation failed."""
+
+
+@dataclass(frozen=True)
+class CoderWorkspace:
+    uuid: str
+    name: str
+    owner: str
+    template: str
+    status: str
+    last_used_at: str
+
+
+Runner = Callable[[list[str], dict[str, str], Path], Awaitable[bytes]]
+
+
+class CoderClient:
+    def __init__(
+        self,
+        coder_bin: str,
+        url: str,
+        token: str,
+        cwd: Path,
+        runner: Runner | None = None,
+    ) -> None:
+        self.coder_bin = coder_bin
+        self.url = url
+        self._token = token
+        self.cwd = cwd
+        self._runner = runner or self._run
+
+    def _env(self) -> dict[str, str]:
+        env = {
+            key: value
+            for key in (
+                "PATH",
+                "SSL_CERT_FILE",
+                "SSL_CERT_DIR",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "NO_PROXY",
+            )
+            if (value := os.environ.get(key))
+        }
+        env["CODER_URL"] = self.url
+        env["CODER_SESSION_TOKEN"] = self._token
+        return env
+
+    async def _run(self, argv: list[str], env: dict[str, str], cwd: Path) -> bytes:
+        process = await create_subprocess_limited(
+            *argv,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(cwd),
+            env=env,
+            start_new_session=platform_compat.IS_POSIX,
+            creationflags=(
+                platform_compat.CREATE_NEW_PROCESS_GROUP | platform_compat._SUBPROCESS_NO_WINDOW
+            ),
+            profile=RLIMIT_PROFILE_SESSION_HOST,
+        )
+        try:
+            stdout, _stderr = await asyncio.wait_for(
+                process.communicate(), timeout=_COMMAND_TIMEOUT_SECS
+            )
+        except asyncio.TimeoutError as exc:
+            platform_compat.kill_process_tree(process.pid, platform_compat.SIGKILL)
+            await process.wait()
+            raise CoderClientError("Coder lifecycle command timed out") from exc
+        if process.returncode:
+            raise CoderClientError(f"Coder lifecycle command failed (exit {process.returncode})")
+        if len(stdout) > _OUTPUT_MAX_BYTES:
+            raise CoderClientError("Coder lifecycle command returned too much data")
+        return stdout
+
+    async def _call(self, *args: str) -> bytes:
+        return await self._runner([self.coder_bin, *args], self._env(), self.cwd)
+
+    @staticmethod
+    def _workspace(raw: object) -> CoderWorkspace | None:
+        if not isinstance(raw, dict):
+            return None
+        latest = raw.get("latest_build")
+        status = latest.get("status", "") if isinstance(latest, dict) else raw.get("status", "")
+        values = {
+            "uuid": raw.get("id", ""),
+            "name": raw.get("name", ""),
+            # Lifecycle authorization binds to the immutable Coder owner ID.
+            # Older servers may omit it, so retain the display-name fallback
+            # without preferring that mutable label when both are present.
+            "owner": raw.get(
+                "owner_id",
+                raw.get("owner_name", raw.get("owner", "")),
+            ),
+            "template": raw.get("template_name", raw.get("template", "")),
+            "status": status,
+            "last_used_at": raw.get("last_used_at", ""),
+        }
+        if not all(isinstance(value, str) for value in values.values()):
+            raise CoderClientError("Coder workspace record has an invalid shape")
+        if not values["uuid"] or not values["name"]:
+            return None
+        return CoderWorkspace(**values)
+
+    @staticmethod
+    def _json(output: bytes, operation: str) -> Any:
+        if not output.strip():
+            return []
+        try:
+            return json.loads(output)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise CoderClientError(f"Coder {operation} returned invalid data") from exc
+
+    async def list_workspaces(self) -> tuple[CoderWorkspace, ...]:
+        raw = self._json(await self._call("list", "--output", "json"), "workspace query")
+        if not isinstance(raw, list):
+            raise CoderClientError("Coder workspace query returned an invalid shape")
+        records: list[CoderWorkspace] = []
+        for value in raw:
+            workspace = self._workspace(value)
+            if workspace is not None:
+                records.append(workspace)
+        return tuple(records)
+
+    async def get_workspace(self, name: str) -> CoderWorkspace | None:
+        return next(
+            (workspace for workspace in await self.list_workspaces() if workspace.name == name),
+            None,
+        )
+
+    async def probe(self, *, template: str, preset: str) -> dict[str, str]:
+        owner_bytes = await self._call("whoami")
+        if len(owner_bytes) > 1024:
+            raise CoderClientError("Coder identity response is too large")
+        try:
+            owner = owner_bytes.decode("utf-8").strip()
+        except UnicodeDecodeError as exc:
+            raise CoderClientError("Coder identity response is invalid") from exc
+        if not owner or any(char.isspace() for char in owner):
+            raise CoderClientError("Coder identity response is invalid")
+        raw = self._json(
+            await self._call("templates", "list", "--output", "json"),
+            "template query",
+        )
+        if not isinstance(raw, list):
+            raise CoderClientError("Coder template query returned an invalid shape")
+        names = {
+            value.get("name")
+            for value in raw
+            if isinstance(value, dict) and isinstance(value.get("name"), str)
+        }
+        if template not in names:
+            raise CoderClientError("Coder template is unavailable")
+        # Presets are applied by the create command. Coder deployments that do
+        # not advertise preset metadata still validate the template without
+        # provisioning compute; create remains the authoritative preset check.
+        _ = preset
+        return {"owner": owner, "template": template}
+
+    async def create_workspace(
+        self,
+        *,
+        name: str,
+        template: str,
+        preset: str,
+        stop_after_minutes: int,
+    ) -> CoderWorkspace:
+        args = ["create", name, "--template", template]
+        if preset:
+            args.extend(("--preset", preset))
+        args.extend(
+            (
+                "--stop-after",
+                f"{stop_after_minutes}m",
+                "--yes",
+                "--use-parameter-defaults",
+            )
+        )
+        await self._call(*args)
+        workspace = await self.get_workspace(name)
+        if workspace is None:
+            raise CoderClientError("Coder did not return the created workspace")
+        return workspace
+
+    async def start_workspace(self, name: str) -> CoderWorkspace:
+        await self._call("start", name, "--yes")
+        workspace = await self.get_workspace(name)
+        if workspace is None:
+            raise CoderClientError("Coder did not return the started workspace")
+        return workspace
+
+    async def delete_workspace(self, name: str) -> None:
+        await self._call("delete", name, "--yes")
+
+    @staticmethod
+    def _validated_workspace_name(name: str) -> str:
+        if not _WORKSPACE_NAME_RE.fullmatch(name):
+            raise CoderClientError("Coder workspace name is invalid")
+        return name
+
+    async def has_active_workload_scope(self, name: str) -> bool:
+        """Return whether this workspace has a live Kiro Crew systemd scope."""
+        workspace = self._validated_workspace_name(name)
+        pattern = f"kirocrew-{workspace}-*.scope"
+        command = shlex.join(
+            [
+                "systemctl",
+                "--user",
+                "list-units",
+                "--type=scope",
+                "--state=active",
+                "--no-legend",
+                "--plain",
+                "--no-pager",
+                pattern,
+            ]
+        )
+        output = await self._call("ssh", workspace, "--", command)
+        return bool(output.strip())
+
+    async def extend_workspace_deadline(self, name: str, minutes: int) -> None:
+        """Renew a running workspace deadline without reprovisioning it."""
+        workspace = self._validated_workspace_name(name)
+        duration = max(_CODER_DEADLINE_EXTENSION_MINUTES_MIN, minutes)
+        await self._call("schedule", "extend", workspace, f"{duration}m")

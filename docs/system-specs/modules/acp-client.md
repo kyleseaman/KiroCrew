@@ -15,8 +15,25 @@ The ACP layer spans **seven** modules: the legacy per-session client (`acp/clien
 
 `AcpRuntime` accepts a session host. The default `LocalSessionHost` leaves every
 existing resolution, environment, sandbox, cgroup, cwd, and spawn behavior
-unchanged. `CoderWorkspaceSessionHost` is an explicitly configured Kiro-only
-path. It projects a credential-free agent spec, prepares a normalized remote
+unchanged. `ManagedCoderWorkspaceSessionHost` is an explicitly configured
+Kiro-only path. It resolves a durable parent session to a dedicated Coder
+workspace lazily, then delegates transport to `CoderWorkspaceSessionHost`.
+Settings → Coder persists the URL, template/preset, remote directory, and
+lifecycle policy under `session.coder`; the Coder bearer is stored separately as
+`coder.session_token.v1` in the gateway vault and is returned to the dashboard
+only as a presence boolean. An enabled but incomplete configuration fails
+closed before spawn. The legacy `KIROCREW_CODER_*`, `CODER_URL`, and
+`CODER_SESSION_TOKEN` environment path remains a migration fallback only until
+an explicit enabled/disabled setting is saved. `KIROCREW_CODER_BIN` remains the
+local CLI override.
+
+The owner-only connection probe uses bounded, read-only Coder CLI calls to
+authenticate and verify that the configured template is visible. It neither
+creates nor starts a workspace, persists candidate values, nor echoes the
+bearer. Saving settings rebuilds only the provider defaults and drains the warm
+pool; it does not migrate or terminate active sessions.
+
+The host projects a credential-free agent spec, prepares a normalized remote
 cwd, and launches `kiro-cli acp` behind `coder ssh` while retaining JSON-RPC
 stdio. The same SSH process carries a loopback reverse forward to a gateway MCP
 proxy. Each `session/new` and `session/load` receives freshly minted relay
@@ -39,6 +56,16 @@ existence probe of the validated session id, and `session/load` receives the
 derived workspace `~/.kiro/sessions/<sid>.json` path. It never stats or sends a
 gateway transcript path. Capability relays are rotated before every load so a
 resumed session cannot reuse a bearer from its previous runtime.
+
+The gateway keeps the durable session-to-workspace binding in the owner-only
+`coder_workspaces.json` registry. Workspace names are opaque and generated from
+the configured prefix; session keys never appear in Coder or AWS names. A
+workspace is created or restarted only when its parent session needs a runtime,
+with an exact UUID/name/template/owner identity check before reuse. Parent
+sessions are capacity-limited; descendants reuse their parent's workspace and
+do not consume another slot. Releasing an idle managed runtime closes SSH after
+the short Coder warm window while retaining the session map and workspace disk
+for lossless resume.
 
 **Kiro executable resolution at spawn.** Trust is "the CLI runs": any resolvable
 executable Kiro CLI launches for ACP, regardless of install source, owner, or

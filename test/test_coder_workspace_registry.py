@@ -1,0 +1,71 @@
+"""Durable ownership registry for per-parent Coder workspaces."""
+
+from __future__ import annotations
+
+import json
+import stat
+from pathlib import Path
+
+import pytest
+
+from kiro_crew.coder.registry import (
+    WorkspaceBindingRegistry,
+    WorkspaceRegistryCorrupt,
+)
+from kiro_crew.security import is_sensitive_path
+
+
+def test_allocate_is_idempotent_for_one_parent_and_distinct_between_parents(
+    tmp_path: Path,
+) -> None:
+    registry = WorkspaceBindingRegistry(tmp_path / "coder_workspaces.json")
+
+    first = registry.allocate(
+        "dashboard:one", template="kirocrew-arm", preset="arm-small", prefix="crew"
+    )
+    again = registry.allocate(
+        "dashboard:one", template="kirocrew-arm", preset="arm-small", prefix="crew"
+    )
+    other = registry.allocate(
+        "dashboard:two", template="kirocrew-arm", preset="arm-small", prefix="crew"
+    )
+
+    assert again == first
+    assert other.binding_id != first.binding_id
+    assert other.workspace_name != first.workspace_name
+    assert first.workspace_name.startswith("crew-")
+    assert "dashboard" not in first.workspace_name
+    assert "one" not in first.workspace_name
+
+
+def test_registry_round_trips_and_writes_owner_only(tmp_path: Path) -> None:
+    path = tmp_path / "coder_workspaces.json"
+    created = WorkspaceBindingRegistry(path).allocate(
+        "cron:job:run", template="kirocrew-arm", preset="", prefix="crew"
+    )
+
+    loaded = WorkspaceBindingRegistry(path).get_by_session("cron:job:run")
+
+    assert loaded == created
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["version"] == 1
+    assert payload["bindings"][created.binding_id]["workspace_uuid"] == ""
+
+
+def test_corrupt_registry_fails_closed_without_overwrite(tmp_path: Path) -> None:
+    path = tmp_path / "coder_workspaces.json"
+    original = "{not-json"
+    path.write_text(original, encoding="utf-8")
+    registry = WorkspaceBindingRegistry(path)
+
+    with pytest.raises(WorkspaceRegistryCorrupt):
+        registry.allocate("dashboard:one", template="kirocrew-arm", preset="", prefix="crew")
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize("prefix", (".kiro/crew", ".kirocrew"))
+def test_registry_is_a_read_write_keystone(prefix: str) -> None:
+    assert is_sensitive_path(f"~/{prefix}/coder_workspaces.json")
+    assert is_sensitive_path(f"~/{prefix}/coder_workspaces.lock")

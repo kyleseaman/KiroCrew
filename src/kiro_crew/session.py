@@ -943,6 +943,27 @@ class SessionManager:
         sess = self._sessions.get(self._fold_key(key))
         return sess.provider if sess else None
 
+    def execution_location(self, key: str) -> dict[str, str] | None:
+        """Return a non-secret descriptor for the live session's remote host.
+
+        The provider is the authority rather than the current workspace default:
+        changing a default never migrates an active session, so config-derived
+        metadata would immediately mislabel existing local sessions.
+        """
+        from kiro_crew.acp.session_host import CoderWorkspaceSessionHost
+
+        provider = self.get_provider(key)
+        host = getattr(provider, "_session_host", None) if provider is not None else None
+        if isinstance(host, CoderWorkspaceSessionHost):
+            return host.execution_location
+        return None
+
+    def coder_workspace_manager(self) -> Any:
+        """Return the current factory's lifecycle manager, if managed Coder is enabled."""
+        if self._provider_factory is None:
+            return None
+        return getattr(self._provider_factory, "_coder_manager", None)
+
     async def try_acquire(self, key: str) -> bool:
         """Atomically take *key*'s turn semaphore iff a session exists and is idle.
 
@@ -5614,7 +5635,8 @@ class SessionManager:
         """Idle/orphan session expiry. Gate + timeout are published onto self by
         _cleanup_loop, which owns the <60 clamp. Preserves the original
         ``logger.exception`` on failure."""
-        if not self._idle_sweep_enabled:
+        managed_coder_enabled = self._cfg.session.coder.enabled is True
+        if not self._idle_sweep_enabled and not managed_coder_enabled:
             return
         try:
             await self._expire_idle(self._idle_timeout)
@@ -5848,6 +5870,9 @@ class SessionManager:
         # (orphaned MCP servers, leaked kiro-cli PIDs) on a fixed cadence so
         # operators who set timeout_secs=0 don't also lose process hygiene.
         interval = max(timeout // 6, 60) if idle_sweep_enabled else 300
+        if self._cfg.session.coder.enabled is True:
+            warm_secs = max(0, self._cfg.session.coder.runtime_warm_minutes) * 60
+            interval = min(interval, max(warm_secs // 3, 60))
         while not shutdown_event.is_set():
             try:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
@@ -6037,7 +6062,15 @@ class SessionManager:
                 # own lock via skip_if_busy for the collect→reset race.
                 if sess.semaphore.locked():
                     continue
-                idle = now - sess.last_used > timeout_secs
+                session_timeout = timeout_secs
+                provider = getattr(sess, "provider", None)
+                host = getattr(provider, "_session_host", None)
+                managed_warm = getattr(host, "runtime_warm_seconds", None)
+                if isinstance(managed_warm, int) and managed_warm >= 0:
+                    session_timeout = managed_warm
+                if session_timeout <= 0 and managed_warm is None:
+                    continue
+                idle = now - sess.last_used > session_timeout
                 orphaned = (
                     key.startswith("dashboard:")
                     and self._active_dashboard_slots is not None

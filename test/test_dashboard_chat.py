@@ -2585,6 +2585,42 @@ class TestSlotLifecycle:
         assert owner_link["ci"] == "passed"
         assert owner_link["state"] == "open"
 
+    def test_slot_serialization_uses_live_session_execution_location(self, tmp_path, monkeypatch):
+        """The UI badge must describe the provider currently backing the slot.
+
+        This catches deriving a badge from the workspace-wide Coder preference:
+        an existing local session would otherwise be mislabeled immediately after
+        the default changes, even though active sessions never migrate.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("remote")
+        monkeypatch.setattr(
+            state.sessions,
+            "execution_location",
+            lambda key: (
+                {
+                    "kind": "coder",
+                    "workspace": "crew-dogfood",
+                    "remote_cwd": "/home/coder/workspace",
+                }
+                if key == "dashboard:remote"
+                else None
+            ),
+            raising=False,
+        )
+
+        payload = state.serialize_slot(slot)
+
+        assert payload["execution_location"] == {
+            "kind": "coder",
+            "workspace": "crew-dogfood",
+            "remote_cwd": "/home/coder/workspace",
+        }
+
+        monkeypatch.setattr(state.sessions, "execution_location", lambda _key: None)
+        assert "execution_location" not in state.serialize_slot(slot)
+
     @pytest.mark.asyncio
     async def test_approve_no_pending(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)

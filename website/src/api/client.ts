@@ -314,6 +314,46 @@ export interface ComputerUseConfigSave {
   extra_denied_apps: string[]
 }
 
+/** Owner-only Coder defaults. The bearer is represented by presence only. */
+export interface CoderConfigData {
+  enabled: boolean
+  url: string
+  template: string
+  preset: string
+  remote_cwd: string
+  runtime_warm_minutes: number
+  stop_after_minutes: number
+  delete_after_days: number
+  max_running: number
+  workspace_prefix: string
+  token_configured: boolean
+  legacy_environment: boolean
+  static_workspace?: string
+}
+
+export interface CoderConfigSave {
+  enabled: boolean
+  url: string
+  template: string
+  preset: string
+  remote_cwd: string
+  runtime_warm_minutes: number
+  stop_after_minutes: number
+  delete_after_days: number
+  max_running: number
+  workspace_prefix: string
+  /** Blank preserves the gateway's existing vault entry. */
+  token: string
+}
+
+export interface CoderConfigSaveResult {
+  ok: boolean
+  token_configured: boolean
+  active_sessions_unchanged: boolean
+}
+
+export type CoderConnectionTest = Omit<CoderConfigSave, 'enabled'>
+
 /** Slack config as returned by GET /api/slack/config (secrets masked). */
 export interface SlackConfigData {
   connected: boolean
@@ -3105,6 +3145,17 @@ export const api = {
   getComputerUseConfig: () => get('/api/computer-use/config').then(j) as Promise<ComputerUseConfigData>,
   saveComputerUseConfig: (body: Partial<ComputerUseConfigSave>) =>
     put('/api/computer-use/config', body).then(j) as Promise<ComputerUseConfigData>,
+  // Coder session hosting. Reads are presence-only for the bearer; writes split
+  // non-secret coordinates into config.json and the candidate token into the vault.
+  getCoderConfig: () => get('/api/coder/config').then(j) as Promise<CoderConfigData>,
+  saveCoderConfig: (body: CoderConfigSave) =>
+    put('/api/coder/config', body).then(j) as Promise<CoderConfigSaveResult>,
+  testCoderConnection: (body: CoderConnectionTest) =>
+    post('/api/coder/test', body).then(j) as Promise<{
+      ok: boolean
+      owner: string
+      template: string
+    }>,
   // Slack integration config
   getSlackConfig: () => get('/api/slack/config').then(j) as Promise<SlackConfigData>,
   getSlackManifest: () => get('/api/slack/manifest').then(j) as Promise<{ alias: string; manifest: string; create_url: string }>,

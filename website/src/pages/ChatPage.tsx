@@ -98,6 +98,7 @@ import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter } from '../compo
 import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
 import ProjectPicker from '../components/ProjectPicker'
 import InboundLinkChip from '../components/InboundLinkChip'
+import { CoderExecutionBadge } from '../components/CoderExecutionBadge'
 import SessionActionsMenu from '../components/SessionActionsMenu'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent,
@@ -6825,6 +6826,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               )}
                 </div>
               {effectiveMode === 'orchestrator' && <span className="pointer-events-auto"><InfoTip text={i18nT('pages.chatPage.autopilot_plans_before_executing_each_stage_need')} /></span>}
+              <CoderExecutionBadge location={currentSlot?.execution_location} />
               <InboundLinkChip slotKey={activeSlot} />
               {/* Trailing controls grouped under a single ml-auto so multiple
                   right-aligned items don't each absorb free space (two ml-auto
@@ -7717,4 +7719,3 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     </RowDisclosureProvider>
   )
 }
-

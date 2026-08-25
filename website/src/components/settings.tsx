@@ -188,18 +188,19 @@ interface SettingsInputProps {
   onCompositionStart?: React.CompositionEventHandler<HTMLInputElement | HTMLTextAreaElement>
   onCompositionEnd?: React.CompositionEventHandler<HTMLInputElement | HTMLTextAreaElement>
   placeholder?: string
-  type?: 'text' | 'number'
+  type?: 'text' | 'number' | 'password'
   min?: number
   max?: number
   step?: number
   disabled?: boolean
+  autoComplete?: string
   multiline?: boolean
   'aria-label'?: string
   /** Backend config key this input writes. */
   configKey?: string
 }
 
-export function SettingsInput({ label, description, hint, value, onChange, onBlur, onKeyDown, onFocus, onCompositionStart, onCompositionEnd, placeholder, type = 'text', min, max, step, disabled, multiline, 'aria-label': ariaLabel, configKey }: SettingsInputProps) {
+export function SettingsInput({ label, description, hint, value, onChange, onBlur, onKeyDown, onFocus, onCompositionStart, onCompositionEnd, placeholder, type = 'text', min, max, step, disabled, autoComplete, multiline, 'aria-label': ariaLabel, configKey }: SettingsInputProps) {
   // Per-instance id pairing the caption's htmlFor with the control. This is
   // what gives the single-line branch an accessible name by DEFAULT: it used
   // to render aria-label={ariaLabel} with ariaLabel undefined unless a caller
@@ -221,6 +222,7 @@ export function SettingsInput({ label, description, hint, value, onChange, onBlu
           onCompositionEnd={onCompositionEnd}
           placeholder={placeholder}
           disabled={disabled}
+          autoComplete={autoComplete}
           rows={3}
           aria-label={ariaLabel ?? label}
           className="w-full rounded border border-border bg-bg px-2 py-1 text-sm text-text focus-visible:border-accent focus:outline-none resize-y flex-none"
@@ -241,6 +243,7 @@ export function SettingsInput({ label, description, hint, value, onChange, onBlu
           max={max}
           step={step}
           disabled={disabled}
+          autoComplete={autoComplete}
           aria-label={ariaLabel}
           className="flex-none"
         />

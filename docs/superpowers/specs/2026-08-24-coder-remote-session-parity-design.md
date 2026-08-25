@@ -3,6 +3,11 @@
 **Status:** Stdio MCP, memory, resume, and subagent-affinity milestone implemented; gateway-owned HTTP/OAuth and hook relays remain
 **Date:** 2026-08-24
 
+> Workspace cardinality and lifecycle are governed by
+> [Coder Per-Session Workspace Lifecycle](2026-08-25-coder-per-session-workspace-lifecycle-design.md).
+> One durable parent session tree owns one workspace; the static shared
+> `crew-dogfood` POC is not the target topology.
+
 ## Decision
 
 A Kiro Crew gateway may host a Kiro ACP session in a Coder workspace while
@@ -379,7 +384,8 @@ Cron ownership and execution placement are deliberately distinct:
   records.
 - A due job configured for Coder asks the gateway session manager to create a
   Coder-hosted parent session.
-- The parent and every descendant execute in the configured workspace.
+- The parent and every descendant execute in the parent session's bound
+  workspace.
 - Calls to `kirocrew-cron` from that remote tree return through the gateway MCP
   bridge and mutate gateway cron state.
 - Consolidation and scheduler housekeeping remain gateway-local.

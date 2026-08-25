@@ -141,6 +141,7 @@ const PANEL_TAB_MAP: Record<string, PanelTarget> = {
     { tab: 'channels', params: { channel: 'wecom' }, labelSuffix: 'WeCom' },
   ],
   'DeveloperPanel.tsx': 'developer',
+  'CoderPanel.tsx': 'coder',
   'AboutPanel.tsx': 'about',
   'SttSettings.tsx': 'voice',
 }

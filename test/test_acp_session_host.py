@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -887,3 +888,78 @@ async def test_runtime_remote_resume_uses_workspace_transcript_and_rotated_relay
     await runtime.terminate_session("sid-remote")
     assert runtime._remote_session_keys == {}
     revoke.assert_called_once_with("dashboard:one")
+
+
+@pytest.mark.asyncio
+async def test_managed_host_resolves_parent_workspace_before_remote_prepare(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kiro_crew.acp.session_host import ManagedCoderWorkspaceSessionHost
+    from kiro_crew.coder.client import CoderWorkspace
+
+    class _Manager:
+        def __init__(self) -> None:
+            self.sessions: list[str] = []
+
+        async def ensure_ready(self, session_key: str) -> CoderWorkspace:
+            self.sessions.append(session_key)
+            return CoderWorkspace(
+                uuid="workspace-uuid",
+                name="crew-opaque123",
+                owner="kyleseaman",
+                template="kirocrew-arm",
+                status="running",
+                last_used_at="2026-08-25T12:00:00Z",
+            )
+
+    manager = _Manager()
+    host = ManagedCoderWorkspaceSessionHost(
+        session_key="dashboard:one",
+        manager=manager,  # type: ignore[arg-type]
+        remote_cwd="/home/coder/workspace",
+        coder_bin="/opt/coder",
+        coder_url="https://coder.example",
+        session_token="token",
+    )
+
+    async def run_remote(**kwargs: object) -> bytes:
+        return json.dumps(
+            {
+                "runtime_dir": ("/home/coder/.kiro/crew/remote-runtimes/" + host._runtime_id),
+                "port": host._remote_port_candidates[0],
+            }
+        ).encode()
+
+    monkeypatch.setattr(host, "_run_remote_python", run_remote)
+    monkeypatch.setattr(
+        "kiro_crew.acp.session_host.Path.read_text",
+        lambda self, encoding="utf-8": "relay",
+    )
+
+    await host.prepare(
+        agent="kirocrew",
+        projected_spec={"name": "Kiro Crew"},
+        environ={"PATH": "/usr/bin"},
+        local_cwd=tmp_path,
+    )
+
+    assert manager.sessions == ["dashboard:one"]
+    assert host.execution_location["workspace"] == "crew-opaque123"
+    assert host.prepare_argv(agent="kirocrew")[2] == "crew-opaque123"
+    argv = host.spawn_argv(agent="kirocrew", model="auto")
+    assert argv[5:13] == [
+        "--",
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        f"--unit=kirocrew-crew-opaque123-{host._runtime_id}",
+        "kiro-cli",
+    ]
+    clone = host.clone()
+    await clone.start_bridge()
+    assert "systemd-run" in clone.spawn_argv(agent="kirocrew", model="auto")
+    await host.close()
+    await clone.close()

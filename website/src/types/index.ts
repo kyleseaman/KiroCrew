@@ -703,6 +703,13 @@ export interface ChatSlot {
   wait_state?: { wait_id: string; seconds: number; deadline_ts: number } | null
   /** Agent TODO list. Null/absent = the todo tool was never used in this slot. */
   todo?: TodoList | null
+  /** Non-secret execution host reported by the provider backing this live slot. */
+  execution_location?: {
+    kind: 'coder'
+    workspace: string
+    remote_cwd: string
+    state?: 'allocating' | 'running'
+  }
 }
 
 export interface PullRequestCommit {
