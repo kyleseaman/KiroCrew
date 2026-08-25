@@ -84,6 +84,8 @@ def test_workspace_bootstrap_makes_working_directory_traversable() -> None:
     bootstrap = _read("workspace/cloud-init.sh.tftpl")
 
     assert "install -d -m 0700 -o coder -g coder /home/coder/workspace" in bootstrap
+    assert "systemd-run --user --scope --quiet /usr/bin/true" in bootstrap
+    assert "systemd-run --user --scope --quiet --wait" not in bootstrap
 
 
 def test_control_bootstrap_pins_coder_and_serves_only_over_tailscale() -> None:
