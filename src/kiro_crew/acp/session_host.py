@@ -18,6 +18,7 @@ from kiro_crew.acp import remote_mcp_relay
 from kiro_crew.coder.client import CoderClient
 from kiro_crew.coder.manager import CoderWorkspaceManager, ManagedWorkspacePolicy
 from kiro_crew.coder.registry import WorkspaceBindingRegistry
+from kiro_crew.coder.user_bus import user_bus_command
 from kiro_crew.constants import CODER_DEFAULT_REMOTE_CWD
 from kiro_crew.env import mcp_search_path, sanitize_spec_env, spec_path_key
 from kiro_crew.mcp_gateway.remote_proxy import (
@@ -250,6 +251,7 @@ class CoderWorkspaceSessionHost:
                 f"--unit={unit}",
                 *remote_argv,
             ]
+            remote_argv = [user_bus_command(remote_argv)]
         return [
             self._coder_bin,
             "ssh",

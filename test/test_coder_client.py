@@ -139,6 +139,8 @@ async def test_scope_probe_and_deadline_extension_use_bounded_coder_commands(
             "ssh",
             "crew-abc123",
             "--",
+            'user_id="$(id -u)" && export XDG_RUNTIME_DIR="/run/user/$user_id" && '
+            'export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus" && exec '
             "systemctl --user list-units --type=scope --state=active --no-legend "
             "--plain --no-pager 'kirocrew-crew-abc123-*.scope'",
         ],

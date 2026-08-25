@@ -6,13 +6,13 @@ import asyncio
 import json
 import os
 import re
-import shlex
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from kiro_crew import platform_compat
+from kiro_crew.coder.user_bus import user_bus_command
 from kiro_crew.sandbox import RLIMIT_PROFILE_SESSION_HOST, create_subprocess_limited
 
 _COMMAND_TIMEOUT_SECS = 600.0
@@ -235,7 +235,7 @@ class CoderClient:
         """Return whether this workspace has a live Kiro Crew systemd scope."""
         workspace = self._validated_workspace_name(name)
         pattern = f"kirocrew-{workspace}-*.scope"
-        command = shlex.join(
+        command = user_bus_command(
             [
                 "systemctl",
                 "--user",

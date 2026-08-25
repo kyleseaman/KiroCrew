@@ -948,18 +948,25 @@ async def test_managed_host_resolves_parent_workspace_before_remote_prepare(
     assert host.execution_location["workspace"] == "crew-opaque123"
     assert host.prepare_argv(agent="kirocrew")[2] == "crew-opaque123"
     argv = host.spawn_argv(agent="kirocrew", model="auto")
-    assert argv[5:13] == [
+    assert argv[:6] == [
+        "/opt/coder",
+        "ssh",
+        "crew-opaque123",
+        "--remote-forward",
+        f"{host.remote_port}:127.0.0.1:{host._proxy.local_port}",
         "--",
-        "systemd-run",
-        "--user",
-        "--scope",
-        "--quiet",
-        "--collect",
-        f"--unit=kirocrew-crew-opaque123-{host._runtime_id}",
-        "kiro-cli",
     ]
+    assert argv[6] == (
+        'user_id="$(id -u)" && export XDG_RUNTIME_DIR="/run/user/$user_id" && '
+        'export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus" && exec '
+        "systemd-run --user --scope --quiet --collect "
+        f"--unit=kirocrew-crew-opaque123-{host._runtime_id} "
+        "kiro-cli acp --agent kirocrew --model auto"
+    )
     clone = host.clone()
     await clone.start_bridge()
-    assert "systemd-run" in clone.spawn_argv(agent="kirocrew", model="auto")
+    assert any(
+        "systemd-run" in argument for argument in clone.spawn_argv(agent="kirocrew", model="auto")
+    )
     await host.close()
     await clone.close()
