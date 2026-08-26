@@ -2593,6 +2593,8 @@ class _ChatSlot:
         "title",
         "agent",
         "model",
+        "coder_profile",
+        "coder_workspace",
         "reasoning_effort",
         "mode",
         "workspace",
@@ -2738,6 +2740,12 @@ class _ChatSlot:
         self.title = title or key
         self.agent = agent
         self.model = model
+        # Empty selects the Settings default. A named value is immutable after
+        # this parent allocates its managed Coder workspace.
+        self.coder_profile: str = ""
+        # Durable generated name for an allocated managed Coder workspace. The
+        # live provider descriptor disappears when its ACP runtime idles out.
+        self.coder_workspace: str = ""
         # Reasoning effort: "" = provider default, else one of low/medium/high/max.
         # Currently consumed by an alternate ACP backend (--effort flag); ACP wired later.
         self.reasoning_effort: str = ""
@@ -4436,6 +4444,8 @@ class _ChatSlot:
             "title": _redact(self.display_title),
             "agent": self.agent,
             "model": self.model,
+            "coder_profile": self.coder_profile,
+            "coder_workspace": self.coder_workspace,
             "reasoning_effort": self.reasoning_effort,
             "mode": self.mode,
             # Forward-compat alias of `mode` for the frontend's surface
@@ -4979,6 +4989,17 @@ class DashboardState:
                     )
 
         self.sessions.set_compact_callback(_on_compacted)
+
+    def wire_session_execution_location_callback(self) -> None:
+        """Push slot metadata when a remote execution environment changes state."""
+
+        def _on_execution_location_changed(key: str) -> None:
+            from kiro_crew.dashboard.chat_utils import dashboard_slot_key
+
+            if dashboard_slot_key(key):
+                self.push_slots_update()
+
+        self.sessions.set_execution_location_callback(_on_execution_location_changed)
 
     async def _notify_channel_compaction(self, key: str, pct: float, *, success: bool) -> None:
         """Deliver the auto-compact notice to a channel-originated session.
@@ -7743,9 +7764,11 @@ class DashboardState:
         )
         if (
             isinstance(execution_location, dict)
-            and execution_location.get("kind") == "coder"
+            and isinstance(execution_location.get("kind"), str)
+            and bool(execution_location.get("kind"))
             and isinstance(execution_location.get("workspace"), str)
             and isinstance(execution_location.get("remote_cwd"), str)
+            and execution_location.get("state") in ("starting", "running")
         ):
             payload["execution_location"] = execution_location
         return payload

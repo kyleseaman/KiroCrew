@@ -257,6 +257,14 @@ class TestSlotModel:
         slot = state.get_or_create_slot("test-1", model="claude-opus-4.5")
         assert slot.to_dict()["model"] == "claude-opus-4.5"
 
+    def test_slot_serializes_selected_coder_profile(self, state: DashboardState) -> None:
+        slot = state.get_or_create_slot("coder-profile")
+        slot.coder_profile = "gpu"
+        slot.coder_workspace = "crew-session-kyle-opaque"
+
+        assert slot.to_dict()["coder_profile"] == "gpu"
+        assert slot.to_dict()["coder_workspace"] == "crew-session-kyle-opaque"
+
     def test_model_defaults_empty(self, state: DashboardState) -> None:
         slot = state.get_or_create_slot("test-2")
         assert slot.model == ""
@@ -500,6 +508,27 @@ def test_folder_breadcrumb_cycle_safe(state):
     ]
     # No infinite loop; each visited once.
     assert state.folder_breadcrumb("a") == "B › A"
+
+
+class TestExecutionLocationCallbackWiring:
+    def test_callback_pushes_slots_for_dashboard_session(self, state: DashboardState) -> None:
+        state.push_slots_update = MagicMock()
+
+        state.wire_session_execution_location_callback()
+
+        state.sessions.set_execution_location_callback.assert_called_once()
+        callback = state.sessions.set_execution_location_callback.call_args.args[0]
+        callback("dashboard:chat-1")
+        state.push_slots_update.assert_called_once_with()
+
+    def test_callback_ignores_non_dashboard_session(self, state: DashboardState) -> None:
+        state.push_slots_update = MagicMock()
+
+        state.wire_session_execution_location_callback()
+
+        callback = state.sessions.set_execution_location_callback.call_args.args[0]
+        callback("cron:nightly")
+        state.push_slots_update.assert_not_called()
 
 
 class TestOwnerSourceStatusTransport:

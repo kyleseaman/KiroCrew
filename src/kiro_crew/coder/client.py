@@ -153,7 +153,8 @@ class CoderClient:
             None,
         )
 
-    async def probe(self, *, template: str, preset: str) -> dict[str, str]:
+    async def current_user(self) -> tuple[str, str]:
+        """Return the authenticated Coder username and immutable user id."""
         owner_bytes = await self._call("whoami", "--output", "json")
         if len(owner_bytes) > 1024:
             raise CoderClientError("Coder identity response is too large")
@@ -167,6 +168,10 @@ class CoderClient:
         owner_id = record.get("user_id")
         if not isinstance(owner, str) or not owner or not isinstance(owner_id, str) or not owner_id:
             raise CoderClientError("Coder identity response is invalid")
+        return owner, owner_id
+
+    async def probe(self, *, template: str, preset: str) -> dict[str, str]:
+        owner, _owner_id = await self.current_user()
         raw = self._json(
             await self._call("templates", "list", "--output", "json"),
             "template query",
@@ -220,6 +225,13 @@ class CoderClient:
         workspace = await self.get_workspace(name)
         if workspace is None:
             raise CoderClientError("Coder did not return the started workspace")
+        return workspace
+
+    async def stop_workspace(self, name: str) -> CoderWorkspace:
+        await self._call("stop", self._validated_workspace_name(name), "--yes")
+        workspace = await self.get_workspace(name)
+        if workspace is None:
+            raise CoderClientError("Coder did not return the stopped workspace")
         return workspace
 
     async def delete_workspace(self, name: str) -> None:

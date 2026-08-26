@@ -27,6 +27,7 @@ def _make_state(tmp_path, **kwargs):
     sessions = MagicMock(count=0)
     sessions.remove = AsyncMock()
     sessions.get_pid = MagicMock(return_value=None)
+    sessions.coder_workspace_manager = MagicMock(return_value=None)
     state = DashboardState(
         sessions=sessions,
         crons=MagicMock(list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})),

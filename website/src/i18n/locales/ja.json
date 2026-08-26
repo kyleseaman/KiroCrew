@@ -1,9 +1,20 @@
 {
   "coder": {
+    "add_profile": "プロファイルを追加",
+    "default_profile": "既定の Coder プロファイル",
+    "profile_badge": "Coder プロファイル · {{profile}}",
+    "profile_change_failed": "Coder プロファイルを変更できませんでした",
+    "profile_name_label": "プロファイル名",
+    "profile_preset_label": "{{name}} のプリセット",
+    "profile_template_label": "{{name}} のテンプレート",
+    "profiles_description": "名前付きテンプレートを追加できます。ワークスペースが割り当てられる前に新しいセッションで選択します。",
+    "profiles_title": "セッションプロファイル",
+    "remove_profile": "プロファイルを削除",
+    "remove_profile_named": "プロファイル {{name}} を削除",
+    "session_profile_label": "このセッションの Coder プロファイル",
     "architecture": "ゲートウェイがメモリ、MCP、OAuth、cron、認証情報を保持します。Coder で動作するのはセッションプロセスだけで、サブエージェントはそのワークスペースを引き継ぎます。",
     "badge_allocating": "Coder ワークスペースを割り当て中",
     "badge_label": "Coder ワークスペース · {{workspace}}",
-    "badge_title": "このライブセッションは Coder で実行中です",
     "connected_to": "{{owner}} として接続しました。テンプレート {{template}} を利用できます",
     "connection_failed": "接続テストに失敗しました",
     "control_plane_template": "完全な AWS コントロールプレーン",
@@ -48,6 +59,11 @@
     "workspace_label": "ワークスペース名のプレフィックス",
     "workspace_template": "ワークスペーステンプレート",
     "workspace_template_description": "既存の Coder デプロイメントに ARM EC2 ワークスペーステンプレートをプッシュします。コントロールプレーンとネットワークは作成済みである必要があります。"
+  },
+  "execution_environment": {
+    "badge_starting": "{{kind}} ワークスペースを起動中",
+    "badge_starting_named": "{{kind}} ワークスペースを起動中 · {{workspace}}",
+    "badge_running": "{{kind}} ワークスペース · {{workspace}}"
   },
   "api": {
     "client": {
@@ -7144,6 +7160,7 @@
       "working": "作業中"
     },
     "useSessionActions": {
+      "archive_and_stop_coder_workspace": "「{{title}}」をアーカイブし、その Coder ワークスペースを停止しますか？\n\nプロファイル: {{profile}}\nワークスペース: {{workspace}}\n\n実行中のターン、ターミナル、ビルド、バックグラウンドプロセスが終了します。チャット履歴、メモリ、永続ワークスペースストレージは保持されます。",
       "close_this_session": "このセッションを閉じますか？",
       "reload_failed": "セッションの再読み込みに失敗しました。エージェントが応答中かゲートウェイに接続できない可能性があります。セッションがアイドルのときに再試行してください。",
       "reload_failed_subagents": "このセッションのサブエージェントがまだ動作中です。完了してから再試行してください。",
@@ -8709,7 +8726,9 @@
       "add_state_lanes": "自動カラムを追加",
       "lane_seed_failed": "自動カラムを追加できませんでした。",
       "lane_seed_retry": "再試行",
-      "lane_legacy_column_hint": "すべてのセッションを表示"
+      "lane_legacy_column_hint": "すべてのセッションを表示",
+      "coder_workspace_will_stop": "{{count}} 個の Coder ワークスペースを今すぐ停止します: {{workspaces}}。",
+      "coder_workspaces_will_stop": "{{count}} 個の Coder ワークスペースを今すぐ停止します: {{workspaces}}。"
     },
     "connectionsPage": {
       "action_failed": "操作に失敗しました: {{error}}",
@@ -12050,7 +12069,7 @@
         "delete": "Delete…",
         "deleting": "削除中…",
         "delete_crew": "Delete {{name}}",
-        "confirm_delete_of": "Confirm deleting {{name}}",
+      "confirm_delete_of": "{{name}} の削除を確認",
         "delete_warning": "Delete terminates the EC2 instance and ends its charges. This cannot be undone.",
         "before_you_start": "Before you start — your AWS setup",
         "checking": "Checking…",

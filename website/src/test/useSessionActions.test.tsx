@@ -40,8 +40,8 @@ import { useSessionActions } from '../hooks/useSessionActions'
 
 const SLOT = 'chat-actions-1'
 
-function seed(pinned = false) {
-  const slot: ChatSlot = { key: SLOT, title: SLOT, messages: 0, running: false, folder_id: '' }
+function seed(pinned = false, patch: Partial<ChatSlot> = {}) {
+  const slot: ChatSlot = { key: SLOT, title: SLOT, messages: 0, running: false, folder_id: '', ...patch }
   store.dispatch(sseSlots([slot]))
   store.dispatch(updateSlotPin({ key: SLOT, pinned }))
 }
@@ -118,6 +118,28 @@ describe('useSessionActions', () => {
     dispatchSpy.mockClear()
     act(() => a.current.close(SLOT))
     expect(decline).toHaveBeenCalled()
+    expect(dispatchSpy).not.toHaveBeenCalled()
+    dispatchSpy.mockRestore()
+  })
+
+  it('always confirms the exact Coder workspace before closing', () => {
+    seed(false, {
+      title: 'Build release',
+      coder_profile: 'cpu-large',
+      coder_workspace: 'crew-session-kyle-opaque',
+    })
+    cfgMock.loadChatConfig.mockReturnValue({ confirmCloseSession: false })
+    const decline = vi.fn(() => false)
+    vi.stubGlobal('confirm', decline)
+    const dispatchSpy = vi.spyOn(store, 'dispatch')
+    const a = renderActions()
+    dispatchSpy.mockClear()
+
+    act(() => a.current.close(SLOT))
+
+    expect(decline).toHaveBeenCalledOnce()
+    expect(decline.mock.calls[0][0]).toContain('crew-session-kyle-opaque')
+    expect(decline.mock.calls[0][0]).toContain('cpu-large')
     expect(dispatchSpy).not.toHaveBeenCalled()
     dispatchSpy.mockRestore()
   })

@@ -1,0 +1,81 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 3 ]; then
+  printf 'Usage (as root): %s <wheel> <sha256> <dashboard-url-base64>\n' "$0" >&2
+  exit 2
+fi
+
+wheel=$1
+expected_sha=$2
+dashboard_url_b64=$3
+
+case "$expected_sha" in
+  *[!0-9a-f]*|'') printf 'Invalid SHA-256 value\n' >&2; exit 2 ;;
+esac
+[ "${#expected_sha}" -eq 64 ] || {
+  printf 'Invalid SHA-256 length\n' >&2
+  exit 2
+}
+wheel_name=${wheel##*/}
+remote_dir=/tmp/kirocrew-$expected_sha
+case "$wheel_name" in
+  kirocrew-*-py3-none-any.whl) ;;
+  *) printf 'Refusing unexpected wheel name: %s\n' "$wheel_name" >&2; exit 2 ;;
+esac
+[ "$wheel" = "$remote_dir/$wheel_name" ] || {
+  printf 'Refusing unexpected wheel path: %s\n' "$wheel" >&2
+  exit 2
+}
+printf '%s  %s\n' "$expected_sha" "$wheel" | /usr/bin/sha256sum --check --status
+
+dashboard_url=$(printf '%s' "$dashboard_url_b64" | /usr/bin/base64 --decode)
+printf '%s\n' "$dashboard_url" \
+  | /usr/bin/grep -Eq '^https://[A-Za-z0-9._-]+(:[0-9]{1,5})?/?$' || {
+    printf 'Invalid dashboard URL\n' >&2
+    exit 2
+  }
+
+verified_dir=/tmp/kirocrew-verified-$expected_sha
+verified_wheel=$verified_dir/$wheel_name
+/usr/bin/install -d -m 0700 -o coder -g coder "$verified_dir"
+/usr/bin/install -m 0644 -o coder -g coder "$wheel" "$verified_wheel"
+
+/usr/sbin/runuser -u coder -- env \
+  HOME=/home/coder USER=coder LOGNAME=coder \
+  /usr/bin/python3.11 -m venv /home/coder/kirocrew-venv
+/usr/sbin/runuser -u coder -- env \
+  HOME=/home/coder USER=coder LOGNAME=coder \
+  /home/coder/kirocrew-venv/bin/pip install --upgrade "$verified_wheel"
+/usr/sbin/runuser -u coder -- env \
+  HOME=/home/coder USER=coder LOGNAME=coder \
+  /home/coder/kirocrew-venv/bin/pip install --force-reinstall --no-deps "$verified_wheel"
+/usr/sbin/runuser -u coder -- env \
+  HOME=/home/coder USER=coder LOGNAME=coder \
+  /bin/sh -c 'cd /home/coder && exec /home/coder/kirocrew-venv/bin/kirocrew setup --agent-only'
+# The child shell expands its positional argument after the privilege drop.
+# shellcheck disable=SC2016
+/usr/sbin/runuser -u coder -- env \
+  HOME=/home/coder USER=coder LOGNAME=coder \
+  /bin/sh -c 'cd /home/coder && exec /home/coder/kirocrew-venv/bin/kirocrew config set dashboard.url "$1"' \
+  sh "$dashboard_url"
+
+env SUDO_USER=coder USER=coder LOGNAME=coder HOME=/home/coder KIROCREW_PORT=8443 \
+  KIROCREW_SERVICE_BIN=/home/coder/kirocrew-venv/bin/kirocrew \
+  /home/coder/kirocrew-venv/bin/kirocrew service install
+
+attempt=0
+until /usr/bin/systemctl is-active --quiet kirocrew.service \
+  && /usr/bin/curl --fail --silent --show-error \
+    http://127.0.0.1:8443/api/health >/dev/null; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 30 ]; then
+    /usr/bin/journalctl -u kirocrew.service --no-pager -n 80 >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+
+/usr/bin/rm -f -- "$wheel" "$verified_wheel"
+/usr/bin/rmdir -- "$remote_dir" "$verified_dir"
+printf 'Installed verified Kiro Crew wheel and restarted the gateway.\n'

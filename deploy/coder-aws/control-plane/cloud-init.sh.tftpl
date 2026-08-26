@@ -4,14 +4,7 @@ umask 077
 
 dnf install -y \
   ca-certificates \
-  dnf-plugins-core \
-  git \
-  jq \
-  nodejs22 \
-  nodejs22-npm \
-  python3.11 \
-  python3.11-pip \
-  unzip
+  dnf-plugins-core
 dnf config-manager --add-repo \
   https://pkgs.tailscale.com/stable/amazon-linux/2023/tailscale.repo
 dnf install -y tailscale
@@ -38,55 +31,8 @@ printf '%s  %s\n' "${coder_rpm_sha256}" "/tmp/$CODER_RPM" | sha256sum -c -
 dnf install -y "/tmp/$CODER_RPM"
 rm -f "/tmp/$CODER_RPM"
 
-# Amazon Linux 2023 does not meet the aarch64 GNU artifact's glibc floor, so
-# select the static musl package from Kiro's signed release manifest.
-KIRO_ARCH="aarch64"
-curl --proto '=https' --tlsv1.2 -fsSL \
-  https://desktop-release.q.us-east-1.amazonaws.com/latest/manifest.json \
-  -o /tmp/kirocli-manifest.json
-readarray -t KIRO_PACKAGE < <(python3 - <<'PY'
-import json
-
-with open("/tmp/kirocli-manifest.json", encoding="utf-8") as handle:
-    manifest = json.load(handle)
-package = next(
-    package
-    for package in manifest["packages"]
-    if package["fileType"] == "zip"
-    and package["architecture"] == "aarch64"
-    and "musl" in package["download"]
-)
-print(package["download"])
-print(package["sha256"])
-PY
-)
-curl --proto '=https' --tlsv1.2 -fsSL \
-  "https://desktop-release.q.us-east-1.amazonaws.com/$${KIRO_PACKAGE[0]}" \
-  -o /tmp/kirocli.zip
-printf '%s  %s\n' "$${KIRO_PACKAGE[1]}" /tmp/kirocli.zip | sha256sum -c -
-unzip -q /tmp/kirocli.zip -d /tmp
-Q_INSTALL_GLOBAL=1 Q_SKIP_SETUP=1 /tmp/kirocli/install.sh
-rm -rf /tmp/kirocli /tmp/kirocli.zip /tmp/kirocli-manifest.json
-kiro-cli --version
-
 id coder >/dev/null 2>&1 || useradd --create-home --shell /bin/bash coder
-base64 --decode > /usr/local/bin/kirocrew <<'EOF'
-${kirocrew_admin_launcher_b64}
-EOF
-chown root:root /usr/local/bin/kirocrew
-chmod 0755 /usr/local/bin/kirocrew
 install -d -o coder -g coder /home/coder/.config/coderv2 /home/coder/.cache/coder
-install -d -o coder -g coder -m 0700 /home/coder/.kiro/crew
-KIRO_API_KEY="$(aws ssm get-parameter \
-  --region "${region}" \
-  --name "${kiro_api_key_parameter}" \
-  --with-decryption \
-  --query Parameter.Value \
-  --output text)"
-printf 'KIRO_API_KEY=%s\n' "$KIRO_API_KEY" > /home/coder/.kiro/crew/.env
-unset KIRO_API_KEY
-chown coder:coder /home/coder/.kiro/crew/.env
-chmod 0600 /home/coder/.kiro/crew/.env
 install -d -m 0755 /etc/coder.d
 cat > /etc/coder.d/coder.env <<'EOF'
 CODER_ACCESS_URL=https://${tailscale_hostname}.${tailnet_dns_name}
@@ -120,7 +66,4 @@ EOF
 systemctl daemon-reload
 systemctl enable --now coder-poc.service
 
-# Coder is the default HTTPS service. Port 8443 is reserved for the Crew
-# gateway after the branch wheel is installed on this control node.
 tailscale serve --bg --https=443 http://127.0.0.1:3000
-tailscale serve --bg --https=8443 http://127.0.0.1:8443

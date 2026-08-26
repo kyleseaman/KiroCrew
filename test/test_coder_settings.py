@@ -61,6 +61,12 @@ def _write_enabled_config(path: Path) -> None:
                         "url": "https://coder.example",
                         "template": "kirocrew-arm",
                         "preset": "arm-small",
+                        "profiles": {
+                            "gpu": {
+                                "template": "kirocrew-gpu",
+                                "preset": "gpu-medium",
+                            }
+                        },
                         "remote_cwd": "/home/coder/workspace",
                         "runtime_warm_minutes": 5,
                         "stop_after_minutes": 30,
@@ -92,6 +98,7 @@ async def test_get_returns_only_masked_token_status(coder_paths: Path, tmp_path:
         "url": "https://coder.example",
         "template": "kirocrew-arm",
         "preset": "arm-small",
+        "profiles": {"gpu": {"template": "kirocrew-gpu", "preset": "gpu-medium"}},
         "remote_cwd": "/home/coder/workspace",
         "runtime_warm_minutes": 5,
         "stop_after_minutes": 30,
@@ -120,6 +127,7 @@ async def test_put_persists_non_secret_config_and_vault_token(
                 "url": "https://coder.example",
                 "template": "kirocrew-arm",
                 "preset": "arm-small",
+                "profiles": {"gpu": {"template": "kirocrew-gpu", "preset": "gpu-medium"}},
                 "remote_cwd": "/home/coder/project",
                 "runtime_warm_minutes": 7,
                 "stop_after_minutes": 45,
@@ -144,6 +152,7 @@ async def test_put_persists_non_secret_config_and_vault_token(
         "url": "https://coder.example",
         "template": "kirocrew-arm",
         "preset": "arm-small",
+        "profiles": {"gpu": {"template": "kirocrew-gpu", "preset": "gpu-medium"}},
         "remote_cwd": "/home/coder/project",
         "runtime_warm_minutes": 7,
         "stop_after_minutes": 45,
@@ -172,6 +181,7 @@ async def test_put_rejects_enabled_config_without_a_token(
                 "url": "https://coder.example",
                 "template": "kirocrew-arm",
                 "preset": "",
+                "profiles": {},
                 "remote_cwd": "/home/coder/workspace",
                 "runtime_warm_minutes": 5,
                 "stop_after_minutes": 30,
@@ -220,6 +230,48 @@ async def test_connection_probe_uses_candidate_values_without_echoing_token(
     assert probe.await_args.kwargs["preset"] == "arm-small"
 
 
+def test_loader_resolves_named_profiles_without_changing_the_default(
+    coder_paths: Path,
+) -> None:
+    _write_enabled_config(coder_paths)
+
+    coder = loader_mod.KiroCrewConfig.load().session.coder
+
+    assert coder.resolve_profile("") == ("kirocrew-arm", "arm-small")
+    assert coder.resolve_profile("gpu") == ("kirocrew-gpu", "gpu-medium")
+    with pytest.raises(ValueError, match="Unknown Coder profile"):
+        coder.resolve_profile("missing")
+
+
+@pytest.mark.asyncio
+async def test_put_rejects_unsafe_profile_names_before_writing(coder_paths: Path) -> None:
+    app = _app()
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.put(
+            "/api/coder/config",
+            json={
+                "enabled": True,
+                "url": "https://coder.example",
+                "template": "kirocrew-arm",
+                "preset": "",
+                "profiles": {"gpu;bad": {"template": "kirocrew-gpu", "preset": ""}},
+                "remote_cwd": "/home/coder/workspace",
+                "runtime_warm_minutes": 5,
+                "stop_after_minutes": 30,
+                "delete_after_days": 30,
+                "max_running": 3,
+                "workspace_prefix": "crew",
+                "token": "candidate-secret",
+            },
+        )
+        payload = await response.json()
+
+    assert response.status == 400
+    assert payload["code"] == "coder_profiles_invalid"
+    assert not coder_paths.exists()
+
+
 def test_loader_exposes_managed_workspace_policy_defaults(
     coder_paths: Path,
 ) -> None:
@@ -237,7 +289,7 @@ def test_loader_exposes_managed_workspace_policy_defaults(
     assert coder.stop_after_minutes == 30
     assert coder.delete_after_days == 30
     assert coder.max_running == 3
-    assert coder.workspace_prefix == "crew"
+    assert coder.workspace_prefix == "crew-session"
     assert not hasattr(coder, "workspace")
 
 

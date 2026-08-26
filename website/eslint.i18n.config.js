@@ -205,6 +205,10 @@ export default [
       // header name would produce a snippet that fails. Exempted by exact path;
       // the Webhooks page itself remains fully gated.
       'src/pages/webhooks/requestExamples.ts',
+      // Runnable Coder/Terraform shell commands shown for copy/paste. The exact
+      // path keeps the settings component gated while preventing translation
+      // from changing command syntax.
+      'src/pages/settings/coderDeployExamples.ts',
       // Model-facing, not user-facing: `planningInstructionForMode` returns the
       // behaviour instruction embedded in the pet's planning PROMPT. Translating it
       // would send the agent a localized instruction while the rest of its prompt

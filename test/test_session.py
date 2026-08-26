@@ -1580,8 +1580,87 @@ class TestRecordSuccessFailure:
             "kind": "coder",
             "workspace": "crew-dogfood",
             "remote_cwd": "/home/coder/workspace",
+            "state": "running",
         }
         assert mgr.execution_location("dashboard:missing") is None
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_execution_location_tracks_generic_host_while_provider_starts(self, cfg):
+        """A remote host is visible before its provider finishes starting."""
+        provider = _mock_provider_factory()()
+        provider._session_host = SimpleNamespace(
+            execution_location={
+                "kind": "test-sandbox",
+                "workspace": "sandbox-opaque",
+                "remote_cwd": "/workspace",
+                "token": "must-not-leak",
+            }
+        )
+        start_entered = asyncio.Event()
+        allow_start = asyncio.Event()
+
+        async def start() -> None:
+            start_entered.set()
+            await allow_start.wait()
+
+        provider.start = AsyncMock(side_effect=start)
+        changed = MagicMock()
+        mgr = SessionManager(cfg, provider_factory=lambda *_args, **_kwargs: provider)
+        mgr.set_execution_location_callback(changed)
+
+        create = asyncio.create_task(mgr.get_or_create("dashboard:remote"))
+        await start_entered.wait()
+
+        assert mgr.execution_location("dashboard:remote") == {
+            "kind": "test-sandbox",
+            "workspace": "sandbox-opaque",
+            "remote_cwd": "/workspace",
+            "state": "starting",
+        }
+        changed.assert_called_with("dashboard:remote")
+
+        allow_start.set()
+        await create
+        mgr.release("dashboard:remote")
+        assert mgr.execution_location("dashboard:remote") == {
+            "kind": "test-sandbox",
+            "workspace": "sandbox-opaque",
+            "remote_cwd": "/workspace",
+            "state": "running",
+        }
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_execution_location_clears_after_start_failure(self, cfg):
+        """A failed provider start cannot leave a workspace stuck as starting."""
+        provider = _mock_provider_factory()()
+        provider._session_host = SimpleNamespace(
+            execution_location={
+                "kind": "test-sandbox",
+                "workspace": "sandbox-opaque",
+                "remote_cwd": "/workspace",
+            }
+        )
+        start_entered = asyncio.Event()
+        allow_failure = asyncio.Event()
+
+        async def fail_start() -> None:
+            start_entered.set()
+            await allow_failure.wait()
+            raise RuntimeError("startup failed")
+
+        provider.start = AsyncMock(side_effect=fail_start)
+        mgr = SessionManager(cfg, provider_factory=lambda *_args, **_kwargs: provider)
+
+        create = asyncio.create_task(mgr.get_or_create("dashboard:remote"))
+        await start_entered.wait()
+        assert mgr.execution_location("dashboard:remote")["state"] == "starting"
+
+        allow_failure.set()
+        with pytest.raises(RuntimeError, match="startup failed"):
+            await create
+        assert mgr.execution_location("dashboard:remote") is None
         await mgr.close_all()
 
     def test_get_provider_missing_returns_none(self, cfg):

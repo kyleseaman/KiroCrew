@@ -1,9 +1,20 @@
 {
   "coder": {
+    "add_profile": "प्रोफ़ाइल जोड़ें",
+    "default_profile": "डिफ़ॉल्ट Coder प्रोफ़ाइल",
+    "profile_badge": "Coder प्रोफ़ाइल · {{profile}}",
+    "profile_change_failed": "Coder प्रोफ़ाइल बदली नहीं जा सकी",
+    "profile_name_label": "प्रोफ़ाइल नाम",
+    "profile_preset_label": "{{name}} के लिए प्रीसेट",
+    "profile_template_label": "{{name}} के लिए टेम्पलेट",
+    "profiles_description": "वैकल्पिक नामित टेम्पलेट विकल्प। वर्कस्पेस आवंटित होने से पहले नई सत्र में एक चुनें।",
+    "profiles_title": "सत्र प्रोफ़ाइल",
+    "remove_profile": "प्रोफ़ाइल हटाएँ",
+    "remove_profile_named": "प्रोफ़ाइल {{name}} हटाएँ",
+    "session_profile_label": "इस सत्र के लिए Coder प्रोफ़ाइल",
     "architecture": "गेटवे मेमोरी, MCP, OAuth, क्रॉन और क्रेडेंशियल संभालता है। केवल सत्र प्रक्रिया Coder में चलती है; सबएजेंट वही वर्कस्पेस अपनाते हैं।",
     "badge_allocating": "Coder वर्कस्पेस आवंटित हो रहा है",
     "badge_label": "Coder वर्कस्पेस · {{workspace}}",
-    "badge_title": "यह सक्रिय सत्र Coder में चल रहा है",
     "connected_to": "{{owner}} के रूप में कनेक्ट; टेम्पलेट {{template}} उपलब्ध है",
     "connection_failed": "कनेक्शन परीक्षण विफल रहा",
     "control_plane_template": "पूरा AWS कंट्रोल प्लेन",
@@ -48,6 +59,11 @@
     "workspace_label": "वर्कस्पेस नाम उपसर्ग",
     "workspace_template": "वर्कस्पेस टेम्पलेट",
     "workspace_template_description": "ARM EC2 वर्कस्पेस टेम्पलेट को मौजूदा Coder डिप्लॉयमेंट में पुश करें। कंट्रोल प्लेन और नेटवर्क पहले से मौजूद होने चाहिए।"
+  },
+  "execution_environment": {
+    "badge_starting": "{{kind}} वर्कस्पेस शुरू हो रहा है",
+    "badge_starting_named": "{{kind}} वर्कस्पेस शुरू हो रहा है · {{workspace}}",
+    "badge_running": "{{kind}} वर्कस्पेस · {{workspace}}"
   },
   "api": {
     "client": {
@@ -7235,6 +7251,7 @@
       "working": "काम कर रहा है"
     },
     "useSessionActions": {
+      "archive_and_stop_coder_workspace": "“{{title}}” को आर्काइव करके उसका Coder वर्कस्पेस रोकें?\n\nप्रोफ़ाइल: {{profile}}\nवर्कस्पेस: {{workspace}}\n\nइससे चल रहा टर्न, टर्मिनल, बिल्ड और बैकग्राउंड प्रोसेस समाप्त हो जाएंगे। चैट इतिहास, मेमरी और स्थायी वर्कस्पेस स्टोरेज सुरक्षित रहेंगे।",
       "close_this_session": "यह सेशन बंद करें?",
       "reload_failed": "सत्र फिर से लोड नहीं हो सका। एजेंट व्यस्त हो सकता है या गेटवे उपलब्ध नहीं है; सत्र निष्क्रिय होने पर पुनः प्रयास करें।",
       "reload_failed_subagents": "इस सत्र पर उप-एजेंट अभी भी काम कर रहे हैं। उनके समाप्त होने पर पुनः प्रयास करें।",
@@ -8821,7 +8838,9 @@
       "add_state_lanes": "स्वचालित कॉलम जोड़ें",
       "lane_seed_failed": "स्वचालित कॉलम नहीं जोड़ सके।",
       "lane_seed_retry": "फिर कोशिश करो",
-      "lane_legacy_column_hint": "सभी सत्र दिखाता है"
+      "lane_legacy_column_hint": "सभी सत्र दिखाता है",
+      "coder_workspace_will_stop": "{{count}} Coder वर्कस्पेस अब रुकेगा: {{workspaces}}।",
+      "coder_workspaces_will_stop": "{{count}} Coder वर्कस्पेस अब रुकेंगे: {{workspaces}}।"
     },
     "connectionsPage": {
       "action_failed": "कार्रवाई विफल: {{error}}",
@@ -12179,7 +12198,7 @@
         "delete": "Delete…",
         "deleting": "हटाया जा रहा है…",
         "delete_crew": "Delete {{name}}",
-        "confirm_delete_of": "Confirm deleting {{name}}",
+      "confirm_delete_of": "{{name}} को हटाने की पुष्टि करें",
         "delete_warning": "Delete terminates the EC2 instance and ends its charges. This cannot be undone.",
         "before_you_start": "Before you start — your AWS setup",
         "checking": "Checking…",

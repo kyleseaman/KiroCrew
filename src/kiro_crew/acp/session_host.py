@@ -62,9 +62,21 @@ _REMOTE_HTTP_HEADER_VALUE_MAX_BYTES = 8 * 1024
 _REMOTE_HTTP_HEADERS_MAX_BYTES = 64 * 1024
 _REMOTE_HTTP_CLIENT_ID_MAX_BYTES = 4 * 1024
 _REMOTE_HTTP_LOOPBACK_HOSTS = frozenset(("localhost", "127.0.0.1", "::1"))
+_CODER_TEMPLATE_CONTRACT_PATH = "/etc/kirocrew-coder-contract.json"
+_CODER_TEMPLATE_CONTRACT_VERSION = 1
 _REMOTE_PREPARE_SCRIPT = r"""
-import json, os, pathlib, socket, sys
-runtime_id, agent, work_dir, marker, raw_ports = sys.argv[1:]
+import json, os, pathlib, pwd, shutil, socket, sys
+runtime_id, agent, work_dir, marker, raw_ports, contract_path, expected_version = sys.argv[1:]
+contract = json.loads(pathlib.Path(contract_path).read_text(encoding="utf-8"))
+required = {"kiro-cli", "systemd-user-scopes"}
+if (
+    contract.get("version") != int(expected_version)
+    or contract.get("user") != pwd.getpwuid(os.geteuid()).pw_name
+    or contract.get("remote_cwd") != work_dir
+    or not required.issubset(set(contract.get("capabilities", [])))
+    or shutil.which("kiro-cli") is None
+):
+    raise SystemExit(4)
 ports = [int(value) for value in raw_ports.split(",")]
 selected_port = None
 for candidate in ports:
@@ -101,7 +113,10 @@ relay_path.write_text(payload["relay"], encoding="utf-8")
 agent_path.write_text(json.dumps(expand(payload["agent"]), separators=(",", ":")) + "\n", encoding="utf-8")
 os.chmod(relay_path, 0o600)
 os.chmod(agent_path, 0o600)
-pathlib.Path(work_dir).mkdir(parents=True, exist_ok=True)
+work_path = pathlib.Path(work_dir)
+work_path.mkdir(parents=True, exist_ok=True)
+if work_path.stat().st_uid != os.geteuid() or not os.access(work_path, os.R_OK | os.W_OK | os.X_OK):
+    raise SystemExit(4)
 print(json.dumps({"runtime_dir": str(runtime_dir), "port": selected_port}, separators=(",", ":")))
 """.strip()
 _REMOTE_CAPABILITY_SCRIPT = r"""
@@ -280,6 +295,8 @@ class CoderWorkspaceSessionHost:
                 self._remote_cwd,
                 _REMOTE_RUNTIME_MARKER,
                 ",".join(str(port) for port in self._remote_port_candidates),
+                _CODER_TEMPLATE_CONTRACT_PATH,
+                str(_CODER_TEMPLATE_CONTRACT_VERSION),
             ]
         )
         return [self._coder_bin, "ssh", self._workspace, "--", remote_command]
@@ -511,6 +528,8 @@ class ManagedCoderWorkspaceSessionHost(CoderWorkspaceSessionHost):
         coder_url: str,
         session_token: str,
         runtime_warm_minutes: int = 5,
+        template: str | None = None,
+        preset: str | None = None,
     ) -> None:
         super().__init__(
             workspace="crew-pending",
@@ -521,6 +540,8 @@ class ManagedCoderWorkspaceSessionHost(CoderWorkspaceSessionHost):
         )
         self._parent_session_key = session_key
         self._manager = manager
+        self._template = template
+        self._preset = preset
         self._managed_ready = False
         self.runtime_warm_seconds = max(0, runtime_warm_minutes) * 60
 
@@ -531,7 +552,7 @@ class ManagedCoderWorkspaceSessionHost(CoderWorkspaceSessionHost):
                 "kind": "coder",
                 "workspace": "",
                 "remote_cwd": self._remote_cwd,
-                "state": "allocating",
+                "state": "starting",
             }
         location = super().execution_location
         location["state"] = "running"
@@ -545,7 +566,11 @@ class ManagedCoderWorkspaceSessionHost(CoderWorkspaceSessionHost):
         environ: Mapping[str, str],
         local_cwd: str | Path,
     ) -> None:
-        workspace = await self._manager.ensure_ready(self._parent_session_key)
+        workspace = await self._manager.ensure_ready(
+            self._parent_session_key,
+            template=self._template,
+            preset=self._preset,
+        )
         if not _WORKSPACE_RE.fullmatch(workspace.name):
             raise SessionHostError("Managed Coder workspace returned an invalid name")
         self._workspace = workspace.name

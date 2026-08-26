@@ -1,9 +1,20 @@
 {
   "coder": {
+    "add_profile": "添加配置文件",
+    "default_profile": "默认 Coder 配置文件",
+    "profile_badge": "Coder 配置文件 · {{profile}}",
+    "profile_change_failed": "无法更改 Coder 配置文件",
+    "profile_name_label": "配置文件名称",
+    "profile_preset_label": "{{name}} 的预设",
+    "profile_template_label": "{{name}} 的模板",
+    "profiles_description": "可选的命名模板。在工作区分配之前，为新会话选择一个。",
+    "profiles_title": "会话配置文件",
+    "remove_profile": "删除配置文件",
+    "remove_profile_named": "删除配置文件 {{name}}",
+    "session_profile_label": "此会话的 Coder 配置文件",
     "architecture": "网关负责内存、MCP、OAuth、定时任务和凭据。只有会话进程在 Coder 中运行；子代理继承该工作区。",
     "badge_allocating": "正在分配 Coder 工作区",
     "badge_label": "Coder 工作区 · {{workspace}}",
-    "badge_title": "此实时会话正在 Coder 中运行",
     "connected_to": "已以 {{owner}} 身份连接；模板 {{template}} 可用",
     "connection_failed": "连接测试失败",
     "control_plane_template": "完整 AWS 控制平面",
@@ -48,6 +59,11 @@
     "workspace_label": "工作区名称前缀",
     "workspace_template": "工作区模板",
     "workspace_template_description": "将 ARM EC2 工作区模板推送到现有 Coder 部署。控制平面和网络须已存在。"
+  },
+  "execution_environment": {
+    "badge_starting": "正在启动 {{kind}} 工作区",
+    "badge_starting_named": "正在启动 {{kind}} 工作区 · {{workspace}}",
+    "badge_running": "{{kind}} 工作区 · {{workspace}}"
   },
   "api": {
     "client": {
@@ -7144,6 +7160,7 @@
       "working": "工作中"
     },
     "useSessionActions": {
+      "archive_and_stop_coder_workspace": "要归档“{{title}}”并停止其 Coder 工作区吗？\n\n配置：{{profile}}\n工作区：{{workspace}}\n\n正在运行的轮次、终端、构建和后台进程会结束。聊天记录、记忆和持久工作区存储会保留。",
       "close_this_session": "关闭此会话？",
       "reload_failed": "会话重新加载失败。代理可能正在处理消息或网关不可达；请等会话空闲后重试。",
       "reload_failed_subagents": "该会话的子代理仍在工作中。等它们完成后再试。",
@@ -8709,7 +8726,9 @@
       "add_state_lanes": "添加自动栏",
       "lane_seed_failed": "无法添加自动栏。",
       "lane_seed_retry": "重试",
-      "lane_legacy_column_hint": "显示所有会话"
+      "lane_legacy_column_hint": "显示所有会话",
+      "coder_workspace_will_stop": "现在将停止 {{count}} 个 Coder 工作区：{{workspaces}}。",
+      "coder_workspaces_will_stop": "现在将停止 {{count}} 个 Coder 工作区：{{workspaces}}。"
     },
     "connectionsPage": {
       "action_failed": "操作失败：{{error}}",
@@ -12050,7 +12069,7 @@
         "delete": "Delete…",
         "deleting": "正在删除…",
         "delete_crew": "Delete {{name}}",
-        "confirm_delete_of": "Confirm deleting {{name}}",
+      "confirm_delete_of": "确认删除 {{name}}",
         "delete_warning": "Delete terminates the EC2 instance and ends its charges. This cannot be undone.",
         "before_you_start": "Before you start — your AWS setup",
         "checking": "Checking…",

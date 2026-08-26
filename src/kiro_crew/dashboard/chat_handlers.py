@@ -1784,7 +1784,6 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                 )
         except Exception:
             logger.warning("Failed to resolve bindings for slot create", exc_info=True)
-
     # Coalesce every push inside into ONE broadcast at exit, so the first frame
     # any client sees already carries the folder, title, artifact binding and
     # project. Otherwise each of those is a separate post-create correction the
@@ -1948,6 +1947,58 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
     # think-time before their first message. No-op unless session.eager_spawn.
     schedule_eager_spawn(state, slot)
     return web.json_response(state.serialize_slot(slot))
+
+
+async def api_chat_slot_coder_profile(request: web.Request) -> web.Response:
+    """Select a named Coder profile before this parent allocates a workspace."""
+    if request.get("app", ""):
+        return web.json_response(
+            {"error": "owner access required", "code": "owner_only"}, status=403
+        )
+    state: DashboardState = request.app["state"]
+    slot = state.get_slot(request.match_info["slot"])
+    if slot is None:
+        return web.json_response({"error": "slot not found", "code": "slot_not_found"}, status=404)
+    try:
+        body = await request.json()
+    except ValueError:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    profile = body.get("profile", "") if isinstance(body, dict) else None
+    if not isinstance(profile, str):
+        return web.json_response(
+            {"error": "invalid Coder profile", "code": "coder_profile_invalid"}, status=400
+        )
+    try:
+        cfg = KiroCrewConfig.load()
+        if cfg.session.coder.enabled is not True:
+            raise RuntimeError("managed Coder is not enabled")
+        cfg.session.coder.resolve_profile(profile)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc), "code": "coder_profile_unknown"}, status=400)
+    except Exception:
+        return web.json_response(
+            {"error": "managed Coder is unavailable", "code": "coder_not_enabled"},
+            status=409,
+        )
+
+    session_key = effective_session_key(slot)
+    manager = state.sessions.coder_workspace_manager()
+    has_binding = bool(
+        manager is not None
+        and await asyncio.to_thread(manager.registry.get_by_session, session_key) is not None
+    )
+    if slot.running or state.sessions.has_session(session_key) or has_binding:
+        return web.json_response(
+            {
+                "error": "Coder profile is locked after session allocation",
+                "code": "coder_profile_locked",
+            },
+            status=409,
+        )
+    slot.coder_profile = profile
+    state.push_slots_update()
+    await save_slot_off_loop(state, slot, force=True)
+    return web.json_response({"ok": True, "profile": profile})
 
 
 def _reject_pending_approvals(slot: _ChatSlot) -> None:
@@ -3189,6 +3240,20 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
         # missing one — anti-enumeration (CWE-204); true reason logged via SEL.
         return web.json_response({"error": "not found"}, status=404)
 
+    manager = state.sessions.coder_workspace_manager()
+    if manager is not None:
+        try:
+            await manager.stop_for_session(_history_key_for(name))
+        except Exception:
+            logger.warning("Failed to stop managed Coder workspace for %s", name, exc_info=True)
+            return web.json_response(
+                {
+                    "error": "failed to stop managed Coder workspace",
+                    "code": "coder_workspace_stop_failed",
+                },
+                status=502,
+            )
+
     # Synchronous tombstone, BEFORE any await: a channel-slot reconcile pass
     # whose snapshot predates this close reads these after its last await, so
     # it cannot re-surface the tab this handler is dismissing (see
@@ -3449,6 +3514,18 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
     failed: list[str] = []
     _tasks_to_cancel: list[asyncio.Task] = []
     for name in stale_keys:
+        manager = state.sessions.coder_workspace_manager()
+        if manager is not None:
+            try:
+                await manager.stop_for_session(_history_key_for(name))
+            except Exception:
+                logger.warning(
+                    "Cleanup: failed to stop managed Coder workspace for %s",
+                    name,
+                    exc_info=True,
+                )
+                failed.append(name)
+                continue
         removed = state._slots.pop(name, None)
         if not removed:
             continue

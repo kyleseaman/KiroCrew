@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+exec /usr/bin/sudo -n -u coder /usr/bin/env \
+  HOME=/home/coder \
+  USER=coder \
+  LOGNAME=coder \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  /bin/sh -c \
+  'cd /home/coder && exec /home/coder/kirocrew-venv/bin/kirocrew "$@"' \
+  kirocrew "$@"

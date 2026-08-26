@@ -1,9 +1,20 @@
 {
   "coder": {
+    "add_profile": "প্রোফাইল যোগ করুন",
+    "default_profile": "ডিফল্ট Coder প্রোফাইল",
+    "profile_badge": "Coder প্রোফাইল · {{profile}}",
+    "profile_change_failed": "Coder প্রোফাইল পরিবর্তন করা যায়নি",
+    "profile_name_label": "প্রোফাইলের নাম",
+    "profile_preset_label": "{{name}}-এর প্রিসেট",
+    "profile_template_label": "{{name}}-এর টেমপ্লেট",
+    "profiles_description": "ঐচ্ছিক নামযুক্ত টেমপ্লেট। ওয়ার্কস্পেস বরাদ্দের আগে নতুন সেশনে একটি বেছে নিন।",
+    "profiles_title": "সেশন প্রোফাইল",
+    "remove_profile": "প্রোফাইল সরান",
+    "remove_profile_named": "{{name}} প্রোফাইল সরান",
+    "session_profile_label": "এই সেশনের Coder প্রোফাইল",
     "architecture": "গেটওয়ে মেমরি, MCP, OAuth, ক্রন ও পরিচয়পত্র সংরক্ষণ করে। শুধু সেশন প্রক্রিয়াটি Coder-এ চলে; সাবএজেন্টরা সেই ওয়ার্কস্পেস ব্যবহার করে।",
     "badge_allocating": "Coder ওয়ার্কস্পেস বরাদ্দ করা হচ্ছে",
     "badge_label": "Coder ওয়ার্কস্পেস · {{workspace}}",
-    "badge_title": "এই সক্রিয় সেশনটি Coder-এ চলছে",
     "connected_to": "{{owner}} হিসেবে সংযুক্ত; {{template}} টেমপ্লেটটি উপলভ্য",
     "connection_failed": "সংযোগ পরীক্ষা ব্যর্থ হয়েছে",
     "control_plane_template": "সম্পূর্ণ AWS কন্ট্রোল প্লেন",
@@ -48,6 +59,11 @@
     "workspace_label": "ওয়ার্কস্পেস নামের উপসর্গ",
     "workspace_template": "ওয়ার্কস্পেস টেমপ্লেট",
     "workspace_template_description": "বিদ্যমান Coder ডিপ্লয়মেন্টে ARM EC2 ওয়ার্কস্পেস টেমপ্লেট পাঠান। কন্ট্রোল প্লেন ও নেটওয়ার্ক আগে থেকেই থাকতে হবে।"
+  },
+  "execution_environment": {
+    "badge_starting": "{{kind}} ওয়ার্কস্পেস চালু হচ্ছে",
+    "badge_starting_named": "{{kind}} ওয়ার্কস্পেস চালু হচ্ছে · {{workspace}}",
+    "badge_running": "{{kind}} ওয়ার্কস্পেস · {{workspace}}"
   },
   "api": {
     "client": {
@@ -7235,6 +7251,7 @@
       "working": "কাজ করছে"
     },
     "useSessionActions": {
+      "archive_and_stop_coder_workspace": "“{{title}}” আর্কাইভ করে এর Coder ওয়ার্কস্পেস বন্ধ করবেন?\n\nপ্রোফাইল: {{profile}}\nওয়ার্কস্পেস: {{workspace}}\n\nএতে চলমান টার্ন, টার্মিনাল, বিল্ড ও ব্যাকগ্রাউন্ড প্রসেস শেষ হবে। চ্যাটের ইতিহাস, মেমরি ও স্থায়ী ওয়ার্কস্পেস স্টোরেজ রাখা হবে।",
       "close_this_session": "এই সেশন বন্ধ করবে?",
       "reload_failed": "সেশন পুনরায় লোড ব্যর্থ হয়েছে। এজেন্ট ব্যস্ত থাকতে পারে বা গেটওয়ে পৌঁছানো যাচ্ছে না; সেশন নিষ্ক্রিয় হলে আবার চেষ্টা করুন।",
       "reload_failed_subagents": "এই সেশনে সাব-এজেন্টরা এখনও কাজ করছে। তারা শেষ করলে আবার চেষ্টা করুন।",
@@ -8821,7 +8838,9 @@
       "add_state_lanes": "স্বয়ংক্রিয় কলাম যোগ করুন",
       "lane_seed_failed": "স্বয়ংক্রিয় কলাম যোগ করা যায়নি।",
       "lane_seed_retry": "আবার চেষ্টা করুন",
-      "lane_legacy_column_hint": "সব সেশন দেখায়"
+      "lane_legacy_column_hint": "সব সেশন দেখায়",
+      "coder_workspace_will_stop": "{{count}}টি Coder ওয়ার্কস্পেস এখন বন্ধ হবে: {{workspaces}}।",
+      "coder_workspaces_will_stop": "{{count}}টি Coder ওয়ার্কস্পেস এখন বন্ধ হবে: {{workspaces}}।"
     },
     "connectionsPage": {
       "action_failed": "অ্যাকশন ব্যর্থ: {{error}}",
@@ -12179,7 +12198,7 @@
         "delete": "Delete…",
         "deleting": "মুছে ফেলা হচ্ছে…",
         "delete_crew": "Delete {{name}}",
-        "confirm_delete_of": "Confirm deleting {{name}}",
+      "confirm_delete_of": "{{name}} মুছে ফেলা নিশ্চিত করুন",
         "delete_warning": "Delete terminates the EC2 instance and ends its charges. This cannot be undone.",
         "before_you_start": "Before you start — your AWS setup",
         "checking": "Checking…",

@@ -21,9 +21,14 @@ class _FakeClient:
     def __init__(self) -> None:
         self.workspaces: dict[str, CoderWorkspace] = {}
         self.created: list[str] = []
+        self.created_specs: list[tuple[str, str, str]] = []
         self.started: list[str] = []
+        self.stopped: list[str] = []
         self.active_scopes: set[str] = set()
         self.extended: list[tuple[str, int]] = []
+
+    async def current_user(self) -> tuple[str, str]:
+        return "kyleseaman", "owner-kyleseaman"
 
     async def get_workspace(self, name: str) -> CoderWorkspace | None:
         return self.workspaces.get(name)
@@ -36,6 +41,7 @@ class _FakeClient:
     ) -> CoderWorkspace:
         await asyncio.sleep(0)
         self.created.append(name)
+        self.created_specs.append((name, template, preset))
         workspace = CoderWorkspace(
             uuid=f"uuid-{name}",
             name=name,
@@ -54,6 +60,13 @@ class _FakeClient:
         self.workspaces[name] = running
         return running
 
+    async def stop_workspace(self, name: str) -> CoderWorkspace:
+        self.stopped.append(name)
+        current = self.workspaces[name]
+        stopped = CoderWorkspace(**{**current.__dict__, "status": "stopped"})
+        self.workspaces[name] = stopped
+        return stopped
+
     async def delete_workspace(self, name: str) -> None:
         self.workspaces.pop(name, None)
 
@@ -71,7 +84,7 @@ def _manager(tmp_path: Path, client: _FakeClient) -> CoderWorkspaceManager:
         policy=ManagedWorkspacePolicy(
             template="kirocrew-arm",
             preset="arm-small",
-            prefix="crew",
+            prefix="crew-session",
             stop_after_minutes=30,
             delete_after_days=30,
             max_running=3,
@@ -107,6 +120,41 @@ async def test_unrelated_parents_get_distinct_workspaces(tmp_path: Path) -> None
 
     assert first.uuid != second.uuid
     assert first.name != second.name
+    assert first.name.startswith("crew-session-kyleseaman-")
+    assert second.name.startswith("crew-session-kyleseaman-")
+
+
+@pytest.mark.asyncio
+async def test_each_parent_can_allocate_from_a_different_profile(tmp_path: Path) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+
+    first = await manager.ensure_ready("dashboard:one", template="kirocrew-arm", preset="arm-small")
+    second = await manager.ensure_ready(
+        "dashboard:two", template="kirocrew-gpu", preset="gpu-medium"
+    )
+
+    assert client.created_specs == [
+        (first.name, "kirocrew-arm", "arm-small"),
+        (second.name, "kirocrew-gpu", "gpu-medium"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_existing_binding_keeps_original_profile_coordinates(tmp_path: Path) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    first = await manager.ensure_ready("dashboard:one", template="kirocrew-arm", preset="arm-small")
+    client.workspaces[first.name] = CoderWorkspace(**{**first.__dict__, "status": "stopped"})
+
+    resumed = await manager.ensure_ready(
+        "dashboard:one", template="kirocrew-gpu", preset="gpu-medium"
+    )
+
+    assert resumed.template == "kirocrew-arm"
+    binding = manager.registry.get_by_session("dashboard:one")
+    assert binding is not None
+    assert (binding.template, binding.preset) == ("kirocrew-arm", "arm-small")
 
 
 @pytest.mark.asyncio
@@ -120,6 +168,21 @@ async def test_stopped_workspace_restarts_with_same_uuid(tmp_path: Path) -> None
 
     assert resumed.uuid == first.uuid
     assert client.started == [first.name]
+
+
+@pytest.mark.asyncio
+async def test_stop_for_session_stops_its_exact_bound_workspace(tmp_path: Path) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    workspace = await manager.ensure_ready("dashboard:one")
+
+    stopped = await manager.stop_for_session("dashboard:one")
+
+    assert stopped == workspace.name
+    assert client.stopped == [workspace.name]
+    binding = manager.registry.get_by_session("dashboard:one")
+    assert binding is not None
+    assert binding.state == "stopped"
 
 
 @pytest.mark.asyncio

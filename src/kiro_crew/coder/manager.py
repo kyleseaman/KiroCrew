@@ -50,13 +50,23 @@ class CoderWorkspaceManager:
             self._locks[session_key] = lock
         return lock
 
-    async def ensure_ready(self, session_key: str) -> CoderWorkspace:
+    async def ensure_ready(
+        self,
+        session_key: str,
+        *,
+        template: str | None = None,
+        preset: str | None = None,
+    ) -> CoderWorkspace:
+        selected_template = self.policy.template if template is None else template
+        selected_preset = self.policy.preset if preset is None else preset
+        owner_name, _owner_id = await self.client.current_user()
         binding = await asyncio.to_thread(
             self.registry.allocate,
             session_key,
-            template=self.policy.template,
-            preset=self.policy.preset,
+            template=selected_template,
+            preset=selected_preset,
             prefix=self.policy.prefix,
+            owner_name=owner_name,
         )
         async with self._lock_for(session_key):
             current_binding = await asyncio.to_thread(self.registry.get, binding.binding_id)
@@ -127,6 +137,30 @@ class CoderWorkspaceManager:
             raise CoderCapacityError(
                 f"Managed Coder workspace capacity reached ({running}/{self.policy.max_running})"
             )
+
+    async def stop_for_session(self, session_key: str) -> str | None:
+        """Stop the exact registry-owned workspace bound to a parent session."""
+        snapshot = await asyncio.to_thread(self.registry.get_by_session, session_key)
+        if snapshot is None or not snapshot.workspace_uuid or snapshot.state == "deleted":
+            return None
+        async with self._lock_for(session_key):
+            binding = await asyncio.to_thread(self.registry.get, snapshot.binding_id)
+            if binding is None or not binding.workspace_uuid or binding.state == "deleted":
+                return None
+            workspace = await self.client.get_workspace(binding.workspace_name)
+            if workspace is None:
+                return binding.workspace_name
+            self._verify_destructive_identity(binding, workspace)
+            if workspace.status != "stopped":
+                workspace = await self.client.stop_workspace(binding.workspace_name)
+                self._verify_destructive_identity(binding, workspace)
+                if workspace.status != "stopped":
+                    raise CoderWorkspaceIdentityError("Coder workspace did not stop")
+            await asyncio.to_thread(
+                self.registry.replace,
+                replace(binding, state="stopped"),
+            )
+            return binding.workspace_name
 
     @staticmethod
     def _parse_time(value: str) -> datetime:

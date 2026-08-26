@@ -2810,6 +2810,8 @@ async def start_dashboard(
     state.wire_session_compact_callback()
     # Visible notice when the watchdog recycles a dashboard session (e.g. RSS)
     state.wire_session_recycle_callback()
+    # Live starting/running environment badges for remotely hosted sessions
+    state.wire_session_execution_location_callback()
     # Visible notice in a channel that just lost its session-resume binding
     state.wire_session_unbind_listener()
 
@@ -3814,6 +3816,8 @@ async def start_api_server(
     state.wire_session_compact_callback()
     # Visible notice when the watchdog recycles a dashboard session (e.g. RSS)
     state.wire_session_recycle_callback()
+    # Live starting/running environment badges for remotely hosted sessions
+    state.wire_session_execution_location_callback()
     # Visible notice in a channel that just lost its session-resume binding
     state.wire_session_unbind_listener()
 

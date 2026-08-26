@@ -58,7 +58,7 @@ import { DndDraggable, DndDroppable } from '../components/dnd'
 import { collectFolderSubtreeIds } from '../utils/folderTree'
 import { runBelongsToSlot } from '../apps/workflows/runModel'
 import { sanitizeLlmOutput } from '../utils/sanitize'
-import type { ChatFolder, ChatTag, TagColumn, TagColumnMode, SubagentActivity, SessionLink } from '../types'
+import type { ChatFolder, ChatTag, TagColumn, TagColumnMode, SubagentActivity, SessionLink, ExecutionLocation } from '../types'
 import { SESSION_LANES, inferLane } from './chat/sessionLane'
 import { decideUnreadDrain } from './unreadDrain'
 import {
@@ -543,6 +543,9 @@ interface Slot {
   clean_mode?: boolean
   folder_id?: string
   pinned?: boolean
+  coder_profile?: string
+  coder_workspace?: string
+  execution_location?: ExecutionLocation
   tags?: string[]
   forked_from?: string | null
   source_links?: Array<{
@@ -4610,6 +4613,12 @@ function ChatSidebar({
       {/* Clean Up dialog */}
       {cleanupOpen && (() => {
         const archivable = cleanupPreview ? cleanupPreview.map(k => slots.find(s => s.key === k)).filter(Boolean) as Slot[] : []
+        const coderWorkspaces = archivable.flatMap(s => {
+          const workspace = s.coder_workspace || (
+            s.execution_location?.kind === 'coder' ? s.execution_location.workspace : ''
+          )
+          return workspace ? [workspace] : []
+        })
         const noStale = cleanupPreview != null && cleanupPreview.length === 0 && !activeIsStale
         return (
           <div className="mx-2 mb-2 p-3 rounded-lg bg-bg border border-border shadow-md text-sm animate-rise">
@@ -4631,6 +4640,19 @@ function ChatSidebar({
                     ? i18nT('pages.chatSidebar.no_inactive_sessions_to_archive')
                     : cleanupPreview != null && <>
                       {i18nT('pages.chatSidebar.session', { count: archivable.length })} {i18nT('pages.chatSidebar.will_be_moved_to_older_sessions')}{activeIsStale ? ` ${i18nT('pages.chatSidebar.1_skipped_currently_selected')}` : ''} {i18nT('pages.chatSidebar.pinned_sessions_are_kept')}
+                      {coderWorkspaces.length > 0 && (
+                        <div className="mt-2 text-danger">
+                          {coderWorkspaces.length === 1
+                            ? i18nT('pages.chatSidebar.coder_workspace_will_stop', {
+                              count: coderWorkspaces.length,
+                              workspaces: coderWorkspaces.join(', '),
+                            })
+                            : i18nT('pages.chatSidebar.coder_workspaces_will_stop', {
+                              count: coderWorkspaces.length,
+                              workspaces: coderWorkspaces.join(', '),
+                            })}
+                        </div>
+                      )}
                       {archivable.length > 0 && (
                         <button className="ml-1 text-accent hover:underline cursor-pointer bg-transparent border-none p-0 text-[12px]" onClick={() => setCleanupExpanded(!cleanupExpanded)}>
                           {cleanupExpanded ? i18nT('pages.chatSidebar.hide') : i18nT('pages.chatSidebar.show')} {i18nT('pages.chatSidebar.session', { count: archivable.length })} ▸

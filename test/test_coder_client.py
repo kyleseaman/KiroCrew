@@ -86,6 +86,35 @@ async def test_get_workspace_returns_none_for_absent_record(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_stop_workspace_uses_noninteractive_coder_command(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    async def run(argv: list[str], env: dict[str, str], cwd: Path) -> bytes:
+        calls.append(argv)
+        if argv[1] == "stop":
+            return b""
+        return json.dumps(
+            [
+                {
+                    "id": "workspace-uuid",
+                    "name": "crew-abc123",
+                    "owner_id": "owner-immutable-uuid",
+                    "template_name": "kirocrew-arm",
+                    "latest_build": {"status": "stopped"},
+                    "last_used_at": "2026-08-25T12:00:00Z",
+                }
+            ]
+        ).encode()
+
+    client = CoderClient("/opt/coder", "https://coder.example", "token", tmp_path, run)
+
+    workspace = await client.stop_workspace("crew-abc123")
+
+    assert workspace.status == "stopped"
+    assert calls[0] == ["/opt/coder", "stop", "crew-abc123", "--yes"]
+
+
+@pytest.mark.asyncio
 async def test_probe_verifies_identity_and_template_without_creating_compute(
     tmp_path: Path,
 ) -> None:

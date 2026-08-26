@@ -1570,14 +1570,8 @@ class TestSlotDetailPagination:
             )
             assert resp.status == 200
             slot.drain()
-            mids = [
-                m["meta"].get("mid")
-                for m in slot.messages
-                if isinstance(m.get("meta"), dict)
-            ]
-            assert mids.count(dup) == 2, (
-                f"fixture no longer reproduces a repeated id; got {mids}"
-            )
+            mids = [m["meta"].get("mid") for m in slot.messages if isinstance(m.get("meta"), dict)]
+            assert mids.count(dup) == 2, f"fixture no longer reproduces a repeated id; got {mids}"
 
             resp = await client.get("/api/chat/slots/dupmid?limit=10")
             assert resp.status == 200, await resp.text()
@@ -1675,9 +1669,7 @@ class TestSlotDetailPagination:
         without_id = [
             m
             for m in disk
-            if not (
-                isinstance(m.get("meta"), dict) and isinstance(m["meta"].get("mid"), str)
-            )
+            if not (isinstance(m.get("meta"), dict) and isinstance(m["meta"].get("mid"), str))
         ]
         assert with_id and without_id, (
             f"fixture did not produce a MIXED disk window; "
@@ -1728,14 +1720,14 @@ class TestSlotDetailPagination:
         window_row = slot.append("assistant", "injected result")
         slot.drain()
         mid = window_row["meta"]["mid"]
-        assert state.conversation_log.append_if_absent(
-            key, "assistant", "injected result", mid=mid
-        ) is True
+        assert (
+            state.conversation_log.append_if_absent(key, "assistant", "injected result", mid=mid)
+            is True
+        )
 
         disk = state.conversation_log.read_messages_chained(key)
         region_mids = [
-            m["meta"].get("mid") if isinstance(m.get("meta"), dict) else None
-            for m in disk
+            m["meta"].get("mid") if isinstance(m.get("meta"), dict) else None for m in disk
         ]
         assert all(isinstance(x, str) and x for x in region_mids), (
             f"the durable copy dropped the id — the region is mixed, not all-id: {region_mids}"
@@ -1776,9 +1768,7 @@ class TestSlotDetailPagination:
         # (slot save and id-carrying durable appends) stamps meta.mid.
         state.conversation_log.append(key, "user", "q1", mid="m-disk-0000000001")
         state.conversation_log.append(key, "assistant", "a1", mid="m-disk-0000000002")
-        state.conversation_log.append(
-            key, "assistant", "cron result", mid="m-disk-0000000003"
-        )
+        state.conversation_log.append(key, "assistant", "cron result", mid="m-disk-0000000003")
 
         slot = state.get_or_create_slot("cronhyd")
         hydrate_slot_from_history(slot, state.conversation_log.read_messages(key))
@@ -1791,9 +1781,7 @@ class TestSlotDetailPagination:
 
         contents = [m["content"] for m in data["messages"]]
         for body in ("q1", "a1", "cron result"):
-            assert contents.count(body) == 1, (
-                f"a hydrated row was served twice; got {contents}"
-            )
+            assert contents.count(body) == 1, f"a hydrated row was served twice; got {contents}"
 
     @pytest.mark.asyncio
     async def test_interleaved_foreign_row_does_not_duplicate_the_persisted_suffix(
@@ -1845,9 +1833,11 @@ class TestSlotDetailPagination:
         _save_slot_to_history(state, slot, force=True)
 
         disk = [m.get("content") for m in state.conversation_log.read_messages_chained(key)]
-        assert disk == ["w1", "foreign row", "w2"], (
-            f"fixture did not interleave the foreign row mid-window; disk={disk}"
-        )
+        assert disk == [
+            "w1",
+            "foreign row",
+            "w2",
+        ], f"fixture did not interleave the foreign row mid-window; disk={disk}"
 
         # A genuinely un-flushed turn after the interleave.
         slot.append("user", "w3", ts="2030-01-02T00:00:00.000000+00:00")
@@ -1920,16 +1910,14 @@ class TestSlotDetailPagination:
 
         disk = state.conversation_log.read_messages_chained(key)
         has_id = [
-            isinstance(m.get("meta"), dict) and isinstance(m["meta"].get("mid"), str)
-            for m in disk
+            isinstance(m.get("meta"), dict) and isinstance(m["meta"].get("mid"), str) for m in disk
         ]
         assert any(has_id) and not all(has_id), (
             f"fixture did not produce a MIXED disk window, so the ordered path "
             f"would not run; has_id={has_id}"
         )
         assert any(m["content"] == redacted for m in disk), (
-            f"fixture did not persist the redacted form; disk="
-            f"{[m['content'] for m in disk]}"
+            f"fixture did not persist the redacted form; disk=" f"{[m['content'] for m in disk]}"
         )
         assert any(m.get("content") == secret for m in slot.messages), (
             "fixture did not keep the window copy raw"
@@ -2002,8 +1990,7 @@ class TestSlotDetailPagination:
 
         disk = state.conversation_log.read_messages_chained(key)
         has_id = [
-            isinstance(m.get("meta"), dict) and isinstance(m["meta"].get("mid"), str)
-            for m in disk
+            isinstance(m.get("meta"), dict) and isinstance(m["meta"].get("mid"), str) for m in disk
         ]
         assert any(has_id) and not all(has_id), (
             f"fixture did not produce a MIXED disk window, so the ordered path "
@@ -2025,9 +2012,7 @@ class TestSlotDetailPagination:
         )
 
     @pytest.mark.asyncio
-    async def test_bounded_read_runs_the_tail_match_off_the_event_loop(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_bounded_read_runs_the_tail_match_off_the_event_loop(self, tmp_path, monkeypatch):
         """The tail match must not run on the event loop.
 
         It walks the whole window against the whole disk window region and applies
@@ -2127,12 +2112,10 @@ class TestSlotDetailPagination:
             data = await resp.json()
 
         contents = [m["content"] for m in data["messages"]]
-        assert "owed-turn" in contents, (
-            f"the un-flushed row before a persisted row was dropped; got {contents}"
-        )
-        assert contents.count("a1") == 1, (
-            f"the persisted row was duplicated; got {contents}"
-        )
+        assert (
+            "owed-turn" in contents
+        ), f"the un-flushed row before a persisted row was dropped; got {contents}"
+        assert contents.count("a1") == 1, f"the persisted row was duplicated; got {contents}"
 
     @pytest.mark.asyncio
     async def test_transient_window_row_does_not_truncate_the_id_prefix(
@@ -2251,9 +2234,7 @@ class TestSlotDetailPagination:
             f"the pending approval prompt was dropped or duplicated; roles={roles}"
         )
         contents = [m["content"] for m in data["messages"]]
-        assert contents.count("a1") == 1, (
-            f"a persisted row was duplicated; got {contents}"
-        )
+        assert contents.count("a1") == 1, f"a persisted row was duplicated; got {contents}"
 
     @pytest.mark.asyncio
     async def test_resolved_permission_is_not_appended_after_later_turns(
@@ -2303,9 +2284,9 @@ class TestSlotDetailPagination:
         )
         window_roles = [m.get("role") for m in slot.messages]
         assert "permission" in window_roles, "fixture expects the permission row in the window"
-        assert window_roles.index("permission") < window_roles.index("assistant"), (
-            f"fixture expects the approval to sit BEFORE the later turn; {window_roles}"
-        )
+        assert window_roles.index("permission") < window_roles.index(
+            "assistant"
+        ), f"fixture expects the approval to sit BEFORE the later turn; {window_roles}"
         perm = next(m for m in slot.messages if m.get("role") == "permission")
         assert _json.loads(perm["cls"]).get("resolved") == "approved", (
             "fixture expects the permission row to be marked resolved"
@@ -2352,8 +2333,7 @@ class TestSlotDetailPagination:
 
         disk = state.conversation_log.read_messages_chained(key)
         has_id = [
-            isinstance(m.get("meta"), dict) and isinstance(m["meta"].get("mid"), str)
-            for m in disk
+            isinstance(m.get("meta"), dict) and isinstance(m["meta"].get("mid"), str) for m in disk
         ]
         assert has_id and all(has_id), (
             f"fixture needs every disk row to carry an id so the owed-set path "
@@ -2432,8 +2412,7 @@ class TestSlotDetailPagination:
         assert window.fired, "fixture never fired the trim, so nothing was raced"
         contents = [m["content"] for m in out]
         assert contents.count("q1") == 1 and contents.count("a1") == 1, (
-            f"a trim between the two snapshot reads duplicated a persisted row; "
-            f"got {contents}"
+            f"a trim between the two snapshot reads duplicated a persisted row; " f"got {contents}"
         )
 
 
@@ -2585,7 +2564,9 @@ class TestSlotLifecycle:
         assert owner_link["ci"] == "passed"
         assert owner_link["state"] == "open"
 
-    def test_slot_serialization_uses_live_session_execution_location(self, tmp_path, monkeypatch):
+    def test_slot_serialization_uses_provider_neutral_execution_location(
+        self, tmp_path, monkeypatch
+    ):
         """The UI badge must describe the provider currently backing the slot.
 
         This catches deriving a badge from the workspace-wide Coder preference:
@@ -2600,9 +2581,10 @@ class TestSlotLifecycle:
             "execution_location",
             lambda key: (
                 {
-                    "kind": "coder",
-                    "workspace": "crew-dogfood",
-                    "remote_cwd": "/home/coder/workspace",
+                    "kind": "test-sandbox",
+                    "workspace": "sandbox-opaque",
+                    "remote_cwd": "/workspace",
+                    "state": "starting",
                 }
                 if key == "dashboard:remote"
                 else None
@@ -2613,13 +2595,26 @@ class TestSlotLifecycle:
         payload = state.serialize_slot(slot)
 
         assert payload["execution_location"] == {
-            "kind": "coder",
-            "workspace": "crew-dogfood",
-            "remote_cwd": "/home/coder/workspace",
+            "kind": "test-sandbox",
+            "workspace": "sandbox-opaque",
+            "remote_cwd": "/workspace",
+            "state": "starting",
         }
 
         monkeypatch.setattr(state.sessions, "execution_location", lambda _key: None)
         assert "execution_location" not in state.serialize_slot(slot)
+
+    def test_slot_serialization_keeps_allocated_coder_workspace_without_live_provider(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("remote")
+        slot.coder_workspace = "crew-session-kyle-opaque"
+
+        payload = state.serialize_slot(slot)
+
+        assert payload["coder_workspace"] == "crew-session-kyle-opaque"
 
     @pytest.mark.asyncio
     async def test_approve_no_pending(self, tmp_path, monkeypatch):
@@ -3214,9 +3209,7 @@ class TestResumeDedupe:
 
         async with TestClient(TestServer(_make_app(state))) as client:
             r = await (
-                await client.post(
-                    "/api/chat/slots/deep/resume", json={"key": "dashboard:deep"}
-                )
+                await client.post("/api/chat/slots/deep/resume", json={"key": "dashboard:deep"})
             ).json()
 
         assert r["ok"] is True
@@ -4257,9 +4250,7 @@ class TestSessionColor:
             assert slot.color_index == 2 and slot.color_hex is None
 
     @pytest.mark.asyncio
-    async def test_color_index_only_patch_keeps_existing_hex_when_null(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_color_index_only_patch_keeps_existing_hex_when_null(self, tmp_path, monkeypatch):
         """An index-only PATCH with null must not silently null a hex (in-body gating)."""
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
@@ -5626,9 +5617,7 @@ class TestTokenUsageSurface:
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
 
         persist = AsyncMock()
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.persist_token_record_async", persist
-        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner.persist_token_record_async", persist)
 
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -5665,9 +5654,7 @@ class TestTokenUsageSurface:
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
 
         persist = AsyncMock()
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_runner.persist_token_record_async", persist
-        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner.persist_token_record_async", persist)
 
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -6303,9 +6290,7 @@ class TestRuntimeWiring:
             raise RuntimeError("config unreadable")
 
         monkeypatch.setattr("kiro_crew.dashboard.chat.KiroCrewConfig.load", _boom)
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", _boom
-        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", _boom)
 
         async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
             resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "oncall"})
@@ -6541,9 +6526,7 @@ class TestRuntimeWiring:
             assert data["workspace"] == "research-ws"
 
     @pytest.mark.asyncio
-    async def test_api_chat_slot_agent_new_agent_visible_during_reset(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_api_chat_slot_agent_new_agent_visible_during_reset(self, tmp_path, monkeypatch):
         """The new agent is committed before the reset runs.
 
         A message send landing while the reset await is in flight creates a
@@ -6570,9 +6553,7 @@ class TestRuntimeWiring:
 
         # Resolution outcome is irrelevant to the visibility property.
         monkeypatch.setattr("kiro_crew.dashboard.chat.KiroCrewConfig.load", _boom)
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", _boom
-        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", _boom)
 
         async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
             resp = await client.post("/api/chat/slots/s1/agent", json={"agent": "research"})
@@ -6604,9 +6585,7 @@ class TestRuntimeWiring:
 
         # Resolution outcome is irrelevant; keep the derived commit a no-op.
         monkeypatch.setattr("kiro_crew.dashboard.chat.KiroCrewConfig.load", _boom)
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", _boom
-        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", _boom)
 
         # A conversation_log whose update_metadata simulates a concurrent
         # /workspace pick landing while the persist thread runs.
@@ -6683,9 +6662,7 @@ class TestRuntimeWiring:
             assert slot.project == "/workspace/dev"
 
     @pytest.mark.asyncio
-    async def test_api_chat_slot_agent_keeps_project_for_project_agent(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_api_chat_slot_agent_keeps_project_for_project_agent(self, tmp_path, monkeypatch):
         """Selecting a PROJECT-scope agent must not reset slot.project.
 
         kiro-cli resolves --agent against $PWD/.kiro/agents, so clobbering the
@@ -9781,6 +9758,42 @@ class TestSlotTaskNoneGuard:
             assert resp.status == 200
             assert slot.task.cancelled()
 
+    @pytest.mark.asyncio
+    async def test_delete_stops_bound_coder_workspace_before_archiving(
+        self, tmp_path: Path
+    ) -> None:
+        state = _make_state(tmp_path)
+        state.get_or_create_slot("s1")
+        manager = MagicMock()
+        manager.stop_for_session = AsyncMock(return_value="crew-session-user-opaque")
+        state.sessions.coder_workspace_manager = MagicMock(return_value=manager)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            with patch("kiro_crew.dashboard.chat_handlers.save_slot_off_loop"):
+                resp = await client.delete("/api/chat/slots/s1")
+
+        assert resp.status == 200
+        manager.stop_for_session.assert_awaited_once_with("dashboard:s1")
+        assert "s1" not in state._slots
+
+    @pytest.mark.asyncio
+    async def test_delete_keeps_slot_when_bound_coder_workspace_cannot_stop(
+        self, tmp_path: Path
+    ) -> None:
+        state = _make_state(tmp_path)
+        state.get_or_create_slot("s1")
+        manager = MagicMock()
+        manager.stop_for_session = AsyncMock(side_effect=RuntimeError("coder unavailable"))
+        state.sessions.coder_workspace_manager = MagicMock(return_value=manager)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.delete("/api/chat/slots/s1")
+            body = await resp.json()
+
+        assert resp.status == 502
+        assert body["code"] == "coder_workspace_stop_failed"
+        assert "s1" in state._slots
+
 
 # ── Bulk cleanup tests ──
 
@@ -9822,6 +9835,32 @@ class TestBulkCleanup:
         assert "stale1" not in state._slots
         assert "fresh1" in state._slots
         assert "pinned1" in state._slots
+
+    @pytest.mark.asyncio
+    async def test_cleanup_stops_each_stale_sessions_bound_coder_workspace(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        from datetime import datetime, timedelta, timezone
+
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+        stale = state.get_or_create_slot("stale1")
+        stale.append("user", "old msg", ts=old_ts)
+        stale.drain()
+        manager = MagicMock()
+        manager.stop_for_session = AsyncMock(return_value="crew-session-user-opaque")
+        state.sessions.coder_workspace_manager = MagicMock(return_value=manager)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/cleanup",
+                json={"max_inactive_days": 3},
+            )
+
+        assert resp.status == 200
+        manager.stop_for_session.assert_awaited_once_with("dashboard:stale1")
+        assert "stale1" not in state._slots
 
     @pytest.mark.asyncio
     async def test_cleanup_skips_active_slot(self, tmp_path, monkeypatch):
@@ -10211,9 +10250,7 @@ class TestFolderCRUD:
             assert data["name"] == "New"
 
     @pytest.mark.asyncio
-    async def test_a_failed_folder_write_restores_the_slots_it_unfiled(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_a_failed_folder_write_restores_the_slots_it_unfiled(self, tmp_path, monkeypatch):
         """Delete must not half-land: unfiled slots go back if the store write fails.
 
         The handler unfiles the folder's slots first, then commits the folder
@@ -10243,9 +10280,7 @@ class TestFolderCRUD:
         )
 
     @pytest.mark.asyncio
-    async def test_a_parent_deleted_under_the_lock_rejects_the_create(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_a_parent_deleted_under_the_lock_rejects_the_create(self, tmp_path, monkeypatch):
         """A child must not land with a dangling parent_id.
 
         Parent existence is validated before the store lock is taken, so a
@@ -10394,9 +10429,9 @@ class TestFolderCRUD:
                     cur = parents.get(cur, "")
                 return True
 
-            assert all(_reaches_root(fid) for fid in parents), (
-                f"a parent cycle was persisted: {parents}"
-            )
+            assert all(
+                _reaches_root(fid) for fid in parents
+            ), f"a parent cycle was persisted: {parents}"
             stored = json.loads((tmp_path / state._FOLDERS_FILE).read_text(encoding="utf-8"))
             assert {f["id"]: f.get("parent_id", "") for f in stored} == parents
 
@@ -11535,6 +11570,25 @@ class TestRegenerateAndVariants:
         assert "variants" in ai
         assert len(ai["variants"]) == 2
         assert ai["variant_idx"] == 1
+
+    @pytest.mark.asyncio
+    async def test_restore_preserves_allocated_coder_workspace(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("coder-session")
+        slot.coder_profile = "cpu-large"
+        slot.coder_workspace = "crew-session-kyle-opaque"
+        slot.append("user", "keep this session")
+        slot.drain()
+        from kiro_crew.dashboard.chat import _save_slot_to_history, restore_recent_sessions
+
+        _save_slot_to_history(state, slot, force=True)
+        state._slots.clear()
+        restore_recent_sessions(state, window_minutes=9999)
+
+        restored = state._slots["coder-session"]
+        assert restored.coder_profile == "cpu-large"
+        assert restored.coder_workspace == "crew-session-kyle-opaque"
 
     @pytest.mark.asyncio
     async def test_regenerate_clears_pending_on_cancel(self, tmp_path, monkeypatch):
@@ -14941,9 +14995,7 @@ class TestRunChatTransientRetry:
         assert slot._prestream_exhausted_cycles == 0
 
     @pytest.mark.asyncio
-    async def test_poisoned_discard_is_one_shot_until_a_turn_lands(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_poisoned_discard_is_one_shot_until_a_turn_lands(self, tmp_path, monkeypatch):
         """If even the fresh post-discard conversation keeps failing (genuine
         prolonged outage), no second discard fires: the one-shot is consumed by
         the first escalation and only a LANDED turn re-arms it, so a discard
@@ -14990,9 +15042,7 @@ class TestRunChatTransientRetry:
         assert sum(1 for t in self._err_texts(slot) if t.startswith("❌")) >= 2
 
     @pytest.mark.asyncio
-    async def test_cancelled_turn_does_not_rearm_poisoned_one_shot(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_cancelled_turn_does_not_rearm_poisoned_one_shot(self, tmp_path, monkeypatch):
         """Regression: the poisoned-discard one-shot re-arms only on a LANDED
         turn. But the STREAK is evidence-based: a cancelled turn that EMITTED
         output proves the backend accepts this conversation, so it breaks the
@@ -15101,9 +15151,7 @@ class TestRunChatTransientRetry:
         assert sum(1 for t in self._err_texts(slot) if t.startswith("❌")) >= 2
 
     @pytest.mark.asyncio
-    async def test_canary_empty_reply_is_not_positive_evidence(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_canary_empty_reply_is_not_positive_evidence(self, tmp_path, monkeypatch):
         """A canary that completes with EMPTY output proves nothing about the
         fresh conversation working — fail-safe to no-discard."""
         from kiro_crew.acp.client import AcpError
@@ -15136,9 +15184,7 @@ class TestRunChatTransientRetry:
         assert slot._poisoned_reset_used is False
 
     @pytest.mark.asyncio
-    async def test_stop_during_canary_vetoes_discard_and_requeue(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_stop_during_canary_vetoes_discard_and_requeue(self, tmp_path, monkeypatch):
         """GPT-review fix: a Stop initiated DURING the (up to 30s) canary probe
         must veto the discard and the synthetic re-queue even when the canary
         succeeds — the user just cancelled this work, and re-queueing would
@@ -15190,9 +15236,7 @@ class TestRunChatTransientRetry:
         assert slot._prestream_exhausted_cycles == 2
 
     @pytest.mark.asyncio
-    async def test_unreadable_session_model_skips_canary_and_discard(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_unreadable_session_model_skips_canary_and_discard(self, tmp_path, monkeypatch):
         """When the session's served model cannot be read, the canary cannot
         be pinned to it, so the probe is meaningless — fail-safe: no probe,
         no discard, one-shot preserved."""
@@ -15295,9 +15339,7 @@ class TestRunChatTransientRetry:
         assert slot._transient_5xx_retries == 0
 
     @pytest.mark.asyncio
-    async def test_thinking_only_failures_never_accrue_discard_streak(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_thinking_only_failures_never_accrue_discard_streak(self, tmp_path, monkeypatch):
         """A turn that streamed REASONING before dying is a mid-generation
         failure — the backend demonstrably serves this conversation — not the
         poisoned pre-stream signature. Repeated thinking-then-transient-death
@@ -16480,9 +16522,7 @@ class TestSessionReload:
         eager.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_reload_retries_when_racing_turn_already_finished(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_reload_retries_when_racing_turn_already_finished(self, tmp_path, monkeypatch):
         """A declined reset whose racing turn already FINISHED retries once.
 
         Falling through would report success while the stale live process
@@ -16544,9 +16584,7 @@ class TestSessionReload:
 
         from kiro_crew.dashboard.system_notices import SYSTEM_NOTICE_KINDS
 
-        ts_path = (
-            Path(__file__).resolve().parents[1] / "website/src/lib/systemNotice.ts"
-        )
+        ts_path = Path(__file__).resolve().parents[1] / "website/src/lib/systemNotice.ts"
         ts_src = ts_path.read_text(encoding="utf-8")
         m = re.search(r"new Set\(\[([^\]]*)\]\)", ts_src)
         assert m, "SYSTEM_NOTICE_KINDS Set literal not found in systemNotice.ts"
@@ -16683,9 +16721,7 @@ class TestSessionReload:
         eager.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_reload_fails_closed_on_unreadable_children_probe(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_reload_fails_closed_on_unreadable_children_probe(self, tmp_path, monkeypatch):
         """A None running-probe is the probe FAILING, not zero children."""
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
@@ -16775,9 +16811,7 @@ class TestCloseBroadcastDurability:
         return calls
 
     @pytest.mark.asyncio
-    async def test_failed_close_never_emits_a_frame_without_the_slot(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_failed_close_never_emits_a_frame_without_the_slot(self, tmp_path, monkeypatch):
         """The regression guard: a rollback must not be preceded by an omission.
 
         A frame omitting the slot is what makes another client drop this slot's
@@ -17125,8 +17159,7 @@ class TestUnflushedTailOrderingAndSnapshot:
             f"the trailing transient was emitted more than once; got {bodies}"
         )
         assert bodies == ["run it", "stopped", "partial an"], (
-            f"a transient already after the last match must stay where it was; got "
-            f"{bodies}"
+            f"a transient already after the last match must stay where it was; got " f"{bodies}"
         )
 
     def test_unowed_and_answered_rows_stay_excluded_from_the_idless_tail(self):
@@ -17166,8 +17199,7 @@ class TestUnflushedTailOrderingAndSnapshot:
             bodies = [m["content"] for m in out]
             if owed:
                 assert body in bodies, (
-                    f"{extra['role']} row {body!r} is owed and must be merged; got "
-                    f"{bodies}"
+                    f"{extra['role']} row {body!r} is owed and must be merged; got " f"{bodies}"
                 )
             else:
                 assert body not in bodies, (
@@ -17316,8 +17348,7 @@ class TestUnflushedTailOrderingAndSnapshot:
                 f"tail slice; got {bodies}"
             )
             assert bodies == ["run it", "stopped"], (
-                f"the bounded page must hold exactly the persisted rows in order; got "
-                f"{bodies}"
+                f"the bounded page must hold exactly the persisted rows in order; got " f"{bodies}"
             )
 
     def test_trailing_owed_rows_survive_the_idless_tail_filter(self):
@@ -17349,8 +17380,7 @@ class TestUnflushedTailOrderingAndSnapshot:
         out = _append_unflushed_tail(slot, [q, stop])  # type: ignore[arg-type]
         bodies = [m["content"] for m in out]
         assert bodies == ["run it", "stopped", "pending-approval"], (
-            f"a still-pending permission is owed and must survive the tail filter; got "
-            f"{bodies}"
+            f"a still-pending permission is owed and must survive the tail filter; got " f"{bodies}"
         )
 
         slot = SimpleNamespace(messages=[q, stop, chunk], _disk_older_count=0)

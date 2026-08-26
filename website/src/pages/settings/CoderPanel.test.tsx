@@ -22,6 +22,9 @@ function snapshot(overrides: Partial<CoderConfigData> = {}): CoderConfigData {
     url: 'https://coder.example',
     template: 'kirocrew-arm',
     preset: 'arm-small',
+    profiles: {
+      gpu: { template: 'kirocrew-gpu', preset: 'gpu-medium' },
+    },
     remote_cwd: '/home/coder/workspace',
     runtime_warm_minutes: 5,
     stop_after_minutes: 30,
@@ -75,6 +78,9 @@ describe('CoderPanel', () => {
       url: 'https://coder.example',
       template: 'kirocrew-arm',
       preset: 'arm-small',
+      profiles: {
+        gpu: { template: 'kirocrew-gpu', preset: 'gpu-medium' },
+      },
       remote_cwd: '/home/coder/workspace',
       runtime_warm_minutes: 5,
       stop_after_minutes: 30,
@@ -101,6 +107,9 @@ describe('CoderPanel', () => {
       url: 'https://candidate.example',
       template: 'kirocrew-arm',
       preset: 'arm-small',
+      profiles: {
+        gpu: { template: 'kirocrew-gpu', preset: 'gpu-medium' },
+      },
       remote_cwd: '/home/coder/workspace',
       runtime_warm_minutes: 5,
       stop_after_minutes: 30,
@@ -118,6 +127,25 @@ describe('CoderPanel', () => {
     expect(screen.getByText(/Each new parent session gets its own workspace/)).toBeInTheDocument()
     expect(screen.getByText(/stopped workspaces are deleted after 30 inactive days/)).toBeInTheDocument()
     expect(screen.queryByDisplayValue('crew-dogfood')).not.toBeInTheDocument()
+  })
+
+  it('edits named template profiles for per-session selection', async () => {
+    const user = userEvent.setup()
+    await renderPanel()
+
+    expect(screen.getByLabelText('Template for gpu')).toHaveValue('kirocrew-gpu')
+    await user.click(screen.getByRole('button', { name: 'Add profile' }))
+    expect(screen.getAllByLabelText('Profile name')).toHaveLength(2)
+    await user.click(screen.getByRole('button', { name: 'Save configuration' }))
+
+    await waitFor(() => expect(api.saveCoderConfig).toHaveBeenCalledWith(
+      expect.objectContaining({
+        profiles: {
+          gpu: { template: 'kirocrew-gpu', preset: 'gpu-medium' },
+          'profile-2': { template: 'kirocrew-arm', preset: '' },
+        },
+      }),
+    ))
   })
 
   it('includes expandable setup docs and links for both deploy templates', async () => {

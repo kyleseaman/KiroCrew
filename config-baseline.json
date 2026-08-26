@@ -942,12 +942,13 @@
           "url": "",
           "template": "",
           "preset": "",
+          "profiles": {},
           "remote_cwd": "/home/coder/workspace",
           "runtime_warm_minutes": 5,
           "stop_after_minutes": 30,
           "delete_after_days": 30,
           "max_running": 3,
-          "workspace_prefix": "crew"
+          "workspace_prefix": "crew-session"
         }
       }
     },
@@ -1095,12 +1096,13 @@
         "url": "",
         "template": "",
         "preset": "",
+        "profiles": {},
         "remote_cwd": "/home/coder/workspace",
         "runtime_warm_minutes": 5,
         "stop_after_minutes": 30,
         "delete_after_days": 30,
         "max_running": 3,
-        "workspace_prefix": "crew"
+        "workspace_prefix": "crew-session"
       }
     },
     {
@@ -1156,6 +1158,62 @@
       "tags": [],
       "label": "Coder Preset",
       "help": "Optional template preset for new workspaces.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
+      "path": "session.coder.profiles",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Coder Profiles",
+      "help": "Named template and preset choices selectable before a parent session allocates.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {}
+    },
+    {
+      "path": "session.coder.profiles.*",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
+      "path": "session.coder.profiles.*.template",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Coder Template",
+      "help": "Template used for sessions selecting this profile.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
+      "path": "session.coder.profiles.*.preset",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Coder Preset",
+      "help": "Optional template preset for this profile.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
@@ -1242,7 +1300,7 @@
       "help": "Safe prefix for opaque managed workspace names.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": "crew"
+      "defaultValue": "crew-session"
     },
     {
       "path": "taskrunner",

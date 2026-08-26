@@ -3507,6 +3507,11 @@ def schedule_eager_spawn(
         cfg = KiroCrewConfig.load()
         if not cfg.session.eager_spawn:
             return None
+        # Managed Coder allocation can start billable compute. Wait for the
+        # first real turn so the operator can choose a session profile and an
+        # untouched tab never creates a workspace merely by being opened.
+        if cfg.session.coder.enabled is True:
+            return None
     except Exception:
         return None
     prev = getattr(slot, "_eager_spawn_task", None)
@@ -3713,6 +3718,7 @@ async def _eager_spawn(
                     speculative=True,
                     speculative_resume=allow_resume,
                     reasoning_effort_override=slot.reasoning_effort or None,
+                    coder_profile_override=slot.coder_profile or None,
                 )
             except SpeculativeResumeRefused:
                 # Two sources: the entry gate (resumable key, resume not
@@ -5344,8 +5350,20 @@ async def _run_chat(
             model=slot.model or agent_model or None,
             cwd=slot.project or None,
             reasoning_effort_override=slot.reasoning_effort or None,
+            coder_profile_override=slot.coder_profile or None,
         )
         _acquired = True
+        location_resolver = getattr(state.sessions, "execution_location", None)
+        execution_location = (
+            location_resolver(session_key) if callable(location_resolver) else None
+        )
+        if (
+            isinstance(execution_location, dict)
+            and execution_location.get("kind") == "coder"
+            and isinstance(execution_location.get("workspace"), str)
+            and execution_location["workspace"]
+        ):
+            slot.coder_workspace = execution_location["workspace"]
         # Member activity pointer — once per SESSION, not per turn: the log
         # answers "which sessions did this member take part in", so a per-turn
         # append would inflate every count taken from it. `slot.agent` is the

@@ -32,6 +32,7 @@ from kiro_crew.constants import (
     CODER_DEFAULT_RUNTIME_WARM_MINUTES,
     CODER_DEFAULT_STOP_AFTER_MINUTES,
     CODER_DEFAULT_WORKSPACE_PREFIX,
+    CODER_MAX_PROFILES,
 )
 from kiro_crew.dashboard.handlers.agents import _get_config_lock
 from kiro_crew.dashboard.handlers.secrets import _owner_only
@@ -83,6 +84,26 @@ def _int_field(body: dict[str, Any], name: str, *, minimum: int, maximum: int) -
     return value
 
 
+def _profiles_field(body: dict[str, Any]) -> dict[str, dict[str, str]]:
+    value = body.get("profiles", {})
+    if not isinstance(value, dict) or len(value) > CODER_MAX_PROFILES:
+        raise ValueError(f"profiles must be an object with at most {CODER_MAX_PROFILES} entries")
+    profiles: dict[str, dict[str, str]] = {}
+    for name, raw in value.items():
+        if not isinstance(name, str) or not isinstance(raw, dict):
+            raise ValueError("each Coder profile must be a named object")
+        safe_name = validate_coder_workspace(name)
+        template = raw.get("template", "")
+        preset = raw.get("preset", "")
+        if not isinstance(template, str) or not isinstance(preset, str):
+            raise ValueError("Coder profile template and preset must be strings")
+        profiles[safe_name] = {
+            "template": validate_coder_workspace(template.strip()),
+            "preset": validate_coder_workspace(preset.strip()) if preset.strip() else "",
+        }
+    return profiles
+
+
 async def probe_coder_managed_config(**kwargs: Any) -> dict[str, str]:
     """Verify auth and template visibility without creating billable compute."""
     env = os.environ
@@ -129,6 +150,7 @@ async def api_coder_config(request: web.Request) -> web.Response:
             managed = {
                 "template": "",
                 "preset": "",
+                "profiles": {},
                 "runtime_warm_minutes": CODER_DEFAULT_RUNTIME_WARM_MINUTES,
                 "stop_after_minutes": CODER_DEFAULT_STOP_AFTER_MINUTES,
                 "delete_after_days": CODER_DEFAULT_DELETE_AFTER_DAYS,
@@ -142,6 +164,10 @@ async def api_coder_config(request: web.Request) -> web.Response:
             managed = {
                 "template": coder.template,
                 "preset": coder.preset,
+                "profiles": {
+                    name: {"template": profile.template, "preset": profile.preset}
+                    for name, profile in coder.profiles.items()
+                },
                 "runtime_warm_minutes": coder.runtime_warm_minutes,
                 "stop_after_minutes": coder.stop_after_minutes,
                 "delete_after_days": coder.delete_after_days,
@@ -181,6 +207,10 @@ async def api_coder_config(request: web.Request) -> web.Response:
         token = _string_field(body, "token")
     except ValueError as exc:
         return _error(str(exc), "coder_field_invalid")
+    try:
+        profiles = _profiles_field(body)
+    except ValueError as exc:
+        return _error(str(exc), "coder_profiles_invalid")
     if len(token.encode("utf-8")) > _CODER_TOKEN_MAX_BYTES:
         return _error("token is too large", "coder_token_invalid")
     if enabled:
@@ -224,6 +254,7 @@ async def api_coder_config(request: web.Request) -> web.Response:
                 "url": url,
                 "template": template,
                 "preset": preset,
+                "profiles": profiles,
                 "remote_cwd": remote_cwd,
                 "runtime_warm_minutes": runtime_warm_minutes,
                 "stop_after_minutes": stop_after_minutes,

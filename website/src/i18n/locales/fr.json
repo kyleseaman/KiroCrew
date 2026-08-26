@@ -1,9 +1,20 @@
 {
   "coder": {
+    "add_profile": "Ajouter un profil",
+    "default_profile": "Profil Coder par défaut",
+    "profile_badge": "Profil Coder · {{profile}}",
+    "profile_change_failed": "Impossible de modifier le profil Coder",
+    "profile_name_label": "Nom du profil",
+    "profile_preset_label": "Préréglage pour {{name}}",
+    "profile_template_label": "Modèle pour {{name}}",
+    "profiles_description": "Choix de modèles nommés facultatifs. Sélectionnez-en un dans une nouvelle session avant l’allocation de son espace de travail.",
+    "profiles_title": "Profils de session",
+    "remove_profile": "Supprimer le profil",
+    "remove_profile_named": "Supprimer le profil {{name}}",
+    "session_profile_label": "Profil Coder pour cette session",
     "architecture": "La passerelle conserve la mémoire, MCP, OAuth, les tâches cron et les identifiants. Seul le processus de session s’exécute dans Coder ; les sous-agents héritent de cet espace de travail.",
     "badge_allocating": "Attribution de l’espace de travail Coder",
     "badge_label": "Espace Coder · {{workspace}}",
-    "badge_title": "Cette session active s’exécute dans Coder",
     "connected_to": "Connecté en tant que {{owner}} ; le modèle {{template}} est disponible",
     "connection_failed": "Échec du test de connexion",
     "control_plane_template": "Plan de contrôle AWS complet",
@@ -48,6 +59,11 @@
     "workspace_label": "Préfixe du nom d’espace",
     "workspace_template": "Modèle d’espace de travail",
     "workspace_template_description": "Envoyez le modèle d’espace ARM EC2 vers un déploiement Coder existant. Le plan de contrôle et le réseau doivent déjà exister."
+  },
+  "execution_environment": {
+    "badge_starting": "Démarrage de l’espace de travail {{kind}}",
+    "badge_starting_named": "Démarrage de l’espace de travail {{kind}} · {{workspace}}",
+    "badge_running": "Espace de travail {{kind}} · {{workspace}}"
   },
   "api": {
     "client": {
@@ -7326,6 +7342,7 @@
       "working": "En cours"
     },
     "useSessionActions": {
+      "archive_and_stop_coder_workspace": "Archiver « {{title}} » et arrêter son espace de travail Coder ?\n\nProfil : {{profile}}\nEspace de travail : {{workspace}}\n\nCela met fin au tour en cours, aux terminaux, aux compilations et aux processus en arrière-plan. L’historique du chat, la mémoire et le stockage persistant de l’espace de travail sont conservés.",
       "close_this_session": "Fermer cette session ?",
       "reload_failed": "Échec du rechargement de la session. L'agent est peut-être en train de répondre ou la passerelle est injoignable ; réessayez quand la session est inactive.",
       "reload_failed_subagents": "Des sous-agents travaillent encore sur cette session. Réessayez quand ils auront terminé.",
@@ -8933,7 +8950,9 @@
       "add_state_lanes": "Ajouter les colonnes automatiques",
       "lane_seed_failed": "Impossible d'ajouter les colonnes automatiques.",
       "lane_seed_retry": "Réessayer",
-      "lane_legacy_column_hint": "affiche toutes les sessions"
+      "lane_legacy_column_hint": "affiche toutes les sessions",
+      "coder_workspace_will_stop": "{{count}} espace de travail Coder va s’arrêter maintenant : {{workspaces}}.",
+      "coder_workspaces_will_stop": "{{count}} espaces de travail Coder vont s’arrêter maintenant : {{workspaces}}."
     },
     "connectionsPage": {
       "action_failed": "Échec de l’action : {{error}}",

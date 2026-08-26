@@ -82,7 +82,7 @@ import re
 import threading
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -462,6 +462,10 @@ class _CompactCallback(Protocol):
 
 class _RecycleCallback(Protocol):
     async def __call__(self, key: str, *, reason: str) -> None: ...  # noqa: E704
+
+
+class _ExecutionLocationCallback(Protocol):
+    def __call__(self, key: str) -> None: ...  # noqa: E704
 
 
 # Circuit breaker: force-reset after this many consecutive failures
@@ -907,6 +911,8 @@ def _unlink_session_queue(session: "_Session") -> None:
 class SessionManager:
     """Thread-keyed LLM provider pool with warm session pre-spawning."""
 
+    _on_execution_location_changed: _ExecutionLocationCallback | None
+
     def _fold_key(self, key: str) -> str:
         """Resolve bare/canonical Slack session-key aliases onto the live entry.
 
@@ -943,20 +949,80 @@ class SessionManager:
         sess = self._sessions.get(self._fold_key(key))
         return sess.provider if sess else None
 
+    @staticmethod
+    def _provider_execution_location(
+        provider: LLMProvider | None, *, state: Literal["starting", "running"]
+    ) -> dict[str, str] | None:
+        """Read one allowlisted, provider-neutral execution-host descriptor."""
+        host = getattr(provider, "_session_host", None) if provider is not None else None
+        raw = getattr(host, "execution_location", None) if host is not None else None
+        if not isinstance(raw, Mapping):
+            return None
+        kind = raw.get("kind")
+        workspace = raw.get("workspace")
+        remote_cwd = raw.get("remote_cwd")
+        if (
+            not isinstance(kind, str)
+            or not kind
+            or not isinstance(workspace, str)
+            or not isinstance(remote_cwd, str)
+        ):
+            return None
+        location = {
+            "kind": kind,
+            "workspace": workspace,
+            "remote_cwd": remote_cwd,
+            "state": state,
+        }
+        profile = raw.get("profile")
+        if isinstance(profile, str) and profile:
+            location["profile"] = profile
+        return location
+
     def execution_location(self, key: str) -> dict[str, str] | None:
-        """Return a non-secret descriptor for the live session's remote host.
+        """Return the execution environment for a live or starting session.
 
         The provider is the authority rather than the current workspace default:
         changing a default never migrates an active session, so config-derived
-        metadata would immediately mislabel existing local sessions.
+        metadata would immediately mislabel existing local sessions. A starting
+        provider is observable here but remains absent from ``_sessions`` and
+        therefore cannot be claimed before its startup handshake succeeds.
         """
-        from kiro_crew.acp.session_host import CoderWorkspaceSessionHost
-
+        key = self._fold_key(key)
         provider = self.get_provider(key)
-        host = getattr(provider, "_session_host", None) if provider is not None else None
-        if isinstance(host, CoderWorkspaceSessionHost):
-            return host.execution_location
-        return None
+        if provider is not None:
+            return self._provider_execution_location(provider, state="running")
+        return self._provider_execution_location(
+            self._starting_providers.get(key), state="starting"
+        )
+
+    def set_execution_location_callback(self, cb: _ExecutionLocationCallback | None) -> None:
+        """Register a synchronous callback for execution-location transitions."""
+        if self._on_execution_location_changed is not None and cb is not None:
+            logger.warning(
+                "Execution-location callback already registered; replacing existing handler"
+            )
+        self._on_execution_location_changed = cb
+
+    def _execution_location_changed(self, key: str) -> None:
+        callback = self._on_execution_location_changed
+        if callback is None:
+            return
+        try:
+            callback(key)
+        except Exception:
+            logger.debug("Execution-location callback failed for %s", key, exc_info=True)
+
+    def _track_starting_provider(self, key: str, provider: LLMProvider) -> None:
+        self._starting_providers[key] = provider
+        self._execution_location_changed(key)
+
+    def _untrack_starting_provider(self, key: str, provider: LLMProvider) -> None:
+        if self._starting_providers.get(key) is provider:
+            self._starting_providers.pop(key, None)
+        # Notify even when a same-key race replaced the tracked starter: a live
+        # winner may now be authoritative, and readers always prefer it.
+        self._execution_location_changed(key)
 
     def coder_workspace_manager(self) -> Any:
         """Return the current factory's lifecycle manager, if managed Coder is enabled."""
@@ -1063,6 +1129,12 @@ class SessionManager:
         self._background_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
         self._on_compacted: _CompactCallback | None = None
         self._on_recycled: _RecycleCallback | None = None
+        # Providers are intentionally absent from ``_sessions`` until their
+        # startup handshake succeeds. Keep their non-secret execution-host
+        # descriptor separately so surfaces can show a remote environment
+        # booting without making a half-started provider claimable.
+        self._starting_providers: dict[str, LLMProvider] = {}
+        self._on_execution_location_changed = None
         self._pool_started = False
         self._session_map = SessionMap()
         # Continuable subagent conversations: session keys registered here
@@ -3060,21 +3132,23 @@ class SessionManager:
                 elif ClaudeCodeProvider is not None and isinstance(provider, ClaudeCodeProvider):
                     provider.set_resume_session_id(resume_sid)
                     logger.info("CC resume for %s (sid=%s)", key, resume_sid)
-            async with self._start_sem:
-                try:
+            self._track_starting_provider(key, provider)
+            try:
+                async with self._start_sem:
                     await provider.start()
-                except (asyncio.CancelledError, Exception):
-                    # Provider process may have spawned before the cancel/error —
-                    # shut it down so it doesn't leak. Dispatched to the
-                    # subprocess executor: awaiting an async shutdown here is
-                    # unreliable during cancellation (the awaited future
-                    # re-raises CancelledError immediately), and an inline
-                    # _sync_kill_provider blocks the event loop (os.waitpid /
-                    # taskkill). Resume prefetch makes this path routine — a
-                    # focus flip mid-session/load cancels the loading task —
-                    # so it must not stall the loop.
-                    self._dispatch_hard_kill(provider)
-                    raise
+            except (asyncio.CancelledError, Exception):
+                # Provider process may have spawned before the cancel/error —
+                # shut it down so it doesn't leak. Dispatched to the
+                # subprocess executor: awaiting an async shutdown here is
+                # unreliable during cancellation (the awaited future
+                # re-raises CancelledError immediately), and an inline
+                # _sync_kill_provider blocks the event loop (os.waitpid /
+                # taskkill). Resume prefetch makes this path routine — a
+                # focus flip mid-session/load cancels the loading task —
+                # so it must not stall the loop.
+                self._dispatch_hard_kill(provider)
+                self._untrack_starting_provider(key, provider)
+                raise
 
         # start() has written the provider's PID to kiro_session_pids.txt, but
         # the session is not registered in self._sessions yet. Guard the PID so
@@ -3248,6 +3322,7 @@ class SessionManager:
             # now either in self._sessions or dead, so drop the start-up guard.
             if _starting_pid is not None:
                 self._starting_pids.discard(_starting_pid)
+            self._untrack_starting_provider(key, provider)
 
         # Lost the same-key race: shut down our duplicate provider (outside the
         # lock — subprocess teardown), then acquire the winner's semaphore HERE,

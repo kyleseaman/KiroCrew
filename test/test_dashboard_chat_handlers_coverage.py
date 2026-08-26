@@ -1204,6 +1204,59 @@ class TestSlotReasoningEffort:
         reset.assert_awaited_once()
 
 
+class TestSlotCoderProfile:
+    async def _post(self, state, name, payload):
+        app = _app(
+            state,
+            "POST",
+            "/api/chat/slots/{slot}/coder-profile",
+            ch.api_chat_slot_coder_profile,
+        )
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(f"/api/chat/slots/{name}/coder-profile", json=payload)
+            return response.status, await response.json()
+
+    @pytest.mark.asyncio
+    async def test_selects_profile_before_allocation(self):
+        slot = _ChatSlot("s1")
+        state = _state(slot)
+        state.get_slot = MagicMock(return_value=slot)
+        state.sessions.has_session = MagicMock(return_value=False)
+        state.sessions.coder_workspace_manager = MagicMock(return_value=None)
+        cfg = MagicMock()
+        cfg.session.coder.enabled = True
+        cfg.session.coder.resolve_profile = MagicMock(return_value=("kirocrew-gpu", ""))
+        with (
+            patch.object(ch.KiroCrewConfig, "load", return_value=cfg),
+            patch(f"{MOD}.save_slot_off_loop", new=AsyncMock()) as save,
+        ):
+            status, body = await self._post(state, "s1", {"profile": "gpu"})
+
+        assert (status, body) == (200, {"ok": True, "profile": "gpu"})
+        assert slot.coder_profile == "gpu"
+        state.push_slots_update.assert_called_once()
+        save.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_rejects_change_after_workspace_binding_exists(self):
+        slot = _ChatSlot("s1")
+        state = _state(slot)
+        state.get_slot = MagicMock(return_value=slot)
+        state.sessions.has_session = MagicMock(return_value=False)
+        manager = MagicMock()
+        manager.registry.get_by_session = MagicMock(return_value=MagicMock())
+        state.sessions.coder_workspace_manager = MagicMock(return_value=manager)
+        cfg = MagicMock()
+        cfg.session.coder.enabled = True
+        cfg.session.coder.resolve_profile = MagicMock(return_value=("kirocrew-gpu", ""))
+        with patch.object(ch.KiroCrewConfig, "load", return_value=cfg):
+            status, body = await self._post(state, "s1", {"profile": "gpu"})
+
+        assert status == 409
+        assert body["code"] == "coder_profile_locked"
+        assert slot.coder_profile == ""
+
+
 # ── POST /api/chat/slots/{slot}/followup ─────────────────────────────────────
 
 

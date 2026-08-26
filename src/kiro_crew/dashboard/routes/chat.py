@@ -72,6 +72,7 @@ def register(app: web.Application) -> None:
     app.router.add_put("/api/chat/slots/{slot}/queue/order", chat.api_chat_slot_queue_reorder)
     app.router.add_delete("/api/chat/slots/{slot}", chat.api_chat_slot_delete)
     app.router.add_post("/api/chat/slots/{slot}/agent", chat.api_chat_slot_agent)
+    app.router.add_post("/api/chat/slots/{slot}/coder-profile", chat.api_chat_slot_coder_profile)
 
     # Optimizer
     app.router.add_post("/api/optimizer/optimize", handlers.handle_optimize)

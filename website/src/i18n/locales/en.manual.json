@@ -1,9 +1,20 @@
 {
   "coder": {
+    "add_profile": "Add profile",
+    "default_profile": "Default Coder profile",
+    "profile_badge": "Coder profile · {{profile}}",
+    "profile_change_failed": "Could not change the Coder profile",
+    "profile_name_label": "Profile name",
+    "profile_preset_label": "Preset for {{name}}",
+    "profile_template_label": "Template for {{name}}",
+    "profiles_description": "Optional named template choices. Pick one in a fresh session before its workspace is allocated.",
+    "profiles_title": "Session profiles",
+    "remove_profile": "Remove profile",
+    "remove_profile_named": "Remove profile {{name}}",
+    "session_profile_label": "Coder profile for this session",
     "architecture": "The gateway keeps memory, MCP, OAuth, cron, and credentials. Only the session process runs in Coder; subagents inherit that workspace.",
-    "badge_allocating": "Allocating Coder workspace",
+    "badge_allocating": "Starting Coder workspace",
     "badge_label": "Coder workspace · {{workspace}}",
-    "badge_title": "This live session is running in Coder",
     "connected_to": "Connected as {{owner}}; template {{template}} is available",
     "connection_failed": "Connection test failed",
     "control_plane_template": "Full AWS control plane",
@@ -48,6 +59,11 @@
     "workspace_label": "Workspace name prefix",
     "workspace_template": "Workspace template",
     "workspace_template_description": "Push the ARM EC2 workspace template into an existing Coder deployment. The control plane and network already exist."
+  },
+  "execution_environment": {
+    "badge_starting": "Starting {{kind}} workspace",
+    "badge_starting_named": "Starting {{kind}} workspace · {{workspace}}",
+    "badge_running": "{{kind}} workspace · {{workspace}}"
   },
   "api": {
     "client": {
@@ -2524,6 +2540,7 @@
       "working": "Working"
     },
     "useSessionActions": {
+      "archive_and_stop_coder_workspace": "Archive “{{title}}” and stop its Coder workspace?\n\nProfile: {{profile}}\nWorkspace: {{workspace}}\n\nThis ends the running turn, terminals, builds, and background processes. Chat history, memory, and persistent workspace storage are kept.",
       "close_this_session": "Close this session?",
       "reload_failed": "Session reload failed. The agent may be mid-turn or the gateway unreachable; try again when the session is idle.",
       "reload_failed_subagents": "Sub-agents are still working on this session. Try again when they finish.",
@@ -3154,6 +3171,8 @@
       "all_sessions": "All sessions",
       "archive_failed": "Archive failed",
       "archiving": "Archiving…",
+      "coder_workspace_will_stop": "{{count}} Coder workspace will stop now: {{workspaces}}.",
+      "coder_workspaces_will_stop": "{{count}} Coder workspaces will stop now: {{workspaces}}.",
       "back_to_folder_view": "Back to folder view",
       "checking": "Checking…",
       "collapse_hidden_folders": "Collapse hidden folders",

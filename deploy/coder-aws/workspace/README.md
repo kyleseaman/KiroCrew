@@ -16,6 +16,14 @@ lingering and verifies a transient user scope during bootstrap. That scope is
 the conservative boundary used to keep ordinary build descendants visible to
 the gateway after an ACP runtime disconnects.
 
+Bootstrap also writes the root-owned
+`/etc/kirocrew-coder-contract.json` marker. Before starting ACP, the gateway
+fails closed unless the marker declares contract version 1, the `coder` user,
+the exact remote directory, and both `kiro-cli` and `systemd-user-scopes`
+capabilities. Alternate templates may choose different compute, storage, and
+networking, but they must publish the same marker with their actual user and
+remote directory and satisfy every declared capability.
+
 ```bash
 coder templates push kirocrew-arm --yes \
   --directory deploy/coder-aws/workspace \
@@ -26,14 +34,20 @@ coder templates push kirocrew-arm --yes \
   --var tailscale_auth_parameter=/kirocrew/poc/tailscale-auth-key \
   --var kiro_api_key_parameter=/kirocrew/poc/kiro-api-key
 
-coder create crew-dogfood --template kirocrew-arm \
-  --parameter instance_type=c8g.large \
-  --parameter volume_gb=30 --yes
+# Normally Kiro Crew creates this through its lifecycle manager. For a manual
+# template-only check, choose any name that fits Coder's 32-character limit.
+coder create crew-session-user-smoke --template kirocrew-arm --yes
 ```
 
-`crew-dogfood` is an optional bootstrap/smoke workspace. Managed Kiro Crew
-sessions use opaque `crew-*` names created from this template; the gateway does
-not adopt, stop, or delete the bootstrap workspace.
+Managed Kiro Crew sessions use
+`crew-session-<user>-<opaque-id>` names created from this template. A manually
+created smoke workspace is intentionally unmanaged: the gateway will not adopt,
+stop, or delete it.
+
+Settings can define several named Coder profiles that point at different
+templates or presets. A parent session chooses one profile before its first
+workspace allocation; that binding remains fixed for the life of the session,
+and every subagent inherits it.
 
 The template expects an outbound-only public subnet to avoid a NAT Gateway's
 fixed hourly charge, an instance profile scoped to the two named SSM parameters,

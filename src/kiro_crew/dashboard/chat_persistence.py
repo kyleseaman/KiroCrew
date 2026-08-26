@@ -566,6 +566,10 @@ def _rehydrate_slot_from_history(
                 slot.model = kiro_model_map.get(kiro_name, "")
             except Exception:
                 logger.debug("Failed to resolve model for rehydrated slot %s", slot_name, exc_info=True)
+        if isinstance(meta.get("coder_profile"), str):
+            slot.coder_profile = meta["coder_profile"]
+        if isinstance(meta.get("coder_workspace"), str):
+            slot.coder_workspace = meta["coder_workspace"]
         if meta.get("reasoning_effort"):
             slot.reasoning_effort = _validate_reasoning_effort(meta["reasoning_effort"])
         if meta.get("workspace"):
@@ -933,6 +937,10 @@ def _restore_recent_sessions_steps(
                 logger.debug(
                     "Failed to resolve model for restored slot %s", slot_name, exc_info=True
                 )
+        if isinstance(meta.get("coder_profile"), str):
+            slot.coder_profile = meta["coder_profile"]
+        if isinstance(meta.get("coder_workspace"), str):
+            slot.coder_workspace = meta["coder_workspace"]
         if meta.get("reasoning_effort"):
             slot.reasoning_effort = _validate_reasoning_effort(meta["reasoning_effort"])
         if meta.get("workspace"):
@@ -1960,6 +1968,10 @@ def _save_slot_to_history(
             if slot.agent:
                 meta_line["agent"] = slot.agent
             meta_line["model"] = slot.model
+            if slot.coder_profile:
+                meta_line["coder_profile"] = slot.coder_profile
+            if slot.coder_workspace:
+                meta_line["coder_workspace"] = slot.coder_workspace
             if slot.reasoning_effort:
                 meta_line["reasoning_effort"] = slot.reasoning_effort
             if slot.mode:

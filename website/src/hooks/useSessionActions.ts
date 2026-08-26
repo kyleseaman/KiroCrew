@@ -147,7 +147,18 @@ export function useSessionActions(mode?: string): SessionActions {
   const reload = useCallback((slotKey: string) => { reloadMutate(slotKey) }, [reloadMutate])
 
   const close = useCallback((slotKey: string) => {
-    if (!loadChatConfig().confirmCloseSession || confirm(i18nT('hooks.useSessionActions.close_this_session'))) dispatch(deleteSlot(slotKey))
+    const slot = store.getState().dashboard.slots.find(s => s.key === slotKey)
+    const coder = slot?.execution_location?.kind === 'coder' ? slot.execution_location : undefined
+    const coderWorkspace = slot?.coder_workspace || coder?.workspace
+    const needsConfirm = Boolean(coderWorkspace) || loadChatConfig().confirmCloseSession
+    const prompt = coderWorkspace
+      ? i18nT('hooks.useSessionActions.archive_and_stop_coder_workspace', {
+          title: slot?.title || slotKey,
+          profile: slot?.coder_profile || i18nT('coder.default_profile'),
+          workspace: coderWorkspace,
+        })
+      : i18nT('hooks.useSessionActions.close_this_session')
+    if (!needsConfirm || confirm(prompt)) dispatch(deleteSlot(slotKey))
   }, [dispatch])
 
   return { duplicate, toggleRead, togglePin, toggleMode, copyLink, move, reload, close }

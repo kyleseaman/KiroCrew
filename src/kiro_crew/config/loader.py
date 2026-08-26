@@ -109,6 +109,7 @@ from kiro_crew.constants import (
     CODER_DEFAULT_RUNTIME_WARM_MINUTES,
     CODER_DEFAULT_STOP_AFTER_MINUTES,
     CODER_DEFAULT_WORKSPACE_PREFIX,
+    CODER_MAX_PROFILES,
 )
 from kiro_crew.effort import EFFORT_LEVELS, is_valid_effort, model_supports_effort
 from kiro_crew.instances.constants import CONNECT_TIMEOUT_CEILING_SECS as _CONNECT_TIMEOUT_CEILING
@@ -1896,6 +1897,42 @@ class AgentConfig:
         return self.role_efforts.get(role, "")
 
 
+@dataclass(frozen=True)
+class CoderProfileConfig:
+    """One named Coder template choice for a new parent session."""
+
+    template: str = field(
+        default="",
+        metadata=_meta("Coder Template", "Template used for sessions selecting this profile."),
+    )
+    preset: str = field(
+        default="",
+        metadata=_meta("Coder Preset", "Optional template preset for this profile."),
+    )
+
+
+_CODER_PROFILE_NAME_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def _coerce_coder_profiles(value: object) -> dict[str, CoderProfileConfig]:
+    if not isinstance(value, dict):
+        return {}
+    profiles: dict[str, CoderProfileConfig] = {}
+    for name, raw in value.items():
+        if len(profiles) >= CODER_MAX_PROFILES:
+            break
+        if not isinstance(name, str) or not _CODER_PROFILE_NAME_RE.fullmatch(name):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        template = raw.get("template", "")
+        preset = raw.get("preset", "")
+        if not isinstance(template, str) or not isinstance(preset, str):
+            continue
+        profiles[name] = CoderProfileConfig(template=template, preset=preset)
+    return profiles
+
+
 @dataclass
 class CoderSessionConfig:
     """Gateway-owned defaults for running interactive sessions in Coder.
@@ -1927,6 +1964,13 @@ class CoderSessionConfig:
         default="",
         metadata=_meta("Coder Preset", "Optional template preset for new workspaces."),
     )
+    profiles: dict[str, CoderProfileConfig] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Coder Profiles",
+            "Named template and preset choices selectable before a parent session allocates.",
+        ),
+    )
     remote_cwd: str = field(
         default=CODER_DEFAULT_REMOTE_CWD,
         metadata=_meta(
@@ -1954,6 +1998,15 @@ class CoderSessionConfig:
         default=CODER_DEFAULT_WORKSPACE_PREFIX,
         metadata=_meta("Workspace Prefix", "Safe prefix for opaque managed workspace names."),
     )
+
+    def resolve_profile(self, name: str) -> tuple[str, str]:
+        """Resolve a persisted selection without silently falling back."""
+        if not name:
+            return self.template, self.preset
+        profile = self.profiles.get(name)
+        if profile is None:
+            raise ValueError(f"Unknown Coder profile: {name}")
+        return profile.template, profile.preset
 
 
 @dataclass
@@ -7142,6 +7195,7 @@ class KiroCrewConfig:
                         if isinstance(coder_data.get("preset", ""), str)
                         else ""
                     ),
+                    profiles=_coerce_coder_profiles(coder_data.get("profiles", {})),
                     remote_cwd=(
                         coder_data.get("remote_cwd", CODER_DEFAULT_REMOTE_CWD)
                         if isinstance(coder_data.get("remote_cwd", CODER_DEFAULT_REMOTE_CWD), str)
@@ -8244,6 +8298,7 @@ class KiroCrewConfig:
             extra_env: dict[str, str] | None = None,
             reasoning_effort_override: str | None = None,
             crew_agent: str | None = None,
+            coder_profile_override: str | None = None,
             session_host_override: Any = None,
             **_kwargs: object,
         ) -> AcpProvider:
@@ -8326,6 +8381,22 @@ class KiroCrewConfig:
                 elif coder_cfg.enabled is True:
                     if coder_manager is None:  # pragma: no cover - built with enabled config
                         raise RuntimeError("managed Coder workspace manager is unavailable")
+                    try:
+                        coder_template, coder_preset = coder_cfg.resolve_profile(
+                            coder_profile_override or ""
+                        )
+                    except ValueError:
+                        # A binding is the immutable allocation record. Removing
+                        # a named profile from Settings must not strand a retained
+                        # workspace, but an unknown selection with no binding
+                        # must never fall back to the default template.
+                        existing_binding = coder_manager.registry.get_by_session(
+                            session_key or "main"
+                        )
+                        if existing_binding is None:
+                            raise
+                        coder_template = existing_binding.template
+                        coder_preset = existing_binding.preset
                     session_host = ManagedCoderWorkspaceSessionHost(
                         session_key=session_key or "main",
                         manager=coder_manager,
@@ -8334,6 +8405,8 @@ class KiroCrewConfig:
                         coder_url=coder_cfg.url,
                         session_token=coder_token,
                         runtime_warm_minutes=coder_cfg.runtime_warm_minutes,
+                        template=coder_template,
+                        preset=coder_preset,
                     )
                 else:
                     session_host = session_host_from_config(

@@ -849,6 +849,14 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "configKey": "session.coder.max_running"
   },
   {
+    "id": "coder.profile-name",
+    "label": "Profile name",
+    "labelKey": "coder.profile_name_label",
+    "tab": "coder",
+    "type": "input",
+    "occurrence": 1
+  },
+  {
     "id": "coder.remote-working-directory",
     "label": "Remote working directory",
     "labelKey": "coder.cwd_label",

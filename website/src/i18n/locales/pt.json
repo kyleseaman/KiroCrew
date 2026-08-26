@@ -1,9 +1,20 @@
 {
   "coder": {
+    "add_profile": "Adicionar perfil",
+    "default_profile": "Perfil padrão do Coder",
+    "profile_badge": "Perfil do Coder · {{profile}}",
+    "profile_change_failed": "Não foi possível alterar o perfil do Coder",
+    "profile_name_label": "Nome do perfil",
+    "profile_preset_label": "Predefinição para {{name}}",
+    "profile_template_label": "Modelo para {{name}}",
+    "profiles_description": "Opções de modelo nomeadas. Escolha uma em uma nova sessão antes da alocação do espaço de trabalho.",
+    "profiles_title": "Perfis de sessão",
+    "remove_profile": "Remover perfil",
+    "remove_profile_named": "Remover perfil {{name}}",
+    "session_profile_label": "Perfil do Coder para esta sessão",
     "architecture": "O gateway mantém memória, MCP, OAuth, cron e credenciais. Apenas o processo da sessão é executado no Coder; os subagentes herdam esse espaço de trabalho.",
     "badge_allocating": "Alocando espaço de trabalho do Coder",
     "badge_label": "Espaço do Coder · {{workspace}}",
-    "badge_title": "Esta sessão ativa está sendo executada no Coder",
     "connected_to": "Conectado como {{owner}}; o modelo {{template}} está disponível",
     "connection_failed": "Falha no teste de conexão",
     "control_plane_template": "Plano de controle AWS completo",
@@ -48,6 +59,11 @@
     "workspace_label": "Prefixo do nome do espaço",
     "workspace_template": "Modelo de espaço de trabalho",
     "workspace_template_description": "Envie o modelo ARM EC2 para uma implantação existente do Coder. O plano de controle e a rede já devem existir."
+  },
+  "execution_environment": {
+    "badge_starting": "Iniciando espaço de trabalho {{kind}}",
+    "badge_starting_named": "Iniciando espaço de trabalho {{kind}} · {{workspace}}",
+    "badge_running": "Espaço de trabalho {{kind}} · {{workspace}}"
   },
   "api": {
     "client": {
@@ -7326,6 +7342,7 @@
       "working": "Trabalhando"
     },
     "useSessionActions": {
+      "archive_and_stop_coder_workspace": "Arquivar “{{title}}” e parar seu espaço de trabalho do Coder?\n\nPerfil: {{profile}}\nEspaço de trabalho: {{workspace}}\n\nIsso encerra o turno em execução, terminais, compilações e processos em segundo plano. O histórico do chat, a memória e o armazenamento persistente do espaço de trabalho são mantidos.",
       "close_this_session": "Fechar esta sessão?",
       "reload_failed": "Falha ao recarregar a sessão. O agente pode estar no meio de um turno ou o gateway inacessível; tente novamente quando a sessão estiver ociosa.",
       "reload_failed_subagents": "Os subagentes ainda estão trabalhando nesta sessão. Tente novamente quando terminarem.",
@@ -8933,7 +8950,9 @@
       "add_state_lanes": "Adicionar colunas automáticas",
       "lane_seed_failed": "Não foi possível adicionar as colunas automáticas.",
       "lane_seed_retry": "Tentar de novo",
-      "lane_legacy_column_hint": "mostra todas as sessões"
+      "lane_legacy_column_hint": "mostra todas as sessões",
+      "coder_workspace_will_stop": "{{count}} espaço de trabalho do Coder será parado agora: {{workspaces}}.",
+      "coder_workspaces_will_stop": "{{count}} espaços de trabalho do Coder serão parados agora: {{workspaces}}."
     },
     "connectionsPage": {
       "action_failed": "Falha na ação: {{error}}",

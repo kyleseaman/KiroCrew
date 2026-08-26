@@ -31,6 +31,17 @@ runuser -u coder -- env \
   DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$${coder_uid}/bus" \
   systemd-run --user --scope --quiet /usr/bin/true
 
+cat > /etc/kirocrew-coder-contract.json <<'EOF'
+{
+  "version": 1,
+  "user": "coder",
+  "remote_cwd": "/home/coder/workspace",
+  "capabilities": ["kiro-cli", "systemd-user-scopes"]
+}
+EOF
+chown root:root /etc/kirocrew-coder-contract.json
+chmod 0644 /etc/kirocrew-coder-contract.json
+
 # Amazon Linux 2023 does not meet the aarch64 GNU artifact's glibc floor, so
 # select the static musl package from Kiro's signed release manifest.
 KIRO_ARCH="aarch64"

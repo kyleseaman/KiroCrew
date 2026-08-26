@@ -21,19 +21,32 @@ def test_allocate_is_idempotent_for_one_parent_and_distinct_between_parents(
     registry = WorkspaceBindingRegistry(tmp_path / "coder_workspaces.json")
 
     first = registry.allocate(
-        "dashboard:one", template="kirocrew-arm", preset="arm-small", prefix="crew"
+        "dashboard:one",
+        template="kirocrew-arm",
+        preset="arm-small",
+        prefix="crew-session",
+        owner_name="kyleseaman",
     )
     again = registry.allocate(
-        "dashboard:one", template="kirocrew-arm", preset="arm-small", prefix="crew"
+        "dashboard:one",
+        template="kirocrew-arm",
+        preset="arm-small",
+        prefix="crew-session",
+        owner_name="kyleseaman",
     )
     other = registry.allocate(
-        "dashboard:two", template="kirocrew-arm", preset="arm-small", prefix="crew"
+        "dashboard:two",
+        template="kirocrew-arm",
+        preset="arm-small",
+        prefix="crew-session",
+        owner_name="kyleseaman",
     )
 
     assert again == first
     assert other.binding_id != first.binding_id
     assert other.workspace_name != first.workspace_name
-    assert first.workspace_name.startswith("crew-")
+    assert first.workspace_name.startswith("crew-session-kyleseaman-")
+    assert len(first.workspace_name) <= 32
     assert "dashboard" not in first.workspace_name
     assert "one" not in first.workspace_name
 
@@ -41,7 +54,11 @@ def test_allocate_is_idempotent_for_one_parent_and_distinct_between_parents(
 def test_registry_round_trips_and_writes_owner_only(tmp_path: Path) -> None:
     path = tmp_path / "coder_workspaces.json"
     created = WorkspaceBindingRegistry(path).allocate(
-        "cron:job:run", template="kirocrew-arm", preset="", prefix="crew"
+        "cron:job:run",
+        template="kirocrew-arm",
+        preset="",
+        prefix="crew-session",
+        owner_name="kyleseaman",
     )
 
     loaded = WorkspaceBindingRegistry(path).get_by_session("cron:job:run")
@@ -53,6 +70,22 @@ def test_registry_round_trips_and_writes_owner_only(tmp_path: Path) -> None:
     assert payload["bindings"][created.binding_id]["workspace_uuid"] == ""
 
 
+def test_owner_name_with_email_shape_is_not_exposed_in_workspace_name(tmp_path: Path) -> None:
+    registry = WorkspaceBindingRegistry(tmp_path / "coder_workspaces.json")
+
+    binding = registry.allocate(
+        "dashboard:one",
+        template="kirocrew-arm",
+        preset="",
+        prefix="crew-session",
+        owner_name="operator@example.com",
+    )
+
+    assert binding.workspace_name.startswith("crew-session-user-")
+    assert "operator" not in binding.workspace_name
+    assert "example" not in binding.workspace_name
+
+
 def test_corrupt_registry_fails_closed_without_overwrite(tmp_path: Path) -> None:
     path = tmp_path / "coder_workspaces.json"
     original = "{not-json"
@@ -60,7 +93,13 @@ def test_corrupt_registry_fails_closed_without_overwrite(tmp_path: Path) -> None
     registry = WorkspaceBindingRegistry(path)
 
     with pytest.raises(WorkspaceRegistryCorrupt):
-        registry.allocate("dashboard:one", template="kirocrew-arm", preset="", prefix="crew")
+        registry.allocate(
+            "dashboard:one",
+            template="kirocrew-arm",
+            preset="",
+            prefix="crew-session",
+            owner_name="kyleseaman",
+        )
 
     assert path.read_text(encoding="utf-8") == original
 

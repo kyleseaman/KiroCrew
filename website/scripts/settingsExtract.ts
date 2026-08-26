@@ -329,7 +329,7 @@ export function extractFromSource(
           label: displayLabel,
           ...(labelKey ? { labelKey } : {}),
           ...(suffix && labelKey ? { labelSuffix: suffix } : {}),
-          description: description || undefined,
+          ...(description ? { description } : {}),
           tab,
           type: PRIMITIVE_MAP[primitiveName],
           occurrence: 1,

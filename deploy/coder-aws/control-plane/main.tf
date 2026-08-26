@@ -162,6 +162,19 @@ resource "aws_security_group" "workspace" {
   }
 }
 
+resource "aws_security_group" "gateway" {
+  name        = "${local.name}-gateway"
+  description = "Outbound-only Kiro Crew gateway workspace"
+  vpc_id      = aws_vpc.poc.id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
 resource "aws_iam_role" "workspace" {
   name = "${local.name}-workspace"
 
@@ -197,6 +210,79 @@ resource "aws_iam_instance_profile" "workspace" {
   role = aws_iam_role.workspace.name
 }
 
+# Gateway and session profiles are separate identities even though the POC
+# currently uses the same two bootstrap parameters. That keeps later tightening
+# additive and prevents a session template from ever inheriting Coder authority.
+resource "aws_iam_role" "gateway" {
+  name = "${local.name}-gateway"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "gateway_ssm" {
+  role       = aws_iam_role.gateway.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_role_policy" "gateway_secrets" {
+  role = aws_iam_role.gateway.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["ssm:GetParameter"]
+      Resource = [local.parameter_arns.tailscale, local.parameter_arns.kiro]
+    }]
+  })
+}
+
+resource "aws_iam_instance_profile" "gateway" {
+  name = "${local.name}-gateway"
+  role = aws_iam_role.gateway.name
+}
+
+resource "aws_iam_role" "session" {
+  name = "${local.name}-session"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "session_ssm" {
+  role       = aws_iam_role.session.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_role_policy" "session_secrets" {
+  role = aws_iam_role.session.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["ssm:GetParameter"]
+      Resource = [local.parameter_arns.tailscale, local.parameter_arns.kiro]
+    }]
+  })
+}
+
+resource "aws_iam_instance_profile" "session" {
+  name = "${local.name}-session"
+  role = aws_iam_role.session.name
+}
+
 resource "aws_iam_role" "control" {
   name = "${local.name}-control"
 
@@ -225,7 +311,6 @@ resource "aws_iam_role_policy" "control" {
         Action = ["ssm:GetParameter"]
         Resource = [
           local.parameter_arns.tailscale,
-          local.parameter_arns.kiro,
           local.parameter_arns.al2023,
         ]
       },
@@ -235,6 +320,7 @@ resource "aws_iam_role_policy" "control" {
           "ec2:CreateTags",
           "ec2:DescribeImages",
           "ec2:DescribeInstanceAttribute",
+          "ec2:DescribeInstanceCreditSpecifications",
           "ec2:DescribeInstances",
           "ec2:DescribeInstanceStatus",
           "ec2:DescribeInstanceTypes",
@@ -253,14 +339,22 @@ resource "aws_iam_role_policy" "control" {
         Resource = "*"
       },
       {
-        Effect   = "Allow"
-        Action   = "iam:PassRole"
-        Resource = aws_iam_role.workspace.arn
+        Effect = "Allow"
+        Action = "iam:PassRole"
+        Resource = [
+          aws_iam_role.workspace.arn,
+          aws_iam_role.gateway.arn,
+          aws_iam_role.session.arn,
+        ]
       },
       {
-        Effect   = "Allow"
-        Action   = "iam:GetInstanceProfile"
-        Resource = aws_iam_instance_profile.workspace.arn
+        Effect = "Allow"
+        Action = "iam:GetInstanceProfile"
+        Resource = [
+          aws_iam_instance_profile.workspace.arn,
+          aws_iam_instance_profile.gateway.arn,
+          aws_iam_instance_profile.session.arn,
+        ]
       },
     ]
   })
@@ -281,14 +375,12 @@ resource "aws_instance" "control" {
   user_data_replace_on_change = false
 
   user_data = templatefile("${path.module}/cloud-init.sh.tftpl", {
-    region                      = var.region
-    tailscale_auth_parameter    = var.tailscale_auth_parameter
-    kiro_api_key_parameter      = var.kiro_api_key_parameter
-    tailscale_hostname          = var.tailscale_hostname
-    tailnet_dns_name            = var.tailnet_dns_name
-    coder_version               = var.coder_version
-    coder_rpm_sha256            = var.coder_rpm_sha256
-    kirocrew_admin_launcher_b64 = filebase64("${path.module}/kirocrew-admin")
+    region                   = var.region
+    tailscale_auth_parameter = var.tailscale_auth_parameter
+    tailscale_hostname       = var.tailscale_hostname
+    tailnet_dns_name         = var.tailnet_dns_name
+    coder_version            = var.coder_version
+    coder_rpm_sha256         = var.coder_rpm_sha256
   })
 
   metadata_options {
@@ -317,16 +409,36 @@ output "coder_url" {
   value = "https://${var.tailscale_hostname}.${var.tailnet_dns_name}"
 }
 
-output "crew_url" {
-  value = "https://${var.tailscale_hostname}.${var.tailnet_dns_name}:8443"
+output "gateway_template_values" {
+  value = {
+    region                   = var.region
+    subnet_id                = aws_subnet.public.id
+    security_group_id        = aws_security_group.gateway.id
+    instance_profile_name    = aws_iam_instance_profile.gateway.name
+    tailscale_auth_parameter = var.tailscale_auth_parameter
+    kiro_api_key_parameter   = var.kiro_api_key_parameter
+    tailnet_dns_name         = var.tailnet_dns_name
+  }
 }
 
+output "session_template_values" {
+  value = {
+    region                   = var.region
+    subnet_id                = aws_subnet.public.id
+    security_group_id        = aws_security_group.workspace.id
+    instance_profile_name    = aws_iam_instance_profile.session.name
+    tailscale_auth_parameter = var.tailscale_auth_parameter
+    kiro_api_key_parameter   = var.kiro_api_key_parameter
+  }
+}
+
+# Compatibility alias for existing POC automation.
 output "workspace_template_values" {
   value = {
     region                   = var.region
     subnet_id                = aws_subnet.public.id
     security_group_id        = aws_security_group.workspace.id
-    instance_profile_name    = aws_iam_instance_profile.workspace.name
+    instance_profile_name    = aws_iam_instance_profile.session.name
     tailscale_auth_parameter = var.tailscale_auth_parameter
     kiro_api_key_parameter   = var.kiro_api_key_parameter
   }

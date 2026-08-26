@@ -40,26 +40,29 @@ Four parts, in the order you will need them:
 ### AWS + Coder Graviton dogfood POC
 
 The repository includes a deliberately small, single-user POC under
-`deploy/coder-aws/`. It keeps the Kiro Crew gateway and Coder control plane on
-one always-on `t4g.medium`, while CPU-heavier `kiro-cli` ACP processes run in
-per-parent-session Coder workspaces that can stop when idle. The default workspace is a
-`c8g.large` (2 vCPU / 4 GiB); `c8g.xlarge` (4 / 8 GiB) and `m8g.large` (2 / 8
-GiB) are selectable when measurements show CPU or memory pressure.
+`deploy/coder-aws/`. It uses one always-on ARM node for Coder, one dedicated
+always-on `t4g.small` Coder workspace for the Kiro Crew gateway, and isolated
+per-parent-session workspaces that can stop when idle. The default session
+workspace is a `c8g.large` (2 vCPU / 4 GiB); `c8g.xlarge` (4 / 8 GiB) and
+`m8g.large` (2 / 8 GiB) are selectable when measurements show CPU or memory
+pressure.
 
-Both instances are ARM Amazon Linux 2023 with encrypted 30 GiB gp3 roots. They
+The control, gateway, and session instances are ARM Amazon Linux 2023 with
+encrypted gp3 roots. They
 sit in a public subnet to avoid a NAT Gateway's fixed hourly charge, but their
 security groups have no ingress rules: HTTPS and administrative SSH reach the
 control node through Tailscale, and Coder's agent connection is outbound. A
 public IPv4 address is therefore an egress route, not an exposed service.
 
 This is a cost experiment, not a production or multi-user topology. Coder uses
-its built-in PostgreSQL database on the control node. The stopped workspace's
-root disk and the control node remain billable. New parent chat and cron
+its built-in PostgreSQL database on the control node. The control and gateway
+instances remain billable; stopped session workspaces retain only their root
+disks. New parent chat and cron
 sessions each receive a dedicated workspace from the configured template;
 subagents inherit the live parent and run beside it. Gateway maintenance and
-lightweight background work remain
-on the control node. MCP tools, including memory updates and recall, are relayed
-back to the gateway over per-session loopback capabilities. Streamable HTTP,
+lightweight background work remain on the gateway workspace. MCP tools,
+including memory updates and recall, are relayed back to the gateway over
+per-session loopback capabilities. Streamable HTTP,
 legacy SSE, OAuth discovery, tokens, refresh, and callbacks also remain
 gateway-owned. The workspace receives no Kiro Crew state, Coder bearer,
 operator AWS credentials, or SSH credentials. It has only its narrow EC2
@@ -86,10 +89,10 @@ aws ssm put-parameter --region us-east-2 --type SecureString --overwrite \
 unset CREW_KIRO_KEY
 ```
 
-Use a reusable, tagged Tailscale key because both the control node and each
-workspace consume it. Apply a tailnet policy that permits your identity to use
-Tailscale SSH as `ec2-user` on the tagged control node. The AWS security group
-still exposes no port 22.
+Use a reusable, tagged Tailscale key because the control node, gateway, and
+session workspaces consume it. Apply a tailnet policy that permits your
+identity to use Tailscale SSH as `ec2-user` on the tagged control and gateway
+nodes. The AWS security groups still expose no port 22.
 
 #### 2. Provision the control node
 
@@ -104,7 +107,8 @@ terraform -chdir=deploy/coder-aws/control-plane apply \
   -var tailnet_dns_name=example.ts.net
 
 terraform -chdir=deploy/coder-aws/control-plane output coder_url
-terraform -chdir=deploy/coder-aws/control-plane output crew_url
+terraform -chdir=deploy/coder-aws/control-plane output gateway_template_values
+terraform -chdir=deploy/coder-aws/control-plane output session_template_values
 ```
 
 Open the Coder URL while connected to Tailscale and create the single owner
@@ -112,97 +116,105 @@ account. The server is pinned to a checksummed ARM RPM and listens only on
 loopback behind Tailscale Serve. Its database lives under the persistent
 `coder` user's home, so back that volume up before treating the POC as durable.
 
-#### 3. Push the workspace template
+#### 3. Push the gateway and session templates
 
 Install the Coder CLI locally, then authenticate it against the output URL:
 
 ```bash
 coder login https://kirocrew-coder.example.ts.net
 
-CREW_TEMPLATE_VALUES="$(
+CREW_GATEWAY_VALUES="$(
   terraform -chdir=deploy/coder-aws/control-plane \
-    output -json workspace_template_values
+    output -json gateway_template_values
+)"
+coder templates push kirocrew-gateway-aws --yes --directory deploy/coder-aws/gateway \
+  --var "region=$(jq -r .region <<<"$CREW_GATEWAY_VALUES")" \
+  --var "subnet_id=$(jq -r .subnet_id <<<"$CREW_GATEWAY_VALUES")" \
+  --var "security_group_id=$(jq -r .security_group_id <<<"$CREW_GATEWAY_VALUES")" \
+  --var "instance_profile_name=$(jq -r .instance_profile_name <<<"$CREW_GATEWAY_VALUES")" \
+  --var "tailscale_auth_parameter=$(jq -r .tailscale_auth_parameter <<<"$CREW_GATEWAY_VALUES")" \
+  --var "kiro_api_key_parameter=$(jq -r .kiro_api_key_parameter <<<"$CREW_GATEWAY_VALUES")" \
+  --var "tailnet_dns_name=$(jq -r .tailnet_dns_name <<<"$CREW_GATEWAY_VALUES")"
+
+CREW_SESSION_VALUES="$(
+  terraform -chdir=deploy/coder-aws/control-plane \
+    output -json session_template_values
 )"
 coder templates push kirocrew-arm --yes --directory deploy/coder-aws/workspace \
-  --var "region=$(jq -r .region <<<"$CREW_TEMPLATE_VALUES")" \
-  --var "subnet_id=$(jq -r .subnet_id <<<"$CREW_TEMPLATE_VALUES")" \
-  --var "security_group_id=$(jq -r .security_group_id <<<"$CREW_TEMPLATE_VALUES")" \
-  --var "instance_profile_name=$(jq -r .instance_profile_name <<<"$CREW_TEMPLATE_VALUES")" \
-  --var "tailscale_auth_parameter=$(jq -r .tailscale_auth_parameter <<<"$CREW_TEMPLATE_VALUES")" \
-  --var "kiro_api_key_parameter=$(jq -r .kiro_api_key_parameter <<<"$CREW_TEMPLATE_VALUES")"
-unset CREW_TEMPLATE_VALUES
+  --var "region=$(jq -r .region <<<"$CREW_SESSION_VALUES")" \
+  --var "subnet_id=$(jq -r .subnet_id <<<"$CREW_SESSION_VALUES")" \
+  --var "security_group_id=$(jq -r .security_group_id <<<"$CREW_SESSION_VALUES")" \
+  --var "instance_profile_name=$(jq -r .instance_profile_name <<<"$CREW_SESSION_VALUES")" \
+  --var "tailscale_auth_parameter=$(jq -r .tailscale_auth_parameter <<<"$CREW_SESSION_VALUES")" \
+  --var "kiro_api_key_parameter=$(jq -r .kiro_api_key_parameter <<<"$CREW_SESSION_VALUES")"
+unset CREW_GATEWAY_VALUES CREW_SESSION_VALUES
 
-coder create crew-dogfood --template kirocrew-arm \
-  --parameter instance_type=c8g.large \
+coder create crew-gateway-user --template kirocrew-gateway-aws \
+  --parameter instance_type=t4g.small \
   --parameter volume_gb=30 --yes
 ```
 
-The first start installs the verified aarch64 musl Kiro CLI build. Stopping the
-workspace preserves its full root disk:
+The gateway workspace is the only Kiro Crew workspace intended to run
+continuously. Its first start installs the checksummed Coder CLI, Tailscale,
+and the Kiro CLI. Its root EBS volume has `delete_on_termination = false`, so a
+replacement or workspace deletion leaves the gateway state available for
+recovery. Session workspaces are created lazily by Kiro Crew; stopping one
+preserves its full root disk:
 
 ```bash
-coder stop crew-dogfood --yes
-coder start crew-dogfood --yes
+coder stop crew-session-user-opaqueid --yes
+coder start crew-session-user-opaqueid --yes
 ```
 
-#### 4. Install this Kiro Crew build on the control node
+#### 4. Install this Kiro Crew build on the gateway workspace
 
-Build the dashboard and wheel in this checkout, then copy the wheel over the
-tailnet. Tailscale SSH must permit the `ec2-user` login for these commands:
+Build the dashboard and wheel in this checkout, then use the deployment helper
+over the tailnet. Tailscale SSH must permit the `ec2-user` login:
 
 ```bash
 (cd website && npm ci && npm run build)
 cp -R website/dist src/kiro_crew/static/dist
 python -m build --wheel
 
-scp dist/kirocrew-*.whl ec2-user@kirocrew-coder:/tmp/
-ssh ec2-user@kirocrew-coder <<'EOF'
-sudo -u coder python3.11 -m venv /home/coder/kirocrew-venv
-sudo -u coder env HOME=/home/coder \
-  /home/coder/kirocrew-venv/bin/pip install /tmp/kirocrew-*.whl
-sudo -u coder env HOME=/home/coder /bin/sh -c \
-  'cd /home/coder && exec /home/coder/kirocrew-venv/bin/kirocrew setup --agent-only'
-EOF
+deploy/coder-aws/deploy-gateway.sh \
+  ec2-user@crew-gateway-user \
+  dist/kirocrew-*.whl \
+  https://crew-gateway-user.example.ts.net:8443
 ```
 
-The control-plane template provides `/usr/local/bin/kirocrew` for gateway
+The helper copies a verified wheel, installs it into the stable
+`/home/coder/kirocrew-venv`, configures the external dashboard URL, and installs
+the main gateway as a `coder`-owned systemd service on port 8443. Deployment
+fails unless the service is active and `http://127.0.0.1:8443/api/health`
+responds. Run the same command for later wheel updates.
+
+The gateway template provides `/usr/local/bin/kirocrew` for gateway
 administration. It delegates to the stable virtual environment above as the
 `coder` service identity, so the private gateway configuration, sessions, and
 memory are not duplicated under `ec2-user`. Once the wheel is installed, verify
 the launcher from an administrative shell:
 
 ```bash
-ssh ec2-user@kirocrew-coder 'kirocrew --version'
-ssh ec2-user@kirocrew-coder 'kirocrew token'
+ssh ec2-user@crew-gateway-user 'kirocrew --version'
+ssh ec2-user@crew-gateway-user 'kirocrew token'
 ```
 
 This launcher administers the main gateway; it does not place the CLI inside a
 per-session Coder workspace.
 
-The control node permits an owner to create an automation token with a one-year
+The Coder server permits an owner to create an automation token with a one-year
 lifetime. Create it with `coder tokens create --name crew-control --lifetime
 1y`. Do not add it to a systemd environment file or copy it into the workspace.
 
-Set the external dashboard URL and install the gateway service as the `coder`
-user:
-
-```bash
-ssh -t ec2-user@kirocrew-coder \
-  "sudo -u coder env HOME=/home/coder /bin/sh -c \
-   'cd /home/coder && /home/coder/kirocrew-venv/bin/kirocrew config set \
-   dashboard.url https://kirocrew-coder.example.ts.net:8443'"
-ssh -t ec2-user@kirocrew-coder \
-  'sudo env SUDO_USER=coder USER=coder LOGNAME=coder HOME=/home/coder \
-   /home/coder/kirocrew-venv/bin/kirocrew service install'
-```
-
-Open the Crew URL from the Terraform output, then open **Settings → Coder**.
-Enter the internal Coder URL (`http://127.0.0.1:3000` for this combined control
-node), template (`kirocrew-arm`), optional preset (blank for the template
+Open the gateway workspace URL, then open **Settings → Coder**. Enter the
+tailnet Coder URL (`https://kirocrew-coder.example.ts.net`), template
+(`kirocrew-arm`), optional preset (blank for the template
 defaults), remote directory (`/home/coder/workspace`), and automation token.
+Add named profiles when sessions should be able to choose another Coder
+template or preset, such as a larger CPU profile or a memory-heavy profile.
 The POC defaults keep a remote runtime warm for 5 minutes, request Coder
 autostop after 30 minutes, retain an inactive stopped workspace for 30 days,
-allow three running parent workspaces, and use the opaque `crew` name prefix.
+allow three running parent workspaces, and use the `crew-session` name prefix.
 Use **Test connection**, then save and enable the default. The probe authenticates
 and checks template visibility but does not create or start a workspace. The
 bearer is written only to the gateway's
@@ -211,10 +223,16 @@ their current location, so reset or restart an existing chat to adopt the new
 default. The chat header shows `Coder workspace · <opaque-name>` only after the
 live provider has actually connected remotely.
 
-Each durable parent chat or cron session receives its own generated workspace;
-its subagents share that workspace. The bootstrap `crew-dogfood` workspace is a
-manual verification target and stays unmanaged: Kiro Crew will not stop or
-delete it. Managed workspaces remain visible in Coder while stopped, so many
+Before a new chat's first workspace allocation, its execution selector offers
+the default Coder configuration and every named profile. Selection is persisted
+with the chat and becomes immutable once Coder allocates the binding. A removed
+profile cannot redirect an existing session: the recorded template and preset
+continue to resume that binding. Subagents never choose a profile; they inherit
+their parent's concrete workspace.
+
+Each durable parent chat or cron session receives its own generated
+`crew-session-<user>-<opaque-id>` workspace; its subagents share that workspace.
+Managed workspaces remain visible in Coder while stopped, so many
 retained rows do not imply many billable EC2 instances. A later turn starts the
 same binding and resumes its native Kiro conversation. Only stopped,
 registry-owned workspaces can age into the 30-day retention deletion path.
@@ -232,19 +250,23 @@ initialization, workspace start time, steady SSH frame latency, and current AWS
 Pricing API estimates without printing credentials:
 
 ```bash
-python deploy/coder-aws/verify.py crew-dogfood --start --stop-after
+python deploy/coder-aws/verify.py crew-session-user-opaqueid --start --stop-after
 ```
 
 Keep `c8g.large` until CPU measurements justify a resize. The report separates
-workspace active compute from the fixed monthly control-node plus gp3 estimate,
-which is the useful number for this dogfood experiment.
+workspace active compute from the fixed monthly control-and-gateway plus gp3
+estimate, which is the useful number for this dogfood experiment.
 
-To remove the POC, delete the Coder workspace first so its EC2 instance is
-terminated, then destroy the control stack. Confirm the targets in the Coder UI
-and Terraform plan before proceeding:
+To remove the POC, delete every managed session workspace and the gateway
+workspace first so their EC2 instances are terminated, then destroy the control
+stack. The gateway's retained EBS volume is intentionally not deleted with its
+instance; after verifying a backup, locate it by the gateway workspace tags and
+delete it separately to stop its storage charge. Confirm every target in the
+Coder UI, AWS console, and Terraform plan before proceeding:
 
 ```bash
-coder delete crew-dogfood
+coder delete crew-session-user-opaqueid
+coder delete crew-gateway-user
 terraform -chdir=deploy/coder-aws/control-plane destroy \
   -var tailscale_auth_parameter=/kirocrew/poc/tailscale-auth-key \
   -var kiro_api_key_parameter=/kirocrew/poc/kiro-api-key \

@@ -21,7 +21,9 @@ def test_control_plane_is_arm_nat_free_and_has_no_ingress() -> None:
     terraform = _read("control-plane/main.tf")
 
     assert 'resource "aws_iam_role_policy_attachment" "workspace_ssm"' in terraform
-    control_policy = terraform.split('resource "aws_iam_role_policy" "control"', 1)[1]
+    control_policy = terraform.split('resource "aws_iam_role_policy" "control"', 1)[1].split(
+        'resource "aws_iam_instance_profile" "control"', 1
+    )[0]
 
     assert 'required_version = ">= 1.5"' in terraform
     assert 'default     = "us-east-2"' in terraform
@@ -33,10 +35,11 @@ def test_control_plane_is_arm_nat_free_and_has_no_ingress() -> None:
     assert 'resource "aws_nat_gateway"' not in terraform
     assert "ingress {" not in terraform
     assert "ec2:DescribeInstanceTypes" in terraform
+    assert "ec2:DescribeInstanceCreditSpecifications" in terraform
     assert "ec2:DescribeNetworkInterfaces" in terraform
     assert "iam:GetInstanceProfile" in terraform
     assert "parameter/aws/service/ami-amazon-linux-latest/*" in terraform
-    assert "local.parameter_arns.kiro" in control_policy
+    assert "local.parameter_arns.kiro" not in control_policy
 
 
 def test_workspace_is_persistent_arm_compute_with_bounded_choices() -> None:
@@ -50,7 +53,7 @@ def test_workspace_is_persistent_arm_compute_with_bounded_choices() -> None:
     assert not re.search(r"(?m)^\s*dir\s*=", terraform)
     assert "al2023-ami-kernel-default-arm64" in terraform
     assert 'resource "aws_ec2_instance_state" "workspace"' in terraform
-    assert 'volume_type = "gp3"' in terraform
+    assert re.search(r'volume_type\s*=\s*"gp3"', terraform)
     assert "aws_nat_gateway" not in terraform
 
 
@@ -80,12 +83,53 @@ def test_workspace_bootstrap_verifies_kiro_and_reads_secrets_from_ssm() -> None:
     assert "chown coder:coder /etc/kiro-api-key.b64" in bootstrap
 
 
+def test_gateway_is_a_dedicated_persistent_coder_workspace() -> None:
+    terraform = _read("gateway/main.tf")
+    bootstrap = _read("gateway/cloud-init.sh.tftpl")
+
+    assert re.search(r'default\s*=\s*"t4g.small"', terraform)
+    assert re.search(r'arch\s*=\s*"arm64"', terraform)
+    assert 'resource "aws_ec2_instance_state" "gateway"' in terraform
+    assert 'resource "coder_app" "kiro_crew"' in terraform
+    assert 'url          = "http://localhost:8443"' in terraform
+    assert re.search(r'volume_type\s*=\s*"gp3"', terraform)
+    assert re.search(r"delete_on_termination\s*=\s*false", terraform)
+    assert "associate_public_ip_address," in terraform
+    assert "aws_nat_gateway" not in terraform
+    assert "kirocrew-install-wheel" in bootstrap
+    assert "tailscale serve --bg --https=8443 http://127.0.0.1:8443" in bootstrap
+    assert "CODER_AGENT_TOKEN_FILE=/etc/coder-agent-token" in bootstrap
+    assert "KIRO_API_KEY=" in bootstrap
+    assert "coder_${coder_version}_linux_arm64.rpm" in bootstrap
+    assert "coder_rpm_sha256" in bootstrap
+    assert "usermod --shell /bin/bash coder" in bootstrap
+    assert re.search(
+        r"(?m)^install -d -o coder -g coder -m 0700 /home/coder/\.kiro$",
+        bootstrap,
+    )
+    assert 'KIRO_BOOTSTRAP_DIR="/var/tmp/kirocrew-bootstrap"' in bootstrap
+    assert "/tmp/kirocli.zip" not in bootstrap
+
+
+def test_control_plane_exports_distinct_gateway_and_session_template_values() -> None:
+    terraform = _read("control-plane/main.tf")
+
+    assert 'output "gateway_template_values"' in terraform
+    assert 'output "session_template_values"' in terraform
+    assert 'resource "aws_iam_instance_profile" "gateway"' in terraform
+    assert 'resource "aws_iam_instance_profile" "session"' in terraform
+
+
 def test_workspace_bootstrap_makes_working_directory_traversable() -> None:
     bootstrap = _read("workspace/cloud-init.sh.tftpl")
 
     assert "install -d -m 0700 -o coder -g coder /home/coder/workspace" in bootstrap
     assert "systemd-run --user --scope --quiet /usr/bin/true" in bootstrap
     assert "systemd-run --user --scope --quiet --wait" not in bootstrap
+    assert "/etc/kirocrew-coder-contract.json" in bootstrap
+    assert '"version": 1' in bootstrap
+    assert '"remote_cwd": "/home/coder/workspace"' in bootstrap
+    assert '"systemd-user-scopes"' in bootstrap
 
 
 def test_control_bootstrap_pins_coder_and_serves_only_over_tailscale() -> None:
@@ -95,16 +139,14 @@ def test_control_bootstrap_pins_coder_and_serves_only_over_tailscale() -> None:
     assert "coder_${coder_version}_linux_arm64.rpm" in bootstrap
     assert "coder_rpm_sha256" in bootstrap
     assert "sha256sum -c -" in bootstrap
-    assert 'KIRO_ARCH="aarch64"' in bootstrap
-    assert "kirocli-manifest.json" in bootstrap
-    assert "nodejs22" in bootstrap
-    assert "python3.11" in bootstrap
     assert "CODER_HTTP_ADDRESS=127.0.0.1:3000" in bootstrap
     assert "CODER_MAX_ADMIN_TOKEN_LIFETIME=8760h" in bootstrap
     assert "tailscale serve --bg --https=443" in bootstrap
-    assert "tailscale serve --bg --https=8443 http://127.0.0.1:8443" in bootstrap
-    assert 'filebase64("${path.module}/kirocrew-admin")' in terraform
-    assert "${kirocrew_admin_launcher_b64}" in bootstrap
+    assert "--https=8443" not in bootstrap
+    assert "kirocrew" not in bootstrap.lower()
+    assert "kiro_api_key_parameter" not in bootstrap
+    assert 'filebase64("${path.module}/kirocrew-admin")' not in terraform
+    assert 'filebase64("${path.module}/kirocrew-install-wheel")' not in terraform
     assert "--ssh" in bootstrap
     assert "curl | sh" not in bootstrap
 
@@ -114,8 +156,8 @@ def test_control_launcher_preserves_gateway_identity_and_arguments(tmp_path: Pat
     if shell is None:
         return
 
-    source_path = POC / "control-plane" / "kirocrew-admin"
-    assert source_path.exists(), "the control-plane template must ship its admin launcher"
+    source_path = POC / "gateway" / "kirocrew-admin"
+    assert source_path.exists(), "the gateway template must ship its admin launcher"
 
     service_home = tmp_path / "coder-home"
     service_bin = service_home / "kirocrew-venv" / "bin" / "kirocrew"
@@ -188,6 +230,127 @@ exec "$@"
     assert not injection_target.exists()
 
 
+def test_gateway_deployer_preserves_valid_wheel_name_for_remote_pip(
+    tmp_path: Path,
+) -> None:
+    bash = shutil.which("bash")
+    if bash is None:
+        return
+
+    wheel = tmp_path / "kirocrew-0.0.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel-under-test")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    trace = tmp_path / "trace"
+    for command in ("scp", "ssh"):
+        executable = fake_bin / command
+        executable.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            f"printf '{command}' >> {trace!s}\n"
+            f"printf ' <%s>' \"$@\" >> {trace!s}\n"
+            f"printf '\\n' >> {trace!s}\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            bash,
+            str(POC / "deploy-gateway.sh"),
+            "ec2-user@kirocrew-coder",
+            str(wheel),
+            "https://kirocrew-coder.example.ts.net:8443",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env={"PATH": f"{fake_bin}:/usr/bin:/bin"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    lines = trace.read_text(encoding="utf-8").splitlines()
+    remote_dir = "/tmp/kirocrew-2557613cf564ea9331cf47c9bca13e48a2fedd0e6d49ab33872b5de70227af16"
+    remote_wheel = f"{remote_dir}/{wheel.name}"
+
+    assert len(lines) == 8
+    assert lines[0].startswith("scp <-->")
+    assert "gateway/kirocrew-install-wheel" in lines[0]
+    assert lines[1].startswith("scp <-->")
+    assert "gateway/kirocrew-admin" in lines[1]
+    assert lines[2] == (
+        "ssh <--> <ec2-user@kirocrew-coder> </usr/bin/install> <-d> <-m> <0700> " f"<{remote_dir}>"
+    )
+    assert lines[3] == f"scp <--> <{str(wheel)}> <ec2-user@kirocrew-coder:{remote_wheel}>"
+    assert lines[4].startswith("ssh <--> <ec2-user@kirocrew-coder>")
+    assert "/usr/local/sbin/kirocrew-install-wheel" in lines[4]
+    assert lines[5].startswith("ssh <--> <ec2-user@kirocrew-coder>")
+    assert "/usr/local/bin/kirocrew" in lines[5]
+    assert f"<{remote_wheel}>" in lines[6]
+    assert lines[7].startswith("ssh <--> <ec2-user@kirocrew-coder>")
+    assert "systemctl is-active --quiet kirocrew.service" in lines[7]
+    assert "curl --fail --silent --show-error http://127.0.0.1:8443/api/health" in lines[7]
+
+
+def test_gateway_deployer_rejects_shell_metacharacters_before_remote_calls(
+    tmp_path: Path,
+) -> None:
+    bash = shutil.which("bash")
+    if bash is None:
+        return
+
+    wheel = tmp_path / "kirocrew.whl"
+    wheel.write_bytes(b"wheel-under-test")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    touched = tmp_path / "remote-command-ran"
+    for command in ("scp", "ssh"):
+        executable = fake_bin / command
+        executable.write_text(
+            f"#!/bin/sh\ntouch {touched!s}\nexit 99\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            bash,
+            str(POC / "deploy-gateway.sh"),
+            "ec2-user@host;touch-bad",
+            str(wheel),
+            "https://kirocrew-coder.example.ts.net:8443",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env={"PATH": f"{fake_bin}:/usr/bin:/bin"},
+    )
+
+    assert result.returncode != 0
+    assert not touched.exists()
+
+
+def test_gateway_remote_installer_is_identity_scoped_and_health_checked() -> None:
+    installer = _read("gateway/kirocrew-install-wheel")
+
+    assert "sha256sum" in installer
+    assert "KIROCREW_PORT=8443" in installer
+    assert "SUDO_USER=coder" in installer
+    assert "USER=coder" in installer
+    assert "LOGNAME=coder" in installer
+    assert "HOME=/home/coder" in installer
+    assert "KIROCREW_SERVICE_BIN=/home/coder/kirocrew-venv/bin/kirocrew" in installer
+    assert "kirocrew setup --agent-only" in installer
+    assert "kirocrew service install" in installer
+    assert 'pip install --force-reinstall --no-deps "$verified_wheel"' in installer
+    assert "systemctl is-active --quiet kirocrew.service" in installer
+    assert "http://127.0.0.1:8443/api/health" in installer
+    assert "curl | sh" not in installer
+    assert "git clone" not in installer
+
+
 def test_control_bootstrap_starts_with_one_package_install_command(tmp_path: Path) -> None:
     bash = shutil.which("bash")
     if bash is None:
@@ -214,13 +377,6 @@ def test_control_bootstrap_starts_with_one_package_install_command(tmp_path: Pat
         "-y",
         "ca-certificates",
         "dnf-plugins-core",
-        "git",
-        "jq",
-        "nodejs22",
-        "nodejs22-npm",
-        "python3.11",
-        "python3.11-pip",
-        "unzip",
     ]
 
 

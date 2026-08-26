@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -16,7 +17,11 @@ from kiro_crew.platform_compat import file_lock
 
 _SCHEMA_VERSION = 1
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-_BINDING_BYTES = 8
+_BINDING_BYTES = 6
+_OWNER_SLUG_MAX_CHARS = 20
+_WORKSPACE_NAME_MAX_CHARS = 32
+_BINDING_ID_CHARS = 8
+_MAX_PREFIX_CHARS = _WORKSPACE_NAME_MAX_CHARS - _BINDING_ID_CHARS - 3
 
 
 class WorkspaceRegistryCorrupt(RuntimeError):
@@ -122,6 +127,7 @@ class WorkspaceBindingRegistry:
         template: str,
         preset: str,
         prefix: str,
+        owner_name: str,
     ) -> WorkspaceBinding:
         if not session_key:
             raise ValueError("session_key is required")
@@ -129,8 +135,12 @@ class WorkspaceBindingRegistry:
             raise ValueError("template must be one safe Coder name")
         if preset and not _SAFE_NAME_RE.fullmatch(preset):
             raise ValueError("preset must be one safe Coder name")
-        if not _SAFE_NAME_RE.fullmatch(prefix) or len(prefix) > 32:
-            raise ValueError("prefix must be one safe Coder name of at most 32 characters")
+        if not _SAFE_NAME_RE.fullmatch(prefix) or len(prefix) > _MAX_PREFIX_CHARS:
+            raise ValueError(
+                f"prefix must be one safe Coder name of at most {_MAX_PREFIX_CHARS} characters"
+            )
+        if not owner_name:
+            raise ValueError("owner_name is required")
         with self._open_lock() as lock_fd:
             with file_lock(lock_fd.fileno(), exclusive=True, required=True):
                 bindings = self._read_unlocked()
@@ -140,8 +150,20 @@ class WorkspaceBindingRegistry:
                 now = self._now()
                 while True:
                     binding_id = secrets.token_urlsafe(_BINDING_BYTES).rstrip("=")
-                    workspace_name = f"{prefix}-{binding_id}"
-                    if binding_id not in bindings and _SAFE_NAME_RE.fullmatch(workspace_name):
+                    owner_slug = owner_name.lower()
+                    if len(owner_slug) > _OWNER_SLUG_MAX_CHARS or not _SAFE_NAME_RE.fullmatch(
+                        owner_slug
+                    ):
+                        digest = hashlib.sha256(owner_name.encode("utf-8")).hexdigest()[:8]
+                        owner_slug = f"user-{digest}"
+                    owner_chars = _WORKSPACE_NAME_MAX_CHARS - len(prefix) - len(binding_id) - 2
+                    owner_slug = owner_slug[:owner_chars]
+                    workspace_name = f"{prefix}-{owner_slug}-{binding_id}"
+                    if (
+                        binding_id not in bindings
+                        and len(workspace_name) <= _WORKSPACE_NAME_MAX_CHARS
+                        and _SAFE_NAME_RE.fullmatch(workspace_name)
+                    ):
                         break
                 binding = WorkspaceBinding(
                     binding_id=binding_id,

@@ -257,8 +257,8 @@ send time.
 | Method | Purpose |
 |--------|---------|
 | `start_pool(blocking=True)` | Pre-spawn warm + background sessions. `blocking=False` for non-blocking mode. |
-| `get_or_create(key, agent=None, approval_policy="", speculative=False, speculative_resume=False)` | Returns `(LLMProvider, is_new, resumed)`. Uses warm pool for new sessions (default agent only). Sessions with a resume mapping skip warm pool (cold start needed for `session/load`). Every decision is counted via `_record_pool_decision` (`kirocrew.session.pool.decision`) with the single disqualifying reason, so the pool's hit rate and the frequency of the `bypass_resume` case are observable. Non-default agents skip warm pool and resolve their model by precedence via `_model_fallback()` — caller model > per-agent pin > global default: `model=None` (defer to kiro's agent-JSON resolution) only when the agent pins its own model, otherwise the global default, unless that default is the `"auto"` sentinel (also `None`). The per-agent pin is resolved off the event loop via `run_in_executor` using `_resolve_named_agent_model`; blank agents inherit the global, and `kirocrew` is excluded (tracks the global). `approval_policy` is persisted on the new `_Session` — callers (e.g. subagent) pass parent policy so the session inherits it. `speculative=True` (eager spawn) pre-creates ahead of a real first turn: the one-shot `_Session.first_turn` observation — a single three-member `FirstTurnState` enum (`NOTHING_ARMED` / `FRESH` / `RESUMED`), so a resume marker on an already-claimed session is unrepresentable rather than forbidden by convention — is registered ARMED (`FRESH`) and never consumed by speculative callers, and a resumable key raises `SpeculativeResumeRefused` — unless `speculative_resume=True` (resume prefetch) opts in, in which case the speculative creator performs the `session/load` and registers the observation as `RESUMED` when the load restored the transcript. The observation is consumed in one read-then-clear by the first real claimant under the per-session semaphore (fast path and won-race path alike), with the returned booleans derived from it at the return boundary — so that turn observes `(is_new=True, resumed=True)` exactly as if it had resumed itself, preserving its history-injection decision. |
-| `execution_location(key)` | Returns the non-secret Coder workspace/cwd descriptor from the provider currently registered for the live session, or `None` for local/absent sessions. Config defaults are deliberately not consulted because active sessions do not migrate when a default changes. |
+| `get_or_create(key, agent=None, approval_policy="", speculative=False, speculative_resume=False, coder_profile_override="")` | Returns `(LLMProvider, is_new, resumed)`. Uses warm pool for new sessions (default agent only). Sessions with a resume mapping skip warm pool (cold start needed for `session/load`). Every decision is counted via `_record_pool_decision` (`kirocrew.session.pool.decision`) with the single disqualifying reason, so the pool's hit rate and the frequency of the `bypass_resume` case are observable. Non-default agents skip warm pool and resolve their model by precedence via `_model_fallback()` — caller model > per-agent pin > global default: `model=None` (defer to kiro's agent-JSON resolution) only when the agent pins its own model, otherwise the global default, unless that default is the `"auto"` sentinel (also `None`). The per-agent pin is resolved off the event loop via `run_in_executor` using `_resolve_named_agent_model`; blank agents inherit the global, and `kirocrew` is excluded (tracks the global). `approval_policy` is persisted on the new `_Session` — callers (e.g. subagent) pass parent policy so the session inherits it. `speculative=True` (eager spawn) pre-creates ahead of a real first turn: the one-shot `_Session.first_turn` observation — a single three-member `FirstTurnState` enum (`NOTHING_ARMED` / `FRESH` / `RESUMED`), so a resume marker on an already-claimed session is unrepresentable rather than forbidden by convention — is registered ARMED (`FRESH`) and never consumed by speculative callers, and a resumable key raises `SpeculativeResumeRefused` — unless `speculative_resume=True` (resume prefetch) opts in, in which case the speculative creator performs the `session/load` and registers the observation as `RESUMED` when the load restored the transcript. The observation is consumed in one read-then-clear by the first real claimant under the per-session semaphore (fast path and won-race path alike), with the returned booleans derived from it at the return boundary — so that turn observes `(is_new=True, resumed=True)` exactly as if it had resumed itself, preserving its history-injection decision. `coder_profile_override` selects a named Coder template/preset only for initial managed allocation; an existing binding remains authoritative. |
+| `execution_location(key)` | Returns an allowlisted, non-secret execution-environment descriptor (`kind`, `workspace`, `remote_cwd`, `state`, and optional `profile`) from the provider starting or running the session, or `None` for local/absent sessions. `state` is `starting` before the provider handshake completes and `running` only after registration; a starting provider is observable but never claimable. Config defaults are deliberately not consulted because active sessions do not migrate when a default changes. |
 | `coder_workspace_manager()` | Returns the manager owned by the current default provider factory, or `None` while managed Coder placement is disabled. The gateway retention reconciler resolves it on every pass so a Settings refresh takes effect without restarting the service. |
 | `refresh_defaults()` | Reloads config and the provider factory for future sessions, drains stale warm providers, and refills the pool without touching active sessions. Settings → Coder uses this after a save. |
 | `check_context_usage(key, provider)` | Returns %. Triggers compaction at configured threshold (default 70%), warns one `CONTEXT_WARN_MARGIN_PCT` below it (50% on the default). |
@@ -284,6 +284,38 @@ transport while preserving the session-map entry; a later claim cold-starts the
 workspace and uses `session/load`. The cleanup cadence is reduced to at most a
 third of the managed warm duration (with a one-minute floor), including when the
 global local-session idle timeout is disabled.
+
+Managed placement deliberately bypasses speculative eager spawn so merely
+opening a tab cannot allocate billable compute before its named Coder profile is
+selected. A slot persists that profile, and the first real turn passes it to the
+provider factory. Allocation records the resolved template and preset in the
+integrity-protected binding; profile changes are rejected after that binding
+exists. Removed profiles may resume an existing binding from its recorded
+coordinates but cannot allocate a new one. Remote preparation also requires the
+template's root-owned versioned contract marker and fails closed before ACP when
+the runtime user, remote directory, or declared capabilities do not match.
+
+The dashboard's active-session execution badge is provider-neutral. The session
+manager keeps a starting provider outside the claimable session registry, emits
+slot updates on its `starting`/`running`/failed transitions, and copies only the
+descriptor allowlist above from the provider's session host. A Coder host supplies
+its generated workspace name and the dashboard separately shows the immutable
+Coder profile; another remote host can use the same lifecycle contract without
+adding provider-specific dashboard state.
+
+Closing or archiving a dashboard slot with a managed Coder binding is an explicit
+compute-stop action, not an idle-expiry decision. The dashboard always confirms
+it and identifies the selected profile and generated workspace. The handler
+revalidates the binding's UUID, owner, and generated name, stops that exact
+workspace before it tombstones the slot, and leaves the slot visible with a
+retryable error if the stop cannot be verified. Bulk cleanup applies the same
+ordering independently to every stale slot, so one failed stop does not archive
+that slot or prevent safe siblings from being archived. A successful close keeps
+the session map, transcript, memory, durable generated workspace label, binding,
+and template-persistent storage;
+restoring the session starts the same workspace. Active turns, terminals, builds,
+and background processes inside its compute are intentionally terminated only
+after the operator accepts that confirmation.
 
 ## Stop Orchestration
 

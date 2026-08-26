@@ -85,6 +85,17 @@ class TestScheduleEagerSpawn:
         assert slot._eager_spawn_task is None
 
     @pytest.mark.asyncio
+    async def test_noop_for_managed_coder_until_the_first_real_turn(self):
+        slot = _ChatSlot("t1")
+        state = _mock_state(slot)
+        cfg = MagicMock()
+        cfg.session.eager_spawn = True
+        cfg.session.coder.enabled = True
+        with patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg):
+            schedule_eager_spawn(state, slot)
+        assert slot._eager_spawn_task is None
+
+    @pytest.mark.asyncio
     async def test_newer_signal_cancels_older_task(self):
         slot = _ChatSlot("t1")
         state = _mock_state(slot)

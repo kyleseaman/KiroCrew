@@ -315,11 +315,17 @@ export interface ComputerUseConfigSave {
 }
 
 /** Owner-only Coder defaults. The bearer is represented by presence only. */
+export interface CoderProfileData {
+  template: string
+  preset: string
+}
+
 export interface CoderConfigData {
   enabled: boolean
   url: string
   template: string
   preset: string
+  profiles: Record<string, CoderProfileData>
   remote_cwd: string
   runtime_warm_minutes: number
   stop_after_minutes: number
@@ -336,6 +342,7 @@ export interface CoderConfigSave {
   url: string
   template: string
   preset: string
+  profiles: Record<string, CoderProfileData>
   remote_cwd: string
   runtime_warm_minutes: number
   stop_after_minutes: number
@@ -2147,6 +2154,8 @@ export const api = {
     post('/api/chat/slots/model', { model, skip_running }).then(j) as Promise<{ ok: boolean; model: string; switched: string[]; skipped_running: string[]; unchanged: string[]; failed: string[] }>,
   chatSlotReasoningEffort: (slot: string, reasoning_effort: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/reasoning-effort', { reasoning_effort }).then(j) as Promise<{ ok?: boolean; reasoning_effort?: string; deferred?: boolean }>,
+  chatSlotCoderProfile: (slot: string, profile: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/coder-profile', { profile }).then(j) as Promise<{ ok: boolean; profile: string }>,
   chatSlotWorkspace: (slot: string, workspace: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/workspace', { workspace }).then(j),
   // Relaunch the slot's agent process in place (fresh agent spec, env, and MCP

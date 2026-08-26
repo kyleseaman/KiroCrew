@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -147,9 +148,37 @@ class TestCoderWorkspaceSessionHost:
             "/home/coder/workspace",
             host_mod._REMOTE_RUNTIME_MARKER,
             ",".join(str(port) for port in host._remote_port_candidates),
+            host_mod._CODER_TEMPLATE_CONTRACT_PATH,
+            str(host_mod._CODER_TEMPLATE_CONTRACT_VERSION),
         ]
         assert len(host._remote_port_candidates) == host_mod._REMOTE_FORWARD_PORT_ATTEMPTS
         assert len(set(host._remote_port_candidates)) == len(host._remote_port_candidates)
+
+    def test_remote_prepare_fails_closed_without_template_contract(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        work = tmp_path / "workspace"
+        home.mkdir()
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                host_mod._REMOTE_PREPARE_SCRIPT,
+                "runtime-id",
+                "kirocrew",
+                str(work),
+                host_mod._REMOTE_RUNTIME_MARKER,
+                "32123",
+                str(tmp_path / "missing-contract.json"),
+                str(host_mod._CODER_TEMPLATE_CONTRACT_VERSION),
+            ],
+            input=b"{}",
+            check=False,
+            capture_output=True,
+            env={**os.environ, "HOME": str(home)},
+        )
+
+        assert result.returncode != 0
+        assert not work.exists()
 
     @pytest.mark.asyncio
     async def test_prepare_sends_only_projected_json_to_bounded_subprocess(
@@ -902,7 +931,13 @@ async def test_managed_host_resolves_parent_workspace_before_remote_prepare(
         def __init__(self) -> None:
             self.sessions: list[str] = []
 
-        async def ensure_ready(self, session_key: str) -> CoderWorkspace:
+        async def ensure_ready(
+            self,
+            session_key: str,
+            *,
+            template: str | None = None,
+            preset: str | None = None,
+        ) -> CoderWorkspace:
             self.sessions.append(session_key)
             return CoderWorkspace(
                 uuid="workspace-uuid",

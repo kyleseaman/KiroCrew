@@ -1,9 +1,20 @@
 {
   "coder": {
+    "add_profile": "Добавить профиль",
+    "default_profile": "Профиль Coder по умолчанию",
+    "profile_badge": "Профиль Coder · {{profile}}",
+    "profile_change_failed": "Не удалось изменить профиль Coder",
+    "profile_name_label": "Имя профиля",
+    "profile_preset_label": "Предустановка для {{name}}",
+    "profile_template_label": "Шаблон для {{name}}",
+    "profiles_description": "Необязательные именованные шаблоны. Выберите один в новой сессии до выделения рабочей области.",
+    "profiles_title": "Профили сессий",
+    "remove_profile": "Удалить профиль",
+    "remove_profile_named": "Удалить профиль {{name}}",
+    "session_profile_label": "Профиль Coder для этой сессии",
     "architecture": "Шлюз хранит память, MCP, OAuth, задания cron и учётные данные. В Coder выполняется только процесс сеанса; субагенты наследуют это рабочее пространство.",
     "badge_allocating": "Выделение рабочего пространства Coder",
     "badge_label": "Рабочее пространство Coder · {{workspace}}",
-    "badge_title": "Этот активный сеанс выполняется в Coder",
     "connected_to": "Подключено как {{owner}}; шаблон {{template}} доступен",
     "connection_failed": "Проверка подключения не удалась",
     "control_plane_template": "Полная плоскость управления AWS",
@@ -48,6 +59,11 @@
     "workspace_label": "Префикс имени пространства",
     "workspace_template": "Шаблон рабочего пространства",
     "workspace_template_description": "Отправьте шаблон ARM EC2 в существующее развёртывание Coder. Плоскость управления и сеть уже должны существовать."
+  },
+  "execution_environment": {
+    "badge_starting": "Запуск рабочего пространства {{kind}}",
+    "badge_starting_named": "Запуск рабочего пространства {{kind}} · {{workspace}}",
+    "badge_running": "Рабочее пространство {{kind}} · {{workspace}}"
   },
   "api": {
     "client": {
@@ -7417,6 +7433,7 @@
       "working": "Работает"
     },
     "useSessionActions": {
+      "archive_and_stop_coder_workspace": "Архивировать «{{title}}» и остановить его рабочее пространство Coder?\n\nПрофиль: {{profile}}\nРабочее пространство: {{workspace}}\n\nЭто завершит текущий ход, терминалы, сборки и фоновые процессы. История чата, память и постоянное хранилище рабочего пространства сохранятся.",
       "close_this_session": "Закрыть этот сеанс?",
       "reload_failed": "Не удалось перезагрузить сессию. Возможно, агент отвечает или шлюз недоступен; повторите попытку, когда сессия будет свободна.",
       "reload_failed_subagents": "Субагенты всё ещё работают в этой сессии. Повторите попытку, когда они закончат.",
@@ -9045,7 +9062,9 @@
       "add_state_lanes": "Добавить автоматические колонки",
       "lane_seed_failed": "Не удалось добавить автоматические колонки.",
       "lane_seed_retry": "Повторить",
-      "lane_legacy_column_hint": "показывает все сессии"
+      "lane_legacy_column_hint": "показывает все сессии",
+      "coder_workspace_will_stop": "Сейчас будет остановлено {{count}} рабочее пространство Coder: {{workspaces}}.",
+      "coder_workspaces_will_stop": "Сейчас будет остановлено {{count}} рабочих пространств Coder: {{workspaces}}."
     },
     "connectionsPage": {
       "action_failed": "Не удалось выполнить действие: {{error}}",
@@ -12435,7 +12454,7 @@
         "delete": "Delete…",
         "deleting": "Удаление…",
         "delete_crew": "Delete {{name}}",
-        "confirm_delete_of": "Confirm deleting {{name}}",
+      "confirm_delete_of": "Подтвердить удаление {{name}}",
         "delete_warning": "Delete terminates the EC2 instance and ends its charges. This cannot be undone.",
         "before_you_start": "Before you start — your AWS setup",
         "checking": "Checking…",

@@ -1,6 +1,6 @@
 # Coder Per-Session Workspace Lifecycle
 
-**Status:** Approved; implementation in progress  
+**Status:** Implemented in the fork
 **Date:** 2026-08-25
 
 ## Decision
@@ -9,23 +9,28 @@ Each durable Kiro Crew parent session owns one Coder workspace. Every subagent
 and dedicated ACP runtime descended from that parent executes in the same
 workspace. No two unrelated parent sessions share a workspace.
 
-The gateway remains the only always-on Kiro Crew control plane. It owns session
-history, memory, MCP and OAuth credentials, cron, policy, the Coder automation
-token, workspace bindings, and lifecycle reconciliation. Coder workspaces own
-only session compute, the remote Kiro transcript, and that session's persistent
-filesystem.
+The gateway remains the only always-on Kiro Crew control plane. It runs in its
+own dedicated Coder workspace, isolated from both the Coder server and every
+session workspace. It owns session history, memory, MCP and OAuth credentials,
+cron, policy, the Coder automation token, workspace bindings, and lifecycle
+reconciliation. Session workspaces own only session compute, the remote Kiro
+transcript, and that session's persistent filesystem.
 
 ```text
-Gateway (small, always on)
+Coder control plane (small, always on; no Crew state)
   |
-  +-- session A binding --> crew-4m6p2j8r --> running only while active
-  |                           +-- parent ACP runtime
-  |                           +-- all A subagents
-  |                           +-- A filesystem and transcript
-  |
-  +-- session B binding --> crew-v9q3k7dw --> stopped, disk retained
-  |
-  +-- session C binding --> absent after 30 inactive days
+  +-- gateway workspace (small, always on)
+        |
+        +-- session A binding --> crew-session-user-4m6p2j8r
+        |                           running only while active
+        |                           +-- parent ACP runtime
+        |                           +-- all A subagents
+        |                           +-- A filesystem and transcript
+        |
+        +-- session B binding --> crew-session-user-v9q3k7dw
+        |                           stopped, disk retained
+        |
+        +-- session C binding --> absent after 30 inactive days
 ```
 
 Workspaces target a 30-minute inactivity window through Coder's activity-aware
@@ -34,9 +39,9 @@ session resumes. A gateway reconciler deletes a stopped workspace after 30 days
 of inactivity by default. Resuming after deletion creates a fresh workspace
 while retaining gateway history and memory.
 
-This supersedes the static POC assumption that every remote session uses the
-configured `crew-dogfood` workspace. That workspace remains a useful deployment
-smoke target, but it is not the target runtime topology.
+This supersedes the static POC assumption that every remote session uses one
+configured `crew-dogfood` workspace. New deployments use the lifecycle manager
+itself for smoke allocation, so the proof exercises the target topology.
 
 ## Why the Static Workspace Is Insufficient
 
@@ -67,7 +72,7 @@ persistent resources; an expired session pays nothing for Coder resources.
 
 ## Non-Goals
 
-- Moving the gateway or its durable stores into a workspace.
+- Co-locating the gateway with the Coder server or a session workspace.
 - One workspace per subagent. Subagents share their parent session's boundary.
 - Sharing a workspace pool between unrelated sessions.
 - Cloning a parent workspace filesystem when a chat is forked.
@@ -140,6 +145,7 @@ one shared workspace:
 | `session.coder.url` | empty | Trusted Coder base URL |
 | `session.coder.template` | `kirocrew-arm` in the sample | Template used for newly created workspaces |
 | `session.coder.preset` | empty | Optional Coder template preset; empty uses template defaults |
+| `session.coder.profiles` | empty | Named template/preset alternatives selectable before a session allocates its workspace |
 | `session.coder.remote_cwd` | `/home/coder/workspace` | Working directory within every workspace |
 | `session.coder.runtime_warm_minutes` | `5` | Keep an idle remote ACP runtime warm before closing its SSH connection |
 | `session.coder.stop_after_minutes` | `30` | Coder activity-aware autostop duration |
@@ -163,6 +169,15 @@ workspace update flow is added. Changing the Coder URL or token refreshes the
 manager for future operations but never silently rebinds an existing UUID from
 another deployment.
 
+A new parent slot may select the default or a named profile before allocation.
+The selection is persisted in slot metadata and passed into the first managed
+host allocation. The binding's recorded template and preset become
+authoritative after allocation, so a setting rename or deletion cannot redirect
+the session. Descendant runtimes clone the concrete parent host and therefore
+cannot select another profile. Managed Coder sessions do not speculative-spawn
+when a tab opens; the first real turn performs allocation after the choice is
+known.
+
 ## Workspace Template Contract
 
 A managed template must provide:
@@ -175,6 +190,13 @@ A managed template must provide:
 - a functioning systemd user manager and transient user scopes for the
   conservative background-work guarantee;
 - outbound connectivity required by the coding workload and Kiro service.
+
+Every compatible template publishes a root-owned
+`/etc/kirocrew-coder-contract.json` marker containing contract version 1, the
+runtime user, exact remote directory, and the `kiro-cli` and
+`systemd-user-scopes` capabilities. Remote preparation verifies the marker,
+the executable, and directory ownership/access before starting ACP. A missing,
+malformed, or mismatched contract fails the session closed.
 
 The sample AWS template enables lingering for `coder`, exposes the user D-Bus
 runtime needed by `systemd-run --user`, and verifies a transient scope during
@@ -279,6 +301,15 @@ regex is used to guess that intent.
 Coder's native autostop is the stop authority because it knows about active
 VS Code, JetBrains, terminal, SSH, and reported AI-task sessions. The gateway
 does not issue a blind stop based only on chat timestamps.
+
+An explicit dashboard close or archive is the deliberate exception. The UI
+always confirms the session title, selected Coder profile, generated workspace,
+and the fact that active turns, terminals, builds, and background processes will
+end. On confirmation, the gateway revalidates the integrity-bound UUID, owner,
+and generated name and stops that exact workspace before archiving the slot. A
+failed or unverifiable stop leaves the slot visible for retry. Bulk cleanup names
+the affected workspaces and applies the same stop-before-archive contract to each
+session independently.
 
 While a managed workload scope is active without an ACP SSH connection, the
 gateway renews Coder activity. Once managed leases/scopes end, it stops renewing.

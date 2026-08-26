@@ -1,19 +1,18 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Check, Copy, ExternalLink, Loader, TestTube2 } from 'lucide-react'
+import { Check, Copy, ExternalLink, Loader, Plus, TestTube2, Trash2 } from 'lucide-react'
 
 import { api, type CoderConfigData, type CoderConfigSave } from '../../api/client'
 import { SettingsCard, SettingsInput, SettingsSection, SettingsToggle } from '../../components/settings'
 import { Btn } from '../../components/ui'
 import { i18nT } from '../../i18n/t'
 import { copyToClipboard } from '../../utils/clipboard'
+import { CONTROL_PLANE_COMMAND, WORKSPACE_COMMAND } from './coderDeployExamples'
 
 const CODER_CONFIG_QUERY = ['coder-config'] as const
 const WORKSPACE_TEMPLATE_URL = 'https://github.com/kirodotdev/KiroCrew/tree/main/deploy/coder-aws/workspace'
 const CONTROL_PLANE_TEMPLATE_URL = 'https://github.com/kirodotdev/KiroCrew/tree/main/deploy/coder-aws/control-plane'
 const REMOTE_GUIDE_URL = 'https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/remote-and-mobile.md'
-const WORKSPACE_COMMAND = 'coder templates push kirocrew-arm --yes --directory deploy/coder-aws/workspace'
-const CONTROL_PLANE_COMMAND = 'terraform -chdir=deploy/coder-aws/control-plane apply'
 
 type FormState = Omit<CoderConfigSave, 'token'>
 
@@ -85,6 +84,7 @@ export function CoderPanel() {
     url: '',
     template: '',
     preset: '',
+    profiles: {},
     remote_cwd: '/home/coder/workspace',
     runtime_warm_minutes: 5,
     stop_after_minutes: 30,
@@ -103,6 +103,7 @@ export function CoderPanel() {
       url,
       template,
       preset,
+      profiles,
       remote_cwd,
       runtime_warm_minutes,
       stop_after_minutes,
@@ -115,6 +116,7 @@ export function CoderPanel() {
       url,
       template,
       preset,
+      profiles,
       remote_cwd,
       runtime_warm_minutes,
       stop_after_minutes,
@@ -156,6 +158,7 @@ export function CoderPanel() {
       url: form.url,
       template: form.template,
       preset: form.preset,
+      profiles: form.profiles,
       remote_cwd: form.remote_cwd,
       runtime_warm_minutes: form.runtime_warm_minutes,
       stop_after_minutes: form.stop_after_minutes,
@@ -221,6 +224,85 @@ export function CoderPanel() {
             disabled={busy}
             configKey="session.coder.preset"
           />
+          <div className="border-t border-border pt-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-[13px] font-medium text-text">
+                  {i18nT('coder.profiles_title')}
+                </div>
+                <div className="mt-0.5 text-[11px] leading-relaxed text-muted">
+                  {i18nT('coder.profiles_description')}
+                </div>
+              </div>
+              <Btn
+                type="button"
+                disabled={busy || Object.keys(form.profiles).length >= 16}
+                onClick={() => setForm(current => {
+                  let suffix = Object.keys(current.profiles).length + 1
+                  while (current.profiles[`profile-${suffix}`]) suffix += 1
+                  return {
+                    ...current,
+                    profiles: {
+                      ...current.profiles,
+                      [`profile-${suffix}`]: { template: current.template, preset: '' },
+                    },
+                  }
+                })}
+              >
+                <Plus className="lucide-inline" /> {i18nT('coder.add_profile')}
+              </Btn>
+            </div>
+            <div className="mt-3 space-y-3">
+              {Object.entries(form.profiles).map(([name, profile], index) => (
+                <div key={index} className="rounded-md border border-border bg-bg px-3 py-3">
+                  <div className="grid gap-3 md:grid-cols-3">
+                    <SettingsInput
+                      label={i18nT('coder.profile_name_label')}
+                      value={name}
+                      onChange={nextName => setForm(current => {
+                        const entries = Object.entries(current.profiles)
+                        entries[index] = [nextName, entries[index][1]]
+                        return { ...current, profiles: Object.fromEntries(entries) }
+                      })}
+                      disabled={busy}
+                    />
+                    <SettingsInput
+                      label={i18nT('coder.profile_template_label', { name })}
+                      value={profile.template}
+                      onChange={template => setForm(current => ({
+                        ...current,
+                        profiles: { ...current.profiles, [name]: { ...profile, template } },
+                      }))}
+                      disabled={busy}
+                    />
+                    <SettingsInput
+                      label={i18nT('coder.profile_preset_label', { name })}
+                      value={profile.preset}
+                      onChange={preset => setForm(current => ({
+                        ...current,
+                        profiles: { ...current.profiles, [name]: { ...profile, preset } },
+                      }))}
+                      disabled={busy}
+                    />
+                  </div>
+                  <div className="mt-2 flex justify-end">
+                    <Btn
+                      type="button"
+                      aria-label={i18nT('coder.remove_profile_named', { name })}
+                      disabled={busy}
+                      onClick={() => setForm(current => {
+                        const profiles = { ...current.profiles }
+                        delete profiles[name]
+                        return { ...current, profiles }
+                      })}
+                    >
+                      <Trash2 className="lucide-inline" /> {i18nT('coder.remove_profile')}
+                    </Btn>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
           <SettingsInput
             label={i18nT('coder.cwd_label')}
             description={i18nT('coder.cwd_description')}
