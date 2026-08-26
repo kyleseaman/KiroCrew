@@ -165,6 +165,20 @@ sudo -u coder env HOME=/home/coder /bin/sh -c \
 EOF
 ```
 
+The control-plane template provides `/usr/local/bin/kirocrew` for gateway
+administration. It delegates to the stable virtual environment above as the
+`coder` service identity, so the private gateway configuration, sessions, and
+memory are not duplicated under `ec2-user`. Once the wheel is installed, verify
+the launcher from an administrative shell:
+
+```bash
+ssh ec2-user@kirocrew-coder 'kirocrew --version'
+ssh ec2-user@kirocrew-coder 'kirocrew token'
+```
+
+This launcher administers the main gateway; it does not place the CLI inside a
+per-session Coder workspace.
+
 The control node permits an owner to create an automation token with a one-year
 lifetime. Create it with `coder tokens create --name crew-control --lifetime
 1y`. Do not add it to a systemd environment file or copy it into the workspace.

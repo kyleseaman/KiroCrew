@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+# The gateway owns state under coder's private home. Keep administrative CLI
+# calls on that identity instead of weakening the home directory boundary.
+exec /usr/bin/sudo -n -u coder /usr/bin/env \
+  HOME=/home/coder \
+  USER=coder \
+  LOGNAME=coder \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  /bin/sh -c \
+  'cd /home/coder && exec /home/coder/kirocrew-venv/bin/kirocrew "$@"' \
+  kirocrew "$@"

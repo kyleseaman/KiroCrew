@@ -89,6 +89,7 @@ def test_workspace_bootstrap_makes_working_directory_traversable() -> None:
 
 
 def test_control_bootstrap_pins_coder_and_serves_only_over_tailscale() -> None:
+    terraform = _read("control-plane/main.tf")
     bootstrap = _read("control-plane/cloud-init.sh.tftpl")
 
     assert "coder_${coder_version}_linux_arm64.rpm" in bootstrap
@@ -102,8 +103,89 @@ def test_control_bootstrap_pins_coder_and_serves_only_over_tailscale() -> None:
     assert "CODER_MAX_ADMIN_TOKEN_LIFETIME=8760h" in bootstrap
     assert "tailscale serve --bg --https=443" in bootstrap
     assert "tailscale serve --bg --https=8443 http://127.0.0.1:8443" in bootstrap
+    assert 'filebase64("${path.module}/kirocrew-admin")' in terraform
+    assert "${kirocrew_admin_launcher_b64}" in bootstrap
     assert "--ssh" in bootstrap
     assert "curl | sh" not in bootstrap
+
+
+def test_control_launcher_preserves_gateway_identity_and_arguments(tmp_path: Path) -> None:
+    shell = shutil.which("sh")
+    if shell is None:
+        return
+
+    source_path = POC / "control-plane" / "kirocrew-admin"
+    assert source_path.exists(), "the control-plane template must ship its admin launcher"
+
+    service_home = tmp_path / "coder-home"
+    service_bin = service_home / "kirocrew-venv" / "bin" / "kirocrew"
+    service_bin.parent.mkdir(parents=True)
+    service_bin.write_text(
+        """#!/bin/sh
+printf 'home=%s\\n' "$HOME"
+printf 'user=%s\\n' "$USER"
+printf 'logname=%s\\n' "$LOGNAME"
+printf 'cwd=%s\\n' "$PWD"
+printf 'sudo-user=%s\\n' "$OBSERVED_SUDO_USER"
+printf 'argc=%s\\n' "$#"
+for argument in "$@"; do
+  printf 'arg=%s\\n' "$argument"
+done
+""",
+        encoding="utf-8",
+    )
+    service_bin.chmod(0o755)
+
+    fake_sudo = tmp_path / "sudo"
+    fake_sudo.write_text(
+        """#!/bin/sh
+set -eu
+test "$1" = "-n"
+shift
+test "$1" = "-u"
+shift
+export OBSERVED_SUDO_USER="$1"
+shift
+exec "$@"
+""",
+        encoding="utf-8",
+    )
+    fake_sudo.chmod(0o755)
+
+    launcher = tmp_path / "kirocrew"
+    launcher.write_text(
+        source_path.read_text(encoding="utf-8")
+        .replace("/usr/bin/sudo", str(fake_sudo))
+        .replace("/home/coder", str(service_home)),
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+
+    injection_target = tmp_path / "must-not-exist"
+    injection_argument = f"$(touch {injection_target})"
+    result = subprocess.run(
+        [str(launcher), "token", "value with spaces", injection_argument],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=tmp_path,
+        env={"PATH": "/usr/bin:/bin"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        f"home={service_home}",
+        "user=coder",
+        "logname=coder",
+        f"cwd={service_home}",
+        "sudo-user=coder",
+        "argc=3",
+        "arg=token",
+        "arg=value with spaces",
+        f"arg={injection_argument}",
+    ]
+    assert not injection_target.exists()
 
 
 def test_control_bootstrap_starts_with_one_package_install_command(tmp_path: Path) -> None:

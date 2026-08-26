@@ -281,13 +281,14 @@ resource "aws_instance" "control" {
   user_data_replace_on_change = false
 
   user_data = templatefile("${path.module}/cloud-init.sh.tftpl", {
-    region                   = var.region
-    tailscale_auth_parameter = var.tailscale_auth_parameter
-    kiro_api_key_parameter   = var.kiro_api_key_parameter
-    tailscale_hostname       = var.tailscale_hostname
-    tailnet_dns_name         = var.tailnet_dns_name
-    coder_version            = var.coder_version
-    coder_rpm_sha256         = var.coder_rpm_sha256
+    region                      = var.region
+    tailscale_auth_parameter    = var.tailscale_auth_parameter
+    kiro_api_key_parameter      = var.kiro_api_key_parameter
+    tailscale_hostname          = var.tailscale_hostname
+    tailnet_dns_name            = var.tailnet_dns_name
+    coder_version               = var.coder_version
+    coder_rpm_sha256            = var.coder_rpm_sha256
+    kirocrew_admin_launcher_b64 = filebase64("${path.module}/kirocrew-admin")
   })
 
   metadata_options {

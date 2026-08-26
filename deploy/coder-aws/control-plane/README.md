@@ -32,5 +32,13 @@ recorded in its integrity-protected binding registry; an operator-created
 not a multi-user or highly available Coder topology; Coder's built-in PostgreSQL
 database lives on the control node.
 
+The bootstrap installs `/usr/local/bin/kirocrew` as a gateway administration
+launcher. After the Kiro Crew wheel is installed in the documented
+`/home/coder/kirocrew-venv`, commands entered as `ec2-user` run under the same
+`coder` identity, home, and working directory as the gateway. This keeps
+`/home/coder` private while making commands such as `kirocrew token` available
+over the administrative Tailscale SSH connection. Session workspaces remain a
+separate execution boundary.
+
 Continue with the [workspace template](../workspace/) and the full
 [remote-host guide](../../../docs/guides/remote-and-mobile.md#aws--coder-graviton-dogfood-poc).

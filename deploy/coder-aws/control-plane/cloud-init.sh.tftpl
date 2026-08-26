@@ -70,6 +70,11 @@ rm -rf /tmp/kirocli /tmp/kirocli.zip /tmp/kirocli-manifest.json
 kiro-cli --version
 
 id coder >/dev/null 2>&1 || useradd --create-home --shell /bin/bash coder
+base64 --decode > /usr/local/bin/kirocrew <<'EOF'
+${kirocrew_admin_launcher_b64}
+EOF
+chown root:root /usr/local/bin/kirocrew
+chmod 0755 /usr/local/bin/kirocrew
 install -d -o coder -g coder /home/coder/.config/coderv2 /home/coder/.cache/coder
 install -d -o coder -g coder -m 0700 /home/coder/.kiro/crew
 KIRO_API_KEY="$(aws ssm get-parameter \
