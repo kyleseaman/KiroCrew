@@ -31,13 +31,13 @@ from kiro_crew.browser_cli import snapshots as browser_cli_snapshots
 from kiro_crew.browser_cli import token as browser_cli_token
 from kiro_crew.browser_cli import view as browser_cli_view
 from kiro_crew.channel_transcript_migration import migrate_channel_transcripts
+from kiro_crew.coder.manager import CoderWorkspaceManager
 from kiro_crew.config import data_home
 from kiro_crew.config.loader import (
     KiroCrewConfig,
     refresh_config_meta_stamp,
     refresh_materialized_agents,
 )
-from kiro_crew.coder.manager import CoderWorkspaceManager
 from kiro_crew.constants import CODER_RECONCILE_INTERVAL_SECONDS
 from kiro_crew.dashboard import (
     cautious_boot,
