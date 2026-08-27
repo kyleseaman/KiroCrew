@@ -33,7 +33,8 @@ export function CoderExecutionControl({ slot }: { slot?: ChatSlot }) {
     return (
       <div className="pointer-events-auto flex min-w-0 shrink items-center gap-1">
         <ExecutionLocationBadge location={slot.execution_location} />
-        {slot.execution_location.kind === 'coder' && (
+        {slot.execution_location.kind === 'coder'
+          && slot.execution_location.state !== 'starting' && (
           <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-accent/30 bg-accent-subtle px-2 py-0.5 text-[11px] font-medium text-accent">
             <Server className="lucide-inline" />
             {profileLabel}

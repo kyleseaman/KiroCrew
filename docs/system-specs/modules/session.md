@@ -295,13 +295,19 @@ coordinates but cannot allocate a new one. Remote preparation also requires the
 template's root-owned versioned contract marker and fails closed before ACP when
 the runtime user, remote directory, or declared capabilities do not match.
 
-The dashboard's active-session execution badge is provider-neutral. The session
-manager keeps a starting provider outside the claimable session registry, emits
-slot updates on its `starting`/`running`/failed transitions, and copies only the
+The dashboard's active-session execution UI is provider-neutral. While the
+descriptor is `starting`, the transcript replaces the decorative model loader
+with an indeterminate startup card that explains the isolated environment,
+shows the provider, selected profile, and generated workspace name as each
+becomes available, and keeps the composer available for queued instructions.
+The compact execution badge remains in the header, but provider profile metadata
+is not repeated there until the descriptor is `running`. The session manager
+keeps a starting provider outside the claimable session registry, emits slot
+updates on its `starting`/`running`/failed transitions, and copies only the
 descriptor allowlist above from the provider's session host. A Coder host supplies
-its generated workspace name and the dashboard separately shows the immutable
-Coder profile; another remote host can use the same lifecycle contract without
-adding provider-specific dashboard state.
+its generated workspace name and immutable profile through this contract; another
+remote host can use the same lifecycle without adding provider-specific dashboard
+state.
 
 Closing or archiving a dashboard slot with a managed Coder binding is an explicit
 compute-stop action, not an idle-expiry decision. The dashboard always confirms

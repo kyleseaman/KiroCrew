@@ -7118,7 +7118,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               {/* Bottom sentinel: drives downward window expansion when in jump mode. */}
               <div ref={virt.bottomSentinelRef} aria-hidden style={{ height: 1 }} />
               {/* Footer */}
-              <ChatFooter running={slotRunning} stopping={slotStopping} state={slotState} lastRole={lastRole} streamTick={streamTick} regenerating={regenerating} stopState={currentSlot?.stop_state} />
+              <ChatFooter
+                running={slotRunning}
+                stopping={slotStopping}
+                state={slotState}
+                lastRole={lastRole}
+                streamTick={streamTick}
+                regenerating={regenerating}
+                stopState={currentSlot?.stop_state}
+                executionLocation={currentSlot?.execution_location}
+                executionProfile={currentSlot?.coder_profile}
+              />
               {activeSlot && !slotLoading && !embedded && !popout && slotSwitchTarget !== activeSlot && (
                 <div className="px-4 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
                   <SessionPulseSurveyCard

@@ -63,7 +63,15 @@
   "execution_environment": {
     "badge_starting": "Запуск рабочего пространства {{kind}}",
     "badge_starting_named": "Запуск рабочего пространства {{kind}} · {{workspace}}",
-    "badge_running": "Рабочее пространство {{kind}} · {{workspace}}"
+    "badge_running": "Рабочее пространство {{kind}} · {{workspace}}",
+    "profile_label": "Профиль",
+    "provider_label": "Поставщик",
+    "startup_description": "Изолированная среда создаётся и подключается к этой сессии. Это может занять несколько минут.",
+    "startup_progress_label": "Ход запуска рабочего пространства",
+    "startup_queued": "Твоё сообщение в очереди. Можешь продолжать добавлять инструкции.",
+    "startup_title": "Подготовка рабочего пространства",
+    "workspace_label": "Рабочее пространство",
+    "workspace_pending": "Создание имени рабочего пространства..."
   },
   "api": {
     "client": {

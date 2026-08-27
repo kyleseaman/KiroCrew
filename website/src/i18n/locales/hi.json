@@ -63,7 +63,15 @@
   "execution_environment": {
     "badge_starting": "{{kind}} वर्कस्पेस शुरू हो रहा है",
     "badge_starting_named": "{{kind}} वर्कस्पेस शुरू हो रहा है · {{workspace}}",
-    "badge_running": "{{kind}} वर्कस्पेस · {{workspace}}"
+    "badge_running": "{{kind}} वर्कस्पेस · {{workspace}}",
+    "profile_label": "प्रोफ़ाइल",
+    "provider_label": "प्रदाता",
+    "startup_description": "एक अलग वातावरण बनाया जा रहा है और इस सत्र से जोड़ा जा रहा है। इसमें कुछ मिनट लग सकते हैं।",
+    "startup_progress_label": "वर्कस्पेस शुरू होने की प्रगति",
+    "startup_queued": "तुम्हारा संदेश कतार में है। तुम और निर्देश जोड़ सकते हो।",
+    "startup_title": "वर्कस्पेस तैयार हो रहा है…",
+    "workspace_label": "वर्कस्पेस",
+    "workspace_pending": "वर्कस्पेस का नाम बनाया जा रहा है…"
   },
   "api": {
     "client": {

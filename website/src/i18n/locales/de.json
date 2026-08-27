@@ -63,7 +63,15 @@
   "execution_environment": {
     "badge_starting": "{{kind}}-Arbeitsbereich wird gestartet",
     "badge_starting_named": "{{kind}}-Arbeitsbereich wird gestartet · {{workspace}}",
-    "badge_running": "{{kind}}-Arbeitsbereich · {{workspace}}"
+    "badge_running": "{{kind}}-Arbeitsbereich · {{workspace}}",
+    "profile_label": "Profil",
+    "provider_label": "Anbieter",
+    "startup_description": "Eine isolierte Umgebung wird erstellt und mit dieser Sitzung verbunden. Das kann einige Minuten dauern.",
+    "startup_progress_label": "Fortschritt beim Starten des Arbeitsbereichs",
+    "startup_queued": "Deine Nachricht ist in der Warteschlange. Du kannst weitere Anweisungen hinzufügen.",
+    "startup_title": "Arbeitsbereich wird vorbereitet",
+    "workspace_label": "Arbeitsbereich",
+    "workspace_pending": "Arbeitsbereichsname wird erstellt…"
   },
   "api": {
     "client": {

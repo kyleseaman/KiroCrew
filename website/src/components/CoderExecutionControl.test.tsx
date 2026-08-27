@@ -78,7 +78,7 @@ describe('CoderExecutionControl', () => {
     expect(screen.queryByRole('combobox')).not.toBeInTheDocument()
   })
 
-  it('shows a starting workspace and the selected Coder profile', async () => {
+  it('leaves startup profile details to the transcript card', async () => {
     renderWithProviders(
       <CoderExecutionControl
         slot={{
@@ -96,7 +96,7 @@ describe('CoderExecutionControl', () => {
     )
 
     expect(screen.getByRole('status')).toHaveTextContent('Starting Coder workspace')
-    expect(screen.getByText('Coder profile · gpu')).toBeInTheDocument()
+    expect(screen.queryByText('Coder profile · gpu')).not.toBeInTheDocument()
   })
 
   it('does not fetch Coder settings for an already hosted session', async () => {

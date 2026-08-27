@@ -14,6 +14,48 @@ describe('ChatFooter', () => {
     expect(container.innerHTML).toBe('')
   })
 
+  it('replaces the decorative loader with an informative workspace startup card', () => {
+    render(
+      <ChatFooter
+        {...base}
+        running={true}
+        lastRole="user"
+        executionLocation={{
+          kind: 'coder',
+          workspace: 'crew-session-kyleseaman-opaque',
+          remote_cwd: '/home/coder/workspace',
+          state: 'starting',
+        }}
+        executionProfile="Default Coder profile"
+      />,
+    )
+
+    const status = screen.getByRole('status')
+    expect(status).toHaveTextContent('Preparing your workspace')
+    expect(status).toHaveTextContent('Coder')
+    expect(status).toHaveTextContent('Default Coder profile')
+    expect(status).toHaveTextContent('crew-session-kyleseaman-opaque')
+    expect(status).toHaveTextContent('Your message is queued. You can keep adding instructions.')
+    expect(screen.getByRole('progressbar', { name: 'Workspace startup progress' })).toBeInTheDocument()
+    expect(document.querySelector('.csb4')).not.toBeInTheDocument()
+  })
+
+  it('explains that a workspace name is still being generated', () => {
+    render(
+      <ChatFooter
+        {...base}
+        executionLocation={{
+          kind: 'test-sandbox',
+          workspace: '',
+          remote_cwd: '/workspace',
+          state: 'starting',
+        }}
+      />,
+    )
+
+    expect(screen.getByRole('status')).toHaveTextContent('Generating workspace name…')
+  })
+
   // The indicator must survive the WHOLE turn, including the gap after a tool
   // completes — it must not blink out mid-turn.
   it('stays visible while a tool is running', () => {

@@ -63,7 +63,15 @@
   "execution_environment": {
     "badge_starting": "Avvio dello spazio di lavoro {{kind}}",
     "badge_starting_named": "Avvio dello spazio di lavoro {{kind}} · {{workspace}}",
-    "badge_running": "Spazio di lavoro {{kind}} · {{workspace}}"
+    "badge_running": "Spazio di lavoro {{kind}} · {{workspace}}",
+    "profile_label": "Profilo",
+    "provider_label": "Provider",
+    "startup_description": "È in corso la creazione di un ambiente isolato e il collegamento a questa sessione. Potrebbero essere necessari alcuni minuti.",
+    "startup_progress_label": "Avanzamento dell’avvio dello spazio di lavoro",
+    "startup_queued": "Il tuo messaggio è in coda. Puoi continuare ad aggiungere istruzioni.",
+    "startup_title": "Preparazione dello spazio di lavoro",
+    "workspace_label": "Spazio di lavoro",
+    "workspace_pending": "Generazione del nome dello spazio di lavoro…"
   },
   "api": {
     "client": {

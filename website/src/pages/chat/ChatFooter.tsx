@@ -6,6 +6,8 @@ import { i18nT } from '../../i18n/t'
 import { GHOST_POSE_ICONS } from '../../components/GhostPoses'
 import { getThemeBranding } from '../../themeBranding'
 import ErrorBoundary from '../../components/ErrorBoundary'
+import { ExecutionLocationStartup } from '../../components/ExecutionLocationStartup'
+import type { ExecutionLocation } from '../../types'
 type StopState = 'idle' | 'soft_pending' | 'killing'
 
 /** One carousel beat — the cadence the .csb4 cross-fade was built around. */
@@ -211,8 +213,31 @@ export function useStreamIdle(tick: number, active: boolean, ms: number = STREAM
   return active && idle
 }
 
-const ChatFooter = memo(function ChatFooter({ running, stopping, state, lastRole, regenerating, stopState, streamTick = 0 }: { running: boolean; stopping: boolean; state: string; lastRole: string; regenerating?: boolean; stopState?: StopState; streamTick?: number }) {
+interface ChatFooterProps {
+  running: boolean
+  stopping: boolean
+  state: string
+  lastRole: string
+  regenerating?: boolean
+  stopState?: StopState
+  streamTick?: number
+  executionLocation?: ExecutionLocation
+  executionProfile?: string
+}
+
+const ChatFooter = memo(function ChatFooter({
+  running,
+  stopping,
+  state,
+  lastRole,
+  regenerating,
+  stopState,
+  streamTick = 0,
+  executionLocation,
+  executionProfile,
+}: ChatFooterProps) {
   const loader = resolveLoader(useThemeSlug())
+  const startingLocation = executionLocation?.state === 'starting'
   // Text is only ACTIVELY streaming while the slot says so AND chunks keep
   // arriving. `lastRole` alone cannot tell the two apart: the trailing
   // 'streaming' message is deliberately left unfinalized across a whole tool
@@ -225,11 +250,11 @@ const ChatFooter = memo(function ChatFooter({ running, stopping, state, lastRole
   // thinking, tool calls, AND the gaps between steps: the backend keeps
   // slot.running true for the whole turn, so the post-tool gap stays covered
   // rather than letting the indicator vanish mid-turn.
-  if (!regenerating && !running && stopState !== 'soft_pending' && stopState !== 'killing') return null
+  if (!startingLocation && !regenerating && !running && stopState !== 'soft_pending' && stopState !== 'killing') return null
   // ...but never while text is actively arriving: MarkdownRenderer already renders
   // the real blinking caret (.streaming-caret) there, and a second indicator
   // alongside it reads as two cursors.
-  if (!regenerating && streamingText && !streamQuiet && stopState !== 'soft_pending' && stopState !== 'killing') return null
+  if (!startingLocation && !regenerating && streamingText && !streamQuiet && stopState !== 'soft_pending' && stopState !== 'killing') return null
   // width from CSS var --mc-content-width
   return (
     <div data-testid="chat-footer" className={`px-4 mx-auto w-full py-1${regenerating ? '' : ' animate-slide-up'}`} style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
@@ -237,7 +262,12 @@ const ChatFooter = memo(function ChatFooter({ running, stopping, state, lastRole
           row wrapper's own `px-4` gutter and inset the indicator 14px right of
           every message, tool and card row it sits under. */}
       <div className="py-2.5">
-        {stopState === 'soft_pending' ? (
+        {startingLocation ? (
+          <ExecutionLocationStartup
+            location={executionLocation}
+            profile={executionProfile}
+          />
+        ) : stopState === 'soft_pending' ? (
           <motion.span
             className="text-danger text-[13px] font-mono"
             animate={{ opacity: [0.6, 1, 0.6] }}
