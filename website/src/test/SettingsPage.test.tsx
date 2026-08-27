@@ -7,7 +7,7 @@
  *
  * The five chat integrations live under ONE Channels tab (rows inside
  * ChannelsPanel), the sidebar carries Preferences/System group headers, and
- * legacy ?tab=slack style deep links remap to ?tab=channels&channel=slack.
+ * legacy channel/Coder deep links remap to their provider-neutral destinations.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, cleanup, within } from '@testing-library/react'
@@ -35,6 +35,7 @@ vi.mock('../pages/settings/WebexPanel', () => ({ WebexPanel: () => <div data-tes
 vi.mock('../pages/settings/WeComPanel', () => ({ WeComPanel: () => <div data-testid="wecom-panel" /> }))
 vi.mock('../pages/settings/TeamsPanel', () => ({ TeamsPanel: () => <div data-testid="teams-panel" /> }))
 vi.mock('../pages/settings/DeveloperPanel', () => ({ DeveloperPanel: () => <div data-testid="developer-panel" /> }))
+vi.mock('../pages/settings/CoderPanel', () => ({ CoderPanel: () => <div data-testid="coder-panel" /> }))
 // Default export, unlike the panels above. Stubbed for the same reason the
 // others are, plus one of its own: the real panel calls api.releases(), which
 // the fixed method set below does not carry.
@@ -143,10 +144,22 @@ describe('SettingsPage tabs', () => {
     expect(screen.getByText('Computer Use')).toBeInTheDocument()
   })
 
-  it('uses the official Coder mark in the Coder settings row', () => {
+  it('lists a provider-neutral Session Environments destination', () => {
     renderAt('/settings')
-    const coderTab = screen.getByRole('button', { name: 'Coder' })
-    expect(within(coderTab).getByTestId('coder-logo')).toBeInTheDocument()
+    const environmentsTab = screen.getByRole('button', { name: 'Session Environments' })
+    expect(environmentsTab.querySelector('.lucide-server')).toBeInTheDocument()
+    expect(within(environmentsTab).queryByTestId('coder-logo')).not.toBeInTheDocument()
+  })
+
+  it('renders provider configuration at the canonical session-environments route', () => {
+    renderAt('/settings?tab=session-environments')
+    expect(screen.getByText('Choose where new sessions run.')).toBeInTheDocument()
+    expect(screen.getByTestId('coder-panel')).toBeInTheDocument()
+  })
+
+  it('keeps legacy Coder settings links working', async () => {
+    renderAt('/settings?tab=coder')
+    expect(await screen.findByTestId('coder-panel')).toBeInTheDocument()
   })
 
   it('renders the ComputerUsePanel when the computer-use tab is active', () => {

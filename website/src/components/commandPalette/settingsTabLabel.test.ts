@@ -3,41 +3,35 @@ import path from 'node:path'
 
 import { describe, expect, it } from 'vitest'
 
-import en from '../../i18n/locales/en.json'
-import enManual from '../../i18n/locales/en.manual.json'
 import { SETTINGS_REGISTRY } from './settingsRegistry.gen'
-import { settingsTabLabelKey } from './settingsTabLabel'
+import { settingsTabLabel } from './settingsTabLabel'
 
-const lookup = (catalog: unknown, key: string): unknown =>
-  key.split('.').reduce<unknown>((node, part) => {
-    if (node && typeof node === 'object') return (node as Record<string, unknown>)[part]
-    return undefined
-  }, catalog)
-
-const resolves = (key: string): boolean =>
-  typeof lookup(en, key) === 'string' || typeof lookup(enManual, key) === 'string'
-
-describe('settingsTabLabelKey', () => {
-  it('resolves to a real catalog string for EVERY tab in the registry', () => {
+describe('settingsTabLabel', () => {
+  it('resolves a localized display label for EVERY tab in the registry', () => {
     // The guarantee this test exists for: no settings row can render a raw machine
     // key as its tab name. A new tab, or a tab whose catalog key moves, lands here
     // rather than in front of a user reading a non-English dashboard.
     const tabs = [...new Set(SETTINGS_REGISTRY.map(e => e.tab))].sort()
     expect(tabs.length).toBeGreaterThan(0)
-    const unresolved = tabs.filter(tab => !resolves(settingsTabLabelKey(tab)))
+    const unresolved = tabs.filter(tab => {
+      const label = settingsTabLabel(tab)
+      return !label || label === tab || label === `settings.tabs.${tab}.label`
+    })
     expect(unresolved).toEqual([])
   })
 
-  it('derives the regular shape and overrides only the irregular tabs', () => {
-    expect(settingsTabLabelKey('browser')).toBe('settings.tabs.browser.label')
+  it('translates regular and irregular tabs', () => {
+    expect(settingsTabLabel('browser')).toBe('Browser')
     // Kebab tab key, camelCase catalog segment.
-    expect(settingsTabLabelKey('computer-use')).toBe('settings.tabs.computerUse.label')
+    expect(settingsTabLabel('computer-use')).toBe('Computer Use')
     // Lives outside the settings tab block entirely.
-    expect(settingsTabLabelKey('privacy')).toBe('privacyDisclosure.settingsLabel')
+    expect(settingsTabLabel('privacy')).toBe('Privacy')
+    expect(settingsTabLabel('session-environments')).toBe('Session Environments')
+    expect(settingsTabLabel('coder')).toBe('Session Environments')
   })
 
-  it('does not invent an override for an unknown tab', () => {
-    expect(settingsTabLabelKey('not-a-tab')).toBe('settings.tabs.not-a-tab.label')
+  it('leaves an unknown machine tab unchanged', () => {
+    expect(settingsTabLabel('not-a-tab')).toBe('not-a-tab')
   })
 
   it('is the single source both palette surfaces read', () => {

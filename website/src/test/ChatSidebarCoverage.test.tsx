@@ -220,6 +220,46 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
+describe('ChatSidebar — remote execution marker', () => {
+  it('marks remote sessions by workspace while leaving gateway-local sessions unmarked', () => {
+    renderSidebar({
+      slots: [
+        {
+          key: 'remote-retained',
+          title: 'Retained Coder session',
+          running: false,
+          coder_workspace: 'crew-session-kyle-opaque',
+        },
+        {
+          key: 'remote-live',
+          title: 'Kubernetes session',
+          running: false,
+          execution_location: {
+            kind: 'kubernetes',
+            workspace: 'crew-session-kyle-pod',
+            remote_cwd: '/workspace',
+            state: 'running',
+          },
+        },
+        {
+          key: 'gateway-local',
+          title: 'Gateway-local session',
+          running: false,
+        },
+      ],
+    })
+
+    const row = (title: string) => screen.getByText(title).closest('.session-row') as HTMLElement
+    expect(row('Retained Coder session').querySelector(
+      '[aria-label="Coder workspace · crew-session-kyle-opaque"]',
+    )).toBeTruthy()
+    expect(row('Kubernetes session').querySelector(
+      '[aria-label="kubernetes workspace · crew-session-kyle-pod"]',
+    )).toBeTruthy()
+    expect(row('Gateway-local session').querySelector('[data-remote-workspace]')).toBeNull()
+  })
+})
+
 describe('ChatSidebar — Clean Up Sessions panel', () => {
   const SLOTS: TestSlot[] = [
     { key: 'k-stale', title: 'Stale one', running: false, messages: 3, last_ts: '2020-01-01T00:00:00Z' },

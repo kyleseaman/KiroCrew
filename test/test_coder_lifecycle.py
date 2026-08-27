@@ -145,6 +145,46 @@ async def test_workspace_start_reports_provider_neutral_progress(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_running_workspace_reports_only_connection_progress(tmp_path: Path) -> None:
+    """Reconstructing a runtime must not claim that warm compute is provisioning."""
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    workspace = await manager.ensure_ready("dashboard:one")
+    progress: list[tuple[str, str]] = []
+
+    reused = await manager.ensure_ready(
+        "dashboard:one",
+        on_progress=lambda phase, name: progress.append((phase, name)),
+    )
+
+    assert reused == workspace
+    assert progress == [("connecting", workspace.name)]
+    assert client.created == [workspace.name]
+    assert client.started == []
+
+
+@pytest.mark.asyncio
+async def test_stopped_workspace_reports_compute_start_before_connection(tmp_path: Path) -> None:
+    """A real wake earns the compute-start phase that a warm reuse skips."""
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    workspace = await manager.ensure_ready("dashboard:one")
+    await manager.stop_for_session("dashboard:one")
+    progress: list[tuple[str, str]] = []
+
+    resumed = await manager.ensure_ready(
+        "dashboard:one",
+        on_progress=lambda phase, name: progress.append((phase, name)),
+    )
+
+    assert resumed.uuid == workspace.uuid
+    assert progress == [
+        ("provisioning", workspace.name),
+        ("connecting", workspace.name),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_legacy_unprovisioned_name_is_repaired_before_create(tmp_path: Path) -> None:
     client = _FakeClient()
     manager = _manager(tmp_path, client)

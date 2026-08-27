@@ -23,6 +23,8 @@ from kiro_crew.constants import (
     CODER_DEFAULT_REMOTE_CWD,
     EXECUTION_LOCATION_PHASES,
     EXECUTION_PHASE_ALLOCATING,
+    EXECUTION_PHASE_CONNECTING,
+    EXECUTION_PHASE_PROVISIONING,
 )
 from kiro_crew.env import mcp_search_path, sanitize_spec_env, spec_path_key
 from kiro_crew.mcp_gateway.remote_proxy import (
@@ -547,7 +549,16 @@ class ManagedCoderWorkspaceSessionHost(CoderWorkspaceSessionHost):
         self._template = template
         self._preset = preset
         self._managed_ready = False
-        self._startup_phase = EXECUTION_PHASE_ALLOCATING
+        binding = manager.registry.get_by_session(session_key)
+        if binding is None or binding.state == "deleted":
+            self._startup_phase = EXECUTION_PHASE_ALLOCATING
+        else:
+            self._workspace = binding.workspace_name
+            self._startup_phase = (
+                EXECUTION_PHASE_PROVISIONING
+                if binding.state == "stopped" or not binding.workspace_uuid
+                else EXECUTION_PHASE_CONNECTING
+            )
         self._execution_location_callback: Callable[[], None] | None = None
         self.runtime_warm_seconds = max(0, runtime_warm_minutes) * 60
 
@@ -597,6 +608,8 @@ class ManagedCoderWorkspaceSessionHost(CoderWorkspaceSessionHost):
         self._workspace = workspace.name
         self._workload_scope_prefix = workspace.name
         self._managed_ready = True
+        if self._execution_location_callback is not None:
+            self._execution_location_callback()
         try:
             await super().prepare(
                 agent=agent,
@@ -606,6 +619,8 @@ class ManagedCoderWorkspaceSessionHost(CoderWorkspaceSessionHost):
             )
         except BaseException:
             self._managed_ready = False
+            if self._execution_location_callback is not None:
+                self._execution_location_callback()
             raise
 
     def clone(self) -> CoderWorkspaceSessionHost:

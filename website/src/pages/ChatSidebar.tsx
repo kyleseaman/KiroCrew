@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useLayoutEffect, memo, useMemo, useCallback, Fragment } from 'react'
 import { createPortal } from 'react-dom'
 import { LayoutGroup, AnimatePresence, motion } from 'framer-motion'
-import { Plus, X, Pin, Monitor, Eye, EyeOff, VenetianMask, Droplet, FolderPlus, MessageSquare, MessageSquarePlus, MessagesSquare, Folder, ChevronRight, ChevronDown, ChevronUp, Clock, Pencil, BrushCleaning, Link2, Circle, MoreVertical, Tag as TagIcon, Columns3, GripVertical, Zap, Check, Copy, ListFilter, List, Loader, Loader2, Settings, RotateCcw, Bot, ExternalLink, Cpu, GitMerge, Workflow, CircleDot, Users, TriangleAlert, Goal, MessageCircleQuestionMark, ShieldCheck, Repeat } from 'lucide-react'
+import { Plus, X, Pin, Monitor, Eye, EyeOff, VenetianMask, Droplet, FolderPlus, MessageSquare, MessageSquarePlus, MessagesSquare, Folder, ChevronRight, ChevronDown, ChevronUp, Clock, Pencil, BrushCleaning, Link2, Circle, MoreVertical, Tag as TagIcon, Columns3, GripVertical, Zap, Check, Copy, ListFilter, List, Loader, Loader2, Settings, RotateCcw, Bot, ExternalLink, Cpu, GitMerge, Workflow, CircleDot, Users, TriangleAlert, Goal, MessageCircleQuestionMark, ShieldCheck, Repeat, Server } from 'lucide-react'
 import GithubLogo from '../components/icons/GithubLogo'
 import GitlabLogo from '../components/icons/GitlabLogo'
 import JiraLogo from '../components/icons/JiraLogo'
@@ -3462,6 +3462,30 @@ function ChatSidebar({
     const isPackageAgent = agentMeta?.source === 'package'
     const isBuiltin = agentMeta?.source === 'builtin'
     const agentColor = isPackageAgent ? 'text-[var(--aim)]' : isBuiltin ? 'text-muted' : 'text-muted'
+    // Placement provenance is durable while compute state is not. A stopped
+    // Coder session therefore keeps its marker from `coder_workspace`, while a
+    // live provider supplies the provider-neutral execution descriptor. This
+    // icon never claims the environment is awake; startup/turn status belongs
+    // to the secondary line and transcript loading state.
+    const executionWorkspace = s.execution_location?.workspace || s.coder_workspace || ''
+    const executionKind = s.execution_location?.kind || (s.coder_workspace ? 'coder' : '')
+    const executionLabel = !executionKind
+      ? ''
+      : executionKind === 'coder'
+        ? executionWorkspace
+          ? i18nT('coder.badge_label', { workspace: executionWorkspace })
+          : i18nT('coder.badge_allocating')
+        : s.execution_location?.state === 'starting' && executionWorkspace
+          ? i18nT('execution_environment.badge_starting_named', {
+              kind: executionKind,
+              workspace: executionWorkspace,
+            })
+          : s.execution_location?.state === 'starting' || !executionWorkspace
+            ? i18nT('execution_environment.badge_starting', { kind: executionKind })
+            : i18nT('execution_environment.badge_running', {
+                kind: executionKind,
+                workspace: executionWorkspace,
+              })
     // The meta line's second slot shows the session's TAGS, not a value derived
     // from the project path. The auto-tagger already labels each session with its
     // project, so those tags ARE the context the row needs; deriving a label
@@ -3851,6 +3875,17 @@ function ChatSidebar({
               <AnimatePresence mode="wait">
                 <motion.span key={agentName || 'empty'} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.15 }} className={`truncate shrink-0 ${resolvedSlotTags.length > 0 ? 'max-w-[50%]' : ''}`}>{agentName || '\u00A0'}</motion.span>
               </AnimatePresence>
+              {executionLabel && (
+                <span
+                  className="inline-flex shrink-0 items-center text-muted"
+                  data-remote-workspace={executionWorkspace || executionKind}
+                  role="img"
+                  aria-label={executionLabel}
+                  title={executionLabel}
+                >
+                  <Server className="lucide-inline" aria-hidden="true" />
+                </span>
+              )}
               {resolvedSlotTags.length > 0 && (
                 // Every tag, each as `· <name>` tinted with the tag's own colour
                 // and NO border — plain text sitting as context beside the agent

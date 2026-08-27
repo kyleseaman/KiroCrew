@@ -146,6 +146,16 @@ The static environment path remains a migration fallback only; a manually
 created bootstrap workspace such as `crew-dogfood` is never enrolled in managed
 retention unless it is present in the binding registry.
 
+Dashboard progress follows actual compute work. A new binding reports allocation
+and provisioning, a stopped binding reports provisioning while Coder starts it,
+and a binding whose workspace is already running skips both and reports only the
+short agent-runtime connection. Once Coder confirms the workspace is running,
+the host reports the execution environment as ready even while the ACP handshake
+finishes; that handshake uses the ordinary turn loader rather than replaying the
+billable-compute startup card. A reconstructed host seeds its generated name and
+initial phase from the durable binding, so an existing session never flashes an
+anonymous allocation state before the Coder status check completes.
+
 The runtime invokes `coder ssh <workspace> --remote-forward
 <workspace-port>:127.0.0.1:<gateway-loopback-port> -- kiro-cli acp --agent
 <name>` (plus the selected model) and preserves ACP JSON-RPC stdio end to end.

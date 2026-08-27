@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -930,6 +931,7 @@ async def test_managed_host_resolves_parent_workspace_before_remote_prepare(
     class _Manager:
         def __init__(self) -> None:
             self.sessions: list[str] = []
+            self.registry = SimpleNamespace(get_by_session=lambda _key: None)
 
         async def ensure_ready(
             self,

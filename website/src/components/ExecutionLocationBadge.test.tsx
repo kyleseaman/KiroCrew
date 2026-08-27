@@ -26,7 +26,24 @@ describe('ExecutionLocationBadge', () => {
     )
 
     expect(screen.getByText('Coder workspace · crew-dogfood')).toBeInTheDocument()
+    expect(screen.getByTestId('execution-location-ready')).toBeInTheDocument()
     expect(document.body.textContent).not.toContain('/home/coder/private-project')
+  })
+
+  it('does not claim a retained workspace is currently awake', () => {
+    render(
+      <ExecutionLocationBadge
+        location={{
+          kind: 'coder',
+          workspace: 'crew-retained',
+          remote_cwd: '/workspace',
+          state: 'retained',
+        }}
+      />,
+    )
+
+    expect(screen.getByText('Coder workspace · crew-retained')).toBeInTheDocument()
+    expect(screen.queryByTestId('execution-location-ready')).not.toBeInTheDocument()
   })
 
   it('renders nothing when the slot has no live remote location', () => {

@@ -968,11 +968,13 @@ class SessionManager:
             or not isinstance(remote_cwd, str)
         ):
             return None
+        raw_state = raw.get("state")
+        location_state = raw_state if raw_state in ("starting", "running") else state
         location = {
             "kind": kind,
             "workspace": workspace,
             "remote_cwd": remote_cwd,
-            "state": state,
+            "state": location_state,
         }
         profile = raw.get("profile")
         if isinstance(profile, str) and profile:

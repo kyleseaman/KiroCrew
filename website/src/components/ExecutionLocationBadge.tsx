@@ -20,6 +20,7 @@ export function ExecutionLocationBadge({
   if (!location) return null
 
   const starting = location.state === 'starting'
+  const ready = location.state === 'running'
   let label: string
   if (location.kind === 'coder') {
     label = location.workspace
@@ -61,9 +62,20 @@ export function ExecutionLocationBadge({
       role={starting ? 'status' : undefined}
       aria-live={starting ? 'polite' : undefined}
     >
-      {starting
-        ? <Loader2 className="lucide-inline animate-spin motion-reduce:animate-none" />
-        : <Server className="lucide-inline" />}
+      {starting ? (
+        <Loader2 className="lucide-inline animate-spin motion-reduce:animate-none" />
+      ) : (
+        <>
+          {ready ? (
+            <span
+              className="h-1.5 w-1.5 shrink-0 rounded-full bg-ok"
+              data-testid="execution-location-ready"
+              aria-hidden="true"
+            />
+          ) : null}
+          <Server className="lucide-inline" />
+        </>
+      )}
       <span className="truncate">{label}</span>
       {location.workspace ? (
         <IconButton

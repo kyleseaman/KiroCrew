@@ -6,32 +6,39 @@
  * already localizes every tab name; this resolves the same catalog key so a tab
  * name reads the same wherever it appears.
  *
- * Most tabs follow `settings.tabs.<key>.label`. Two do not, and a mechanical
- * derivation would silently render the key itself for exactly those two, so they
- * are listed explicitly. `settingsTabLabel.test.ts` pins every tab in
- * SETTINGS_REGISTRY to a key that exists in the catalog, so adding a tab or moving
- * its key fails the test instead of shipping a raw id.
+ * Most tabs follow `settings.tabs.<key>.label`. A few do not, and a mechanical
+ * derivation would silently render the key itself for those tabs, so they are
+ * translated explicitly. `settingsTabLabel.test.ts` pins every tab in
+ * SETTINGS_REGISTRY to a resolved label, so adding a tab or moving its key fails
+ * the test instead of shipping a raw id.
  */
 import { i18nT } from '../../i18n/t'
 
-/** Tabs whose catalog key does not follow `settings.tabs.<key>.label`. */
-const IRREGULAR_TAB_LABEL_KEYS: Record<string, string> = {
-  // The tab key is kebab-case; the catalog segment is camelCase.
-  'computer-use': 'settings.tabs.computerUse.label',
-  // Owned by the privacy disclosure copy, not the settings tab block.
-  privacy: 'privacyDisclosure.settingsLabel',
-  // Coder owns one top-level catalog shared by its tab and panel.
-  coder: 'coder.tab_label',
-}
-
-/** Catalog key holding a tab's display name. */
-export function settingsTabLabelKey(tab: string): string {
-  return IRREGULAR_TAB_LABEL_KEYS[tab] ?? `settings.tabs.${tab}.label`
+/**
+ * Registry tabs are finite, so keep every catalog key literal and discoverable.
+ * Functions defer translation until render time without assembling catalog keys.
+ */
+const SETTINGS_TAB_LABEL: Record<string, () => string> = {
+  browser: () => i18nT('settings.tabs.browser.label'),
+  channels: () => i18nT('settings.tabs.channels.label'),
+  chat: () => i18nT('settings.tabs.chat.label'),
+  'computer-use': () => i18nT('settings.tabs.computerUse.label'),
+  developer: () => i18nT('settings.tabs.developer.label'),
+  display: () => i18nT('settings.tabs.display.label'),
+  notifications: () => i18nT('settings.tabs.notifications.label'),
+  privacy: () => i18nT('privacyDisclosure.settingsLabel'),
+  security: () => i18nT('settings.tabs.security.label'),
+  'session-environments': () => i18nT('execution_environment.settings_tab_label'),
+  shortcuts: () => i18nT('settings.tabs.shortcuts.label'),
+  skills: () => i18nT('settings.tabs.skills.label'),
+  voice: () => i18nT('settings.tabs.voice.label'),
+  // Compatibility for saved command-palette entries from the vendor-named route.
+  coder: () => i18nT('execution_environment.settings_tab_label'),
 }
 
 /** Localized display name for a settings tab key. */
 export function settingsTabLabel(tab: string): string {
-  return i18nT(settingsTabLabelKey(tab))
+  return SETTINGS_TAB_LABEL[tab]?.() ?? tab
 }
 
 /**

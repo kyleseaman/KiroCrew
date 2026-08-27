@@ -26,7 +26,6 @@ import { PrivacyPanel } from './settings/PrivacyPanel'
 import { SecretsPanel } from './settings/SecretsPanel'
 import { CoderPanel } from './settings/CoderPanel'
 import SettingsSearch from './settings/SettingsSearch'
-import CoderLogo from '../components/icons/CoderLogo'
 
 import { i18nT } from '../i18n/t'
 import { usePreviewFlag } from '../hooks/usePreviewFlag'
@@ -64,7 +63,7 @@ function buildTabs() {
     { key: 'computer-use', label: i18nT('settings.tabs.computerUse.label'), icon: <SquareMousePointer className="lucide-inline" />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.computerUse.description') },
     { key: 'webhooks', label: i18nT('settings.tabs.webhooks.label'), icon: <Webhook size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.webhooks.description') },
     { key: 'instances', label: i18nT('settings.tabs.instances.label'), icon: <Server size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.instances.description') },
-    { key: 'coder', label: i18nT('coder.tab_label'), icon: <CoderLogo height={8} />, group: GROUP_SYSTEM, description: i18nT('coder.tab_description') },
+    { key: 'session-environments', label: i18nT('execution_environment.settings_tab_label'), icon: <Server className="lucide-inline" />, group: GROUP_SYSTEM, description: i18nT('execution_environment.settings_tab_description') },
     { key: 'privacy', label: i18nT('privacyDisclosure.settingsLabel'), icon: <Fingerprint className="lucide-inline" />, group: GROUP_SYSTEM, description: i18nT('privacyDisclosure.settingsDescription') },
     { key: 'security', label: i18nT('settings.tabs.security.label'), icon: <ShieldCheck size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.security.description') },
     { key: 'secrets', label: i18nT('settings.tabs.secrets.label'), icon: <KeyRound size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.secrets.description') },
@@ -91,19 +90,23 @@ export default function SettingsPage() {
   const [params, setParams] = useSearchParams()
 
   // Legacy deep-link remap: the five per-channel tabs collapsed into one
-  // Channels tab. ?tab=slack (bookmarks, command palette history, docs)
-  // becomes ?tab=channels&channel=slack. Plain useEffect on purpose:
+  // Channels tab, and the vendor-named Coder destination became the
+  // provider-neutral Session Environments destination. Plain useEffect on purpose:
   // react-router 7 drops navigations fired from useLayoutEffect during the
   // initial mount (its ready flag is set in a passive effect), so the remap
   // must run as a passive effect too. Until it fires, SidePanelLayout treats
   // the unknown tab as the default (Overview) for one frame.
   const rawTab = params.get('tab')
   useEffect(() => {
-    if (rawTab && CHANNEL_KEYS.includes(rawTab)) {
+    if (rawTab === 'coder' || (rawTab && CHANNEL_KEYS.includes(rawTab))) {
       setParams(prev => {
         const next = new URLSearchParams(prev)
-        next.set('tab', 'channels')
-        next.set('channel', rawTab)
+        if (rawTab === 'coder') {
+          next.set('tab', 'session-environments')
+        } else {
+          next.set('tab', 'channels')
+          next.set('channel', rawTab)
+        }
         return next
       }, { replace: true })
     }
@@ -159,7 +162,7 @@ export default function SettingsPage() {
         {tab === 'computer-use' && <ComputerUsePanel />}
         {tab === 'webhooks' && <WebhooksPanel />}
         {tab === 'instances' && !embedded && <RemoteCrewPanel />}
-        {tab === 'coder' && <CoderPanel />}
+        {tab === 'session-environments' && <CoderPanel />}
         {tab === 'privacy' && <PrivacyPanel />}
         {tab === 'security' && <SecurityPanel />}
         {tab === 'secrets' && <SecretsPanel />}

@@ -215,7 +215,8 @@ The Coder server permits an owner to create an automation token with a one-year
 lifetime. Create it with `coder tokens create --name crew-control --lifetime
 1y`. Do not add it to a systemd environment file or copy it into the workspace.
 
-Open the gateway workspace URL, then open **Settings → Coder**. Enter the
+Open the gateway workspace URL, then open **Settings → Session Environments →
+Coder**. Enter the
 tailnet Coder URL (`https://kirocrew-coder.example.ts.net`), template
 (`kirocrew-arm`), optional preset (blank for the template
 defaults), remote directory (`/home/coder/workspace`), and automation token.

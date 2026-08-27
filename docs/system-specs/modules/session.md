@@ -258,9 +258,9 @@ send time.
 |--------|---------|
 | `start_pool(blocking=True)` | Pre-spawn warm + background sessions. `blocking=False` for non-blocking mode. |
 | `get_or_create(key, agent=None, approval_policy="", speculative=False, speculative_resume=False, coder_profile_override="")` | Returns `(LLMProvider, is_new, resumed)`. Uses warm pool for new sessions (default agent only). Sessions with a resume mapping skip warm pool (cold start needed for `session/load`). Every decision is counted via `_record_pool_decision` (`kirocrew.session.pool.decision`) with the single disqualifying reason, so the pool's hit rate and the frequency of the `bypass_resume` case are observable. Non-default agents skip warm pool and resolve their model by precedence via `_model_fallback()` — caller model > per-agent pin > global default: `model=None` (defer to kiro's agent-JSON resolution) only when the agent pins its own model, otherwise the global default, unless that default is the `"auto"` sentinel (also `None`). The per-agent pin is resolved off the event loop via `run_in_executor` using `_resolve_named_agent_model`; blank agents inherit the global, and `kirocrew` is excluded (tracks the global). `approval_policy` is persisted on the new `_Session` — callers (e.g. subagent) pass parent policy so the session inherits it. `speculative=True` (eager spawn) pre-creates ahead of a real first turn: the one-shot `_Session.first_turn` observation — a single three-member `FirstTurnState` enum (`NOTHING_ARMED` / `FRESH` / `RESUMED`), so a resume marker on an already-claimed session is unrepresentable rather than forbidden by convention — is registered ARMED (`FRESH`) and never consumed by speculative callers, and a resumable key raises `SpeculativeResumeRefused` — unless `speculative_resume=True` (resume prefetch) opts in, in which case the speculative creator performs the `session/load` and registers the observation as `RESUMED` when the load restored the transcript. The observation is consumed in one read-then-clear by the first real claimant under the per-session semaphore (fast path and won-race path alike), with the returned booleans derived from it at the return boundary — so that turn observes `(is_new=True, resumed=True)` exactly as if it had resumed itself, preserving its history-injection decision. `coder_profile_override` selects a named Coder template/preset only for initial managed allocation; an existing binding remains authoritative. |
-| `execution_location(key)` | Returns an allowlisted, non-secret execution-environment descriptor (`kind`, `workspace`, `remote_cwd`, `state`, optional `profile`, and optional startup `phase`) from the provider starting or running the session, or `None` for local/absent sessions. `state` is `starting` before the provider handshake completes and `running` only after registration; a starting provider is observable but never claimable. `phase` is one of `allocating`, `provisioning`, or `connecting`, and hosts notify the manager as it advances so dashboard metadata updates before the handshake finishes. Config defaults are deliberately not consulted because active sessions do not migrate when a default changes. |
+| `execution_location(key)` | Returns an allowlisted, non-secret execution-environment descriptor (`kind`, `workspace`, `remote_cwd`, `state`, optional `profile`, and optional startup `phase`) from the provider starting or running the session, or `None` for local/absent sessions. A host may authoritatively report `state=running` once its environment is ready while the provider handshake is still completing; otherwise the manager derives `starting` before registration and `running` afterward. A starting provider is observable but never claimable. `phase` is one of `allocating`, `provisioning`, or `connecting`, and hosts notify the manager as it advances so dashboard metadata updates before the handshake finishes. Config defaults are deliberately not consulted because active sessions do not migrate when a default changes. |
 | `coder_workspace_manager()` | Returns the manager owned by the current default provider factory, or `None` while managed Coder placement is disabled. The gateway retention reconciler resolves it on every pass so a Settings refresh takes effect without restarting the service. |
-| `refresh_defaults()` | Reloads config and the provider factory for future sessions, drains stale warm providers, and refills the pool without touching active sessions. Settings → Coder uses this after a save. |
+| `refresh_defaults()` | Reloads config and the provider factory for future sessions, drains stale warm providers, and refills the pool without touching active sessions. Settings → Session Environments → Coder uses this after a save. |
 | `check_context_usage(key, provider)` | Returns %. Triggers compaction at configured threshold (default 70%), warns one `CONTEXT_WARN_MARGIN_PCT` below it (50% on the default). |
 | `compact_if_needed(key)` | Awaitable twin of the `check_context_usage` trigger for callers that must not start their next turn while a compaction is pending (the task runner's between-steps check, #4686). Same gates in the same order — both entry points consume the shared `_compaction_gate_decision` ladder, the single owner of the gate order (its docstring documents each rung) — then AWAITS `_compact_session`. Returns the outcome: `"absent"`, `"reset"` (the settled verdict on the prior attempt was ineffective-and-still-critical and the promoted escalation reset the session here, awaited), `"cc_managed"` (checked before the threshold, mirroring `check_context_usage`), `"below_threshold"`, `"unconfirmed"`, `"in_progress"`, `"cooldown"`, `"ok"`, `"busy"`, `"recycled"`, `"failed"`. A `"busy"` decline means a turn holds the semaphore — the caller leaves the session alone and retries later, never falls back to a direct `provider.compact()`. |
 | `record_success(key)` / `record_failure(key)` | Circuit breaker tracking. |
@@ -299,6 +299,13 @@ they satisfy Coder's CLI contract. A legacy unprovisioned binding with broader
 safe characters is renamed before its first create attempt; provisioned
 workspace identities remain immutable.
 
+Settings exposes placement under the provider-neutral **Session Environments**
+destination (`?tab=session-environments`), with a generic server glyph and a
+description framed around where sessions run. Coder keeps its own brand mark and
+provider-specific controls inside that destination. The legacy `?tab=coder`
+deep link redirects to the canonical destination so bookmarks, documentation,
+and saved command-palette entries continue to work.
+
 The dashboard's active-session execution UI is provider-neutral. While the
 descriptor is `starting`, the transcript replaces the decorative model loader
 with a staged startup card that explains the isolated environment, shows the
@@ -309,6 +316,18 @@ the header is reserved for an allocated or durable environment identity. If the
 gateway disconnects during a running turn, the transcript replaces the stale
 thinking animation with a reconnecting notice rather than implying fresh model
 activity.
+The session list carries remote placement as a provider-neutral server glyph on
+the existing agent/meta line. Its accessible label and tooltip identify the
+provider and generated workspace. The glyph remains present for a retained Coder
+binding after compute stops, but it never claims that the workspace is awake;
+startup and turn state remain on their dedicated surfaces. Gateway-local sessions
+have no placement glyph.
+The large card is reserved for allocation and compute startup. A `connecting`
+phase for an already-running environment uses the ordinary turn indicator, while
+a live `running` descriptor adds a ready mark to the header badge. When no
+provider is live, the dashboard may reconstruct the durable Coder workspace label
+as client-only `retained` metadata; it carries no ready mark and makes no claim
+that compute is awake.
 The compact execution badge remains in the header, but provider profile metadata
 is not repeated there until the descriptor is `running`. The session manager
 keeps a starting provider outside the claimable session registry, emits slot

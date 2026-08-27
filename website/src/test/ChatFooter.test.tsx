@@ -75,6 +75,52 @@ describe('ChatFooter', () => {
     )
   })
 
+  it('uses the ordinary turn loader while reconnecting to already-running compute', () => {
+    const { container } = render(
+      <ChatFooter
+        {...base}
+        running={true}
+        lastRole="user"
+        executionLocation={{
+          kind: 'coder',
+          workspace: 'crew-session-opaque',
+          remote_cwd: '/workspace',
+          state: 'starting',
+          phase: 'connecting',
+        }}
+      />,
+    )
+
+    expect(screen.queryByTestId('execution-location-startup')).not.toBeInTheDocument()
+    expect(container.querySelector('.csb4')).toBeInTheDocument()
+  })
+
+  it('shows one cold-start card until compute is ready, then does not repeat it', () => {
+    const location = {
+      kind: 'coder',
+      workspace: 'crew-session-opaque',
+      remote_cwd: '/workspace',
+      state: 'starting' as const,
+      phase: 'provisioning' as const,
+    }
+    const { rerender } = render(
+      <ChatFooter {...base} running={true} lastRole="user" executionLocation={location} />,
+    )
+
+    expect(screen.getAllByTestId('execution-location-startup')).toHaveLength(1)
+
+    rerender(
+      <ChatFooter
+        {...base}
+        running={true}
+        lastRole="user"
+        executionLocation={{ ...location, phase: 'connecting' }}
+      />,
+    )
+
+    expect(screen.queryByTestId('execution-location-startup')).not.toBeInTheDocument()
+  })
+
   it('replaces a stale thinking loader with a gateway disconnect notice', () => {
     render(
       <ChatFooter

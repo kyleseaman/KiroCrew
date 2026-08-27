@@ -675,7 +675,8 @@ export interface ExecutionLocation {
   workspace: string
   /** Remote protocol working directory. Never rendered in the session header. */
   remote_cwd: string
-  state: 'starting' | 'running'
+  /** `retained` is a client-side durable label; it does not claim live compute. */
+  state: 'starting' | 'running' | 'retained'
   /** Provider-neutral startup boundary; present only while state is `starting`. */
   phase?: 'allocating' | 'provisioning' | 'connecting'
   /** Optional provider-owned profile or size label. */

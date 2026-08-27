@@ -30,7 +30,7 @@ export function CoderExecutionControl({
           kind: 'coder',
           workspace: slot.coder_workspace,
           remote_cwd: '',
-          state: 'running',
+          state: 'retained',
         }
       : undefined)
   const config = useQuery({
