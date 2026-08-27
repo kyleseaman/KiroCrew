@@ -676,6 +676,8 @@ export interface ExecutionLocation {
   /** Remote protocol working directory. Never rendered in the session header. */
   remote_cwd: string
   state: 'starting' | 'running'
+  /** Provider-neutral startup boundary; present only while state is `starting`. */
+  phase?: 'allocating' | 'provisioning' | 'connecting'
   /** Optional provider-owned profile or size label. */
   profile?: string
 }

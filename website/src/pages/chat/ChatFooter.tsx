@@ -1,5 +1,5 @@
 import { memo, useState, useEffect, useMemo, useRef, type ComponentType } from 'react'
-import { Hourglass } from 'lucide-react'
+import { Hourglass, WifiOff } from 'lucide-react'
 import { motion } from 'framer-motion'
 
 import { i18nT } from '../../i18n/t'
@@ -223,6 +223,7 @@ interface ChatFooterProps {
   streamTick?: number
   executionLocation?: ExecutionLocation
   executionProfile?: string
+  connected?: boolean
 }
 
 const ChatFooter = memo(function ChatFooter({
@@ -235,6 +236,7 @@ const ChatFooter = memo(function ChatFooter({
   streamTick = 0,
   executionLocation,
   executionProfile,
+  connected = true,
 }: ChatFooterProps) {
   const loader = resolveLoader(useThemeSlug())
   const startingLocation = executionLocation?.state === 'starting'
@@ -254,7 +256,7 @@ const ChatFooter = memo(function ChatFooter({
   // ...but never while text is actively arriving: MarkdownRenderer already renders
   // the real blinking caret (.streaming-caret) there, and a second indicator
   // alongside it reads as two cursors.
-  if (!startingLocation && !regenerating && streamingText && !streamQuiet && stopState !== 'soft_pending' && stopState !== 'killing') return null
+  if (connected && !startingLocation && !regenerating && streamingText && !streamQuiet && stopState !== 'soft_pending' && stopState !== 'killing') return null
   // width from CSS var --mc-content-width
   return (
     <div data-testid="chat-footer" className={`px-4 mx-auto w-full py-1${regenerating ? '' : ' animate-slide-up'}`} style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
@@ -262,7 +264,21 @@ const ChatFooter = memo(function ChatFooter({
           row wrapper's own `px-4` gutter and inset the indicator 14px right of
           every message, tool and card row it sits under. */}
       <div className="py-2.5">
-        {startingLocation ? (
+        {!connected && running ? (
+          <div className="rounded-xl border border-danger/30 bg-danger/10 p-3.5" role="alert">
+            <div className="flex items-start gap-2.5">
+              <WifiOff className="lucide-inline mt-0.5 shrink-0 text-danger" />
+              <div>
+                <div className="text-sm font-semibold text-text-strong">
+                  {i18nT('execution_environment.gateway_lost_title')}
+                </div>
+                <p className="mt-0.5 text-[13px] leading-relaxed text-muted">
+                  {i18nT('execution_environment.gateway_lost_description')}
+                </p>
+              </div>
+            </div>
+          </div>
+        ) : startingLocation ? (
           <ExecutionLocationStartup
             location={executionLocation}
             profile={executionProfile}

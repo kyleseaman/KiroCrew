@@ -3,11 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 from kiro_crew.coder.client import CoderClient, CoderClientError, CoderWorkspace
 from kiro_crew.coder.registry import WorkspaceBinding, WorkspaceBindingRegistry
+from kiro_crew.constants import (
+    EXECUTION_PHASE_ALLOCATING,
+    EXECUTION_PHASE_CONNECTING,
+    EXECUTION_PHASE_PROVISIONING,
+)
+
+logger = logging.getLogger(__name__)
+
+WorkspaceProgressCallback = Callable[[str, str], None]
 
 
 class CoderWorkspaceIdentityError(CoderClientError):
@@ -56,7 +67,9 @@ class CoderWorkspaceManager:
         *,
         template: str | None = None,
         preset: str | None = None,
+        on_progress: WorkspaceProgressCallback | None = None,
     ) -> CoderWorkspace:
+        self._report_progress(on_progress, EXECUTION_PHASE_ALLOCATING, "")
         selected_template = self.policy.template if template is None else template
         selected_preset = self.policy.preset if preset is None else preset
         owner_name, _owner_id = await self.client.current_user()
@@ -67,6 +80,11 @@ class CoderWorkspaceManager:
             preset=selected_preset,
             prefix=self.policy.prefix,
             owner_name=owner_name,
+        )
+        self._report_progress(
+            on_progress,
+            EXECUTION_PHASE_PROVISIONING,
+            binding.workspace_name,
         )
         async with self._lock_for(session_key):
             current_binding = await asyncio.to_thread(self.registry.get, binding.binding_id)
@@ -119,7 +137,26 @@ class CoderWorkspaceManager:
                     failure_code="",
                 ),
             )
+            self._report_progress(
+                on_progress,
+                EXECUTION_PHASE_CONNECTING,
+                workspace.name,
+            )
             return workspace
+
+    @staticmethod
+    def _report_progress(
+        callback: WorkspaceProgressCallback | None,
+        phase: str,
+        workspace: str,
+    ) -> None:
+        """Publish non-secret lifecycle progress without risking provisioning."""
+        if callback is None:
+            return
+        try:
+            callback(phase, workspace)
+        except Exception:
+            logger.debug("Coder workspace progress callback failed", exc_info=True)
 
     async def _require_capacity(self, requested_name: str) -> None:
         bindings = await asyncio.to_thread(self.registry.list_bindings)

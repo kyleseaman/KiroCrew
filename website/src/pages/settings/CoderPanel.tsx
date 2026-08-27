@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Check, Copy, ExternalLink, Loader, Plus, TestTube2, Trash2 } from 'lucide-react'
 
 import { api, type CoderConfigData, type CoderConfigSave } from '../../api/client'
+import CoderLogo from '../../components/icons/CoderLogo'
 import { SettingsCard, SettingsInput, SettingsSection, SettingsToggle } from '../../components/settings'
 import { Btn } from '../../components/ui'
 import { i18nT } from '../../i18n/t'
@@ -178,10 +179,18 @@ export function CoderPanel() {
   })
 
   if (configQuery.isLoading) {
-    return <SettingsSection title={i18nT('coder.title')}><div className="text-[12px] text-muted">{i18nT('coder.loading')}</div></SettingsSection>
+    return (
+      <SettingsSection title={i18nT('coder.title')} badge={<CoderLogo />}>
+        <div className="text-[12px] text-muted">{i18nT('coder.loading')}</div>
+      </SettingsSection>
+    )
   }
   if (configQuery.isError) {
-    return <SettingsSection title={i18nT('coder.title')}><div className="text-[12px] text-danger">{i18nT('coder.load_failed')}</div></SettingsSection>
+    return (
+      <SettingsSection title={i18nT('coder.title')} badge={<CoderLogo />}>
+        <div className="text-[12px] text-danger">{i18nT('coder.load_failed')}</div>
+      </SettingsSection>
+    )
   }
 
   const busy = save.isPending || testConnection.isPending
@@ -189,7 +198,7 @@ export function CoderPanel() {
 
   return (
     <>
-      <SettingsSection title={i18nT('coder.title')}>
+      <SettingsSection title={i18nT('coder.title')} badge={<CoderLogo />}>
         <SettingsCard>
           <SettingsToggle
             label={i18nT('coder.enable_label')}

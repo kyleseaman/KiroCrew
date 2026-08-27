@@ -5354,9 +5354,7 @@ async def _run_chat(
         )
         _acquired = True
         location_resolver = getattr(state.sessions, "execution_location", None)
-        execution_location = (
-            location_resolver(session_key) if callable(location_resolver) else None
-        )
+        execution_location = location_resolver(session_key) if callable(location_resolver) else None
         if (
             isinstance(execution_location, dict)
             and execution_location.get("kind") == "coder"

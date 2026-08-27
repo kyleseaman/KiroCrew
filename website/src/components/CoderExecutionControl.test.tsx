@@ -48,13 +48,21 @@ describe('CoderExecutionControl', () => {
 
   it('lets a fresh session select a named profile', async () => {
     const user = userEvent.setup()
-    renderWithProviders(<CoderExecutionControl slot={slot} />)
+    renderWithProviders(<CoderExecutionControl slot={slot} placement="composer" />)
 
     const trigger = await screen.findByRole('combobox', { name: 'Coder profile for this session' })
     await user.click(trigger)
     await user.click(await screen.findByRole('option', { name: 'gpu' }))
 
     expect(api.chatSlotCoderProfile).toHaveBeenCalledWith('chat-1', 'gpu')
+  })
+
+  it('keeps a fresh-session selector out of the session header', async () => {
+    renderWithProviders(<CoderExecutionControl slot={slot} placement="header" />)
+
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(screen.queryByRole('combobox')).not.toBeInTheDocument()
+    expect(api.getCoderConfig).not.toHaveBeenCalled()
   })
 
   it('shows the live workspace instead of a mutable selector after allocation', async () => {
@@ -76,6 +84,23 @@ describe('CoderExecutionControl', () => {
 
     expect(screen.getByText('Coder workspace · crew-opaque')).toBeInTheDocument()
     expect(screen.queryByRole('combobox')).not.toBeInTheDocument()
+  })
+
+  it('keeps the durable workspace ID visible after the live runtime idles', async () => {
+    renderWithProviders(
+      <CoderExecutionControl
+        slot={{
+          ...slot,
+          messages: 1,
+          coder_profile: 'gpu',
+          coder_workspace: 'crew-session-kyle-retained',
+        }}
+      />,
+    )
+
+    expect(await screen.findByText('Coder workspace · crew-session-kyle-retained')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Copy workspace ID' })).toBeInTheDocument()
+    expect(screen.getByText('Coder profile · gpu')).toBeInTheDocument()
   })
 
   it('leaves startup profile details to the transcript card', async () => {

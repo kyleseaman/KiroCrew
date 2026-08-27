@@ -9,7 +9,7 @@ import re
 import secrets
 import shlex
 import shutil
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
@@ -19,7 +19,11 @@ from kiro_crew.coder.client import CoderClient
 from kiro_crew.coder.manager import CoderWorkspaceManager, ManagedWorkspacePolicy
 from kiro_crew.coder.registry import WorkspaceBindingRegistry
 from kiro_crew.coder.user_bus import user_bus_command
-from kiro_crew.constants import CODER_DEFAULT_REMOTE_CWD
+from kiro_crew.constants import (
+    CODER_DEFAULT_REMOTE_CWD,
+    EXECUTION_LOCATION_PHASES,
+    EXECUTION_PHASE_ALLOCATING,
+)
 from kiro_crew.env import mcp_search_path, sanitize_spec_env, spec_path_key
 from kiro_crew.mcp_gateway.remote_proxy import (
     RemoteHttpMcpTarget,
@@ -543,16 +547,32 @@ class ManagedCoderWorkspaceSessionHost(CoderWorkspaceSessionHost):
         self._template = template
         self._preset = preset
         self._managed_ready = False
+        self._startup_phase = EXECUTION_PHASE_ALLOCATING
+        self._execution_location_callback: Callable[[], None] | None = None
         self.runtime_warm_seconds = max(0, runtime_warm_minutes) * 60
+
+    def set_execution_location_callback(self, callback: Callable[[], None] | None) -> None:
+        """Receive a nudge when dashboard-safe startup metadata changes."""
+        self._execution_location_callback = callback
+
+    def _set_startup_progress(self, phase: str, workspace: str) -> None:
+        if phase not in EXECUTION_LOCATION_PHASES:
+            return
+        if workspace and _WORKSPACE_RE.fullmatch(workspace):
+            self._workspace = workspace
+        self._startup_phase = phase
+        if self._execution_location_callback is not None:
+            self._execution_location_callback()
 
     @property
     def execution_location(self) -> dict[str, str]:
         if not self._managed_ready:
             return {
                 "kind": "coder",
-                "workspace": "",
+                "workspace": "" if self._workspace == "crew-pending" else self._workspace,
                 "remote_cwd": self._remote_cwd,
                 "state": "starting",
+                "phase": self._startup_phase,
             }
         location = super().execution_location
         location["state"] = "running"
@@ -570,6 +590,7 @@ class ManagedCoderWorkspaceSessionHost(CoderWorkspaceSessionHost):
             self._parent_session_key,
             template=self._template,
             preset=self._preset,
+            on_progress=self._set_startup_progress,
         )
         if not _WORKSPACE_RE.fullmatch(workspace.name):
             raise SessionHostError("Managed Coder workspace returned an invalid name")

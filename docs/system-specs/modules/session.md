@@ -258,7 +258,7 @@ send time.
 |--------|---------|
 | `start_pool(blocking=True)` | Pre-spawn warm + background sessions. `blocking=False` for non-blocking mode. |
 | `get_or_create(key, agent=None, approval_policy="", speculative=False, speculative_resume=False, coder_profile_override="")` | Returns `(LLMProvider, is_new, resumed)`. Uses warm pool for new sessions (default agent only). Sessions with a resume mapping skip warm pool (cold start needed for `session/load`). Every decision is counted via `_record_pool_decision` (`kirocrew.session.pool.decision`) with the single disqualifying reason, so the pool's hit rate and the frequency of the `bypass_resume` case are observable. Non-default agents skip warm pool and resolve their model by precedence via `_model_fallback()` — caller model > per-agent pin > global default: `model=None` (defer to kiro's agent-JSON resolution) only when the agent pins its own model, otherwise the global default, unless that default is the `"auto"` sentinel (also `None`). The per-agent pin is resolved off the event loop via `run_in_executor` using `_resolve_named_agent_model`; blank agents inherit the global, and `kirocrew` is excluded (tracks the global). `approval_policy` is persisted on the new `_Session` — callers (e.g. subagent) pass parent policy so the session inherits it. `speculative=True` (eager spawn) pre-creates ahead of a real first turn: the one-shot `_Session.first_turn` observation — a single three-member `FirstTurnState` enum (`NOTHING_ARMED` / `FRESH` / `RESUMED`), so a resume marker on an already-claimed session is unrepresentable rather than forbidden by convention — is registered ARMED (`FRESH`) and never consumed by speculative callers, and a resumable key raises `SpeculativeResumeRefused` — unless `speculative_resume=True` (resume prefetch) opts in, in which case the speculative creator performs the `session/load` and registers the observation as `RESUMED` when the load restored the transcript. The observation is consumed in one read-then-clear by the first real claimant under the per-session semaphore (fast path and won-race path alike), with the returned booleans derived from it at the return boundary — so that turn observes `(is_new=True, resumed=True)` exactly as if it had resumed itself, preserving its history-injection decision. `coder_profile_override` selects a named Coder template/preset only for initial managed allocation; an existing binding remains authoritative. |
-| `execution_location(key)` | Returns an allowlisted, non-secret execution-environment descriptor (`kind`, `workspace`, `remote_cwd`, `state`, and optional `profile`) from the provider starting or running the session, or `None` for local/absent sessions. `state` is `starting` before the provider handshake completes and `running` only after registration; a starting provider is observable but never claimable. Config defaults are deliberately not consulted because active sessions do not migrate when a default changes. |
+| `execution_location(key)` | Returns an allowlisted, non-secret execution-environment descriptor (`kind`, `workspace`, `remote_cwd`, `state`, optional `profile`, and optional startup `phase`) from the provider starting or running the session, or `None` for local/absent sessions. `state` is `starting` before the provider handshake completes and `running` only after registration; a starting provider is observable but never claimable. `phase` is one of `allocating`, `provisioning`, or `connecting`, and hosts notify the manager as it advances so dashboard metadata updates before the handshake finishes. Config defaults are deliberately not consulted because active sessions do not migrate when a default changes. |
 | `coder_workspace_manager()` | Returns the manager owned by the current default provider factory, or `None` while managed Coder placement is disabled. The gateway retention reconciler resolves it on every pass so a Settings refresh takes effect without restarting the service. |
 | `refresh_defaults()` | Reloads config and the provider factory for future sessions, drains stale warm providers, and refills the pool without touching active sessions. Settings → Coder uses this after a save. |
 | `check_context_usage(key, provider)` | Returns %. Triggers compaction at configured threshold (default 70%), warns one `CONTEXT_WARN_MARGIN_PCT` below it (50% on the default). |
@@ -297,13 +297,18 @@ the runtime user, remote directory, or declared capabilities do not match.
 
 The dashboard's active-session execution UI is provider-neutral. While the
 descriptor is `starting`, the transcript replaces the decorative model loader
-with an indeterminate startup card that explains the isolated environment,
-shows the provider, selected profile, and generated workspace name as each
-becomes available, and keeps the composer available for queued instructions.
+with a staged startup card that explains the isolated environment, shows the
+provider, selected profile, generated workspace name, and current provider-neutral
+phase as each becomes available, and keeps the composer available for queued
+instructions. A fresh session's profile picker sits directly above the composer;
+the header is reserved for an allocated or durable environment identity. If the
+gateway disconnects during a running turn, the transcript replaces the stale
+thinking animation with a reconnecting notice rather than implying fresh model
+activity.
 The compact execution badge remains in the header, but provider profile metadata
 is not repeated there until the descriptor is `running`. The session manager
 keeps a starting provider outside the claimable session registry, emits slot
-updates on its `starting`/`running`/failed transitions, and copies only the
+updates on its phase plus `starting`/`running`/failed transitions, and copies only the
 descriptor allowlist above from the provider's session host. A Coder host supplies
 its generated workspace name and immutable profile through this contract; another
 remote host can use the same lifecycle without adding provider-specific dashboard

@@ -28,6 +28,10 @@ The control instance, gateway instance, and their gp3 disks remain billable
 around the clock. Kiro Crew creates one workspace per parent session, targets
 Coder autostop after 30 inactive minutes, and retains stopped disks for 30
 inactive days by default.
+Set the gateway template's default TTL to `0h` and its workspace stop schedule
+to `manual`, as shown in the remote-host guide. The gateway is the lifecycle
+controller for session workspaces and must not inherit Coder's ordinary
+workspace autostop default.
 The gateway template also retains its root EBS volume if its EC2 instance is
 replaced or the workspace is deleted. That recovery guard prevents an
 infrastructure update from deleting gateway memory and session state, but the

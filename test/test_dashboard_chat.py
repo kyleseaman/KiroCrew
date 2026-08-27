@@ -2585,6 +2585,7 @@ class TestSlotLifecycle:
                     "workspace": "sandbox-opaque",
                     "remote_cwd": "/workspace",
                     "state": "starting",
+                    "phase": "provisioning",
                 }
                 if key == "dashboard:remote"
                 else None
@@ -2599,6 +2600,7 @@ class TestSlotLifecycle:
             "workspace": "sandbox-opaque",
             "remote_cwd": "/workspace",
             "state": "starting",
+            "phase": "provisioning",
         }
 
         monkeypatch.setattr(state.sessions, "execution_location", lambda _key: None)

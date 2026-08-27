@@ -35,6 +35,21 @@ CODER_DEFAULT_WORKSPACE_PREFIX = "crew-session"
 CODER_MAX_PROFILES = 16
 CODER_RECONCILE_INTERVAL_SECONDS = 60 * 60
 
+# Provider-neutral startup stages exposed to dashboard clients. Execution hosts
+# may have different lifecycle mechanics, but these are the user-observable
+# boundaries every remote environment can map onto without leaking provider
+# command output or credentials.
+EXECUTION_PHASE_ALLOCATING = "allocating"
+EXECUTION_PHASE_PROVISIONING = "provisioning"
+EXECUTION_PHASE_CONNECTING = "connecting"
+EXECUTION_LOCATION_PHASES = frozenset(
+    (
+        EXECUTION_PHASE_ALLOCATING,
+        EXECUTION_PHASE_PROVISIONING,
+        EXECUTION_PHASE_CONNECTING,
+    )
+)
+
 
 # Minimum supported Node.js MAJOR version for every Python-side check
 # (``kirocrew doctor``, the frontend-build probe in ``cli.py``, the TUI

@@ -111,6 +111,14 @@ def test_gateway_is_a_dedicated_persistent_coder_workspace() -> None:
     assert "/tmp/kirocli.zip" not in bootstrap
 
 
+def test_gateway_runbook_disables_autostop_without_changing_session_ttl() -> None:
+    guide = (ROOT / "docs" / "guides" / "remote-and-mobile.md").read_text(encoding="utf-8")
+
+    assert "coder templates edit kirocrew-gateway-aws --default-ttl 0h" in guide
+    assert "coder schedule stop crew-gateway-user manual" in guide
+    assert "autostop after 30 minutes" in guide
+
+
 def test_control_plane_exports_distinct_gateway_and_session_template_values() -> None:
     terraform = _read("control-plane/main.tf")
 

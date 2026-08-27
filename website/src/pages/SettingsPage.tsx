@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { Bell, Boxes, Code, Fingerprint, Globe, History, Import, Info, Keyboard, KeyRound, Link2, MessageSquare, Mic, Palette, PanelsTopLeft, Server, ShieldCheck, Sparkles, SquareMousePointer, Webhook } from 'lucide-react'
+import { Bell, Code, Fingerprint, Globe, History, Import, Info, Keyboard, KeyRound, Link2, MessageSquare, Mic, Palette, PanelsTopLeft, Server, ShieldCheck, Sparkles, SquareMousePointer, Webhook } from 'lucide-react'
 import { useAppSelector } from '../store'
 import SidePanelLayout from '../components/SidePanelLayout'
 import { useSettingHighlight } from '../hooks/useSettingHighlight'
@@ -26,6 +26,7 @@ import { PrivacyPanel } from './settings/PrivacyPanel'
 import { SecretsPanel } from './settings/SecretsPanel'
 import { CoderPanel } from './settings/CoderPanel'
 import SettingsSearch from './settings/SettingsSearch'
+import CoderLogo from '../components/icons/CoderLogo'
 
 import { i18nT } from '../i18n/t'
 import { usePreviewFlag } from '../hooks/usePreviewFlag'
@@ -63,7 +64,7 @@ function buildTabs() {
     { key: 'computer-use', label: i18nT('settings.tabs.computerUse.label'), icon: <SquareMousePointer className="lucide-inline" />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.computerUse.description') },
     { key: 'webhooks', label: i18nT('settings.tabs.webhooks.label'), icon: <Webhook size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.webhooks.description') },
     { key: 'instances', label: i18nT('settings.tabs.instances.label'), icon: <Server size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.instances.description') },
-    { key: 'coder', label: i18nT('coder.tab_label'), icon: <Boxes className="lucide-inline" />, group: GROUP_SYSTEM, description: i18nT('coder.tab_description') },
+    { key: 'coder', label: i18nT('coder.tab_label'), icon: <CoderLogo height={8} />, group: GROUP_SYSTEM, description: i18nT('coder.tab_description') },
     { key: 'privacy', label: i18nT('privacyDisclosure.settingsLabel'), icon: <Fingerprint className="lucide-inline" />, group: GROUP_SYSTEM, description: i18nT('privacyDisclosure.settingsDescription') },
     { key: 'security', label: i18nT('settings.tabs.security.label'), icon: <ShieldCheck size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.security.description') },
     { key: 'secrets', label: i18nT('settings.tabs.secrets.label'), icon: <KeyRound size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.secrets.description') },

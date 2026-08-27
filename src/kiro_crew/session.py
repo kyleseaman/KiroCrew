@@ -113,7 +113,7 @@ from kiro_crew.config.loader import (
     default_project_dir,
     normalize_agent_model,
 )
-from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
+from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS, EXECUTION_LOCATION_PHASES
 from kiro_crew.executors import maintenance_executor, subprocess_executor
 from kiro_crew.mcp_gateway.abort import schedule_abort
 from kiro_crew.messaging.link import (
@@ -977,7 +977,20 @@ class SessionManager:
         profile = raw.get("profile")
         if isinstance(profile, str) and profile:
             location["profile"] = profile
+        phase = raw.get("phase")
+        if isinstance(phase, str) and phase in EXECUTION_LOCATION_PHASES:
+            location["phase"] = phase
         return location
+
+    @staticmethod
+    def _set_provider_execution_location_callback(
+        provider: LLMProvider,
+        callback: Callable[[], None] | None,
+    ) -> None:
+        host = getattr(provider, "_session_host", None)
+        setter = getattr(host, "set_execution_location_callback", None)
+        if callable(setter):
+            setter(callback)
 
     def execution_location(self, key: str) -> dict[str, str] | None:
         """Return the execution environment for a live or starting session.
@@ -1015,9 +1028,14 @@ class SessionManager:
 
     def _track_starting_provider(self, key: str, provider: LLMProvider) -> None:
         self._starting_providers[key] = provider
+        self._set_provider_execution_location_callback(
+            provider,
+            lambda: self._execution_location_changed(key),
+        )
         self._execution_location_changed(key)
 
     def _untrack_starting_provider(self, key: str, provider: LLMProvider) -> None:
+        self._set_provider_execution_location_callback(provider, None)
         if self._starting_providers.get(key) is provider:
             self._starting_providers.pop(key, None)
         # Notify even when a same-key race replaced the tracked starter: a live

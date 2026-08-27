@@ -1,5 +1,4 @@
 import { Box, Layers3, MessageSquareText, Server } from 'lucide-react'
-import { motion, useReducedMotion } from 'framer-motion'
 import { useTranslation } from 'react-i18next'
 
 import type { ExecutionLocation } from '../types'
@@ -12,10 +11,18 @@ export function ExecutionLocationStartup({
   profile?: string
 }) {
   const { t } = useTranslation()
-  const reduceMotion = useReducedMotion()
   const provider = location.kind === 'coder' ? t('coder.tab_label') : location.kind
   const profileLabel = profile || location.profile
     || (location.kind === 'coder' ? t('coder.default_profile') : '')
+  const phase = location.phase || 'allocating'
+  const phases = ['allocating', 'provisioning', 'connecting'] as const
+  const phaseIndex = phases.indexOf(phase) + 1
+  const phaseLabels = {
+    allocating: t('execution_environment.phase_allocating'),
+    provisioning: t('execution_environment.phase_provisioning'),
+    connecting: t('execution_environment.phase_connecting'),
+  }
+  const phaseLabel = phaseLabels[phase]
 
   return (
     <div
@@ -38,6 +45,7 @@ export function ExecutionLocationStartup({
           <p className="mt-0.5 text-[13px] leading-relaxed text-muted">
             {t('execution_environment.startup_description')}
           </p>
+          <p className="mt-1 text-[13px] font-medium text-accent">{phaseLabel}</p>
         </div>
       </div>
 
@@ -45,17 +53,14 @@ export function ExecutionLocationStartup({
         className="mt-3 h-1.5 overflow-hidden rounded-full bg-accent/15"
         role="progressbar"
         aria-label={t('execution_environment.startup_progress_label')}
+        aria-valuemin={1}
+        aria-valuemax={phases.length}
+        aria-valuenow={phaseIndex}
+        aria-valuetext={phaseLabel}
       >
-        <motion.div
-          className="h-full w-1/3 rounded-full bg-accent"
-          initial={{ x: reduceMotion ? '0%' : '-100%' }}
-          animate={{ x: reduceMotion ? '0%' : '300%' }}
-          transition={reduceMotion ? undefined : {
-            duration: 1.6,
-            ease: 'easeInOut',
-            repeat: Infinity,
-            repeatType: 'loop',
-          }}
+        <div
+          className="h-full rounded-full bg-accent transition-[width] duration-300 motion-reduce:transition-none"
+          style={{ width: `${(phaseIndex / phases.length) * 100}%` }}
         />
       </div>
 

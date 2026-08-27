@@ -937,8 +937,12 @@ async def test_managed_host_resolves_parent_workspace_before_remote_prepare(
             *,
             template: str | None = None,
             preset: str | None = None,
+            on_progress=None,
         ) -> CoderWorkspace:
             self.sessions.append(session_key)
+            if on_progress is not None:
+                on_progress("provisioning", "crew-opaque123")
+                on_progress("connecting", "crew-opaque123")
             return CoderWorkspace(
                 uuid="workspace-uuid",
                 name="crew-opaque123",

@@ -125,6 +125,24 @@ async def test_unrelated_parents_get_distinct_workspaces(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_workspace_start_reports_provider_neutral_progress(tmp_path: Path) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    progress: list[tuple[str, str]] = []
+
+    workspace = await manager.ensure_ready(
+        "dashboard:one",
+        on_progress=lambda phase, name: progress.append((phase, name)),
+    )
+
+    assert progress == [
+        ("allocating", ""),
+        ("provisioning", workspace.name),
+        ("connecting", workspace.name),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_each_parent_can_allocate_from_a_different_profile(tmp_path: Path) -> None:
     client = _FakeClient()
     manager = _manager(tmp_path, client)

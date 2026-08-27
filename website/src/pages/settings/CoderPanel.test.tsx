@@ -57,6 +57,29 @@ async function renderPanel(data: CoderConfigData = snapshot()) {
 describe('CoderPanel', () => {
   beforeEach(() => vi.clearAllMocks())
 
+  it('keeps the Coder brand mark visible while configuration loads', () => {
+    vi.mocked(api.getCoderConfig).mockReturnValue(new Promise(() => {}))
+
+    renderWithProviders(<CoderPanel />)
+
+    expect(screen.getByTestId('coder-logo')).toHaveAttribute('aria-hidden', 'true')
+  })
+
+  it('shows the Coder brand mark with the loaded configuration', async () => {
+    await renderPanel()
+
+    expect(screen.getByTestId('coder-logo')).toHaveAttribute('aria-hidden', 'true')
+  })
+
+  it('keeps the Coder brand mark visible when configuration fails', async () => {
+    vi.mocked(api.getCoderConfig).mockRejectedValue(new Error('unavailable'))
+
+    renderWithProviders(<CoderPanel />)
+
+    await screen.findByText('Could not load Coder settings')
+    expect(screen.getByTestId('coder-logo')).toHaveAttribute('aria-hidden', 'true')
+  })
+
   it('shows token presence without receiving or rendering the bearer', async () => {
     await renderPanel()
 

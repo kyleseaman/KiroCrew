@@ -5,8 +5,8 @@
  *   filtering) and the changelog modal's own controls
  * - `handleUpdate` (success + both error-shapes) and the `UpdateOverlay`
  *   progress/failed/stuck states it mounts
- * - the header capsule's resource-posture segment and the system-metrics
- *   segment's error / no-totals branches
+ * - the header capsule's system-metrics segment, including its closed,
+ *   error, and no-totals branches
  * - the Kiro credits modal with a bonus pool and a signed-in identity
  * - the notification popover's pointer-outside and route-change dismissals
  * - developer mode and the Electron native-menu navigation bridge
@@ -233,8 +233,8 @@ describe('App — update progress overlay', () => {
 
 })
 
-describe('App — header capsule resource posture', () => {
-  it('flags a critical host posture with the free-memory reason and subagent cap', async () => {
+describe('App — closed system metrics segment', () => {
+  it('keeps resource posture out of the capsule and does not poll in the background', async () => {
     localStorage.setItem('mc-last-version', '0.4.0')
     vi.mocked(api.system).mockResolvedValue({
       mem_used_gb: 15, mem_total_gb: 16, cpu_pct: 95, disk_total_gb: 100, disk_free_gb: 5,
@@ -242,36 +242,10 @@ describe('App — header capsule resource posture', () => {
     } as never)
     renderWithProviders(<App />, { route: '/chat' })
 
-    expect(await screen.findByText('Critical')).toBeInTheDocument()
-    expect(screen.getByText('· cap: 2')).toBeInTheDocument()
-    expect(screen.getByTitle(/Host memory is critically low \(1.3 GB free\)/)).toBeInTheDocument()
-  })
-
-  it('flags a tight host posture', async () => {
-    localStorage.setItem('mc-last-version', '0.4.0')
-    vi.mocked(api.system).mockResolvedValue({
-      mem_used_gb: 12, mem_total_gb: 16, cpu_pct: 60, disk_total_gb: 100, disk_free_gb: 30,
-      resource_posture: 'tight', resource_available_gb: 3,
-    } as never)
-    renderWithProviders(<App />, { route: '/chat' })
-
-    expect(await screen.findByText('Tight')).toBeInTheDocument()
-    expect(screen.getByTitle(/Host memory is tight \(3.0 GB free\)/)).toBeInTheDocument()
-    // No cap reported, so no cap clause is appended.
-    expect(screen.queryByText(/cap:/)).toBeNull()
-  })
-
-  it('leaves the capsule clean when the host has ample headroom', async () => {
-    localStorage.setItem('mc-last-version', '0.4.0')
-    vi.mocked(api.system).mockResolvedValue({
-      mem_used_gb: 2, mem_total_gb: 16, cpu_pct: 5, disk_total_gb: 100, disk_free_gb: 90,
-      resource_posture: 'ample', resource_available_gb: 12,
-    } as never)
-    renderWithProviders(<App />, { route: '/chat' })
-
     await screen.findByTestId('chat-page')
-    expect(screen.queryByText('Tight')).toBeNull()
     expect(screen.queryByText('Critical')).toBeNull()
+    expect(screen.queryByText(/cap:/)).toBeNull()
+    expect(api.system).not.toHaveBeenCalled()
   })
 })
 

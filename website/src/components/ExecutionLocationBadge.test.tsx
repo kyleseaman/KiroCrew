@@ -1,9 +1,18 @@
 import { render, screen } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
+import userEvent from '@testing-library/user-event'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+vi.mock('../utils/clipboard', () => ({ copyToClipboard: vi.fn() }))
+
+import { copyToClipboard } from '../utils/clipboard'
 import { ExecutionLocationBadge } from './ExecutionLocationBadge'
 
 describe('ExecutionLocationBadge', () => {
+  beforeEach(() => {
+    vi.mocked(copyToClipboard).mockReset()
+    vi.mocked(copyToClipboard).mockResolvedValue()
+  })
+
   it('identifies the live remote workspace without exposing its working directory', () => {
     render(
       <ExecutionLocationBadge
@@ -55,5 +64,24 @@ describe('ExecutionLocationBadge', () => {
     )
 
     expect(screen.getByText('test-sandbox workspace · sandbox-opaque')).toBeInTheDocument()
+  })
+
+  it('copies the generated workspace ID and confirms the completed action', async () => {
+    const user = userEvent.setup()
+    render(
+      <ExecutionLocationBadge
+        location={{
+          kind: 'coder',
+          workspace: 'crew-session-kyle-opaque',
+          remote_cwd: '/workspace',
+          state: 'running',
+        }}
+      />,
+    )
+
+    await user.click(screen.getByRole('button', { name: 'Copy workspace ID' }))
+
+    expect(copyToClipboard).toHaveBeenCalledWith('crew-session-kyle-opaque')
+    expect(screen.getByRole('button', { name: 'Workspace ID copied' })).toBeInTheDocument()
   })
 })

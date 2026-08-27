@@ -6826,7 +6826,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               )}
                 </div>
               {effectiveMode === 'orchestrator' && <span className="pointer-events-auto"><InfoTip text={i18nT('pages.chatPage.autopilot_plans_before_executing_each_stage_need')} /></span>}
-              <CoderExecutionControl slot={currentSlot} />
+              <CoderExecutionControl slot={currentSlot} placement="header" />
               <InboundLinkChip slotKey={activeSlot} />
               {/* Trailing controls grouped under a single ml-auto so multiple
                   right-aligned items don't each absorb free space (two ml-auto
@@ -7128,6 +7128,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 stopState={currentSlot?.stop_state}
                 executionLocation={currentSlot?.execution_location}
                 executionProfile={currentSlot?.coder_profile}
+                connected={connected}
               />
               {activeSlot && !slotLoading && !embedded && !popout && slotSwitchTarget !== activeSlot && (
                 <div className="px-4 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
@@ -7305,22 +7306,25 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                    tipSuppressed). ChatInput renders this slot LAST in the
                    above-composer stack, so the card stays flush against the
                    input box and an options row sits above it. */
-                <AnimatePresence>
-                  {folderSuggestion && activeSlot ? (
-                    <div className="pt-1.5" key="folder-suggestion">
-                      <FolderSuggestionCard
-                        folderName={folderSuggestion.folderName}
-                        breadcrumb={folderSuggestion.breadcrumb}
-                        onAccept={folderSuggestionAccept}
-                        onDecline={folderSuggestionDecline}
-                      />
-                    </div>
-                  ) : activeTip && (
-                    <div className="pt-1.5" key="tip">
-                      <TipCard tip={activeTip} onDismiss={dismissTip} />
-                    </div>
-                  )}
-                </AnimatePresence>
+                <>
+                  <AnimatePresence>
+                    {folderSuggestion && activeSlot ? (
+                      <div className="pt-1.5" key="folder-suggestion">
+                        <FolderSuggestionCard
+                          folderName={folderSuggestion.folderName}
+                          breadcrumb={folderSuggestion.breadcrumb}
+                          onAccept={folderSuggestionAccept}
+                          onDecline={folderSuggestionDecline}
+                        />
+                      </div>
+                    ) : activeTip && (
+                      <div className="pt-1.5" key="tip">
+                        <TipCard tip={activeTip} onDismiss={dismissTip} />
+                      </div>
+                    )}
+                  </AnimatePresence>
+                  <CoderExecutionControl slot={currentSlot} placement="composer" />
+                </>
               }
               value={input}
               onChange={setInput}

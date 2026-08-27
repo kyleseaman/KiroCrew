@@ -136,6 +136,10 @@ coder templates push kirocrew-gateway-aws --yes --directory deploy/coder-aws/gat
   --var "kiro_api_key_parameter=$(jq -r .kiro_api_key_parameter <<<"$CREW_GATEWAY_VALUES")" \
   --var "tailnet_dns_name=$(jq -r .tailnet_dns_name <<<"$CREW_GATEWAY_VALUES")"
 
+# Gateway control must remain available while session workspaces start and stop.
+# A zero template TTL disables Coder's default autostop for new gateways.
+coder templates edit kirocrew-gateway-aws --default-ttl 0h
+
 CREW_SESSION_VALUES="$(
   terraform -chdir=deploy/coder-aws/control-plane \
     output -json session_template_values
@@ -152,10 +156,15 @@ unset CREW_GATEWAY_VALUES CREW_SESSION_VALUES
 coder create crew-gateway-user --template kirocrew-gateway-aws \
   --parameter instance_type=t4g.small \
   --parameter volume_gb=30 --yes
+
+# Repair an existing gateway created before the template TTL was disabled.
+# The manual schedule takes effect on its next build (including the next start).
+coder schedule stop crew-gateway-user manual
 ```
 
 The gateway workspace is the only Kiro Crew workspace intended to run
-continuously. Its first start installs the checksummed Coder CLI, Tailscale,
+continuously. Its template disables autostop, while per-session templates retain
+their bounded lifecycle policy. Its first start installs the checksummed Coder CLI, Tailscale,
 and the Kiro CLI. Its root EBS volume has `delete_on_termination = false`, so a
 replacement or workspace deletion leaves the gateway state available for
 recovery. Session workspaces are created lazily by Kiro Crew; stopping one

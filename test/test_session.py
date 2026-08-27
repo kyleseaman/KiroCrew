@@ -1632,6 +1632,64 @@ class TestRecordSuccessFailure:
         await mgr.close_all()
 
     @pytest.mark.asyncio
+    async def test_execution_location_pushes_provider_progress_while_starting(self, cfg):
+        """A host phase change reaches dashboard metadata before startup finishes."""
+
+        class _ProgressHost:
+            def __init__(self) -> None:
+                self.phase = "allocating"
+                self.callback = None
+
+            @property
+            def execution_location(self):
+                return {
+                    "kind": "test-sandbox",
+                    "workspace": "sandbox-opaque",
+                    "remote_cwd": "/workspace",
+                    "phase": self.phase,
+                }
+
+            def set_execution_location_callback(self, callback):
+                self.callback = callback
+
+        host = _ProgressHost()
+        provider = _mock_provider_factory()()
+        provider._session_host = host
+        start_entered = asyncio.Event()
+        allow_start = asyncio.Event()
+
+        async def start() -> None:
+            start_entered.set()
+            await allow_start.wait()
+
+        provider.start = AsyncMock(side_effect=start)
+        changed = MagicMock()
+        mgr = SessionManager(cfg, provider_factory=lambda *_args, **_kwargs: provider)
+        mgr.set_execution_location_callback(changed)
+
+        create = asyncio.create_task(mgr.get_or_create("dashboard:remote"))
+        await start_entered.wait()
+        assert host.callback is not None
+
+        host.phase = "connecting"
+        host.callback()
+
+        assert mgr.execution_location("dashboard:remote") == {
+            "kind": "test-sandbox",
+            "workspace": "sandbox-opaque",
+            "remote_cwd": "/workspace",
+            "state": "starting",
+            "phase": "connecting",
+        }
+        assert changed.call_count >= 2
+
+        allow_start.set()
+        await create
+        assert host.callback is None
+        mgr.release("dashboard:remote")
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
     async def test_execution_location_clears_after_start_failure(self, cfg):
         """A failed provider start cannot leave a workspace stuck as starting."""
         provider = _mock_provider_factory()()

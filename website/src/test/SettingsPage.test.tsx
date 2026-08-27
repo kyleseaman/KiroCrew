@@ -10,7 +10,7 @@
  * legacy ?tab=slack style deep links remap to ?tab=channels&channel=slack.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/react'
+import { render, screen, cleanup, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
@@ -141,6 +141,12 @@ describe('SettingsPage tabs', () => {
   it('lists the Computer Use tab', () => {
     renderAt('/settings')
     expect(screen.getByText('Computer Use')).toBeInTheDocument()
+  })
+
+  it('uses the official Coder mark in the Coder settings row', () => {
+    renderAt('/settings')
+    const coderTab = screen.getByRole('button', { name: 'Coder' })
+    expect(within(coderTab).getByTestId('coder-logo')).toBeInTheDocument()
   })
 
   it('renders the ComputerUsePanel when the computer-use tab is active', () => {

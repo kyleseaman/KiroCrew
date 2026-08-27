@@ -3804,6 +3804,7 @@ class TestOrchestratorWatchdogThemeAreParsed:
             "workspace": "",
             "remote_cwd": "/home/coder/project",
             "state": "starting",
+            "phase": "allocating",
         }
         assert host.transport_env({"PATH": "/usr/bin"}) == {
             "CODER_URL": "https://coder.example",

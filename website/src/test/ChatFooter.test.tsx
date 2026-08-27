@@ -56,6 +56,40 @@ describe('ChatFooter', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Generating workspace name…')
   })
 
+  it('shows the current provider-neutral startup phase', () => {
+    render(
+      <ChatFooter
+        {...base}
+        executionLocation={{
+          kind: 'coder',
+          workspace: 'crew-session-opaque',
+          remote_cwd: '/workspace',
+          state: 'starting',
+          phase: 'provisioning',
+        }}
+      />,
+    )
+
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Starting compute and waiting for the workspace agent',
+    )
+  })
+
+  it('replaces a stale thinking loader with a gateway disconnect notice', () => {
+    render(
+      <ChatFooter
+        {...base}
+        running={true}
+        lastRole="user"
+        connected={false}
+      />,
+    )
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Gateway connection lost')
+    expect(screen.getByRole('alert')).toHaveTextContent('This session may still be running')
+    expect(document.querySelector('.csb4')).not.toBeInTheDocument()
+  })
+
   // The indicator must survive the WHOLE turn, including the gap after a tool
   // completes — it must not blink out mid-turn.
   it('stays visible while a tool is running', () => {
