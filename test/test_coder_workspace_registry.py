@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import stat
 from pathlib import Path
 
@@ -49,6 +50,7 @@ def test_allocate_is_idempotent_for_one_parent_and_distinct_between_parents(
     assert len(first.workspace_name) <= 32
     assert "dashboard" not in first.workspace_name
     assert "one" not in first.workspace_name
+    assert re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", first.workspace_name)
 
 
 def test_registry_round_trips_and_writes_owner_only(tmp_path: Path) -> None:

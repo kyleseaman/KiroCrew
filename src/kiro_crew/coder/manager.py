@@ -90,7 +90,18 @@ class CoderWorkspaceManager:
             current_binding = await asyncio.to_thread(self.registry.get, binding.binding_id)
             if current_binding is None:
                 raise CoderWorkspaceIdentityError("Coder workspace binding disappeared")
-            binding = current_binding
+            binding = await asyncio.to_thread(
+                self.registry.repair_unprovisioned_name,
+                current_binding.binding_id,
+                prefix=self.policy.prefix,
+                owner_name=owner_name,
+            )
+            if binding.workspace_name != current_binding.workspace_name:
+                self._report_progress(
+                    on_progress,
+                    EXECUTION_PHASE_PROVISIONING,
+                    binding.workspace_name,
+                )
             workspace = await self.client.get_workspace(binding.workspace_name)
             if workspace is None:
                 if binding.workspace_uuid:

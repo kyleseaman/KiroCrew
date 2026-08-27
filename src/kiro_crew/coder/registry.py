@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 import re
 import secrets
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO
@@ -17,7 +18,8 @@ from kiro_crew.platform_compat import file_lock
 
 _SCHEMA_VERSION = 1
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-_BINDING_BYTES = 6
+_CODER_WORKSPACE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+_BINDING_BYTES = 5
 _OWNER_SLUG_MAX_CHARS = 20
 _WORKSPACE_NAME_MAX_CHARS = 32
 _BINDING_ID_CHARS = 8
@@ -120,6 +122,34 @@ class WorkspaceBindingRegistry:
             fd.flush()
         return fd
 
+    @staticmethod
+    def _new_workspace_identity(
+        bindings: dict[str, WorkspaceBinding],
+        *,
+        prefix: str,
+        owner_name: str,
+    ) -> tuple[str, str]:
+        owner_slug = owner_name.lower()
+        if len(owner_slug) > _OWNER_SLUG_MAX_CHARS or not _CODER_WORKSPACE_NAME_RE.fullmatch(
+            owner_slug
+        ):
+            digest = hashlib.sha256(owner_name.encode("utf-8")).hexdigest()[:8]
+            owner_slug = f"user-{digest}"
+        existing_names = {binding.workspace_name for binding in bindings.values()}
+        while True:
+            binding_id = (
+                base64.b32encode(secrets.token_bytes(_BINDING_BYTES)).decode("ascii").lower()
+            )
+            owner_chars = _WORKSPACE_NAME_MAX_CHARS - len(prefix) - len(binding_id) - 2
+            owner_fragment = owner_slug[:owner_chars].rstrip("-")
+            workspace_name = f"{prefix}-{owner_fragment}-{binding_id}"
+            if (
+                binding_id not in bindings
+                and workspace_name not in existing_names
+                and _CODER_WORKSPACE_NAME_RE.fullmatch(workspace_name)
+            ):
+                return binding_id, workspace_name
+
     def allocate(
         self,
         session_key: str,
@@ -135,7 +165,7 @@ class WorkspaceBindingRegistry:
             raise ValueError("template must be one safe Coder name")
         if preset and not _SAFE_NAME_RE.fullmatch(preset):
             raise ValueError("preset must be one safe Coder name")
-        if not _SAFE_NAME_RE.fullmatch(prefix) or len(prefix) > _MAX_PREFIX_CHARS:
+        if not _CODER_WORKSPACE_NAME_RE.fullmatch(prefix) or len(prefix) > _MAX_PREFIX_CHARS:
             raise ValueError(
                 f"prefix must be one safe Coder name of at most {_MAX_PREFIX_CHARS} characters"
             )
@@ -148,23 +178,11 @@ class WorkspaceBindingRegistry:
                     if binding.session_key == session_key:
                         return binding
                 now = self._now()
-                while True:
-                    binding_id = secrets.token_urlsafe(_BINDING_BYTES).rstrip("=")
-                    owner_slug = owner_name.lower()
-                    if len(owner_slug) > _OWNER_SLUG_MAX_CHARS or not _SAFE_NAME_RE.fullmatch(
-                        owner_slug
-                    ):
-                        digest = hashlib.sha256(owner_name.encode("utf-8")).hexdigest()[:8]
-                        owner_slug = f"user-{digest}"
-                    owner_chars = _WORKSPACE_NAME_MAX_CHARS - len(prefix) - len(binding_id) - 2
-                    owner_slug = owner_slug[:owner_chars]
-                    workspace_name = f"{prefix}-{owner_slug}-{binding_id}"
-                    if (
-                        binding_id not in bindings
-                        and len(workspace_name) <= _WORKSPACE_NAME_MAX_CHARS
-                        and _SAFE_NAME_RE.fullmatch(workspace_name)
-                    ):
-                        break
+                binding_id, workspace_name = self._new_workspace_identity(
+                    bindings,
+                    prefix=prefix,
+                    owner_name=owner_name,
+                )
                 binding = WorkspaceBinding(
                     binding_id=binding_id,
                     session_key=session_key,
@@ -186,6 +204,40 @@ class WorkspaceBindingRegistry:
                 bindings[binding_id] = binding
                 self._write_unlocked(bindings)
                 return binding
+
+    def repair_unprovisioned_name(
+        self,
+        binding_id: str,
+        *,
+        prefix: str,
+        owner_name: str,
+    ) -> WorkspaceBinding:
+        """Replace a legacy CLI-incompatible name before it owns a workspace."""
+        with self._open_lock() as lock_fd:
+            with file_lock(lock_fd.fileno(), exclusive=True, required=True):
+                bindings = self._read_unlocked()
+                current = bindings.get(binding_id)
+                if current is None:
+                    raise WorkspaceRegistryCorrupt("Coder workspace binding disappeared")
+                if _CODER_WORKSPACE_NAME_RE.fullmatch(current.workspace_name):
+                    return current
+                if current.workspace_uuid or current.state != "allocated":
+                    raise WorkspaceRegistryCorrupt(
+                        "Provisioned Coder workspace binding has an invalid name"
+                    )
+                _opaque_id, workspace_name = self._new_workspace_identity(
+                    bindings,
+                    prefix=prefix,
+                    owner_name=owner_name,
+                )
+                repaired = replace(
+                    current,
+                    workspace_name=workspace_name,
+                    generation=current.generation + 1,
+                )
+                bindings[binding_id] = repaired
+                self._write_unlocked(bindings)
+                return repaired
 
     def list_bindings(self) -> tuple[WorkspaceBinding, ...]:
         with self._open_lock() as lock_fd:

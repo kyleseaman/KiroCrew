@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -140,6 +142,31 @@ async def test_workspace_start_reports_provider_neutral_progress(tmp_path: Path)
         ("provisioning", workspace.name),
         ("connecting", workspace.name),
     ]
+
+
+@pytest.mark.asyncio
+async def test_legacy_unprovisioned_name_is_repaired_before_create(tmp_path: Path) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    binding = manager.registry.allocate(
+        "dashboard:one",
+        template="kirocrew-arm",
+        preset="arm-small",
+        prefix="crew-session",
+        owner_name="kyleseaman",
+    )
+    payload = json.loads(manager.registry.path.read_text(encoding="utf-8"))
+    payload["bindings"][binding.binding_id]["workspace_name"] = "crew-session-kyleseaman-yjb-GQN_"
+    manager.registry.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    workspace = await manager.ensure_ready("dashboard:one")
+
+    assert workspace.name != "crew-session-kyleseaman-yjb-GQN_"
+    assert re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", workspace.name)
+    repaired = manager.registry.get_by_session("dashboard:one")
+    assert repaired is not None
+    assert repaired.workspace_name == workspace.name
+    assert repaired.generation == binding.generation + 1
 
 
 @pytest.mark.asyncio

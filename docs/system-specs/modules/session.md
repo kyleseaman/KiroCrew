@@ -294,6 +294,10 @@ exists. Removed profiles may resume an existing binding from its recorded
 coordinates but cannot allocate a new one. Remote preparation also requires the
 template's root-owned versioned contract marker and fails closed before ACP when
 the runtime user, remote directory, or declared capabilities do not match.
+Generated workspace names use lowercase ASCII letters, digits, and hyphens so
+they satisfy Coder's CLI contract. A legacy unprovisioned binding with broader
+safe characters is renamed before its first create attempt; provisioned
+workspace identities remain immutable.
 
 The dashboard's active-session execution UI is provider-neutral. While the
 descriptor is `starting`, the transcript replaces the decorative model loader
