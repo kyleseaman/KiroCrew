@@ -221,6 +221,10 @@ from kiro_crew.security import (
 )
 from kiro_crew.sel import sel
 from kiro_crew.session import SessionClosingError, SpeculativeResumeRefused
+from kiro_crew.session_environment import (
+    SessionEnvironmentBinding,
+    SessionEnvironmentRegistry,
+)
 from kiro_crew.slack.handler import post_linked_approval, resolve_linked_approval
 from kiro_crew.slack.outbound import PostedOptions
 from kiro_crew.validation import ValidationError, infer_use_case, validate_ask_user_question
@@ -3507,10 +3511,14 @@ def schedule_eager_spawn(
         cfg = KiroCrewConfig.load()
         if not cfg.session.eager_spawn:
             return None
-        # Managed Coder allocation can start billable compute. Wait for the
-        # first real turn so the operator can choose a session profile and an
-        # untouched tab never creates a workspace merely by being opened.
-        if cfg.session.coder.enabled is True:
+        # A managed environment can start billable compute. Wait for the first
+        # real turn so the operator can choose a configuration and an untouched
+        # tab never allocates a remote resource merely by being opened.
+        registry_getter = getattr(state.sessions, "environment_registry", None)
+        registry = registry_getter() if callable(registry_getter) else None
+        if slot.environment is not None or (
+            isinstance(registry, SessionEnvironmentRegistry) and registry.providers()
+        ):
             return None
     except Exception:
         return None
@@ -3718,7 +3726,9 @@ async def _eager_spawn(
                     speculative=True,
                     speculative_resume=allow_resume,
                     reasoning_effort_override=slot.reasoning_effort or None,
-                    coder_profile_override=slot.coder_profile or None,
+                    environment_selection=(
+                        slot.environment.selection if slot.environment is not None else None
+                    ),
                 )
             except SpeculativeResumeRefused:
                 # Two sources: the entry gate (resumable key, resume not
@@ -5350,18 +5360,34 @@ async def _run_chat(
             model=slot.model or agent_model or None,
             cwd=slot.project or None,
             reasoning_effort_override=slot.reasoning_effort or None,
-            coder_profile_override=slot.coder_profile or None,
+            environment_selection=(
+                slot.environment.selection if slot.environment is not None else None
+            ),
         )
         _acquired = True
         location_resolver = getattr(state.sessions, "execution_location", None)
         execution_location = location_resolver(session_key) if callable(location_resolver) else None
         if (
             isinstance(execution_location, dict)
-            and execution_location.get("kind") == "coder"
+            and isinstance(execution_location.get("kind"), str)
+            and execution_location["kind"]
             and isinstance(execution_location.get("workspace"), str)
             and execution_location["workspace"]
         ):
-            slot.coder_workspace = execution_location["workspace"]
+            provider_id = execution_location["kind"]
+            current = slot.environment
+            configuration = (
+                current.configuration
+                if current is not None and current.provider == provider_id
+                else execution_location.get("profile", "")
+            )
+            if not isinstance(configuration, str):
+                configuration = ""
+            slot.environment = SessionEnvironmentBinding(
+                provider=provider_id,
+                configuration=configuration,
+                resource_name=execution_location["workspace"],
+            )
         # Member activity pointer — once per SESSION, not per turn: the log
         # answers "which sessions did this member take part in", so a per-turn
         # append would inflate every count taken from it. `slot.agent` is the

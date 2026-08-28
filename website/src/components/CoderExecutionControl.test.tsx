@@ -7,71 +7,69 @@ import type { ChatSlot } from '../types'
 
 vi.mock('../api/client', () => ({
   api: {
-    getCoderConfig: vi.fn(),
-    chatSlotCoderProfile: vi.fn(),
+    getSessionEnvironments: vi.fn(),
+    chatSlotEnvironment: vi.fn(),
   },
 }))
 
 import { api } from '../api/client'
-import { CoderExecutionControl } from './CoderExecutionControl'
+import { SessionEnvironmentControl } from './SessionEnvironmentControl'
 
 const slot: ChatSlot = {
   key: 'chat-1',
   title: 'Fresh session',
   messages: 0,
   running: false,
-  coder_profile: '',
+  environment: { provider: 'coder', configuration: '', resource_name: '' },
 }
 
-describe('CoderExecutionControl', () => {
+describe('SessionEnvironmentControl', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    vi.mocked(api.getCoderConfig).mockResolvedValue({
-      enabled: true,
-      url: 'https://coder.example',
-      template: 'kirocrew-arm',
-      preset: '',
-      profiles: {
-        gpu: { template: 'kirocrew-gpu', preset: 'gpu-medium' },
-      },
-      remote_cwd: '/home/coder/workspace',
-      runtime_warm_minutes: 5,
-      stop_after_minutes: 30,
-      delete_after_days: 30,
-      max_running: 3,
-      workspace_prefix: 'crew',
-      token_configured: true,
-      legacy_environment: false,
+    vi.mocked(api.getSessionEnvironments).mockResolvedValue({
+      providers: [{
+        id: 'coder',
+        name: 'Coder',
+        icon: 'coder',
+        configurations: [
+          { id: '', name: 'default' },
+          { id: 'gpu', name: 'gpu' },
+        ],
+      }],
     })
-    vi.mocked(api.chatSlotCoderProfile).mockResolvedValue({ ok: true, profile: 'gpu' })
+    vi.mocked(api.chatSlotEnvironment).mockResolvedValue({
+      ok: true,
+      environment: { provider: 'coder', configuration: 'gpu', resource_name: '' },
+    })
   })
 
-  it('lets a fresh session select a named profile', async () => {
+  it('lets a fresh session select a provider configuration', async () => {
     const user = userEvent.setup()
-    renderWithProviders(<CoderExecutionControl slot={slot} placement="composer" />)
+    renderWithProviders(<SessionEnvironmentControl slot={slot} placement="composer" />)
 
-    const trigger = await screen.findByRole('combobox', { name: 'Coder profile for this session' })
+    const trigger = await screen.findByRole('combobox', {
+      name: 'Environment configuration for this session',
+    })
     await user.click(trigger)
-    await user.click(await screen.findByRole('option', { name: 'gpu' }))
+    await user.click(await screen.findByRole('option', { name: 'Coder · gpu' }))
 
-    expect(api.chatSlotCoderProfile).toHaveBeenCalledWith('chat-1', 'gpu')
+    expect(api.chatSlotEnvironment).toHaveBeenCalledWith('chat-1', 'coder', 'gpu')
   })
 
   it('keeps a fresh-session selector out of the session header', async () => {
-    renderWithProviders(<CoderExecutionControl slot={slot} placement="header" />)
+    renderWithProviders(<SessionEnvironmentControl slot={slot} placement="header" />)
 
     await new Promise(resolve => setTimeout(resolve, 20))
     expect(screen.queryByRole('combobox')).not.toBeInTheDocument()
-    expect(api.getCoderConfig).not.toHaveBeenCalled()
   })
 
   it('shows the live workspace instead of a mutable selector after allocation', async () => {
     renderWithProviders(
-      <CoderExecutionControl
+      <SessionEnvironmentControl
         slot={{
           ...slot,
           messages: 1,
-          coder_profile: 'gpu',
+          environment: { provider: 'coder', configuration: 'gpu', resource_name: 'crew-opaque' },
           execution_location: {
             kind: 'coder',
             workspace: 'crew-opaque',
@@ -83,11 +81,11 @@ describe('CoderExecutionControl', () => {
     )
 
     expect(screen.getByText('Coder workspace · crew-opaque')).toBeInTheDocument()
-    expect(screen.getByText('Coder profile · gpu')).toBeInTheDocument()
+    expect(screen.getByText('Environment configuration · gpu')).toBeInTheDocument()
     expect(screen.getAllByTestId('execution-location-badge')).toHaveLength(1)
     expect(screen.getByTestId('execution-location-badge')).toHaveAttribute(
       'title',
-      'Coder workspace · crew-opaque · Coder profile · gpu',
+      'Coder workspace · crew-opaque · Environment configuration · gpu',
     )
     expect(screen.getByRole('button', { name: 'Copy workspace ID' })).toBeInTheDocument()
     expect(screen.queryByRole('combobox')).not.toBeInTheDocument()
@@ -95,29 +93,32 @@ describe('CoderExecutionControl', () => {
 
   it('keeps the durable workspace ID visible after the live runtime idles', async () => {
     renderWithProviders(
-      <CoderExecutionControl
+      <SessionEnvironmentControl
         slot={{
           ...slot,
           messages: 1,
-          coder_profile: 'gpu',
-          coder_workspace: 'crew-session-kyle-retained',
+          environment: {
+            provider: 'coder',
+            configuration: 'gpu',
+            resource_name: 'crew-session-kyle-retained',
+          },
         }}
       />,
     )
 
     expect(await screen.findByText('Coder workspace · crew-session-kyle-retained')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Copy workspace ID' })).toBeInTheDocument()
-    expect(screen.getByText('Coder profile · gpu')).toBeInTheDocument()
+    expect(screen.getByText('Environment configuration · gpu')).toBeInTheDocument()
     expect(screen.getAllByTestId('execution-location-badge')).toHaveLength(1)
   })
 
   it('leaves startup profile details to the transcript card', async () => {
     renderWithProviders(
-      <CoderExecutionControl
+      <SessionEnvironmentControl
         slot={{
           ...slot,
           messages: 1,
-          coder_profile: 'gpu',
+          environment: { provider: 'coder', configuration: 'gpu', resource_name: '' },
           execution_location: {
             kind: 'coder',
             workspace: '',
@@ -129,12 +130,12 @@ describe('CoderExecutionControl', () => {
     )
 
     expect(screen.getByRole('status')).toHaveTextContent('Starting Coder workspace')
-    expect(screen.queryByText('Coder profile · gpu')).not.toBeInTheDocument()
+    expect(screen.queryByText('Environment configuration · gpu')).not.toBeInTheDocument()
   })
 
-  it('does not fetch Coder settings for an already hosted session', async () => {
+  it('uses provider catalog metadata for an already hosted session', async () => {
     renderWithProviders(
-      <CoderExecutionControl
+      <SessionEnvironmentControl
         slot={{
           ...slot,
           messages: 1,
@@ -149,6 +150,34 @@ describe('CoderExecutionControl', () => {
     )
 
     await new Promise(resolve => setTimeout(resolve, 20))
-    expect(api.getCoderConfig).not.toHaveBeenCalled()
+    expect(api.getSessionEnvironments).toHaveBeenCalledTimes(1)
+  })
+
+  it('renders another provider from the same catalog contract', async () => {
+    vi.mocked(api.getSessionEnvironments).mockResolvedValue({
+      providers: [{
+        id: 'kubernetes',
+        name: 'Kubernetes',
+        icon: 'server',
+        configurations: [{ id: 'standard', name: 'Standard pod' }],
+      }],
+    })
+
+    renderWithProviders(
+      <SessionEnvironmentControl
+        slot={{
+          ...slot,
+          messages: 1,
+          environment: {
+            provider: 'kubernetes',
+            configuration: 'standard',
+            resource_name: 'crew-pod-opaque',
+          },
+        }}
+      />,
+    )
+
+    expect(await screen.findByText('Kubernetes workspace · crew-pod-opaque')).toBeInTheDocument()
+    expect(screen.getByText('Environment configuration · standard')).toBeInTheDocument()
   })
 })

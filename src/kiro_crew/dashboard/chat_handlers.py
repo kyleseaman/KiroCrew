@@ -100,6 +100,10 @@ from kiro_crew.security import (
     redact_exfiltration_urls,
 )
 from kiro_crew.sel import SecurityEvent, sel
+from kiro_crew.session_environment import (
+    SessionEnvironmentBinding,
+    SessionEnvironmentUnavailable,
+)
 from kiro_crew.session_summary import count_user_turns_in_records
 from kiro_crew.validation import (
     _AGENT_NAME_RE,
@@ -2001,6 +2005,83 @@ async def api_chat_slot_coder_profile(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "profile": profile})
 
 
+async def api_chat_slot_environment(request: web.Request) -> web.Response:
+    """Select one managed environment configuration before allocation."""
+    if request.get("app", ""):
+        return web.json_response(
+            {"error": "owner access required", "code": "owner_only"}, status=403
+        )
+    state: DashboardState = request.app["state"]
+    slot = state.get_slot(request.match_info["slot"])
+    if slot is None:
+        return web.json_response({"error": "slot not found", "code": "slot_not_found"}, status=404)
+    try:
+        body = await request.json()
+    except ValueError:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    provider_id = body.get("provider") if isinstance(body, dict) else None
+    configuration = body.get("configuration", "") if isinstance(body, dict) else None
+    if not isinstance(provider_id, str) or not isinstance(configuration, str):
+        return web.json_response(
+            {
+                "error": "invalid session environment selection",
+                "code": "session_environment_invalid",
+            },
+            status=400,
+        )
+    registry_getter = getattr(state.sessions, "environment_registry", None)
+    registry = registry_getter() if callable(registry_getter) else None
+    try:
+        if registry is None:
+            raise SessionEnvironmentUnavailable("session environment registry is unavailable")
+        provider = registry.require(provider_id)
+        configuration = provider.validate_configuration(configuration)
+    except SessionEnvironmentUnavailable as exc:
+        return web.json_response(
+            {"error": str(exc), "code": "session_environment_unavailable"}, status=409
+        )
+    except ValueError as exc:
+        return web.json_response(
+            {
+                "error": str(exc),
+                "code": "session_environment_configuration_unknown",
+            },
+            status=400,
+        )
+
+    session_key = effective_session_key(slot)
+    existing_binding = await asyncio.to_thread(provider.binding_for_session, session_key)
+    if (
+        slot.running
+        or state.sessions.has_session(session_key)
+        or existing_binding is not None
+        or (slot.environment is not None and bool(slot.environment.resource_name))
+    ):
+        return web.json_response(
+            {
+                "error": "session environment is locked after allocation",
+                "code": "session_environment_locked",
+            },
+            status=409,
+        )
+    slot.environment = SessionEnvironmentBinding(provider_id, configuration, "")
+    state.push_slots_update()
+    await save_slot_off_loop(state, slot, force=True)
+    return web.json_response({"ok": True, "environment": slot.environment.to_dict()})
+
+
+async def api_session_environments(request: web.Request) -> web.Response:
+    """Return safe metadata for enabled managed environment providers."""
+    if request.get("app", ""):
+        return web.json_response(
+            {"error": "owner access required", "code": "owner_only"}, status=403
+        )
+    state: DashboardState = request.app["state"]
+    registry_getter = getattr(state.sessions, "environment_registry", None)
+    registry = registry_getter() if callable(registry_getter) else None
+    return web.json_response({"providers": registry.catalog() if registry is not None else []})
+
+
 def _reject_pending_approvals(slot: _ChatSlot) -> None:
     """Reject all pending approval futures so the chat runner unblocks.
 
@@ -3240,19 +3321,43 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
         # missing one — anti-enumeration (CWE-204); true reason logged via SEL.
         return web.json_response({"error": "not found"}, status=404)
 
-    manager = state.sessions.coder_workspace_manager()
-    if manager is not None:
+    environment = slot.environment
+    if environment is not None:
         try:
-            await manager.stop_for_session(_history_key_for(name))
+            registry_getter = getattr(state.sessions, "environment_registry", None)
+            registry = registry_getter() if callable(registry_getter) else None
+            if registry is None:
+                raise SessionEnvironmentUnavailable("session environment registry is unavailable")
+            provider = registry.require(environment.provider)
+            stopped = await provider.stop_for_session(_history_key_for(name))
+            if environment.resource_name and stopped != environment.resource_name:
+                raise RuntimeError("session environment stop could not be verified")
         except Exception:
-            logger.warning("Failed to stop managed Coder workspace for %s", name, exc_info=True)
+            logger.warning("Failed to stop managed session environment for %s", name, exc_info=True)
             return web.json_response(
                 {
-                    "error": "failed to stop managed Coder workspace",
-                    "code": "coder_workspace_stop_failed",
+                    "error": "failed to stop managed session environment",
+                    "code": "session_environment_stop_failed",
                 },
                 status=502,
             )
+    else:
+        # Compatibility for active slots cached before generic environment
+        # metadata shipped. The Coder manager still resolves and verifies the
+        # binding by session key; no client-supplied workspace is trusted.
+        manager = state.sessions.coder_workspace_manager()
+        if manager is not None:
+            try:
+                await manager.stop_for_session(_history_key_for(name))
+            except Exception:
+                logger.warning("Failed to stop managed Coder workspace for %s", name, exc_info=True)
+                return web.json_response(
+                    {
+                        "error": "failed to stop managed Coder workspace",
+                        "code": "coder_workspace_stop_failed",
+                    },
+                    status=502,
+                )
 
     # Synchronous tombstone, BEFORE any await: a channel-slot reconcile pass
     # whose snapshot predates this close reads these after its last await, so
@@ -3514,18 +3619,41 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
     failed: list[str] = []
     _tasks_to_cancel: list[asyncio.Task] = []
     for name in stale_keys:
-        manager = state.sessions.coder_workspace_manager()
-        if manager is not None:
+        stale_slot = state._slots.get(name)
+        environment = stale_slot.environment if stale_slot is not None else None
+        if environment is not None:
             try:
-                await manager.stop_for_session(_history_key_for(name))
+                registry_getter = getattr(state.sessions, "environment_registry", None)
+                registry = registry_getter() if callable(registry_getter) else None
+                if registry is None:
+                    raise SessionEnvironmentUnavailable(
+                        "session environment registry is unavailable"
+                    )
+                provider = registry.require(environment.provider)
+                stopped = await provider.stop_for_session(_history_key_for(name))
+                if environment.resource_name and stopped != environment.resource_name:
+                    raise RuntimeError("session environment stop could not be verified")
             except Exception:
                 logger.warning(
-                    "Cleanup: failed to stop managed Coder workspace for %s",
+                    "Cleanup: failed to stop managed session environment for %s",
                     name,
                     exc_info=True,
                 )
                 failed.append(name)
                 continue
+        else:
+            manager = state.sessions.coder_workspace_manager()
+            if manager is not None:
+                try:
+                    await manager.stop_for_session(_history_key_for(name))
+                except Exception:
+                    logger.warning(
+                        "Cleanup: failed to stop managed Coder workspace for %s",
+                        name,
+                        exc_info=True,
+                    )
+                    failed.append(name)
+                    continue
         removed = state._slots.pop(name, None)
         if not removed:
             continue

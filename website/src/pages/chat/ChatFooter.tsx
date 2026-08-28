@@ -222,7 +222,8 @@ interface ChatFooterProps {
   stopState?: StopState
   streamTick?: number
   executionLocation?: ExecutionLocation
-  executionProfile?: string
+  executionConfiguration?: string
+  executionProvider?: string
   connected?: boolean
 }
 
@@ -235,7 +236,8 @@ const ChatFooter = memo(function ChatFooter({
   stopState,
   streamTick = 0,
   executionLocation,
-  executionProfile,
+  executionConfiguration,
+  executionProvider,
   connected = true,
 }: ChatFooterProps) {
   const loader = resolveLoader(useThemeSlug())
@@ -282,7 +284,8 @@ const ChatFooter = memo(function ChatFooter({
         ) : startingLocation ? (
           <ExecutionLocationStartup
             location={executionLocation}
-            profile={executionProfile}
+            configuration={executionConfiguration}
+            providerId={executionProvider}
           />
         ) : stopState === 'soft_pending' ? (
           <motion.span

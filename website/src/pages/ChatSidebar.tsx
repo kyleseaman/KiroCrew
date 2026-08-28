@@ -58,7 +58,8 @@ import { DndDraggable, DndDroppable } from '../components/dnd'
 import { collectFolderSubtreeIds } from '../utils/folderTree'
 import { runBelongsToSlot } from '../apps/workflows/runModel'
 import { sanitizeLlmOutput } from '../utils/sanitize'
-import type { ChatFolder, ChatTag, TagColumn, TagColumnMode, SubagentActivity, SessionLink, ExecutionLocation } from '../types'
+import type { ChatFolder, ChatTag, TagColumn, TagColumnMode, SubagentActivity, SessionLink, ExecutionLocation, SessionEnvironmentBinding } from '../types'
+import { environmentProviderLabel, sessionEnvironment } from '../sessionEnvironment'
 import { SESSION_LANES, inferLane } from './chat/sessionLane'
 import { decideUnreadDrain } from './unreadDrain'
 import {
@@ -545,6 +546,7 @@ interface Slot {
   pinned?: boolean
   coder_profile?: string
   coder_workspace?: string
+  environment?: SessionEnvironmentBinding | null
   execution_location?: ExecutionLocation
   tags?: string[]
   forked_from?: string | null
@@ -3463,29 +3465,27 @@ function ChatSidebar({
     const isBuiltin = agentMeta?.source === 'builtin'
     const agentColor = isPackageAgent ? 'text-[var(--aim)]' : isBuiltin ? 'text-muted' : 'text-muted'
     // Placement provenance is durable while compute state is not. A stopped
-    // Coder session therefore keeps its marker from `coder_workspace`, while a
-    // live provider supplies the provider-neutral execution descriptor. This
+    // managed session therefore keeps its marker from `environment`, while a
+    // live provider supplies the execution descriptor. This
     // icon never claims the environment is awake; startup/turn status belongs
     // to the secondary line and transcript loading state.
-    const executionWorkspace = s.execution_location?.workspace || s.coder_workspace || ''
-    const executionKind = s.execution_location?.kind || (s.coder_workspace ? 'coder' : '')
+    const environment = sessionEnvironment(s)
+    const executionWorkspace = s.execution_location?.workspace || environment?.resource_name || ''
+    const executionKind = s.execution_location?.kind || environment?.provider || ''
+    const executionProvider = executionKind ? environmentProviderLabel(executionKind) : ''
     const executionLabel = !executionKind
       ? ''
-      : executionKind === 'coder'
-        ? executionWorkspace
-          ? i18nT('coder.badge_label', { workspace: executionWorkspace })
-          : i18nT('coder.badge_allocating')
-        : s.execution_location?.state === 'starting' && executionWorkspace
-          ? i18nT('execution_environment.badge_starting_named', {
-              kind: executionKind,
+      : s.execution_location?.state === 'starting' && executionWorkspace
+        ? i18nT('execution_environment.badge_starting_named', {
+            kind: executionProvider,
+            workspace: executionWorkspace,
+          })
+        : s.execution_location?.state === 'starting' || !executionWorkspace
+          ? i18nT('execution_environment.badge_starting', { kind: executionProvider })
+          : i18nT('execution_environment.badge_running', {
+              kind: executionProvider,
               workspace: executionWorkspace,
             })
-          : s.execution_location?.state === 'starting' || !executionWorkspace
-            ? i18nT('execution_environment.badge_starting', { kind: executionKind })
-            : i18nT('execution_environment.badge_running', {
-                kind: executionKind,
-                workspace: executionWorkspace,
-              })
     // The meta line's second slot shows the session's TAGS, not a value derived
     // from the project path. The auto-tagger already labels each session with its
     // project, so those tags ARE the context the row needs; deriving a label
@@ -4648,11 +4648,11 @@ function ChatSidebar({
       {/* Clean Up dialog */}
       {cleanupOpen && (() => {
         const archivable = cleanupPreview ? cleanupPreview.map(k => slots.find(s => s.key === k)).filter(Boolean) as Slot[] : []
-        const coderWorkspaces = archivable.flatMap(s => {
-          const workspace = s.coder_workspace || (
-            s.execution_location?.kind === 'coder' ? s.execution_location.workspace : ''
-          )
-          return workspace ? [workspace] : []
+        const managedEnvironments = archivable.flatMap(s => {
+          const environment = sessionEnvironment(s)
+          const workspace = environment?.resource_name || s.execution_location?.workspace || ''
+          const provider = environment?.provider || s.execution_location?.kind || ''
+          return workspace ? [{ workspace, provider }] : []
         })
         const noStale = cleanupPreview != null && cleanupPreview.length === 0 && !activeIsStale
         return (
@@ -4675,16 +4675,17 @@ function ChatSidebar({
                     ? i18nT('pages.chatSidebar.no_inactive_sessions_to_archive')
                     : cleanupPreview != null && <>
                       {i18nT('pages.chatSidebar.session', { count: archivable.length })} {i18nT('pages.chatSidebar.will_be_moved_to_older_sessions')}{activeIsStale ? ` ${i18nT('pages.chatSidebar.1_skipped_currently_selected')}` : ''} {i18nT('pages.chatSidebar.pinned_sessions_are_kept')}
-                      {coderWorkspaces.length > 0 && (
+                      {managedEnvironments.length > 0 && (
                         <div className="mt-2 text-danger">
-                          {coderWorkspaces.length === 1
-                            ? i18nT('pages.chatSidebar.coder_workspace_will_stop', {
-                              count: coderWorkspaces.length,
-                              workspaces: coderWorkspaces.join(', '),
+                          {managedEnvironments.length === 1
+                            ? i18nT('pages.chatSidebar.environment_will_stop', {
+                              count: managedEnvironments.length,
+                              workspaces: fmtList(managedEnvironments.map(item => item.workspace)),
+                              provider: environmentProviderLabel(managedEnvironments[0].provider),
                             })
-                            : i18nT('pages.chatSidebar.coder_workspaces_will_stop', {
-                              count: coderWorkspaces.length,
-                              workspaces: coderWorkspaces.join(', '),
+                            : i18nT('pages.chatSidebar.environments_will_stop', {
+                              count: managedEnvironments.length,
+                              workspaces: fmtList(managedEnvironments.map(item => item.workspace)),
                             })}
                         </div>
                       )}

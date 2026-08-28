@@ -683,6 +683,25 @@ export interface ExecutionLocation {
   profile?: string
 }
 
+/** Durable, non-secret association between a session and a managed environment. */
+export interface SessionEnvironmentBinding {
+  provider: string
+  configuration: string
+  resource_name: string
+}
+
+export interface SessionEnvironmentConfiguration {
+  id: string
+  name: string
+}
+
+export interface SessionEnvironmentProviderSummary {
+  id: string
+  name: string
+  icon: string
+  configurations: SessionEnvironmentConfiguration[]
+}
+
 export interface ChatSlot {
   key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; coder_profile?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; clean_mode?: boolean; project?: string; forked_from?: string | null; source_links?: { provider: 'github' | 'gitlab' | 'jira'; number: number; url: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
   /** Provenance bucket from the backend `SlotOrigin` ("user" | "app" | "cron"
@@ -719,6 +738,8 @@ export interface ChatSlot {
   /** Agent TODO list. Null/absent = the todo tool was never used in this slot. */
   todo?: TodoList | null
   /** Non-secret execution host reported by the provider backing this live slot. */
+  environment?: SessionEnvironmentBinding | null
+  /** Compatibility projections for pre-environment gateway payloads. */
   coder_workspace?: string
   execution_location?: ExecutionLocation
 }

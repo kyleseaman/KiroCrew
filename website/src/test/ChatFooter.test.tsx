@@ -26,14 +26,15 @@ describe('ChatFooter', () => {
           remote_cwd: '/home/coder/workspace',
           state: 'starting',
         }}
-        executionProfile="Default Coder profile"
+        executionConfiguration="Default environment configuration"
+        executionProvider="coder"
       />,
     )
 
     const status = screen.getByRole('status')
     expect(status).toHaveTextContent('Preparing your workspace')
     expect(status).toHaveTextContent('Coder')
-    expect(status).toHaveTextContent('Default Coder profile')
+    expect(status).toHaveTextContent('Default environment configuration')
     expect(status).toHaveTextContent('crew-session-kyleseaman-opaque')
     expect(status).toHaveTextContent('Your message is queued. You can keep adding instructions.')
     expect(screen.getByRole('progressbar', { name: 'Workspace startup progress' })).toBeInTheDocument()

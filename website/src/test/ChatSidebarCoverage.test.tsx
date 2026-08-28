@@ -103,6 +103,11 @@ interface TestSlot {
   pinned?: boolean
   coder_profile?: string
   coder_workspace?: string
+  environment?: {
+    provider: string
+    configuration: string
+    resource_name: string
+  }
   execution_location?: {
     kind: string
     workspace: string
@@ -294,7 +299,7 @@ describe('ChatSidebar — Clean Up Sessions panel', () => {
     expect(await screen.findByText(/will be moved to older sessions/)).toBeTruthy()
   })
 
-  it('names Coder workspaces that will be stopped by archival', async () => {
+  it('names managed environments that will be stopped by archival', async () => {
     mocks.cleanupSessions.mockResolvedValue({
       ok: true,
       archived: 0,
@@ -305,15 +310,18 @@ describe('ChatSidebar — Clean Up Sessions panel', () => {
     renderSidebar({
       slots: [{
         ...SLOTS[0],
-        coder_profile: 'cpu-large',
-        coder_workspace: 'crew-session-kyle-opaque',
+        environment: {
+          provider: 'coder',
+          configuration: 'cpu-large',
+          resource_name: 'crew-session-kyle-opaque',
+        },
       }],
     })
 
     await openHeaderPanel('Clean up sessions')
 
     expect(await screen.findByText(/crew-session-kyle-opaque/)).toBeTruthy()
-    expect(screen.getByText(/1 Coder workspace will stop/)).toBeTruthy()
+    expect(screen.getByText(/1 Coder environment will stop/)).toBeTruthy()
   })
 
   it('keeps the panel open and surfaces the count when some archives fail', async () => {

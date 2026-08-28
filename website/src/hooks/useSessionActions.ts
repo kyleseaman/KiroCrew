@@ -8,6 +8,7 @@ import { copySessionLink } from '../utils/shareUrl'
 import { useMoveSlotToFolder } from './useMoveSlotToFolder'
 import { loadChatConfig } from '../pages/chat/ChatSettings'
 import { i18nT } from '../i18n/t'
+import { environmentProviderLabel, sessionEnvironment } from '../sessionEnvironment'
 
 /**
  * The surface-agnostic session actions — the ones that need only a slot key and
@@ -148,14 +149,17 @@ export function useSessionActions(mode?: string): SessionActions {
 
   const close = useCallback((slotKey: string) => {
     const slot = store.getState().dashboard.slots.find(s => s.key === slotKey)
-    const coder = slot?.execution_location?.kind === 'coder' ? slot.execution_location : undefined
-    const coderWorkspace = slot?.coder_workspace || coder?.workspace
-    const needsConfirm = Boolean(coderWorkspace) || loadChatConfig().confirmCloseSession
-    const prompt = coderWorkspace
-      ? i18nT('hooks.useSessionActions.archive_and_stop_coder_workspace', {
+    const environment = sessionEnvironment(slot)
+    const resourceName = environment?.resource_name || slot?.execution_location?.workspace
+    const provider = environment?.provider || slot?.execution_location?.kind || ''
+    const needsConfirm = Boolean(resourceName) || loadChatConfig().confirmCloseSession
+    const prompt = resourceName
+      ? i18nT('hooks.useSessionActions.archive_and_stop_environment', {
           title: slot?.title || slotKey,
-          profile: slot?.coder_profile || i18nT('coder.default_profile'),
-          workspace: coderWorkspace,
+          provider: environmentProviderLabel(provider),
+          configuration: environment?.configuration
+            || i18nT('execution_environment.default_configuration'),
+          workspace: resourceName,
         })
       : i18nT('hooks.useSessionActions.close_this_session')
     if (!needsConfirm || confirm(prompt)) dispatch(deleteSlot(slotKey))

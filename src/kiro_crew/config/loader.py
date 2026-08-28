@@ -8218,7 +8218,6 @@ class KiroCrewConfig:
         """
         from kiro_crew.acp.session_host import (
             CODER_SESSION_TOKEN_SECRET,
-            ManagedCoderWorkspaceSessionHost,
             managed_coder_manager_from_config,
             session_host_from_config,
             session_host_from_env,
@@ -8227,6 +8226,12 @@ class KiroCrewConfig:
             AcpProvider,  # circular: acp -> client -> session -> config.loader
         )
         from kiro_crew.secrets import SecretVault
+        from kiro_crew.session_environment import (
+            CoderSessionEnvironmentProvider,
+            SessionEnvironmentProvider,
+            SessionEnvironmentRegistry,
+            SessionEnvironmentSelection,
+        )
 
         model = self.agent.model
         if model == DEFAULT_MODEL:
@@ -8251,6 +8256,7 @@ class KiroCrewConfig:
         coder_token = ""
         coder_manager = None
         coder_bin = ""
+        environment_providers: list[SessionEnvironmentProvider] = []
         if coder_cfg.enabled is True:
             try:
                 secret = SecretVault(config_dir()).get(CODER_SESSION_TOKEN_SECRET)
@@ -8271,6 +8277,23 @@ class KiroCrewConfig:
                 max_running=coder_cfg.max_running,
                 local_cwd=config_dir(),
             )
+            environment_providers.append(
+                CoderSessionEnvironmentProvider(
+                    manager=coder_manager,
+                    configurations={
+                        name: (profile.template, profile.preset)
+                        for name, profile in coder_cfg.profiles.items()
+                    },
+                    default_template=coder_cfg.template,
+                    default_preset=coder_cfg.preset,
+                    remote_cwd=coder_cfg.remote_cwd,
+                    coder_bin=coder_bin,
+                    coder_url=coder_cfg.url,
+                    session_token=coder_token,
+                    runtime_warm_minutes=coder_cfg.runtime_warm_minutes,
+                )
+            )
+        environment_registry = SessionEnvironmentRegistry(environment_providers)
 
         # MCP gateway: resolve overlay + socket once, iff some server is stubbed
         # through the gateway. Routing is what puts a stub in the path, and the
@@ -8299,6 +8322,7 @@ class KiroCrewConfig:
             reasoning_effort_override: str | None = None,
             crew_agent: str | None = None,
             coder_profile_override: str | None = None,
+            environment_selection: SessionEnvironmentSelection | None = None,
             session_host_override: Any = None,
             **_kwargs: object,
         ) -> AcpProvider:
@@ -8376,37 +8400,28 @@ class KiroCrewConfig:
                 # Parent sessions include named-agent chat and cron runs. The
                 # configured location is a session default, not an agent-name
                 # default, so selecting a custom agent must not move it local.
-                if coder_cfg.enabled is None:
+                selected_environment = environment_selection
+                if selected_environment is None and coder_profile_override is not None:
+                    selected_environment = SessionEnvironmentSelection(
+                        provider="coder",
+                        configuration=coder_profile_override,
+                    )
+                if selected_environment is not None:
+                    environment_provider = environment_registry.require(
+                        selected_environment.provider
+                    )
+                    configuration = environment_provider.validate_configuration(
+                        selected_environment.configuration
+                    )
+                    session_host = environment_provider.create_session_host(
+                        session_key or "main",
+                        configuration,
+                    )
+                elif coder_cfg.enabled is None:
                     session_host = session_host_from_env(wdir)
                 elif coder_cfg.enabled is True:
-                    if coder_manager is None:  # pragma: no cover - built with enabled config
-                        raise RuntimeError("managed Coder workspace manager is unavailable")
-                    try:
-                        coder_template, coder_preset = coder_cfg.resolve_profile(
-                            coder_profile_override or ""
-                        )
-                    except ValueError:
-                        # A binding is the immutable allocation record. Removing
-                        # a named profile from Settings must not strand a retained
-                        # workspace, but an unknown selection with no binding
-                        # must never fall back to the default template.
-                        existing_binding = coder_manager.registry.get_by_session(
-                            session_key or "main"
-                        )
-                        if existing_binding is None:
-                            raise
-                        coder_template = existing_binding.template
-                        coder_preset = existing_binding.preset
-                    session_host = ManagedCoderWorkspaceSessionHost(
-                        session_key=session_key or "main",
-                        manager=coder_manager,
-                        remote_cwd=coder_cfg.remote_cwd,
-                        coder_bin=coder_bin,
-                        coder_url=coder_cfg.url,
-                        session_token=coder_token,
-                        runtime_warm_minutes=coder_cfg.runtime_warm_minutes,
-                        template=coder_template,
-                        preset=coder_preset,
+                    session_host = environment_registry.require("coder").create_session_host(
+                        session_key or "main", ""
                     )
                 else:
                     session_host = session_host_from_config(
@@ -8437,6 +8452,9 @@ class KiroCrewConfig:
                 session_host=session_host,
             )
 
+        setattr(_acp, "_session_environment_registry", environment_registry)
+        # Compatibility for extensions and older dashboard code during the
+        # provider-neutral migration. New common paths use the registry.
         setattr(_acp, "_coder_manager", coder_manager)
         return _acp
 

@@ -109,7 +109,25 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
 - **Resume guard:** `session/load` is attempted only when the session host confirms the prior transcript. Local hosting checks its local Kiro session path; Coder hosting probes the validated id in the workspace and sends the derived remote path. A stale persisted sid falls back to `session/new`.
 - **Working dir:** `AcpProvider.cwd` overrides the `LLMProvider` ABC default so `session_map` persists the real workspace path. AcpProvider's work_dir lives on the inner client (`_client._work_dir`), so the prior `getattr(provider, "_work_dir", "")` persisted `""` for all ACP sessions — `provider.cwd` fixes resume-cwd-override. A remote session still persists this control-plane path, while its ACP `session/new.cwd` is the session host's normalized POSIX path.
 
-#### Session execution host (Coder)
+#### Session environment providers
+
+`session_environment.py` separates managed compute lifecycle from the LLM
+provider. `SessionEnvironmentRegistry` resolves an explicit
+`SessionEnvironmentSelection(provider, configuration)` to a concrete adapter;
+an unavailable persisted provider raises `SessionEnvironmentUnavailable` and
+never degrades to local execution. `SessionEnvironmentBinding` is the only
+dashboard/history wire object and carries three non-secret strings: provider id,
+provider-owned configuration id, and generated resource name. Protected UUIDs,
+owners, credentials, templates, presets, and deletion intents never enter it.
+
+Adapters create a `RemoteSessionHost`, project safe binding metadata, stop by
+trusted session key, and may positively opt into the gateway lifecycle loop.
+Catalog-shaped objects alone cannot gain periodic mutation authority. Each
+adapter keeps its concrete control-plane trust checks at its own boundary. Coder
+is the first implementation; another provider can join the registry without
+adding common dashboard state or changing ACP runtime dispatch.
+
+#### Coder session environment
 
 `acp/session_host.py` makes the process location an explicit runtime boundary.
 `LocalSessionHost` preserves the existing local spawn path. An explicit
@@ -137,7 +155,7 @@ the live provider for `execution_location`, so a local session is never labeled
 remote merely because the default changed. The owner-only test endpoint probes
 candidate coordinates and bearer without saving or returning them.
 
-The managed host binds each durable parent session key to one generated Coder
+The Coder environment adapter binds each durable parent session key to one generated Coder
 workspace in an owner-only registry. It creates the workspace from the selected
 template/preset on first use, starts a stopped binding on resume, and refuses a
 new parent when the configured running-workspace cap is reached. Descendant

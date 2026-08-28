@@ -258,12 +258,31 @@ class TestSlotModel:
         assert slot.to_dict()["model"] == "claude-opus-4.5"
 
     def test_slot_serializes_selected_coder_profile(self, state: DashboardState) -> None:
+        from kiro_crew.session_environment import SessionEnvironmentBinding
+
         slot = state.get_or_create_slot("coder-profile")
+        slot.environment = SessionEnvironmentBinding("coder", "gpu", "crew-session-kyle-opaque")
+
+        assert slot.to_dict()["environment"] == {
+            "provider": "coder",
+            "configuration": "gpu",
+            "resource_name": "crew-session-kyle-opaque",
+        }
+        assert slot.to_dict()["coder_profile"] == "gpu"
+        assert slot.to_dict()["coder_workspace"] == "crew-session-kyle-opaque"
+
+    def test_legacy_coder_assignment_updates_generic_environment(
+        self, state: DashboardState
+    ) -> None:
+        from kiro_crew.session_environment import SessionEnvironmentBinding
+
+        slot = state.get_or_create_slot("legacy-coder-profile")
         slot.coder_profile = "gpu"
         slot.coder_workspace = "crew-session-kyle-opaque"
 
-        assert slot.to_dict()["coder_profile"] == "gpu"
-        assert slot.to_dict()["coder_workspace"] == "crew-session-kyle-opaque"
+        assert slot.environment == SessionEnvironmentBinding(
+            "coder", "gpu", "crew-session-kyle-opaque"
+        )
 
     def test_model_defaults_empty(self, state: DashboardState) -> None:
         slot = state.get_or_create_slot("test-2")

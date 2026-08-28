@@ -1,9 +1,6 @@
 {
   "coder": {
     "add_profile": "প্রোফাইল যোগ করুন",
-    "default_profile": "ডিফল্ট Coder প্রোফাইল",
-    "profile_badge": "Coder প্রোফাইল · {{profile}}",
-    "profile_change_failed": "Coder প্রোফাইল পরিবর্তন করা যায়নি",
     "profile_name_label": "প্রোফাইলের নাম",
     "profile_preset_label": "{{name}}-এর প্রিসেট",
     "profile_template_label": "{{name}}-এর টেমপ্লেট",
@@ -11,10 +8,7 @@
     "profiles_title": "সেশন প্রোফাইল",
     "remove_profile": "প্রোফাইল সরান",
     "remove_profile_named": "{{name}} প্রোফাইল সরান",
-    "session_profile_label": "এই সেশনের Coder প্রোফাইল",
     "architecture": "গেটওয়ে মেমরি, MCP, OAuth, ক্রন ও পরিচয়পত্র সংরক্ষণ করে। শুধু সেশন প্রক্রিয়াটি Coder-এ চলে; সাবএজেন্টরা সেই ওয়ার্কস্পেস ব্যবহার করে।",
-    "badge_allocating": "Coder ওয়ার্কস্পেস বরাদ্দ করা হচ্ছে",
-    "badge_label": "Coder ওয়ার্কস্পেস · {{workspace}}",
     "connected_to": "{{owner}} হিসেবে সংযুক্ত; {{template}} টেমপ্লেটটি উপলভ্য",
     "connection_failed": "সংযোগ পরীক্ষা ব্যর্থ হয়েছে",
     "control_plane_template": "সম্পূর্ণ AWS কন্ট্রোল প্লেন",
@@ -63,16 +57,21 @@
     "badge_starting": "{{kind}} ওয়ার্কস্পেস চালু হচ্ছে",
     "badge_starting_named": "{{kind}} ওয়ার্কস্পেস চালু হচ্ছে · {{workspace}}",
     "badge_running": "{{kind}} ওয়ার্কস্পেস · {{workspace}}",
+    "configuration_badge": "পরিবেশ কনফিগারেশন · {{configuration}}",
+    "configuration_change_failed": "পরিবেশ কনফিগারেশন পরিবর্তন করা যায়নি",
+    "configuration_label": "পরিবেশ কনফিগারেশন",
     "copy_workspace_id": "ওয়ার্কস্পেস আইডি কপি করুন",
+    "default_configuration": "ডিফল্ট পরিবেশ কনফিগারেশন",
+    "default_configuration_short": "ডিফল্ট",
     "gateway_lost_description": "এই সেশনটি এখনও চলতে পারে। গেটওয়ে আবার সংযুক্ত হলে Kiro Crew আপডেট চালু করবে।",
     "gateway_lost_title": "গেটওয়ে সংযোগ বিচ্ছিন্ন হয়েছে",
     "phase_allocating": "ওয়ার্কস্পেস বরাদ্দ হচ্ছে",
     "phase_connecting": "Kiro Crew ওয়ার্কস্পেসে সংযুক্ত হচ্ছে",
     "phase_provisioning": "কম্পিউট চালু হচ্ছে এবং ওয়ার্কস্পেস এজেন্টের জন্য অপেক্ষা করা হচ্ছে",
-    "profile_label": "প্রোফাইল",
     "provider_label": "প্রদানকারী",
     "settings_tab_description": "নতুন সেশন কোথায় চলবে তা বেছে নিন।",
     "settings_tab_label": "সেশন পরিবেশ",
+    "session_configuration_label": "এই সেশনের পরিবেশ কনফিগারেশন",
     "startup_description": "একটি আলাদা পরিবেশ তৈরি করে এই সেশনের সঙ্গে সংযুক্ত করা হচ্ছে। এতে কয়েক মিনিট লাগতে পারে।",
     "startup_progress_label": "ওয়ার্কস্পেস চালুর অগ্রগতি",
     "startup_queued": "তোমার বার্তা সারিতে আছে। তুমি আরও নির্দেশ যোগ করতে পারো।",
@@ -7262,7 +7261,7 @@
       "working": "কাজ করছে"
     },
     "useSessionActions": {
-      "archive_and_stop_coder_workspace": "“{{title}}” আর্কাইভ করে এর Coder ওয়ার্কস্পেস বন্ধ করবেন?\n\nপ্রোফাইল: {{profile}}\nওয়ার্কস্পেস: {{workspace}}\n\nএতে চলমান টার্ন, টার্মিনাল, বিল্ড ও ব্যাকগ্রাউন্ড প্রসেস শেষ হবে। চ্যাটের ইতিহাস, মেমরি ও স্থায়ী ওয়ার্কস্পেস স্টোরেজ রাখা হবে।",
+      "archive_and_stop_environment": "“{{title}}” আর্কাইভ করে এর {{provider}} পরিবেশ বন্ধ করবেন?\n\nকনফিগারেশন: {{configuration}}\nওয়ার্কস্পেস: {{workspace}}\n\nএতে চলমান টার্ন, টার্মিনাল, বিল্ড ও ব্যাকগ্রাউন্ড প্রসেস শেষ হবে। চ্যাটের ইতিহাস, মেমরি ও স্থায়ী ওয়ার্কস্পেস স্টোরেজ রাখা হবে।",
       "close_this_session": "এই সেশন বন্ধ করবে?",
       "reload_failed": "সেশন পুনরায় লোড ব্যর্থ হয়েছে। এজেন্ট ব্যস্ত থাকতে পারে বা গেটওয়ে পৌঁছানো যাচ্ছে না; সেশন নিষ্ক্রিয় হলে আবার চেষ্টা করুন।",
       "reload_failed_subagents": "এই সেশনে সাব-এজেন্টরা এখনও কাজ করছে। তারা শেষ করলে আবার চেষ্টা করুন।",
@@ -8850,8 +8849,8 @@
       "lane_seed_failed": "স্বয়ংক্রিয় কলাম যোগ করা যায়নি।",
       "lane_seed_retry": "আবার চেষ্টা করুন",
       "lane_legacy_column_hint": "সব সেশন দেখায়",
-      "coder_workspace_will_stop": "{{count}}টি Coder ওয়ার্কস্পেস এখন বন্ধ হবে: {{workspaces}}।",
-      "coder_workspaces_will_stop": "{{count}}টি Coder ওয়ার্কস্পেস এখন বন্ধ হবে: {{workspaces}}।"
+      "environment_will_stop": "{{count}}টি {{provider}} পরিবেশ এখন বন্ধ হবে: {{workspaces}}।",
+      "environments_will_stop": "{{count}}টি পরিচালিত পরিবেশ এখন বন্ধ হবে: {{workspaces}}।"
     },
     "connectionsPage": {
       "action_failed": "অ্যাকশন ব্যর্থ: {{error}}",

@@ -9796,6 +9796,33 @@ class TestSlotTaskNoneGuard:
         assert body["code"] == "coder_workspace_stop_failed"
         assert "s1" in state._slots
 
+    @pytest.mark.asyncio
+    async def test_delete_stops_environment_through_its_owning_provider(
+        self, tmp_path: Path
+    ) -> None:
+        from kiro_crew.session_environment import (
+            SessionEnvironmentBinding,
+            SessionEnvironmentRegistry,
+        )
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        slot.environment = SessionEnvironmentBinding("test-provider", "small", "env-opaque")
+        provider = MagicMock()
+        provider.provider_id = "test-provider"
+        provider.stop_for_session = AsyncMock(return_value="env-opaque")
+        state.sessions.environment_registry = MagicMock(
+            return_value=SessionEnvironmentRegistry([provider])
+        )
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            with patch("kiro_crew.dashboard.chat_handlers.save_slot_off_loop"):
+                resp = await client.delete("/api/chat/slots/s1")
+
+        assert resp.status == 200
+        provider.stop_for_session.assert_awaited_once_with("dashboard:s1")
+        assert "s1" not in state._slots
+
 
 # ── Bulk cleanup tests ──
 
@@ -9862,6 +9889,41 @@ class TestBulkCleanup:
 
         assert resp.status == 200
         manager.stop_for_session.assert_awaited_once_with("dashboard:stale1")
+        assert "stale1" not in state._slots
+
+    @pytest.mark.asyncio
+    async def test_cleanup_stops_environment_through_its_owning_provider(
+        self, tmp_path, monkeypatch
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        from kiro_crew.session_environment import (
+            SessionEnvironmentBinding,
+            SessionEnvironmentRegistry,
+        )
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+        stale = state.get_or_create_slot("stale1")
+        stale.append("user", "old msg", ts=old_ts)
+        stale.drain()
+        stale.environment = SessionEnvironmentBinding("test-provider", "small", "env-opaque")
+        provider = MagicMock()
+        provider.provider_id = "test-provider"
+        provider.stop_for_session = AsyncMock(return_value="env-opaque")
+        state.sessions.environment_registry = MagicMock(
+            return_value=SessionEnvironmentRegistry([provider])
+        )
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/cleanup",
+                json={"max_inactive_days": 3},
+            )
+
+        assert resp.status == 200
+        provider.stop_for_session.assert_awaited_once_with("dashboard:stale1")
         assert "stale1" not in state._slots
 
     @pytest.mark.asyncio
@@ -11575,20 +11637,33 @@ class TestRegenerateAndVariants:
 
     @pytest.mark.asyncio
     async def test_restore_preserves_allocated_coder_workspace(self, tmp_path, monkeypatch):
+        from kiro_crew.session_environment import SessionEnvironmentBinding
+
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
         slot = state.get_or_create_slot("coder-session")
-        slot.coder_profile = "cpu-large"
-        slot.coder_workspace = "crew-session-kyle-opaque"
+        slot.environment = SessionEnvironmentBinding(
+            "coder", "cpu-large", "crew-session-kyle-opaque"
+        )
         slot.append("user", "keep this session")
         slot.drain()
         from kiro_crew.dashboard.chat import _save_slot_to_history, restore_recent_sessions
 
         _save_slot_to_history(state, slot, force=True)
+        history_path = tmp_path / "dashboard_coder-session.jsonl"
+        metadata = json.loads(history_path.read_text(encoding="utf-8").splitlines()[0])
+        assert metadata["environment"] == {
+            "provider": "coder",
+            "configuration": "cpu-large",
+            "resource_name": "crew-session-kyle-opaque",
+        }
+        assert "coder_profile" not in metadata
+        assert "coder_workspace" not in metadata
         state._slots.clear()
         restore_recent_sessions(state, window_minutes=9999)
 
         restored = state._slots["coder-session"]
+        assert restored.environment == slot.environment
         assert restored.coder_profile == "cpu-large"
         assert restored.coder_workspace == "crew-session-kyle-opaque"
 

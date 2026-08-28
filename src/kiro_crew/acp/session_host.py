@@ -9,6 +9,7 @@ import re
 import secrets
 import shlex
 import shutil
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
@@ -168,7 +169,94 @@ class LocalSessionHost:
         return str(self._work_dir)
 
 
-class CoderWorkspaceSessionHost:
+class RemoteSessionHost(ABC):
+    """Base contract for a remotely hosted ACP runtime.
+
+    Concrete providers own their transport and lifecycle implementation. ACP
+    common paths use this positive capability instead of naming one provider.
+    """
+
+    @property
+    def is_remote(self) -> bool:
+        return True
+
+    @property
+    @abstractmethod
+    def protocol_cwd(self) -> str:
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def execution_location(self) -> dict[str, str]:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def start_bridge(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def clone(self) -> "RemoteSessionHost":
+        raise NotImplementedError
+
+    @abstractmethod
+    def spawn_argv(self, *, agent: str, model: str) -> list[str]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def transport_env(self, environ: Mapping[str, str]) -> dict[str, str]:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def prepare(
+        self,
+        *,
+        agent: str,
+        projected_spec: Mapping[str, object],
+        environ: Mapping[str, str],
+        local_cwd: str | Path,
+    ) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def prepare_session_capabilities(
+        self,
+        *,
+        agent_spec: Mapping[str, object],
+        session_key: str,
+        environ: Mapping[str, str],
+        local_cwd: str | Path,
+    ) -> list[dict[str, object]]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def revoke_session_grants(self, session_key: str) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def remote_session_file(self, session_id: str) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def session_file_exists(
+        self,
+        session_id: str,
+        *,
+        environ: Mapping[str, str],
+        local_cwd: str | Path,
+    ) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def close(
+        self,
+        *,
+        environ: Mapping[str, str] | None = None,
+        local_cwd: str | Path | None = None,
+    ) -> None:
+        raise NotImplementedError
+
+
+class CoderWorkspaceSessionHost(RemoteSessionHost):
     """A kiro-cli process reached through a Coder workspace SSH channel."""
 
     def __init__(

@@ -1,9 +1,6 @@
 {
   "coder": {
     "add_profile": "प्रोफ़ाइल जोड़ें",
-    "default_profile": "डिफ़ॉल्ट Coder प्रोफ़ाइल",
-    "profile_badge": "Coder प्रोफ़ाइल · {{profile}}",
-    "profile_change_failed": "Coder प्रोफ़ाइल बदली नहीं जा सकी",
     "profile_name_label": "प्रोफ़ाइल नाम",
     "profile_preset_label": "{{name}} के लिए प्रीसेट",
     "profile_template_label": "{{name}} के लिए टेम्पलेट",
@@ -11,10 +8,7 @@
     "profiles_title": "सत्र प्रोफ़ाइल",
     "remove_profile": "प्रोफ़ाइल हटाएँ",
     "remove_profile_named": "प्रोफ़ाइल {{name}} हटाएँ",
-    "session_profile_label": "इस सत्र के लिए Coder प्रोफ़ाइल",
     "architecture": "गेटवे मेमोरी, MCP, OAuth, क्रॉन और क्रेडेंशियल संभालता है। केवल सत्र प्रक्रिया Coder में चलती है; सबएजेंट वही वर्कस्पेस अपनाते हैं।",
-    "badge_allocating": "Coder वर्कस्पेस आवंटित हो रहा है",
-    "badge_label": "Coder वर्कस्पेस · {{workspace}}",
     "connected_to": "{{owner}} के रूप में कनेक्ट; टेम्पलेट {{template}} उपलब्ध है",
     "connection_failed": "कनेक्शन परीक्षण विफल रहा",
     "control_plane_template": "पूरा AWS कंट्रोल प्लेन",
@@ -63,16 +57,21 @@
     "badge_starting": "{{kind}} वर्कस्पेस शुरू हो रहा है",
     "badge_starting_named": "{{kind}} वर्कस्पेस शुरू हो रहा है · {{workspace}}",
     "badge_running": "{{kind}} वर्कस्पेस · {{workspace}}",
+    "configuration_badge": "परिवेश कॉन्फ़िगरेशन · {{configuration}}",
+    "configuration_change_failed": "परिवेश कॉन्फ़िगरेशन बदला नहीं जा सका",
+    "configuration_label": "परिवेश कॉन्फ़िगरेशन",
     "copy_workspace_id": "वर्कस्पेस आईडी कॉपी करें",
+    "default_configuration": "डिफ़ॉल्ट परिवेश कॉन्फ़िगरेशन",
+    "default_configuration_short": "डिफ़ॉल्ट",
     "gateway_lost_description": "यह सत्र अभी भी चल रहा हो सकता है। गेटवे के फिर से जुड़ने पर Kiro Crew अपडेट फिर शुरू करेगा।",
     "gateway_lost_title": "गेटवे कनेक्शन टूट गया",
     "phase_allocating": "वर्कस्पेस आवंटित किया जा रहा है",
     "phase_connecting": "Kiro Crew को वर्कस्पेस से जोड़ा जा रहा है",
     "phase_provisioning": "कंप्यूट शुरू हो रहा है और वर्कस्पेस एजेंट की प्रतीक्षा की जा रही है",
-    "profile_label": "प्रोफ़ाइल",
     "provider_label": "प्रदाता",
     "settings_tab_description": "चुनें कि नए सत्र कहाँ चलें।",
     "settings_tab_label": "सत्र परिवेश",
+    "session_configuration_label": "इस सत्र के लिए परिवेश कॉन्फ़िगरेशन",
     "startup_description": "एक अलग वातावरण बनाया जा रहा है और इस सत्र से जोड़ा जा रहा है। इसमें कुछ मिनट लग सकते हैं।",
     "startup_progress_label": "वर्कस्पेस शुरू होने की प्रगति",
     "startup_queued": "तुम्हारा संदेश कतार में है। तुम और निर्देश जोड़ सकते हो।",
@@ -7262,7 +7261,7 @@
       "working": "काम कर रहा है"
     },
     "useSessionActions": {
-      "archive_and_stop_coder_workspace": "“{{title}}” को आर्काइव करके उसका Coder वर्कस्पेस रोकें?\n\nप्रोफ़ाइल: {{profile}}\nवर्कस्पेस: {{workspace}}\n\nइससे चल रहा टर्न, टर्मिनल, बिल्ड और बैकग्राउंड प्रोसेस समाप्त हो जाएंगे। चैट इतिहास, मेमरी और स्थायी वर्कस्पेस स्टोरेज सुरक्षित रहेंगे।",
+      "archive_and_stop_environment": "“{{title}}” को आर्काइव करके उसका {{provider}} परिवेश रोकें?\n\nकॉन्फ़िगरेशन: {{configuration}}\nवर्कस्पेस: {{workspace}}\n\nइससे चल रहा टर्न, टर्मिनल, बिल्ड और बैकग्राउंड प्रोसेस समाप्त हो जाएंगे। चैट इतिहास, मेमरी और स्थायी वर्कस्पेस स्टोरेज सुरक्षित रहेंगे।",
       "close_this_session": "यह सेशन बंद करें?",
       "reload_failed": "सत्र फिर से लोड नहीं हो सका। एजेंट व्यस्त हो सकता है या गेटवे उपलब्ध नहीं है; सत्र निष्क्रिय होने पर पुनः प्रयास करें।",
       "reload_failed_subagents": "इस सत्र पर उप-एजेंट अभी भी काम कर रहे हैं। उनके समाप्त होने पर पुनः प्रयास करें।",
@@ -8850,8 +8849,8 @@
       "lane_seed_failed": "स्वचालित कॉलम नहीं जोड़ सके।",
       "lane_seed_retry": "फिर कोशिश करो",
       "lane_legacy_column_hint": "सभी सत्र दिखाता है",
-      "coder_workspace_will_stop": "{{count}} Coder वर्कस्पेस अब रुकेगा: {{workspaces}}।",
-      "coder_workspaces_will_stop": "{{count}} Coder वर्कस्पेस अब रुकेंगे: {{workspaces}}।"
+      "environment_will_stop": "{{count}} {{provider}} परिवेश अब रुकेगा: {{workspaces}}।",
+      "environments_will_stop": "{{count}} प्रबंधित परिवेश अब रुकेंगे: {{workspaces}}।"
     },
     "connectionsPage": {
       "action_failed": "कार्रवाई विफल: {{error}}",

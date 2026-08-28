@@ -9,9 +9,11 @@ import { IconButton } from './ui'
 export function ExecutionLocationBadge({
   detailLabel,
   location,
+  providerLabel,
 }: {
   detailLabel?: string
   location?: ExecutionLocation
+  providerLabel?: string
 }) {
   const { t } = useTranslation()
   const [copied, setCopied] = useState(false)
@@ -24,20 +26,17 @@ export function ExecutionLocationBadge({
   const starting = location.state === 'starting'
   const ready = location.state === 'running'
   let label: string
-  if (location.kind === 'coder') {
-    label = location.workspace
-      ? t('coder.badge_label', { workspace: location.workspace })
-      : t('coder.badge_allocating')
-  } else if (starting) {
+  const kind = providerLabel || (location.kind === 'coder' ? t('coder.tab_label') : location.kind)
+  if (starting) {
     label = location.workspace
       ? t('execution_environment.badge_starting_named', {
-          kind: location.kind,
+          kind,
           workspace: location.workspace,
         })
-      : t('execution_environment.badge_starting', { kind: location.kind })
+      : t('execution_environment.badge_starting', { kind })
   } else {
     label = t('execution_environment.badge_running', {
-      kind: location.kind,
+      kind,
       workspace: location.workspace,
     })
   }

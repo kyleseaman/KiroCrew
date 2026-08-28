@@ -18,6 +18,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Coroutine, Iterator
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
@@ -66,6 +67,7 @@ from kiro_crew.release_channel import channel as _release_channel_of_build
 from kiro_crew.safety_override import safety_override
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+from kiro_crew.session_environment import SessionEnvironmentBinding
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard._types import (  # noqa: F401
@@ -2593,8 +2595,7 @@ class _ChatSlot:
         "title",
         "agent",
         "model",
-        "coder_profile",
-        "coder_workspace",
+        "environment",
         "reasoning_effort",
         "mode",
         "workspace",
@@ -2740,12 +2741,10 @@ class _ChatSlot:
         self.title = title or key
         self.agent = agent
         self.model = model
-        # Empty selects the Settings default. A named value is immutable after
-        # this parent allocates its managed Coder workspace.
-        self.coder_profile: str = ""
-        # Durable generated name for an allocated managed Coder workspace. The
-        # live provider descriptor disappears when its ACP runtime idles out.
-        self.coder_workspace: str = ""
+        # Allocation intent and durable public identity for a managed session
+        # environment. Provider-owned secrets and immutable lifecycle records
+        # remain outside dashboard state.
+        self.environment: SessionEnvironmentBinding | None = None
         # Reasoning effort: "" = provider default, else one of low/medium/high/max.
         # Currently consumed by an alternate ACP backend (--effort flag); ACP wired later.
         self.reasoning_effort: str = ""
@@ -3241,6 +3240,42 @@ class _ChatSlot:
         # "the agent is done and asked you something", and which entries a user
         # message may retire.
         self._question_pending: dict[str, dict] = {}
+
+    @property
+    def coder_profile(self) -> str:
+        """Legacy Coder projection backed by the generic environment binding."""
+        environment = self.environment
+        if environment is None or environment.provider != "coder":
+            return ""
+        return environment.configuration
+
+    @coder_profile.setter
+    def coder_profile(self, value: str) -> None:
+        environment = self.environment
+        if environment is None:
+            self.environment = SessionEnvironmentBinding("coder", value, "")
+            return
+        if environment.provider != "coder":
+            raise ValueError("Coder profile cannot replace another environment provider")
+        self.environment = replace(environment, configuration=value)
+
+    @property
+    def coder_workspace(self) -> str:
+        """Legacy Coder resource-name projection for cached dashboard clients."""
+        environment = self.environment
+        if environment is None or environment.provider != "coder":
+            return ""
+        return environment.resource_name
+
+    @coder_workspace.setter
+    def coder_workspace(self, value: str) -> None:
+        environment = self.environment
+        if environment is None:
+            self.environment = SessionEnvironmentBinding("coder", "", value)
+            return
+        if environment.provider != "coder":
+            raise ValueError("Coder workspace cannot replace another environment provider")
+        self.environment = replace(environment, resource_name=value)
 
     @property
     def _dirty(self) -> bool:
@@ -4444,6 +4479,7 @@ class _ChatSlot:
             "title": _redact(self.display_title),
             "agent": self.agent,
             "model": self.model,
+            "environment": self.environment.to_dict() if self.environment is not None else None,
             "coder_profile": self.coder_profile,
             "coder_workspace": self.coder_workspace,
             "reasoning_effort": self.reasoning_effort,

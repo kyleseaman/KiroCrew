@@ -33,7 +33,12 @@ CODER_DEFAULT_DELETE_AFTER_DAYS = 30
 CODER_DEFAULT_MAX_RUNNING = 3
 CODER_DEFAULT_WORKSPACE_PREFIX = "crew-session"
 CODER_MAX_PROFILES = 16
-CODER_RECONCILE_INTERVAL_SECONDS = 60 * 60
+
+# Provider lifecycle adapters may request a shorter cadence, while this value
+# bounds how long the gateway waits before discovering a newly enabled adapter.
+SESSION_ENVIRONMENT_RECONCILE_INTERVAL_SECONDS = 60 * 60
+# Compatibility for integrations that imported the original Coder-specific name.
+CODER_RECONCILE_INTERVAL_SECONDS = SESSION_ENVIRONMENT_RECONCILE_INTERVAL_SECONDS
 
 # Provider-neutral startup stages exposed to dashboard clients. Execution hosts
 # may have different lifecycle mechanics, but these are the user-observable

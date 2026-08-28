@@ -1,9 +1,6 @@
 {
   "coder": {
     "add_profile": "Añadir perfil",
-    "default_profile": "Perfil predeterminado de Coder",
-    "profile_badge": "Perfil de Coder · {{profile}}",
-    "profile_change_failed": "No se pudo cambiar el perfil de Coder",
     "profile_name_label": "Nombre del perfil",
     "profile_preset_label": "Preajuste para {{name}}",
     "profile_template_label": "Plantilla para {{name}}",
@@ -11,10 +8,7 @@
     "profiles_title": "Perfiles de sesión",
     "remove_profile": "Eliminar perfil",
     "remove_profile_named": "Eliminar el perfil {{name}}",
-    "session_profile_label": "Perfil de Coder para esta sesión",
     "architecture": "El gateway conserva la memoria, MCP, OAuth, cron y las credenciales. Solo el proceso de sesión se ejecuta en Coder; los subagentes heredan ese espacio de trabajo.",
-    "badge_allocating": "Asignando espacio de trabajo de Coder",
-    "badge_label": "Espacio de Coder · {{workspace}}",
     "connected_to": "Conectado como {{owner}}; la plantilla {{template}} está disponible",
     "connection_failed": "Falló la prueba de conexión",
     "control_plane_template": "Plano de control de AWS completo",
@@ -63,16 +57,21 @@
     "badge_starting": "Iniciando espacio de trabajo de {{kind}}",
     "badge_starting_named": "Iniciando espacio de trabajo de {{kind}} · {{workspace}}",
     "badge_running": "Espacio de trabajo de {{kind}} · {{workspace}}",
+    "configuration_badge": "Configuración del entorno · {{configuration}}",
+    "configuration_change_failed": "No se pudo cambiar la configuración del entorno",
+    "configuration_label": "Configuración del entorno",
     "copy_workspace_id": "Copiar ID del espacio de trabajo",
+    "default_configuration": "Configuración predeterminada del entorno",
+    "default_configuration_short": "Predeterminada",
     "gateway_lost_description": "Es posible que esta sesión siga ejecutándose. Kiro Crew reanudará las actualizaciones cuando el gateway vuelva a conectarse.",
     "gateway_lost_title": "Se perdió la conexión con el gateway",
     "phase_allocating": "Asignando el espacio de trabajo",
     "phase_connecting": "Conectando Kiro Crew al espacio de trabajo",
     "phase_provisioning": "Iniciando el cómputo y esperando al agente del espacio de trabajo",
-    "profile_label": "Perfil",
     "provider_label": "Proveedor",
     "settings_tab_description": "Elige dónde se ejecutan las sesiones nuevas.",
     "settings_tab_label": "Entornos de sesión",
+    "session_configuration_label": "Configuración del entorno para esta sesión",
     "startup_description": "Se está creando un entorno aislado y conectándolo a esta sesión. Esto puede tardar unos minutos.",
     "startup_progress_label": "Progreso de inicio del espacio de trabajo",
     "startup_queued": "Tu mensaje está en cola. Puedes seguir añadiendo instrucciones.",
@@ -7353,7 +7352,7 @@
       "working": "Trabajando"
     },
     "useSessionActions": {
-      "archive_and_stop_coder_workspace": "¿Archivar «{{title}}» y detener su espacio de trabajo de Coder?\n\nPerfil: {{profile}}\nEspacio de trabajo: {{workspace}}\n\nEsto finaliza el turno en curso, las terminales, las compilaciones y los procesos en segundo plano. Se conservan el historial del chat, la memoria y el almacenamiento persistente del espacio de trabajo.",
+      "archive_and_stop_environment": "¿Archivar «{{title}}» y detener su entorno de {{provider}}?\n\nConfiguración: {{configuration}}\nEspacio de trabajo: {{workspace}}\n\nEsto finaliza el turno en curso, las terminales, las compilaciones y los procesos en segundo plano. Se conservan el historial del chat, la memoria y el almacenamiento persistente del espacio de trabajo.",
       "close_this_session": "¿Cerrar esta sesión?",
       "reload_failed": "No se pudo recargar la sesión. Puede que el agente esté respondiendo o que el gateway no esté accesible; inténtalo de nuevo cuando la sesión esté inactiva.",
       "reload_failed_subagents": "Los subagentes siguen trabajando en esta sesión. Inténtalo de nuevo cuando terminen.",
@@ -8962,8 +8961,8 @@
       "lane_seed_failed": "No se pudieron añadir las columnas automáticas.",
       "lane_seed_retry": "Reintentar",
       "lane_legacy_column_hint": "muestra todas las sesiones",
-      "coder_workspace_will_stop": "{{count}} espacio de trabajo de Coder se detendrá ahora: {{workspaces}}.",
-      "coder_workspaces_will_stop": "{{count}} espacios de trabajo de Coder se detendrán ahora: {{workspaces}}."
+      "environment_will_stop": "{{count}} entorno de {{provider}} se detendrá ahora: {{workspaces}}.",
+      "environments_will_stop": "{{count}} entornos administrados se detendrán ahora: {{workspaces}}."
     },
     "connectionsPage": {
       "action_failed": "La acción falló: {{error}}",

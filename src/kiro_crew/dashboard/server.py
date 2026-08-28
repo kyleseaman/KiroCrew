@@ -31,14 +31,13 @@ from kiro_crew.browser_cli import snapshots as browser_cli_snapshots
 from kiro_crew.browser_cli import token as browser_cli_token
 from kiro_crew.browser_cli import view as browser_cli_view
 from kiro_crew.channel_transcript_migration import migrate_channel_transcripts
-from kiro_crew.coder.manager import CoderWorkspaceManager
 from kiro_crew.config import data_home
 from kiro_crew.config.loader import (
     KiroCrewConfig,
     refresh_config_meta_stamp,
     refresh_materialized_agents,
 )
-from kiro_crew.constants import CODER_RECONCILE_INTERVAL_SECONDS
+from kiro_crew.constants import SESSION_ENVIRONMENT_RECONCILE_INTERVAL_SECONDS
 from kiro_crew.dashboard import (
     cautious_boot,
     channel_slots,
@@ -2065,24 +2064,33 @@ def _register_browser_view_cleanup(app: web.Application) -> None:
     app.on_cleanup.append(_browser_view_shutdown)
 
 
-def _register_coder_lifecycle(app: web.Application, state: DashboardState) -> None:
-    """Reconcile only integrity-bound managed workspaces while the gateway runs."""
+def _register_session_environment_lifecycle(app: web.Application, state: DashboardState) -> None:
+    """Run maintenance only for positively registered lifecycle adapters."""
+
+    from kiro_crew.session_environment import SessionEnvironmentLifecycleProvider
 
     async def _loop() -> None:
         while True:
-            manager_getter = getattr(state.sessions, "coder_workspace_manager", None)
-            manager = manager_getter() if callable(manager_getter) else None
-            interval = CODER_RECONCILE_INTERVAL_SECONDS
-            # Test doubles and optional integrations can synthesize arbitrary
-            # attributes via ``__getattr__``.  Only the concrete gateway-owned
-            # manager is authorized to drive workspace lifecycle mutations.
-            if isinstance(manager, CoderWorkspaceManager):
+            interval = SESSION_ENVIRONMENT_RECONCILE_INTERVAL_SECONDS
+            registry_getter = getattr(state.sessions, "environment_registry", None)
+            registry = registry_getter() if callable(registry_getter) else None
+            providers = registry.providers() if registry is not None else ()
+            for provider in providers:
+                # A catalog-shaped object never gains lifecycle authority. The
+                # concrete adapter owns any additional provider-specific trust
+                # checks before it mutates its control plane.
+                if not isinstance(provider, SessionEnvironmentLifecycleProvider):
+                    continue
                 try:
-                    await manager.reconcile_active_scopes()
-                    await manager.reconcile_retention()
+                    await provider.reconcile_lifecycle()
                 except Exception:  # noqa: BLE001 - lifecycle outage must not stop gateway
-                    logger.warning("Managed Coder lifecycle reconciliation failed", exc_info=True)
-                interval = min(interval, manager.scope_reconcile_interval_seconds)
+                    logger.warning(
+                        "Managed session environment lifecycle reconciliation failed",
+                        exc_info=True,
+                    )
+                provider_interval = provider.lifecycle_interval_seconds
+                if provider_interval is not None:
+                    interval = min(interval, provider_interval)
             await asyncio.sleep(interval)
 
     async def _startup(_app: web.Application) -> None:
@@ -2819,7 +2827,7 @@ async def start_dashboard(
         client_max_size=60 * 1024 * 1024
     )  # 60 MB: covers 50 MB upload + multipart overhead
     app["state"] = state
-    _register_coder_lifecycle(app, state)
+    _register_session_environment_lifecycle(app, state)
     # Bind the serving loop once, here: this runs ON that loop, so every
     # surface that later hands work in from a foreign thread -- slots
     # coalescing, an off-loop websocket send, the log handler's fan-out --
@@ -3825,7 +3833,7 @@ async def start_api_server(
         client_max_size=60 * 1024 * 1024
     )  # 60 MB: covers 50 MB upload + multipart overhead
     app["state"] = state
-    _register_coder_lifecycle(app, state)
+    _register_session_environment_lifecycle(app, state)
     # Bind the serving loop once, here: this runs ON that loop, so every
     # surface that later hands work in from a foreign thread -- slots
     # coalescing, an off-loop websocket send, the log handler's fan-out --

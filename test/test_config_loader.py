@@ -3878,6 +3878,51 @@ class TestOrchestratorWatchdogThemeAreParsed:
         with pytest.raises(ValueError, match="Unknown Coder profile"):
             factory("other", agent="kirocrew", coder_profile_override="missing")
 
+    def test_factory_exposes_generic_environment_registry_and_selection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kiro_crew.acp.session_host as host_mod
+        import kiro_crew.config.loader as loader_mod
+        import kiro_crew.providers.acp as acp_mod
+        from kiro_crew.secrets import SecretVault
+        from kiro_crew.session_environment import SessionEnvironmentSelection
+
+        captured: list[dict] = []
+
+        class _FakeProvider:
+            def __init__(self, **kwargs: object) -> None:
+                captured.append(kwargs)
+
+        monkeypatch.setattr(acp_mod, "AcpProvider", _FakeProvider)
+        monkeypatch.setattr(loader_mod, "config_dir", lambda: tmp_path)
+        monkeypatch.setattr(host_mod.shutil, "which", lambda command, path=None: "/opt/coder")
+        SecretVault(tmp_path)._set_sync(host_mod.CODER_SESSION_TOKEN_SECRET, "vault-token")
+        cfg = _load_from_dict(
+            {
+                "session": {
+                    "coder": {
+                        "enabled": True,
+                        "url": "https://coder.example",
+                        "template": "kirocrew-arm",
+                        "profiles": {"gpu": {"template": "kirocrew-gpu", "preset": "gpu-medium"}},
+                    }
+                }
+            }
+        )
+        factory = cfg.create_provider_factory()
+
+        registry = factory._session_environment_registry
+        assert registry.catalog()[0]["id"] == "coder"
+        factory(
+            "main",
+            agent="kirocrew",
+            environment_selection=SessionEnvironmentSelection("coder", "gpu"),
+        )
+
+        host = captured[0]["session_host"]
+        assert isinstance(host, host_mod.ManagedCoderWorkspaceSessionHost)
+        assert (host._template, host._preset) == ("kirocrew-gpu", "gpu-medium")
+
     def test_factory_prefers_explicit_inherited_session_host(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

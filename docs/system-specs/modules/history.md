@@ -8,18 +8,20 @@ Persistent conversation history with provenance tracking and LLM-driven consolid
 
 Per-thread JSONL files at `~/.kiro/crew/sessions/{safe_key}.jsonl`. First line is metadata, subsequent lines are messages with `role`, `content`, `ts`, `tools`, `source_thread`, `source_user`. A writer can also supply `cls` (presentation class) and `mid` — persisted as `meta.mid`, the same field shape the dashboard slot save writes, so a dual-write injector's durable copy carries the SAME delivery identity as its in-memory window copy and a bounded slot-detail read reconciles the two as one message instead of re-appending the injection. A row appended without an id carries no `meta` at all (the pre-id shape readers keep an id-less fallback for; existing transcripts are never migrated).
 
-Dashboard slot metadata owns `coder_profile` and the non-secret generated
-`coder_workspace` name. Open-slot and recent-session restore paths rehydrate
-them so a session keeps both its selected named Coder profile and the exact
-workspace shown in archive confirmations after its live ACP runtime idles out
-or the gateway restarts. The profile value is allocation intent only: after a
-workspace binding exists, the integrity-protected binding's template and preset
-remain authoritative and the slot cannot redirect them.
+Dashboard slot metadata owns a provider-neutral `environment` object with
+`provider`, `configuration`, and the non-secret generated `resource_name`.
+Open-slot and recent-session restore paths rehydrate it so a session keeps its
+selected environment configuration and exact resource label after its live ACP
+runtime idles out or the gateway restarts. Legacy `coder_profile` and
+`coder_workspace` metadata is accepted on read and projected into that object;
+the next save strips the legacy keys. The public binding is allocation intent
+and display identity only: provider-owned protected records remain authoritative
+for destructive lifecycle operations and cannot be redirected by slot metadata.
 
-Archiving a slot with that binding stops its exact managed Coder workspace before
+Archiving a slot with that binding dispatches shutdown to its owning provider before
 the slot is removed from the active dashboard. The transcript, memory,
-`coder_profile`, workspace binding, and persistent template resources remain
-restorable; restoring the conversation starts the same workspace. A stop failure
+environment binding, protected provider record, and persistent resources remain
+restorable; restoring the conversation starts the same environment. A stop failure
 leaves the slot active instead of recording an archive whose compute may still be
 running. Bulk cleanup reports such a slot as failed and continues with the other
 independently bound sessions.

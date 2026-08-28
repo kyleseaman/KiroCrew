@@ -1,9 +1,6 @@
 {
   "coder": {
     "add_profile": "프로필 추가",
-    "default_profile": "기본 Coder 프로필",
-    "profile_badge": "Coder 프로필 · {{profile}}",
-    "profile_change_failed": "Coder 프로필을 변경할 수 없음",
     "profile_name_label": "프로필 이름",
     "profile_preset_label": "{{name}} 프리셋",
     "profile_template_label": "{{name}} 템플릿",
@@ -11,10 +8,7 @@
     "profiles_title": "세션 프로필",
     "remove_profile": "프로필 제거",
     "remove_profile_named": "{{name}} 프로필 제거",
-    "session_profile_label": "이 세션의 Coder 프로필",
     "architecture": "게이트웨이가 메모리, MCP, OAuth, cron 및 자격 증명을 보관합니다. 세션 프로세스만 Coder에서 실행되며 하위 에이전트는 해당 워크스페이스를 상속합니다.",
-    "badge_allocating": "Coder 워크스페이스 할당 중",
-    "badge_label": "Coder 워크스페이스 · {{workspace}}",
     "connected_to": "{{owner}} 사용자로 연결됨; {{template}} 템플릿 사용 가능",
     "connection_failed": "연결 테스트 실패",
     "control_plane_template": "전체 AWS 컨트롤 플레인",
@@ -63,16 +57,21 @@
     "badge_starting": "{{kind}} 워크스페이스 시작 중",
     "badge_starting_named": "{{kind}} 워크스페이스 시작 중 · {{workspace}}",
     "badge_running": "{{kind}} 워크스페이스 · {{workspace}}",
+    "configuration_badge": "환경 구성 · {{configuration}}",
+    "configuration_change_failed": "환경 구성을 변경할 수 없습니다",
+    "configuration_label": "환경 구성",
     "copy_workspace_id": "워크스페이스 ID 복사",
+    "default_configuration": "기본 환경 구성",
+    "default_configuration_short": "기본값",
     "gateway_lost_description": "이 세션은 계속 실행 중일 수 있습니다. 게이트웨이가 다시 연결되면 Kiro Crew가 업데이트를 재개합니다.",
     "gateway_lost_title": "게이트웨이 연결이 끊어졌습니다",
     "phase_allocating": "워크스페이스 할당 중",
     "phase_connecting": "Kiro Crew를 워크스페이스에 연결 중",
     "phase_provisioning": "컴퓨팅을 시작하고 워크스페이스 에이전트를 기다리는 중",
-    "profile_label": "프로필",
     "provider_label": "제공자",
     "settings_tab_description": "새 세션을 실행할 위치를 선택하세요.",
     "settings_tab_label": "세션 환경",
+    "session_configuration_label": "이 세션의 환경 구성",
     "startup_description": "격리된 환경을 만들고 이 세션에 연결하고 있습니다. 몇 분 정도 걸릴 수 있습니다.",
     "startup_progress_label": "워크스페이스 시작 진행률",
     "startup_queued": "메시지가 대기열에 추가되었습니다. 계속 지시를 추가할 수 있습니다.",
@@ -7171,7 +7170,7 @@
       "working": "작업 중"
     },
     "useSessionActions": {
-      "archive_and_stop_coder_workspace": "‘{{title}}’을(를) 보관하고 해당 Coder 워크스페이스를 중지할까요?\n\n프로필: {{profile}}\n워크스페이스: {{workspace}}\n\n실행 중인 턴, 터미널, 빌드 및 백그라운드 프로세스가 종료됩니다. 채팅 기록, 메모리 및 영구 워크스페이스 저장소는 유지됩니다.",
+      "archive_and_stop_environment": "‘{{title}}’을(를) 보관하고 해당 {{provider}} 환경을 중지할까요?\n\n구성: {{configuration}}\n워크스페이스: {{workspace}}\n\n실행 중인 턴, 터미널, 빌드 및 백그라운드 프로세스가 종료됩니다. 채팅 기록, 메모리 및 영구 워크스페이스 저장소는 유지됩니다.",
       "close_this_session": "이 세션을 닫으시겠습니까?",
       "reload_failed": "세션 다시 로드에 실패했습니다. 에이전트가 응답 중이거나 게이트웨이에 연결할 수 없습니다. 세션이 유휴 상태일 때 다시 시도하세요.",
       "reload_failed_subagents": "이 세션의 하위 에이전트가 아직 작업 중입니다. 완료된 후 다시 시도하세요.",
@@ -8738,8 +8737,8 @@
       "lane_seed_failed": "자동 칼럼을 추가할 수 없습니다.",
       "lane_seed_retry": "다시 시도",
       "lane_legacy_column_hint": "모든 세션 표시",
-      "coder_workspace_will_stop": "Coder 워크스페이스 {{count}}개를 지금 중지합니다: {{workspaces}}.",
-      "coder_workspaces_will_stop": "Coder 워크스페이스 {{count}}개를 지금 중지합니다: {{workspaces}}."
+      "environment_will_stop": "{{provider}} 환경 {{count}}개를 지금 중지합니다: {{workspaces}}.",
+      "environments_will_stop": "관리 환경 {{count}}개를 지금 중지합니다: {{workspaces}}."
     },
     "connectionsPage": {
       "action_failed": "작업에 실패했습니다: {{error}}",

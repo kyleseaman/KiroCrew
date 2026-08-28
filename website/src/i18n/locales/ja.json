@@ -1,9 +1,6 @@
 {
   "coder": {
     "add_profile": "プロファイルを追加",
-    "default_profile": "既定の Coder プロファイル",
-    "profile_badge": "Coder プロファイル · {{profile}}",
-    "profile_change_failed": "Coder プロファイルを変更できませんでした",
     "profile_name_label": "プロファイル名",
     "profile_preset_label": "{{name}} のプリセット",
     "profile_template_label": "{{name}} のテンプレート",
@@ -11,10 +8,7 @@
     "profiles_title": "セッションプロファイル",
     "remove_profile": "プロファイルを削除",
     "remove_profile_named": "プロファイル {{name}} を削除",
-    "session_profile_label": "このセッションの Coder プロファイル",
     "architecture": "ゲートウェイがメモリ、MCP、OAuth、cron、認証情報を保持します。Coder で動作するのはセッションプロセスだけで、サブエージェントはそのワークスペースを引き継ぎます。",
-    "badge_allocating": "Coder ワークスペースを割り当て中",
-    "badge_label": "Coder ワークスペース · {{workspace}}",
     "connected_to": "{{owner}} として接続しました。テンプレート {{template}} を利用できます",
     "connection_failed": "接続テストに失敗しました",
     "control_plane_template": "完全な AWS コントロールプレーン",
@@ -63,16 +57,21 @@
     "badge_starting": "{{kind}} ワークスペースを起動中",
     "badge_starting_named": "{{kind}} ワークスペースを起動中 · {{workspace}}",
     "badge_running": "{{kind}} ワークスペース · {{workspace}}",
+    "configuration_badge": "環境構成 · {{configuration}}",
+    "configuration_change_failed": "環境構成を変更できませんでした",
+    "configuration_label": "環境構成",
     "copy_workspace_id": "ワークスペース ID をコピー",
+    "default_configuration": "デフォルトの環境構成",
+    "default_configuration_short": "デフォルト",
     "gateway_lost_description": "このセッションはまだ実行中の可能性があります。ゲートウェイが再接続すると、Kiro Crew は更新を再開します。",
     "gateway_lost_title": "ゲートウェイ接続が失われました",
     "phase_allocating": "ワークスペースを割り当てています",
     "phase_connecting": "Kiro Crew をワークスペースに接続しています",
     "phase_provisioning": "コンピュートを起動し、ワークスペースエージェントを待機しています",
-    "profile_label": "プロファイル",
     "provider_label": "プロバイダー",
     "settings_tab_description": "新しいセッションの実行場所を選択します。",
     "settings_tab_label": "セッション環境",
+    "session_configuration_label": "このセッションの環境構成",
     "startup_description": "分離された環境を作成し、このセッションに接続しています。数分かかる場合があります。",
     "startup_progress_label": "ワークスペース起動の進行状況",
     "startup_queued": "メッセージはキューに追加されました。引き続き指示を追加できます。",
@@ -7171,7 +7170,7 @@
       "working": "作業中"
     },
     "useSessionActions": {
-      "archive_and_stop_coder_workspace": "「{{title}}」をアーカイブし、その Coder ワークスペースを停止しますか？\n\nプロファイル: {{profile}}\nワークスペース: {{workspace}}\n\n実行中のターン、ターミナル、ビルド、バックグラウンドプロセスが終了します。チャット履歴、メモリ、永続ワークスペースストレージは保持されます。",
+      "archive_and_stop_environment": "「{{title}}」をアーカイブし、その {{provider}} 環境を停止しますか？\n\n構成: {{configuration}}\nワークスペース: {{workspace}}\n\n実行中のターン、ターミナル、ビルド、バックグラウンドプロセスが終了します。チャット履歴、メモリ、永続ワークスペースストレージは保持されます。",
       "close_this_session": "このセッションを閉じますか？",
       "reload_failed": "セッションの再読み込みに失敗しました。エージェントが応答中かゲートウェイに接続できない可能性があります。セッションがアイドルのときに再試行してください。",
       "reload_failed_subagents": "このセッションのサブエージェントがまだ動作中です。完了してから再試行してください。",
@@ -8738,8 +8737,8 @@
       "lane_seed_failed": "自動カラムを追加できませんでした。",
       "lane_seed_retry": "再試行",
       "lane_legacy_column_hint": "すべてのセッションを表示",
-      "coder_workspace_will_stop": "{{count}} 個の Coder ワークスペースを今すぐ停止します: {{workspaces}}。",
-      "coder_workspaces_will_stop": "{{count}} 個の Coder ワークスペースを今すぐ停止します: {{workspaces}}。"
+      "environment_will_stop": "{{count}} 個の {{provider}} 環境を今すぐ停止します: {{workspaces}}。",
+      "environments_will_stop": "{{count}} 個の管理対象環境を今すぐ停止します: {{workspaces}}。"
     },
     "connectionsPage": {
       "action_failed": "操作に失敗しました: {{error}}",

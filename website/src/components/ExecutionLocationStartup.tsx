@@ -4,16 +4,19 @@ import { useTranslation } from 'react-i18next'
 import type { ExecutionLocation } from '../types'
 
 export function ExecutionLocationStartup({
+  configuration,
   location,
-  profile,
+  providerId,
 }: {
+  configuration?: string
   location: ExecutionLocation
-  profile?: string
+  providerId?: string
 }) {
   const { t } = useTranslation()
-  const provider = location.kind === 'coder' ? t('coder.tab_label') : location.kind
-  const profileLabel = profile || location.profile
-    || (location.kind === 'coder' ? t('coder.default_profile') : '')
+  const resolvedProvider = providerId || location.kind
+  const provider = resolvedProvider === 'coder' ? t('coder.tab_label') : resolvedProvider
+  const configurationLabel = configuration || location.profile
+    || t('execution_environment.default_configuration')
   const phase = location.phase || 'allocating'
   const phases = ['allocating', 'provisioning', 'connecting'] as const
   const phaseIndex = phases.indexOf(phase) + 1
@@ -74,14 +77,14 @@ export function ExecutionLocationStartup({
             {provider}
           </dd>
         </div>
-        {profileLabel ? (
+        {configurationLabel ? (
           <div className="min-w-0 rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
             <dt className="flex items-center gap-1 text-[11px] font-medium text-muted">
               <Layers3 className="lucide-inline" />
-              {t('execution_environment.profile_label')}
+              {t('execution_environment.configuration_label')}
             </dt>
-            <dd className="mt-0.5 truncate text-[13px] font-medium text-text" title={profileLabel}>
-              {profileLabel}
+            <dd className="mt-0.5 truncate text-[13px] font-medium text-text" title={configurationLabel}>
+              {configurationLabel}
             </dd>
           </div>
         ) : null}

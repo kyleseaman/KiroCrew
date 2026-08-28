@@ -2156,6 +2156,11 @@ export const api = {
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/reasoning-effort', { reasoning_effort }).then(j) as Promise<{ ok?: boolean; reasoning_effort?: string; deferred?: boolean }>,
   chatSlotCoderProfile: (slot: string, profile: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/coder-profile', { profile }).then(j) as Promise<{ ok: boolean; profile: string }>,
+  chatSlotEnvironment: (slot: string, provider: string, configuration: string) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/environment', {
+      provider,
+      configuration,
+    }).then(j) as Promise<{ ok: boolean; environment: import('../types').SessionEnvironmentBinding }>,
   chatSlotWorkspace: (slot: string, workspace: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/workspace', { workspace }).then(j),
   // Relaunch the slot's agent process in place (fresh agent spec, env, and MCP
@@ -3157,6 +3162,9 @@ export const api = {
   // Coder session hosting. Reads are presence-only for the bearer; writes split
   // non-secret coordinates into config.json and the candidate token into the vault.
   getCoderConfig: () => get('/api/coder/config').then(j) as Promise<CoderConfigData>,
+  getSessionEnvironments: () => get('/api/session-environments').then(j) as Promise<{
+    providers: import('../types').SessionEnvironmentProviderSummary[]
+  }>,
   saveCoderConfig: (body: CoderConfigSave) =>
     put('/api/coder/config', body).then(j) as Promise<CoderConfigSaveResult>,
   testCoderConnection: (body: CoderConnectionTest) =>

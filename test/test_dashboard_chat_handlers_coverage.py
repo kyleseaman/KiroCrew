@@ -1257,6 +1257,121 @@ class TestSlotCoderProfile:
         assert slot.coder_profile == ""
 
 
+class TestSlotEnvironment:
+    async def _post(self, state, name, payload):
+        app = _app(
+            state,
+            "POST",
+            "/api/chat/slots/{slot}/environment",
+            ch.api_chat_slot_environment,
+        )
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(f"/api/chat/slots/{name}/environment", json=payload)
+            return response.status, await response.json()
+
+    @pytest.mark.asyncio
+    async def test_selects_generic_environment_before_allocation(self):
+        from kiro_crew.session_environment import (
+            SessionEnvironmentBinding,
+            SessionEnvironmentRegistry,
+        )
+
+        slot = _ChatSlot("s1")
+        state = _state(slot)
+        state.get_slot = MagicMock(return_value=slot)
+        state.sessions.has_session = MagicMock(return_value=False)
+        provider = MagicMock()
+        provider.provider_id = "coder"
+        provider.validate_configuration = MagicMock(return_value="gpu")
+        provider.binding_for_session = MagicMock(return_value=None)
+        state.sessions.environment_registry = MagicMock(
+            return_value=SessionEnvironmentRegistry([provider])
+        )
+        with patch(f"{MOD}.save_slot_off_loop", new=AsyncMock()) as save:
+            status, body = await self._post(
+                state,
+                "s1",
+                {"provider": "coder", "configuration": "gpu"},
+            )
+
+        assert status == 200
+        assert body == {
+            "ok": True,
+            "environment": {
+                "provider": "coder",
+                "configuration": "gpu",
+                "resource_name": "",
+            },
+        }
+        assert slot.environment == SessionEnvironmentBinding("coder", "gpu", "")
+        save.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_rejects_unavailable_environment_without_local_fallback(self):
+        from kiro_crew.session_environment import SessionEnvironmentRegistry
+
+        slot = _ChatSlot("s1")
+        state = _state(slot)
+        state.get_slot = MagicMock(return_value=slot)
+        state.sessions.environment_registry = MagicMock(return_value=SessionEnvironmentRegistry([]))
+
+        status, body = await self._post(
+            state,
+            "s1",
+            {"provider": "missing", "configuration": "default"},
+        )
+
+        assert status == 409
+        assert body["code"] == "session_environment_unavailable"
+        assert slot.environment is None
+
+    @pytest.mark.asyncio
+    async def test_catalog_returns_safe_provider_metadata(self):
+        from kiro_crew.session_environment import (
+            SessionEnvironmentConfiguration,
+            SessionEnvironmentRegistry,
+        )
+
+        state = _state()
+        provider = MagicMock()
+        provider.provider_id = "coder"
+        provider.display_name = "Coder"
+        provider.icon = "coder"
+        provider.configurations = MagicMock(
+            return_value=(
+                SessionEnvironmentConfiguration("", "default"),
+                SessionEnvironmentConfiguration("gpu", "gpu"),
+            )
+        )
+        state.sessions.environment_registry = MagicMock(
+            return_value=SessionEnvironmentRegistry([provider])
+        )
+        app = _app(
+            state,
+            "GET",
+            "/api/session-environments",
+            ch.api_session_environments,
+        )
+        async with TestClient(TestServer(app)) as client:
+            response = await client.get("/api/session-environments")
+            body = await response.json()
+
+        assert response.status == 200
+        assert body == {
+            "providers": [
+                {
+                    "id": "coder",
+                    "name": "Coder",
+                    "icon": "coder",
+                    "configurations": [
+                        {"id": "", "name": "default"},
+                        {"id": "gpu", "name": "gpu"},
+                    ],
+                }
+            ]
+        }
+
+
 # ── POST /api/chat/slots/{slot}/followup ─────────────────────────────────────
 
 

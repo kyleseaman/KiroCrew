@@ -1,9 +1,6 @@
 {
   "coder": {
     "add_profile": "Добавить профиль",
-    "default_profile": "Профиль Coder по умолчанию",
-    "profile_badge": "Профиль Coder · {{profile}}",
-    "profile_change_failed": "Не удалось изменить профиль Coder",
     "profile_name_label": "Имя профиля",
     "profile_preset_label": "Предустановка для {{name}}",
     "profile_template_label": "Шаблон для {{name}}",
@@ -11,10 +8,7 @@
     "profiles_title": "Профили сессий",
     "remove_profile": "Удалить профиль",
     "remove_profile_named": "Удалить профиль {{name}}",
-    "session_profile_label": "Профиль Coder для этой сессии",
     "architecture": "Шлюз хранит память, MCP, OAuth, задания cron и учётные данные. В Coder выполняется только процесс сеанса; субагенты наследуют это рабочее пространство.",
-    "badge_allocating": "Выделение рабочего пространства Coder",
-    "badge_label": "Рабочее пространство Coder · {{workspace}}",
     "connected_to": "Подключено как {{owner}}; шаблон {{template}} доступен",
     "connection_failed": "Проверка подключения не удалась",
     "control_plane_template": "Полная плоскость управления AWS",
@@ -63,16 +57,21 @@
     "badge_starting": "Запуск рабочего пространства {{kind}}",
     "badge_starting_named": "Запуск рабочего пространства {{kind}} · {{workspace}}",
     "badge_running": "Рабочее пространство {{kind}} · {{workspace}}",
+    "configuration_badge": "Конфигурация среды · {{configuration}}",
+    "configuration_change_failed": "Не удалось изменить конфигурацию среды",
+    "configuration_label": "Конфигурация среды",
     "copy_workspace_id": "Копировать ID рабочего пространства",
+    "default_configuration": "Конфигурация среды по умолчанию",
+    "default_configuration_short": "По умолчанию",
     "gateway_lost_description": "Эта сессия может продолжать работу. Kiro Crew возобновит обновления после повторного подключения шлюза.",
     "gateway_lost_title": "Соединение со шлюзом потеряно",
     "phase_allocating": "Выделение рабочего пространства",
     "phase_connecting": "Подключение Kiro Crew к рабочему пространству",
     "phase_provisioning": "Запуск вычислительных ресурсов и ожидание агента рабочего пространства",
-    "profile_label": "Профиль",
     "provider_label": "Поставщик",
     "settings_tab_description": "Выберите, где будут выполняться новые сеансы.",
     "settings_tab_label": "Среды сеансов",
+    "session_configuration_label": "Конфигурация среды для этой сессии",
     "startup_description": "Изолированная среда создаётся и подключается к этой сессии. Это может занять несколько минут.",
     "startup_progress_label": "Ход запуска рабочего пространства",
     "startup_queued": "Твоё сообщение в очереди. Можешь продолжать добавлять инструкции.",
@@ -7444,7 +7443,7 @@
       "working": "Работает"
     },
     "useSessionActions": {
-      "archive_and_stop_coder_workspace": "Архивировать «{{title}}» и остановить его рабочее пространство Coder?\n\nПрофиль: {{profile}}\nРабочее пространство: {{workspace}}\n\nЭто завершит текущий ход, терминалы, сборки и фоновые процессы. История чата, память и постоянное хранилище рабочего пространства сохранятся.",
+      "archive_and_stop_environment": "Архивировать «{{title}}» и остановить его среду {{provider}}?\n\nКонфигурация: {{configuration}}\nРабочее пространство: {{workspace}}\n\nЭто завершит текущий ход, терминалы, сборки и фоновые процессы. История чата, память и постоянное хранилище рабочего пространства сохранятся.",
       "close_this_session": "Закрыть этот сеанс?",
       "reload_failed": "Не удалось перезагрузить сессию. Возможно, агент отвечает или шлюз недоступен; повторите попытку, когда сессия будет свободна.",
       "reload_failed_subagents": "Субагенты всё ещё работают в этой сессии. Повторите попытку, когда они закончат.",
@@ -9074,8 +9073,8 @@
       "lane_seed_failed": "Не удалось добавить автоматические колонки.",
       "lane_seed_retry": "Повторить",
       "lane_legacy_column_hint": "показывает все сессии",
-      "coder_workspace_will_stop": "Сейчас будет остановлено {{count}} рабочее пространство Coder: {{workspaces}}.",
-      "coder_workspaces_will_stop": "Сейчас будет остановлено {{count}} рабочих пространств Coder: {{workspaces}}."
+      "environment_will_stop": "Сейчас будет остановлена {{count}} среда {{provider}}: {{workspaces}}.",
+      "environments_will_stop": "Сейчас будет остановлено {{count}} управляемых сред: {{workspaces}}."
     },
     "connectionsPage": {
       "action_failed": "Не удалось выполнить действие: {{error}}",

@@ -71,8 +71,8 @@ from kiro_crew.acp.session_handle import (
 )
 from kiro_crew.acp.session_host import (
     _REMOTE_RUNTIME_MARKER,
-    CoderWorkspaceSessionHost,
     LocalSessionHost,
+    RemoteSessionHost,
     project_remote_agent_spec,
     remote_mcp_unsupported_entry,
     resolve_remote_mcp_targets,
@@ -632,7 +632,7 @@ class AcpRuntime:
         expect_mcp_reports: bool = True,
         acp_backend: str = ACP_BACKEND_KIRO,
         crew_agent: str = "",
-        session_host: LocalSessionHost | CoderWorkspaceSessionHost | None = None,
+        session_host: LocalSessionHost | RemoteSessionHost | None = None,
     ):
         if work_dir:
             self._work_dir = Path(work_dir)
@@ -977,13 +977,13 @@ class AcpRuntime:
         return argv
 
     async def _prepare_remote_spawn(self) -> tuple[list[str], dict[str, str]]:
-        """Prepare an MCP-free Kiro agent and its Coder SSH transport."""
+        """Prepare an MCP-free Kiro agent and its remote transport."""
         if self._acp_backend == ACP_BACKEND_KIRO:
             pass
         else:
-            raise AcpRuntimeError("Coder session hosting is available only for kiro-cli")
+            raise AcpRuntimeError("remote session hosting is available only for kiro-cli")
         host = self._session_host
-        if not isinstance(host, CoderWorkspaceSessionHost):
+        if not isinstance(host, RemoteSessionHost):
             raise AcpRuntimeError("remote session host has an unsupported implementation")
 
         def _project_agent() -> tuple[dict[str, object], dict[str, object]]:
@@ -1170,7 +1170,7 @@ class AcpRuntime:
 
         remote_host = (
             self._session_host
-            if isinstance(self._session_host, CoderWorkspaceSessionHost)
+            if isinstance(self._session_host, RemoteSessionHost)
             else None
         )
         try:
@@ -1426,7 +1426,7 @@ class AcpRuntime:
         if remote_session_keys is not None:
             remote_session_keys.clear()
         session_host = getattr(self, "_session_host", None)
-        if isinstance(session_host, CoderWorkspaceSessionHost):
+        if isinstance(session_host, RemoteSessionHost):
             await session_host.close(
                 environ=os.environ,
                 local_cwd=self._work_dir,
@@ -2480,7 +2480,7 @@ class AcpRuntime:
                     )
         finally:
             remote_key = self._remote_session_keys.pop(session_id, None)
-            if remote_key and isinstance(self._session_host, CoderWorkspaceSessionHost):
+            if remote_key and isinstance(self._session_host, RemoteSessionHost):
                 self._session_host.revoke_session_grants(remote_key)
             self.unregister_session(session_id)
 
@@ -2718,7 +2718,7 @@ class AcpRuntime:
             if not session_key:
                 raise AcpRuntimeError("remote MCP session creation requires a logical session key")
             host = self._session_host
-            if not isinstance(host, CoderWorkspaceSessionHost):
+            if not isinstance(host, RemoteSessionHost):
                 raise AcpRuntimeError("remote session host is unsupported")
             if self._remote_agent_spec is None:
                 raise AcpRuntimeError("remote agent bridge is not prepared")
@@ -2766,11 +2766,11 @@ class AcpRuntime:
                 raise AcpRuntimeError(f"session/new did not return sessionId: {resp}")
         except AcpRequestTimeout as exc:
             # Read the staged MCP reports before the finally below clears them.
-            if session_key and isinstance(self._session_host, CoderWorkspaceSessionHost):
+            if session_key and isinstance(self._session_host, RemoteSessionHost):
                 self._session_host.revoke_session_grants(session_key)
             raise self._session_start_stalled(exc, METHOD_SESSION_NEW, mcp_servers) from exc
         except BaseException:
-            if session_key and isinstance(self._session_host, CoderWorkspaceSessionHost):
+            if session_key and isinstance(self._session_host, RemoteSessionHost):
                 self._session_host.revoke_session_grants(session_key)
             raise
         finally:
@@ -2908,7 +2908,7 @@ class AcpRuntime:
             if not session_key:
                 raise AcpRuntimeError("remote MCP session resume requires a logical session key")
             host = self._session_host
-            if not isinstance(host, CoderWorkspaceSessionHost):
+            if not isinstance(host, RemoteSessionHost):
                 raise AcpRuntimeError("remote session host is unsupported")
             if self._remote_agent_spec is None:
                 raise AcpRuntimeError("remote agent bridge is not prepared")
@@ -2984,11 +2984,11 @@ class AcpRuntime:
             loaded_session_id = resume_sid
         except AcpRequestTimeout as exc:
             # Read the staged MCP reports before the finally below clears them.
-            if session_key and isinstance(self._session_host, CoderWorkspaceSessionHost):
+            if session_key and isinstance(self._session_host, RemoteSessionHost):
                 self._session_host.revoke_session_grants(session_key)
             raise self._session_start_stalled(exc, METHOD_SESSION_LOAD, mcp_servers) from exc
         except BaseException:
-            if session_key and isinstance(self._session_host, CoderWorkspaceSessionHost):
+            if session_key and isinstance(self._session_host, RemoteSessionHost):
                 self._session_host.revoke_session_grants(session_key)
             raise
         finally:

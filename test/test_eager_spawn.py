@@ -10,6 +10,7 @@ and the handler wiring on project set.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -18,6 +19,7 @@ from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.chat_runner import _eager_spawn, schedule_eager_spawn
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 from kiro_crew.session import FirstTurnState
+from kiro_crew.session_environment import SessionEnvironmentRegistry
 
 
 def _mock_state(slot: _ChatSlot) -> DashboardState:
@@ -85,12 +87,14 @@ class TestScheduleEagerSpawn:
         assert slot._eager_spawn_task is None
 
     @pytest.mark.asyncio
-    async def test_noop_for_managed_coder_until_the_first_real_turn(self):
+    async def test_noop_for_managed_environment_until_the_first_real_turn(self):
         slot = _ChatSlot("t1")
         state = _mock_state(slot)
         cfg = MagicMock()
         cfg.session.eager_spawn = True
-        cfg.session.coder.enabled = True
+        state.sessions.environment_registry.return_value = SessionEnvironmentRegistry(
+            [SimpleNamespace(provider_id="coder")]
+        )
         with patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg):
             schedule_eager_spawn(state, slot)
         assert slot._eager_spawn_task is None

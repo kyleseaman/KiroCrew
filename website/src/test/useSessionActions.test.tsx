@@ -122,11 +122,14 @@ describe('useSessionActions', () => {
     dispatchSpy.mockRestore()
   })
 
-  it('always confirms the exact Coder workspace before closing', () => {
+  it('always confirms the exact managed environment before closing', () => {
     seed(false, {
       title: 'Build release',
-      coder_profile: 'cpu-large',
-      coder_workspace: 'crew-session-kyle-opaque',
+      environment: {
+        provider: 'coder',
+        configuration: 'cpu-large',
+        resource_name: 'crew-session-kyle-opaque',
+      },
     })
     cfgMock.loadChatConfig.mockReturnValue({ confirmCloseSession: false })
     const decline = vi.fn(() => false)

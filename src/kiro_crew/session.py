@@ -93,7 +93,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from kiro_crew.acp.runtime import AcpRuntime, AcpSessionHandle
-    from kiro_crew.acp.session_host import CoderWorkspaceSessionHost
+    from kiro_crew.acp.session_host import RemoteSessionHost
     from kiro_crew.acp.types import AcpEvent
 
 from kiro_crew import model_registry, platform_compat, shutdown_event
@@ -130,6 +130,7 @@ from kiro_crew.providers.base import CancelOutcome, LLMProvider
 from kiro_crew.pycache_gc import PYCACHE_GC_INTERVAL_SECS, prune_pycache
 from kiro_crew.sandbox import cleanup_stale_sandbox_profiles
 from kiro_crew.sel import sel
+from kiro_crew.session_environment import SessionEnvironmentRegistry
 from kiro_crew.session_map import _kiro_sessions_dir  # noqa: F401
 from kiro_crew.session_map import MIRROR_OPT_OUT_FLAG
 from kiro_crew.session_map import SessionMap as SessionMap  # noqa: F401
@@ -1044,8 +1045,19 @@ class SessionManager:
         # winner may now be authoritative, and readers always prefer it.
         self._execution_location_changed(key)
 
+    def environment_registry(self) -> Any:
+        """Return the current factory's managed environment registry."""
+        if self._provider_factory is None:
+            return None
+        return getattr(self._provider_factory, "_session_environment_registry", None)
+
     def coder_workspace_manager(self) -> Any:
-        """Return the current factory's lifecycle manager, if managed Coder is enabled."""
+        """Compatibility accessor for the Coder manager during API migration."""
+        registry = self.environment_registry()
+        if registry is not None:
+            provider = registry.get("coder")
+            if provider is not None:
+                return getattr(provider, "manager", None)
         if self._provider_factory is None:
             return None
         return getattr(self._provider_factory, "_coder_manager", None)
@@ -1934,9 +1946,9 @@ class SessionManager:
                 kwargs[key] = val
         return kwargs
 
-    def subagent_session_host(self, parent_session_key: str) -> "CoderWorkspaceSessionHost | None":
+    def subagent_session_host(self, parent_session_key: str) -> "RemoteSessionHost | None":
         """Clone a remote parent's execution host for a dedicated child."""
-        from kiro_crew.acp.session_host import CoderWorkspaceSessionHost
+        from kiro_crew.acp.session_host import RemoteSessionHost
 
         provider = self.get_provider(parent_session_key)
         if provider is None:
@@ -1944,7 +1956,7 @@ class SessionManager:
         client = getattr(provider, "client", None) or getattr(provider, "_client", None)
         runtime = getattr(client, "_runtime", None)
         host = getattr(runtime, "_session_host", None)
-        if isinstance(host, CoderWorkspaceSessionHost):
+        if isinstance(host, RemoteSessionHost):
             return host.clone()
         return None
 
@@ -5730,8 +5742,11 @@ class SessionManager:
         """Idle/orphan session expiry. Gate + timeout are published onto self by
         _cleanup_loop, which owns the <60 clamp. Preserves the original
         ``logger.exception`` on failure."""
-        managed_coder_enabled = self._cfg.session.coder.enabled is True
-        if not self._idle_sweep_enabled and not managed_coder_enabled:
+        registry = self.environment_registry()
+        managed_environment_enabled = bool(
+            isinstance(registry, SessionEnvironmentRegistry) and registry.providers()
+        )
+        if not self._idle_sweep_enabled and not managed_environment_enabled:
             return
         try:
             await self._expire_idle(self._idle_timeout)
@@ -5965,8 +5980,19 @@ class SessionManager:
         # (orphaned MCP servers, leaked kiro-cli PIDs) on a fixed cadence so
         # operators who set timeout_secs=0 don't also lose process hygiene.
         interval = max(timeout // 6, 60) if idle_sweep_enabled else 300
-        if self._cfg.session.coder.enabled is True:
-            warm_secs = max(0, self._cfg.session.coder.runtime_warm_minutes) * 60
+        registry = self.environment_registry()
+        warm_values = (
+            [
+                value
+                for provider in registry.providers()
+                if isinstance((value := getattr(provider, "runtime_warm_seconds", None)), int)
+                and value >= 0
+            ]
+            if isinstance(registry, SessionEnvironmentRegistry)
+            else []
+        )
+        if warm_values:
+            warm_secs = min(warm_values)
             interval = min(interval, max(warm_secs // 3, 60))
         while not shutdown_event.is_set():
             try:

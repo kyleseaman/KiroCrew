@@ -66,6 +66,42 @@ def _alive_provider_factory():
 
 class TestSessionManager:
     @pytest.mark.asyncio
+    async def test_environment_selection_reaches_provider_factory(self, cfg):
+        from kiro_crew.session_environment import SessionEnvironmentSelection
+
+        captured: list[dict[str, object]] = []
+
+        def factory(session_key=None, agent=None, channel_id=None, **kwargs):
+            captured.append(kwargs)
+            provider = AsyncMock()
+            provider.start = AsyncMock()
+            provider.shutdown = AsyncMock()
+            provider._session_host = None
+            provider.is_process_alive = lambda: True
+            provider.context_usage_pct = lambda: 0.0
+            provider.has_active_turn = lambda: False
+            return provider
+
+        selection = SessionEnvironmentSelection("coder", "gpu")
+        mgr = SessionManager(cfg, provider_factory=factory)
+
+        await mgr.get_or_create("dashboard:chat-1", environment_selection=selection)
+
+        assert captured[0]["environment_selection"] == selection
+        mgr.release("dashboard:chat-1")
+        await mgr.close_all()
+
+    def test_environment_registry_comes_from_current_factory(self, cfg):
+        from kiro_crew.session_environment import SessionEnvironmentRegistry
+
+        factory = _mock_provider_factory()
+        registry = SessionEnvironmentRegistry([])
+        factory._session_environment_registry = registry
+        mgr = SessionManager(cfg, provider_factory=factory)
+
+        assert mgr.environment_registry() is registry
+
+    @pytest.mark.asyncio
     async def test_reinjection_flag_is_one_shot(self, cfg):
         """mark → consume returns True once, then False. If it did not clear,
         every turn after a compaction would re-pay the skills-index cost."""

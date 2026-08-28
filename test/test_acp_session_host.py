@@ -29,6 +29,18 @@ from kiro_crew.mcp_gateway.remote_proxy import RemoteHttpMcpTarget
 
 
 class TestCoderWorkspaceSessionHost:
+    def test_implements_provider_neutral_remote_host_contract(self) -> None:
+        from kiro_crew.acp.session_host import RemoteSessionHost
+
+        host = CoderWorkspaceSessionHost(
+            workspace="crew-dogfood",
+            remote_cwd="/home/coder/workspace",
+            coder_bin="/opt/coder",
+        )
+
+        assert isinstance(host, RemoteSessionHost)
+        assert not isinstance(LocalSessionHost("."), RemoteSessionHost)
+
     @pytest.mark.asyncio
     async def test_builds_exact_ssh_transport_with_loopback_reverse_forward(self) -> None:
         host = CoderWorkspaceSessionHost(
