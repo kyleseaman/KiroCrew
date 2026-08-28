@@ -8,10 +8,14 @@ disable switch, fail-open) and the ``resource_status`` pull tool wired into
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from kiro_crew import resource_status as rs
+from kiro_crew.context import ContextBuilder
+from kiro_crew.memory import MemoryStore
+from kiro_crew.skills import SkillsLoader
 
 
 def _cfg(pressure: float, critical: float) -> SimpleNamespace:
@@ -101,6 +105,34 @@ def test_context_line_critical_wording(monkeypatch: pytest.MonkeyPatch) -> None:
     line = rs.probe(_cfg(4.0, 2.0)).context_line()
     assert line.startswith("[RESOURCES]")
     assert "CRITICALLY" in line
+
+
+@pytest.mark.parametrize(
+    ("include_gateway_resource_advisory", "expected"),
+    [(True, True), (False, False)],
+)
+def test_message_resource_advisory_respects_execution_boundary(
+    tmp_path, include_gateway_resource_advisory: bool, expected: bool
+) -> None:
+    builder = ContextBuilder(
+        memory=MemoryStore(workspace=tmp_path / "ws"),
+        skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+    )
+    status = SimpleNamespace(
+        posture=rs.POSTURE_CRITICAL,
+        available_gb=0.4,
+        context_line=lambda: "[RESOURCES] gateway pressure",
+    )
+
+    with patch("kiro_crew.resource_status.probe", return_value=status):
+        message, _ = builder.build_message(
+            "hello",
+            is_new_session=False,
+            interactive=False,
+            include_gateway_resource_advisory=include_gateway_resource_advisory,
+        )
+
+    assert ("[RESOURCES]" in message) is expected
 
 
 def test_load_suffix_omitted_when_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -5367,6 +5367,11 @@ async def _run_chat(
         _acquired = True
         location_resolver = getattr(state.sessions, "execution_location", None)
         execution_location = location_resolver(session_key) if callable(location_resolver) else None
+        has_managed_execution_location = bool(
+            isinstance(execution_location, dict)
+            and isinstance(execution_location.get("kind"), str)
+            and execution_location["kind"]
+        )
         if (
             isinstance(execution_location, dict)
             and isinstance(execution_location.get("kind"), str)
@@ -5848,6 +5853,7 @@ async def _run_chat(
                 ),
                 user_span_out=_user_span,
                 needs_reinjection=_needs_reinjection,
+                include_gateway_resource_advisory=not has_managed_execution_location,
             )
             # The reported span is valid for the message as build_message
             # returned it. Several later steps PREPEND to the finished prompt

@@ -193,6 +193,11 @@ send time.
 - **Idle cleanup**: expires sessions after `session.timeout_secs` (default
   60min). Never expires `BACKGROUND_KEY`. Dashboard per-tab sessions
   (`dashboard:{slot_key}`) idle-expire like any other session.
+- **Resource advisory boundary**: the gateway's `[RESOURCES]` memory/CPU
+  advisory is injected only when the interactive agent runs on the gateway.
+  Sessions backed by any managed environment provider omit gateway resource
+  pressure from their model context because that environment owns a separate
+  resource envelope.
 - **Session Watchdog** (`watchdog.py`): the cleanup loop delegates its periodic
   behaviours to a `SessionWatchdog` — a stateless sequential dispatcher over
   named `CleanupHook(name, run)` entries (Command pattern; `tick()` isolates a
@@ -311,9 +316,11 @@ The dashboard's active-session execution UI is provider-neutral. While the
 descriptor is `starting`, the transcript replaces the decorative model loader
 with a staged startup card that explains the isolated environment, shows the
 provider, selected profile, generated workspace name, and current provider-neutral
-phase as each becomes available, and keeps the composer available for queued
-instructions. A fresh session's profile picker sits directly above the composer;
-the header is reserved for an allocated or durable environment identity. If the
+phase as each becomes available. The card renders all startup milestones as a
+completed/current/pending sequence instead of deriving a percentage from coarse
+provider events, and keeps the composer available for queued instructions. A fresh
+session's profile picker sits directly above the composer with a generic environment
+glyph; the header is reserved for a running or durable environment identity. If the
 gateway disconnects during a running turn, the transcript replaces the stale
 thinking animation with a reconnecting notice rather than implying fresh model
 activity.
@@ -323,9 +330,10 @@ provider and generated workspace. The glyph remains present for a retained Coder
 binding after compute stops, but it never claims that the workspace is awake;
 startup and turn state remain on their dedicated surfaces. Gateway-local sessions
 have no placement glyph.
-The large card is reserved for allocation and compute startup. A `connecting`
-phase for an already-running environment uses the ordinary turn indicator, while
-a live `running` descriptor adds a ready mark to the header badge. When no
+The large card remains the single startup surface through `allocating`,
+`provisioning`, and `connecting`; the header never duplicates it with a loading
+badge. A live `running` descriptor removes the card and adds a ready mark to the
+single header badge. When no
 provider is live, the dashboard may reconstruct the durable Coder workspace label
 as client-only `retained` metadata; it carries no ready mark and makes no claim
 that compute is awake.

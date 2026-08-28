@@ -6916,6 +6916,97 @@ class TestRuntimeWiring:
         assert len(build_message_calls) == 1
         assert build_message_calls[0]["kwargs"].get("memory_store") == "oncall-mem"
 
+    @pytest.mark.parametrize(
+        ("execution_location", "expected"),
+        [
+            (None, True),
+            (
+                {
+                    "kind": "test-provider",
+                    "workspace": "remote-environment",
+                    "remote_cwd": "/workspace",
+                    "state": "running",
+                },
+                False,
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_run_chat_scopes_gateway_resources_to_local_execution(
+        self, tmp_path, monkeypatch, execution_location, expected
+    ):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+
+        build_message_calls: list[dict] = []
+
+        def mock_build_message(self_ctx, text, is_new, session_key=None, **kwargs):
+            build_message_calls.append({"text": text, "kwargs": kwargs})
+            return text, MagicMock(action=None, text="")
+
+        mock_cfg = MagicMock()
+        mock_cfg.agents = {}
+        mock_cfg.default_agent = "default"
+        mock_bindings = MagicMock()
+        mock_bindings.memory_store_name = ""
+        mock_bindings.model = ""
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat.KiroCrewConfig.load", lambda: mock_cfg)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat.resolve_agent_bindings",
+            lambda cfg, name, project_dir=None: mock_bindings,
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner.KiroCrewConfig.load", lambda: mock_cfg)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.resolve_agent_bindings",
+            lambda cfg, name, project_dir=None: mock_bindings,
+        )
+
+        from kiro_crew.context import ContextBuilder
+        from kiro_crew.memory import MemoryStore
+        from kiro_crew.skills import SkillsLoader
+
+        ctx_builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+        )
+        monkeypatch.setattr(
+            ctx_builder, "build_message", lambda *a, **kw: mock_build_message(ctx_builder, *a, **kw)
+        )
+
+        state = _make_state(tmp_path, context_builder=ctx_builder)
+        slot = state.get_or_create_slot("remote-resources")
+        from kiro_crew.providers.base import LLMEvent
+
+        mock_client = MagicMock()
+        mock_client.stream = MagicMock(
+            return_value=AsyncIterator(
+                [LLMEvent(kind="text_chunk", text="ok"), LLMEvent(kind="complete")]
+            )
+        )
+        state.sessions.get_or_create = AsyncMock(return_value=(mock_client, True, False))
+        state.sessions.get_pid = MagicMock(return_value=None)
+        state.sessions.execution_location = MagicMock(return_value=execution_location)
+
+        async def no_background_update(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._maybe_auto_title", no_background_update
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.generate_session_summary", no_background_update
+        )
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "test message")
+        await asyncio.gather(*state._background_tasks)
+
+        assert len(build_message_calls) == 1
+        assert (
+            build_message_calls[0]["kwargs"].get("include_gateway_resource_advisory") is expected
+        )
+
     @pytest.mark.asyncio
     async def test_run_chat_forwards_and_clears_the_reinjection_flag(self, tmp_path, monkeypatch):
         """A compaction flags the session; the NEXT _run_chat must forward

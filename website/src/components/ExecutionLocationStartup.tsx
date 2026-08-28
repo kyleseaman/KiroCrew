@@ -1,4 +1,4 @@
-import { Box, Layers3, MessageSquareText, Server } from 'lucide-react'
+import { Box, Check, Circle, Layers3, Loader2, MessageSquareText, Server } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import type { ExecutionLocation } from '../types'
@@ -19,14 +19,12 @@ export function ExecutionLocationStartup({
     || t('execution_environment.default_configuration')
   const phase = location.phase || 'allocating'
   const phases = ['allocating', 'provisioning', 'connecting'] as const
-  const phaseIndex = phases.indexOf(phase) + 1
+  const phaseIndex = Math.max(0, phases.indexOf(phase))
   const phaseLabels = {
     allocating: t('execution_environment.phase_allocating'),
     provisioning: t('execution_environment.phase_provisioning'),
     connecting: t('execution_environment.phase_connecting'),
   }
-  const phaseLabel = phaseLabels[phase]
-
   return (
     <div
       className="rounded-xl border border-accent/25 bg-accent-subtle p-3.5 shadow-sm sm:p-4"
@@ -48,24 +46,40 @@ export function ExecutionLocationStartup({
           <p className="mt-0.5 text-[13px] leading-relaxed text-muted">
             {t('execution_environment.startup_description')}
           </p>
-          <p className="mt-1 text-[13px] font-medium text-accent">{phaseLabel}</p>
         </div>
       </div>
 
-      <div
-        className="mt-3 h-1.5 overflow-hidden rounded-full bg-accent/15"
-        role="progressbar"
-        aria-label={t('execution_environment.startup_progress_label')}
-        aria-valuemin={1}
-        aria-valuemax={phases.length}
-        aria-valuenow={phaseIndex}
-        aria-valuetext={phaseLabel}
-      >
-        <div
-          className="h-full rounded-full bg-accent transition-[width] duration-300 motion-reduce:transition-none"
-          style={{ width: `${(phaseIndex / phases.length) * 100}%` }}
-        />
-      </div>
+      <ol className="mt-3 grid grid-cols-1 gap-1.5 sm:grid-cols-3">
+        {phases.map((step, index) => {
+          const state = index < phaseIndex ? 'complete' : index === phaseIndex ? 'current' : 'pending'
+          return (
+            <li
+              key={step}
+              className={`flex min-w-0 items-center gap-2 rounded-lg border px-2.5 py-2 text-[12px] font-medium ${
+                state === 'current'
+                  ? 'border-accent/30 bg-accent/10 text-accent'
+                  : state === 'complete'
+                    ? 'border-border/70 bg-card/60 text-text'
+                    : 'border-border/50 bg-card/30 text-muted'
+              }`}
+              data-testid={`execution-location-step-${step}`}
+              data-state={state}
+            >
+              {state === 'complete' ? (
+                <Check className="lucide-inline shrink-0 text-ok" aria-hidden="true" />
+              ) : state === 'current' ? (
+                <Loader2
+                  className="lucide-inline shrink-0 animate-spin motion-reduce:animate-none"
+                  aria-hidden="true"
+                />
+              ) : (
+                <Circle className="lucide-inline shrink-0" aria-hidden="true" />
+              )}
+              <span className="min-w-0 leading-snug">{phaseLabels[step]}</span>
+            </li>
+          )
+        })}
+      </ol>
 
       <dl className="mt-3 grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-3">
         <div className="min-w-0 rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">

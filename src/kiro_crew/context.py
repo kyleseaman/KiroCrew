@@ -2507,6 +2507,7 @@ class ContextBuilder:
         provider_type: str = "acp",
         minimal_context: bool = False,
         *,
+        include_gateway_resource_advisory: bool = True,
         runtime_source: str | None = None,
         exclude_last_n: int = 0,
         folder_path: str | None = None,
@@ -2833,14 +2834,13 @@ class ContextBuilder:
                 "when answering questions.\n\n"
             )
 
-        # Resource pressure — inject a compact advisory ONLY when host memory is
-        # tight/critical, so the model can choose the lighter path for heavy work
-        # (targeted tests, smaller sub-agent waves, deferred builds). Silent (zero
-        # token cost) when memory is ample or unreadable. Agent-agnostic: rides
-        # the gateway context rail, so it survives agent switches (a tool grant
-        # cannot). Skipped for minimal contexts. Best-effort — never let a probe
-        # failure break message assembly.
-        if not minimal_context:
+        # Resource pressure describes THIS gateway's host. Inject it only when
+        # the interactive agent also runs here; a managed environment has its
+        # own resource envelope, so gateway pressure would be false session
+        # context. Silent (zero token cost) when memory is ample or unreadable.
+        # Skipped for minimal contexts. Best-effort — never let a probe failure
+        # break message assembly.
+        if not minimal_context and include_gateway_resource_advisory:
             try:
                 from kiro_crew.resource_status import probe as _probe_resources
 

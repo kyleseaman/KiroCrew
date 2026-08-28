@@ -5,9 +5,11 @@ Shared by two advisory surfaces:
 * the **pressure-gated context line** injected in
   :meth:`kiro_crew.context.ContextManager.build_message` — a compact
   ``[RESOURCES]`` note the gateway adds to a turn ONLY when host memory is
-  tight/critical, so the model can pick the lighter path for heavy work. It
-  rides the gateway context rail (not an agent tool grant), so it survives
-  agent switches, including custom agents.
+  tight/critical AND the interactive agent runs on that gateway, so the model
+  can pick the lighter path for heavy work. Managed-environment sessions omit
+  it because their compute has a separate resource envelope. It rides the
+  gateway context rail (not an agent tool grant), so it survives agent switches,
+  including custom agents.
 * the **``resource_status`` pull tool** in ``mcp_core`` — an on-demand probe
   the model can call before a heavy step ("am I clear to run the full suite?").
 

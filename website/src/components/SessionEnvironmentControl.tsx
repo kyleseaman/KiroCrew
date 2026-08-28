@@ -10,9 +10,8 @@ import {
   sessionEnvironment,
   sessionExecutionLocation,
 } from '../sessionEnvironment'
-import type { ChatSlot, SessionEnvironmentProviderSummary } from '../types'
+import type { ChatSlot } from '../types'
 import { ExecutionLocationBadge } from './ExecutionLocationBadge'
-import CoderLogo from './icons/CoderLogo'
 import {
   Select,
   SelectContent,
@@ -34,10 +33,8 @@ function parseSelection(value: string): { provider: string; configuration: strin
     : { provider: value.slice(0, separator), configuration: value.slice(separator + 1) }
 }
 
-function ProviderIcon({ provider }: { provider?: SessionEnvironmentProviderSummary }) {
-  return provider?.icon === 'coder'
-    ? <CoderLogo height={11} />
-    : <Server className="lucide-inline" />
+function ProviderIcon() {
+  return <Server className="lucide-inline" />
 }
 
 export function SessionEnvironmentControl({
@@ -69,12 +66,11 @@ export function SessionEnvironmentControl({
 
   if (executionLocation) {
     if (placement === 'composer') return null
+    if (executionLocation.state === 'starting') return null
     const configuration = binding?.configuration || executionLocation.profile || ''
-    const detailLabel = executionLocation.state !== 'starting'
-      ? configuration
-        ? i18nT('execution_environment.configuration_badge', { configuration })
-        : i18nT('execution_environment.default_configuration')
-      : undefined
+    const detailLabel = configuration
+      ? i18nT('execution_environment.configuration_badge', { configuration })
+      : i18nT('execution_environment.default_configuration')
     return (
       <ExecutionLocationBadge
         location={executionLocation}
@@ -92,7 +88,7 @@ export function SessionEnvironmentControl({
       : i18nT('execution_environment.default_configuration')
     return (
       <span className="pointer-events-auto inline-flex shrink-0 items-center gap-1 rounded-full border border-accent/30 bg-accent-subtle px-2 py-0.5 text-[11px] font-medium text-accent">
-        <ProviderIcon provider={selectedProvider} />
+        <ProviderIcon />
         {providerLabel} · {configuration}
       </span>
     )
@@ -112,11 +108,9 @@ export function SessionEnvironmentControl({
   const selectedValue = binding
     ? selectionValue(binding.provider, binding.configuration)
     : options[0].value
-  const selectedOption = options.find(option => option.value === selectedValue)
-
   return (
     <div className="pointer-events-auto flex items-center justify-end gap-2 pt-1.5" data-testid="composer-execution-profile">
-      <ProviderIcon provider={selectedOption?.provider} />
+      <ProviderIcon />
       <div className="w-[260px] max-w-[75vw] shrink-0">
         <Select
           value={selectedValue}

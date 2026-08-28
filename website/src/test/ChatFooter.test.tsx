@@ -37,7 +37,8 @@ describe('ChatFooter', () => {
     expect(status).toHaveTextContent('Default environment configuration')
     expect(status).toHaveTextContent('crew-session-kyleseaman-opaque')
     expect(status).toHaveTextContent('Your message is queued. You can keep adding instructions.')
-    expect(screen.getByRole('progressbar', { name: 'Workspace startup progress' })).toBeInTheDocument()
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+    expect(screen.getAllByTestId(/^execution-location-step-/)).toHaveLength(3)
     expect(document.querySelector('.csb4')).not.toBeInTheDocument()
   })
 
@@ -74,9 +75,21 @@ describe('ChatFooter', () => {
     expect(screen.getByRole('status')).toHaveTextContent(
       'Starting compute and waiting for the workspace agent',
     )
+    expect(screen.getByTestId('execution-location-step-allocating')).toHaveAttribute(
+      'data-state',
+      'complete',
+    )
+    expect(screen.getByTestId('execution-location-step-provisioning')).toHaveAttribute(
+      'data-state',
+      'current',
+    )
+    expect(screen.getByTestId('execution-location-step-connecting')).toHaveAttribute(
+      'data-state',
+      'pending',
+    )
   })
 
-  it('uses the ordinary turn loader while reconnecting to already-running compute', () => {
+  it('keeps one workspace startup card visible while connecting', () => {
     const { container } = render(
       <ChatFooter
         {...base}
@@ -92,8 +105,12 @@ describe('ChatFooter', () => {
       />,
     )
 
-    expect(screen.queryByTestId('execution-location-startup')).not.toBeInTheDocument()
-    expect(container.querySelector('.csb4')).toBeInTheDocument()
+    expect(screen.getAllByTestId('execution-location-startup')).toHaveLength(1)
+    expect(screen.getByTestId('execution-location-step-connecting')).toHaveAttribute(
+      'data-state',
+      'current',
+    )
+    expect(container.querySelector('.csb4')).not.toBeInTheDocument()
   })
 
   it('shows one cold-start card until compute is ready, then does not repeat it', () => {
@@ -115,7 +132,7 @@ describe('ChatFooter', () => {
         {...base}
         running={true}
         lastRole="user"
-        executionLocation={{ ...location, phase: 'connecting' }}
+        executionLocation={{ ...location, state: 'running', phase: undefined }}
       />,
     )
 

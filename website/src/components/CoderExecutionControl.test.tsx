@@ -45,11 +45,15 @@ describe('SessionEnvironmentControl', () => {
 
   it('lets a fresh session select a provider configuration', async () => {
     const user = userEvent.setup()
-    renderWithProviders(<SessionEnvironmentControl slot={slot} placement="composer" />)
+    const { container } = renderWithProviders(
+      <SessionEnvironmentControl slot={slot} placement="composer" />,
+    )
 
     const trigger = await screen.findByRole('combobox', {
       name: 'Environment configuration for this session',
     })
+    expect(container.querySelector('.lucide-server')).toBeInTheDocument()
+    expect(screen.queryByTestId('coder-logo')).not.toBeInTheDocument()
     await user.click(trigger)
     await user.click(await screen.findByRole('option', { name: 'Coder · gpu' }))
 
@@ -112,7 +116,7 @@ describe('SessionEnvironmentControl', () => {
     expect(screen.getAllByTestId('execution-location-badge')).toHaveLength(1)
   })
 
-  it('leaves startup profile details to the transcript card', async () => {
+  it('leaves all startup progress to the transcript card', async () => {
     renderWithProviders(
       <SessionEnvironmentControl
         slot={{
@@ -129,7 +133,7 @@ describe('SessionEnvironmentControl', () => {
       />,
     )
 
-    expect(screen.getByRole('status')).toHaveTextContent('Starting Coder workspace')
+    expect(screen.queryByTestId('execution-location-badge')).not.toBeInTheDocument()
     expect(screen.queryByText('Environment configuration · gpu')).not.toBeInTheDocument()
   })
 
