@@ -7,8 +7,10 @@ import { copyToClipboard } from '../utils/clipboard'
 import { IconButton } from './ui'
 
 export function ExecutionLocationBadge({
+  detailLabel,
   location,
 }: {
+  detailLabel?: string
   location?: ExecutionLocation
 }) {
   const { t } = useTranslation()
@@ -39,6 +41,7 @@ export function ExecutionLocationBadge({
       workspace: location.workspace,
     })
   }
+  const tooltip = detailLabel ? `${label} · ${detailLabel}` : label
 
   const copyLabel = copied
     ? t('execution_environment.workspace_id_copied')
@@ -57,8 +60,9 @@ export function ExecutionLocationBadge({
 
   return (
     <span
-      className="pointer-events-auto inline-flex max-w-[45vw] shrink-0 items-center gap-1 rounded-full border border-accent/30 bg-accent-subtle px-2 py-0.5 text-[11px] font-medium text-accent md:max-w-[28vw]"
-      title={label}
+      className="pointer-events-auto inline-flex max-w-[70vw] min-w-0 shrink items-center gap-1 rounded-full border border-accent/30 bg-accent-subtle px-2 py-0.5 text-[11px] font-medium text-accent md:max-w-[40vw]"
+      title={tooltip}
+      data-testid="execution-location-badge"
       role={starting ? 'status' : undefined}
       aria-live={starting ? 'polite' : undefined}
     >
@@ -76,7 +80,15 @@ export function ExecutionLocationBadge({
           <Server className="lucide-inline" />
         </>
       )}
-      <span className="truncate">{label}</span>
+      <span className="min-w-0 truncate">{label}</span>
+      {detailLabel ? (
+        <>
+          <span className="shrink-0 text-muted" aria-hidden="true">·</span>
+          <span className="max-w-[24vw] shrink truncate text-muted md:max-w-[16vw]">
+            {detailLabel}
+          </span>
+        </>
+      ) : null}
       {location.workspace ? (
         <IconButton
           className="-my-1 -mr-1 ml-0.5 shrink-0"

@@ -83,6 +83,13 @@ describe('CoderExecutionControl', () => {
     )
 
     expect(screen.getByText('Coder workspace · crew-opaque')).toBeInTheDocument()
+    expect(screen.getByText('Coder profile · gpu')).toBeInTheDocument()
+    expect(screen.getAllByTestId('execution-location-badge')).toHaveLength(1)
+    expect(screen.getByTestId('execution-location-badge')).toHaveAttribute(
+      'title',
+      'Coder workspace · crew-opaque · Coder profile · gpu',
+    )
+    expect(screen.getByRole('button', { name: 'Copy workspace ID' })).toBeInTheDocument()
     expect(screen.queryByRole('combobox')).not.toBeInTheDocument()
   })
 
@@ -101,6 +108,7 @@ describe('CoderExecutionControl', () => {
     expect(await screen.findByText('Coder workspace · crew-session-kyle-retained')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Copy workspace ID' })).toBeInTheDocument()
     expect(screen.getByText('Coder profile · gpu')).toBeInTheDocument()
+    expect(screen.getAllByTestId('execution-location-badge')).toHaveLength(1)
   })
 
   it('leaves startup profile details to the transcript card', async () => {

@@ -328,8 +328,10 @@ a live `running` descriptor adds a ready mark to the header badge. When no
 provider is live, the dashboard may reconstruct the durable Coder workspace label
 as client-only `retained` metadata; it carries no ready mark and makes no claim
 that compute is awake.
-The compact execution badge remains in the header, but provider profile metadata
-is not repeated there until the descriptor is `running`. The session manager
+The header uses one compact execution badge for the environment identity and its
+provider profile, with a full-value tooltip and a copy action for generated workspace
+names. Profile metadata is omitted while the descriptor is `starting`; live and
+retained identities include their immutable profile. The session manager
 keeps a starting provider outside the claimable session registry, emits slot
 updates on its phase plus `starting`/`running`/failed transitions, and copies only the
 descriptor allowlist above from the provider's session host. A Coder host supplies

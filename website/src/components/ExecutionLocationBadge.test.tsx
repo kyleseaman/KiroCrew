@@ -16,6 +16,7 @@ describe('ExecutionLocationBadge', () => {
   it('identifies the live remote workspace without exposing its working directory', () => {
     render(
       <ExecutionLocationBadge
+        detailLabel="Coder profile · gpu"
         location={{
           kind: 'coder',
           workspace: 'crew-dogfood',
@@ -26,6 +27,11 @@ describe('ExecutionLocationBadge', () => {
     )
 
     expect(screen.getByText('Coder workspace · crew-dogfood')).toBeInTheDocument()
+    expect(screen.getByText('Coder profile · gpu')).toBeInTheDocument()
+    expect(screen.getByTestId('execution-location-badge')).toHaveAttribute(
+      'title',
+      'Coder workspace · crew-dogfood · Coder profile · gpu',
+    )
     expect(screen.getByTestId('execution-location-ready')).toBeInTheDocument()
     expect(document.body.textContent).not.toContain('/home/coder/private-project')
   })

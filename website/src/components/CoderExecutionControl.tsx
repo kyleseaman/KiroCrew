@@ -47,18 +47,11 @@ export function CoderExecutionControl({
     const profileLabel = slot?.coder_profile
       ? i18nT('coder.profile_badge', { profile: slot.coder_profile })
       : i18nT('coder.default_profile')
-    return (
-      <div className="pointer-events-auto flex min-w-0 shrink items-center gap-1">
-        <ExecutionLocationBadge location={executionLocation} />
-        {executionLocation.kind === 'coder'
-          && executionLocation.state !== 'starting' && (
-          <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-accent/30 bg-accent-subtle px-2 py-0.5 text-[11px] font-medium text-accent">
-            <Server className="lucide-inline" />
-            {profileLabel}
-          </span>
-        )}
-      </div>
-    )
+    const detailLabel = executionLocation.kind === 'coder'
+      && executionLocation.state !== 'starting'
+      ? profileLabel
+      : undefined
+    return <ExecutionLocationBadge location={executionLocation} detailLabel={detailLabel} />
   }
   if (placement === 'header') {
     if (!slot || slot.messages === 0 || !slot.coder_profile) return null
