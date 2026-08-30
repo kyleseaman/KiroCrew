@@ -952,6 +952,9 @@ export interface ToolActivity {
   purpose?: string      // tool purpose
   input?: string        // tool input (commands, file content, etc.)
   output?: string       // tool output (stdout, results, etc.)
+  /** Explicit transport completion. Partial output keeps the tool running;
+   *  absent preserves compatibility with history from older gateways. */
+  done?: boolean
   ts: number
   execution_started_at?: number // when execution began (after approval); survives remount
   auto?: boolean        // auto-approved tool call

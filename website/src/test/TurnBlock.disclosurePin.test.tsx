@@ -73,7 +73,7 @@ describe('TurnBlock — user disclosure survives running-flag churn', () => {
     const m = aTurn()
     const { rerender } = render(<Transcript messages={m} running={false} />)
     fireEvent.click(screen.getByRole('button'))
-    expect(label()).toContain('Hide')
+    expect(label()).toContain('Collapse')
 
     // Agent resumes: running -> flat branch, toggle hidden.
     rerender(<Transcript messages={m} running={true} />)
@@ -82,7 +82,7 @@ describe('TurnBlock — user disclosure survives running-flag churn', () => {
     // A slots broadcast observes the slot as momentarily idle. The message list
     // is identical and the user never clicked again.
     rerender(<Transcript messages={m} running={false} />)
-    expect(label()).toContain('Hide')
+    expect(label()).toContain('Collapse')
   })
 
   it('keeps the expand across repeated running-flag oscillation', () => {
@@ -94,7 +94,7 @@ describe('TurnBlock — user disclosure survives running-flag churn', () => {
       rerender(<Transcript messages={m} running={true} />)
       rerender(<Transcript messages={m} running={false} />)
     }
-    expect(label()).toContain('Hide')
+    expect(label()).toContain('Collapse')
   })
 
   it('keeps the expand when the agent appends another step and finishes', () => {
@@ -104,7 +104,7 @@ describe('TurnBlock — user disclosure survives running-flag churn', () => {
 
     rerender(<Transcript messages={[...m, tool()]} running={true} />)
     rerender(<Transcript messages={[...m, tool()]} running={false} />)
-    expect(label()).toContain('Hide')
+    expect(label()).toContain('Collapse')
   })
 
   it('keeps an explicit collapse when the user collapsed it themselves', () => {
@@ -126,7 +126,7 @@ describe('TurnBlock — user disclosure survives running-flag churn', () => {
 
     rerender(<Transcript messages={[...m, user('again'), tool(), text('b'), tool()]} running={true} />)
     const labels = screen.queryAllByRole('button').map(b => b.textContent)
-    expect(labels.some(l => l?.includes('Hide'))).toBe(true)
+    expect(labels.some(l => l?.includes('Collapse'))).toBe(true)
   })
 
   it('still auto-collapses on completion when the user never touched it', () => {

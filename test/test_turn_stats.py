@@ -29,6 +29,17 @@ def test_footer_reads_the_auto_aware_model_helper():
 
 
 class TestAttachTurnStats:
+    def test_attaches_total_elapsed_separately_from_provider_elapsed(self):
+        slot = _make_slot_with_assistant_message()
+
+        _attach_turn_stats(slot, 3200, 0.5, 0.0, total_elapsed_ms=9100)
+
+        assert slot.messages[-1]["meta"]["turn_stats"] == {
+            "elapsed_ms": 3200,
+            "total_elapsed_ms": 9100,
+            "credits": 0.5,
+        }
+
     def test_attaches_elapsed_and_credits(self):
         slot = _make_slot_with_assistant_message()
         _attach_turn_stats(slot, 12345, 1.25, 0.0)

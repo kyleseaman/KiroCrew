@@ -12,6 +12,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 import kiro_crew.config.loader as loader_mod
 from kiro_crew.acp.session_host import CODER_SESSION_TOKEN_SECRET
+from kiro_crew.constants import CODER_DEFAULT_RUNTIME_WARM_MINUTES
 from kiro_crew.dashboard.handlers import coder as coder_handlers
 from kiro_crew.secrets import SecretVault
 
@@ -26,6 +27,10 @@ class _State:
 
     def __init__(self) -> None:
         self.sessions = _Sessions()
+
+
+def test_default_runtime_warm_window_avoids_per_message_cold_starts() -> None:
+    assert CODER_DEFAULT_RUNTIME_WARM_MINUTES == 15
 
 
 def _app() -> web.Application:
@@ -285,7 +290,7 @@ def test_loader_exposes_managed_workspace_policy_defaults(
     assert coder.template == ""
     assert coder.preset == ""
     assert coder.remote_cwd == "/home/coder/workspace"
-    assert coder.runtime_warm_minutes == 5
+    assert coder.runtime_warm_minutes == 15
     assert coder.stop_after_minutes == 30
     assert coder.delete_after_days == 30
     assert coder.max_running == 3

@@ -902,6 +902,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     return out
   }, [messages, activeSlot])
   const slotRunning = useAppSelector(s => s.chat.slotRunning)
+  const activeStatusKind = useAppSelector(s => activeSlot
+    ? s.chat.slotStatusDetail[activeSlot]?.kind
+    : undefined)
   // Turn disclosure ("N tool calls" / "Worked through N steps"), keyed by the
   // virtualizer's stable row key. This lives HERE rather than in TurnBlock
   // because the transcript is virtualised: a row is unmounted once it leaves
@@ -7133,6 +7136,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   ?? currentSlot?.execution_location?.kind}
                 hasCompletedTurn={completedTurnCount > 0 || (currentSlot?.messages ?? 0) > 1}
                 connected={connected}
+                statusKind={activeStatusKind}
               />
               {activeSlot && !slotLoading && !embedded && !popout && slotSwitchTarget !== activeSlot && (
                 <div className="px-4 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>

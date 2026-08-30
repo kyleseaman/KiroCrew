@@ -9,6 +9,7 @@ import { isWorkflowCompletionMessage } from './WorkflowCompletionCard'
 import { isSubagentCompletionMessage } from './subagentCompletion'
 import { isDiffToolMessage } from './toolDiff'
 import { OPTION_MARKER_RE } from '../../app-sdk/protocol/optionMarker'
+import { i18nT } from '../../i18n/t'
 
 // A workflow_run launch renders as its own always-visible inline card
 // (WorkflowRunCard), so it must never be folded into the collapsible tool-call
@@ -260,6 +261,9 @@ export default function TurnBlock({ turn, renderItem, collapseAll = false, appTo
       .flatMap(s => s.type === 'collapsed' ? s.items : [])
       .filter(({ it }) => !isHiddenTool(it))
       .length
+    const completedToolCount = beforeItems.filter(
+      it => isTool(it, appToolCallIds) && !isHiddenTool(it),
+    ).length
 
     if (!turn.complete || stepCount === 0) {
       return <>{turn.items.map((it, i) => renderItem(it, i))}</>
@@ -268,7 +272,11 @@ export default function TurnBlock({ turn, renderItem, collapseAll = false, appTo
     return (
       <>
         <CollapseToggle expanded={expanded} onToggle={toggle}
-          label={expanded ? 'Hide reasoning' : `Worked through ${stepCount} step${stepCount !== 1 ? 's' : ''}`} />
+          label={expanded
+            ? i18nT('pages.chat.thinkingBlock.hide_reasoning')
+            : completedToolCount > 0
+              ? i18nT('pages.chat.collapsibleToolGroup.tool_call', { count: completedToolCount })
+              : i18nT('pages.chat.thinkingBlock.show_reasoning')} />
         {segs.map((seg, si) => seg.type === 'visible' ? (
           <div key={`v-${si}`}>{renderItem(seg.it, seg.idx)}</div>
         ) : (
@@ -304,7 +312,9 @@ export default function TurnBlock({ turn, renderItem, collapseAll = false, appTo
   return (
     <>
       <CollapseToggle expanded={expanded} onToggle={toggle}
-        label={expanded ? 'Hide tool calls' : `${toolCount} tool call${toolCount !== 1 ? 's' : ''}`} />
+        label={expanded
+          ? i18nT('pages.chat.collapsibleToolGroup.collapse')
+          : i18nT('pages.chat.collapsibleToolGroup.tool_call', { count: toolCount })} />
       {segments.map((seg, si) => seg.type === 'visible' ? (
         <div key={si}>{renderItem(seg.it, seg.idx)}</div>
       ) : (

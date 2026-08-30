@@ -69,6 +69,23 @@ describe('ToolCallLine simplifiedToolNames', () => {
 })
 
 describe('ToolCallLine inline expansion', () => {
+  it('opens while partial output streams and stays in the running state', () => {
+    const store = createTestStore({
+      chat: {
+        activeSlot: 'slot-1',
+        messages: [toolMsg()],
+        toolLog: [{ type: 'tool', text: 'echo hello', tool_call_id: 'tc_1', output: 'line one', done: false, ts: 1 }],
+        slotRunning: true,
+      } as unknown as ChatState,
+    })
+
+    renderWithProviders(<ToolCallLine message={toolMsg()} running slot="slot-1" />, { store })
+
+    expect(screen.getByText('line one')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Hide details/i })).toHaveAttribute('aria-expanded', 'true')
+    expect(document.querySelector('.lucide-loader-circle')).toBeInTheDocument()
+  })
+
   it('shows an indeterminate activity status for a running shell tool', () => {
     const store = createTestStore({
       chat: {
@@ -79,7 +96,7 @@ describe('ToolCallLine inline expansion', () => {
     })
     renderWithProviders(<ToolCallLine message={toolMsg()} running />, { store })
     expect(screen.getByText(/Running ·/)).toBeTruthy()
-    expect(screen.getByLabelText('Show details for tool: Running: echo hello')).toBeTruthy()
+    expect(screen.getByLabelText('Hide details for tool: Running: echo hello')).toBeTruthy()
   })
 
   it('starts collapsed and expands on click, defaulting to Output section', () => {

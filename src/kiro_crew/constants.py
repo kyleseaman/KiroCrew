@@ -27,7 +27,7 @@ ENV_TRUTHY = frozenset({"1", "true", "yes", "on"})
 # persisted Settings schema, its API, and the legacy environment adapter so a
 # fresh configuration cannot present one path and launch sessions in another.
 CODER_DEFAULT_REMOTE_CWD = "/home/coder/workspace"
-CODER_DEFAULT_RUNTIME_WARM_MINUTES = 5
+CODER_DEFAULT_RUNTIME_WARM_MINUTES = 15
 CODER_DEFAULT_STOP_AFTER_MINUTES = 30
 CODER_DEFAULT_DELETE_AFTER_DAYS = 30
 CODER_DEFAULT_MAX_RUNNING = 3

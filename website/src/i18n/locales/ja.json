@@ -8031,6 +8031,7 @@
         "switch_to_raw_markdown_view": "生 Markdown ビューに切り替え",
         "switch_to_rendered_view": "レンダリング済みビューに切り替え",
         "turn_model": "モデル: {{model}}",
+        "model_run_took": "モデルの実行に {{elapsed}} かかりました",
         "turn_took": "ターンに {{elapsed}} かかりました",
         "turn_took_cost": "ターンに {{elapsed}} かかりました({{cost}} の API コスト)",
         "turn_took_credits": "ターンに {{elapsed}} かかり {{credits}} クレジットを使用しました",
@@ -8040,6 +8041,9 @@
         "unpin_message": "メッセージのピン留めを解除"
       },
       "chatFooter": {
+        "connecting_session_environment": "セッション環境に接続中",
+        "preparing_session_context": "セッションコンテキストを準備中",
+        "waiting_for_model": "モデルを待機中",
         "compacting": "コンパクト中…",
         "killing": "強制終了中…",
         "stopping": "停止中…"

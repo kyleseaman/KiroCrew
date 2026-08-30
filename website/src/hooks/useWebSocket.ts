@@ -1217,7 +1217,7 @@ export function useWebSocket() {
             // Dispatching here would insert a duplicate entry in the message list.
             break
           case 'tool_result':
-            dispatch(sseToolResult(data as { slot: string; output: string; tool_call_id?: string }))
+            dispatch(sseToolResult(data as { slot: string; output: string; tool_call_id?: string; final?: boolean }))
             break
           case 'mcp_app_render':
             // MCP App (SEP-1865) render payload from the gateway. Stored by
@@ -1415,6 +1415,23 @@ export function useWebSocket() {
               if (streaming) flushVoiceTail(segmentSlot, streaming)
             }
             dispatch(sseChatMessage({ ...data, role: '_segment' }))
+            break
+          }
+          case 'chat_stage': {
+            const stage = (data as { stage?: string }).stage
+            const labels: Record<string, string> = {
+              preparing_session: i18nT('pages.chat.chatFooter.connecting_session_environment'),
+              preparing_context: i18nT('pages.chat.chatFooter.preparing_session_context'),
+              waiting_for_model: i18nT('pages.chat.chatFooter.waiting_for_model'),
+            }
+            if (data.slot && stage && labels[stage]) {
+              dispatch(setSlotStatusDetail({
+                slot: data.slot,
+                kind: stage,
+                text: labels[stage],
+                ts: Date.now(),
+              }))
+            }
             break
           }
           case 'chat_status':

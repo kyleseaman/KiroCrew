@@ -9,6 +9,17 @@ const base = { running: false, stopping: false, state: '', lastRole: '', avatar:
 afterEach(() => document.documentElement.removeAttribute('data-theme'))
 
 describe('ChatFooter', () => {
+  it.each([
+    ['preparing_session', 'Connecting to session environment'],
+    ['preparing_context', 'Preparing session context'],
+    ['waiting_for_model', 'Waiting for the model'],
+  ])('shows the real pre-response stage for %s', (stage, label) => {
+    render(<ChatFooter {...base} running lastRole="user" statusKind={stage} />)
+
+    expect(screen.getByRole('status')).toHaveTextContent(label)
+    expect(document.querySelector('.csb4')).not.toBeInTheDocument()
+  })
+
   it('returns null when not running', () => {
     const { container } = render(<ChatFooter {...base} />)
     expect(container.innerHTML).toBe('')

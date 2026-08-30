@@ -1240,6 +1240,7 @@ def _attach_turn_stats(
     cost_usd: float,
     turn_boundary: int = 0,
     model: str = "",
+    total_elapsed_ms: int = 0,
 ) -> None:
     """Attach per-turn stats to the last assistant message's meta.
 
@@ -1247,9 +1248,11 @@ def _attach_turn_stats(
     BEFORE ``_save_slot_to_history`` persists it, and reaches the live UI via
     the ``chat_done`` → ``refreshSlot`` re-fetch (no dedicated WS event).
 
-    ``elapsed_ms`` is the turn wall clock (or the provider-reported duration
-    when available); ``credits`` is kiro-cli's per-turn ``meteringUsage`` sum;
-    ``cost_usd`` is claude_code's API-reported cost. ``model`` is what served
+    ``elapsed_ms`` is the provider execution clock (or its reported duration
+    when available); ``total_elapsed_ms`` includes environment acquisition,
+    context assembly, and provider execution. ``credits`` is kiro-cli's
+    per-turn ``meteringUsage`` sum; ``cost_usd`` is the API-reported cost.
+    ``model`` is what served
     this turn (``read_turn_model``): a concrete id on a pinned session, or the
     bare ``"auto"`` when the turn was handed to Auto and the backend disclosed
     no id for it — Auto's per-turn choice is not on the ACP wire, so ``"auto"``
@@ -1266,6 +1269,8 @@ def _attach_turn_stats(
     if elapsed_ms <= 0:
         return
     stats: dict[str, Any] = {"elapsed_ms": int(elapsed_ms)}
+    if total_elapsed_ms > 0:
+        stats["total_elapsed_ms"] = int(total_elapsed_ms)
     if credits > 0:
         stats["credits"] = round(credits, 4)
     if cost_usd > 0:
@@ -4678,6 +4683,11 @@ async def _run_chat(
 ) -> None:
     """Stream LLM response into *slot*.  Survives browser disconnect."""
 
+    # End-to-end turn clock includes managed-environment acquisition, session
+    # reconnect, context assembly, model wait, and provider execution. The
+    # provider duration below remains separate for diagnostics.
+    _request_t0 = time.monotonic()
+
     # Capture before any await: a Stop can complete while pre-turn setup is
     # suspended and reset _stop_state to idle before continuation processing.
     # The monotonic generation preserves that user intent across the whole call.
@@ -5339,6 +5349,7 @@ async def _run_chat(
         state.broadcast_ws(
             "activity_event", {"slot": slot.key, "kind": "status", "text": "Creating session…"}
         )
+        state.broadcast_ws("chat_stage", {"slot": slot.key, "stage": "preparing_session"})
         slot.model = _normalize_model(slot.model or "") or ""
         # Consume a deferred project-change reset queued while idle, before
         # get_or_create or we'd reuse the stale session for one turn. Safe here:
@@ -5365,6 +5376,7 @@ async def _run_chat(
             ),
         )
         _acquired = True
+        state.broadcast_ws("chat_stage", {"slot": slot.key, "stage": "preparing_context"})
         location_resolver = getattr(state.sessions, "execution_location", None)
         execution_location = location_resolver(session_key) if callable(location_resolver) else None
         has_managed_execution_location = bool(
@@ -5975,6 +5987,7 @@ async def _run_chat(
         state.broadcast_ws(
             "activity_event", {"slot": slot.key, "kind": "status", "text": "Thinking…"}
         )
+        state.broadcast_ws("chat_stage", {"slot": slot.key, "stage": "waiting_for_model"})
 
         # ── Bidirectional sync: mirror user message to linked Slack thread ──
         # Resolving the link is deliberately NOT gated on syntheticness — only the
@@ -6035,6 +6048,7 @@ async def _run_chat(
         # error-only turn can't overwrite the previous turn's stats.
         _turn_t0 = time.monotonic()
         _turn_elapsed_ms = 0
+        _turn_total_elapsed_ms = 0
         _turn_credits = 0.0
         _turn_cost_usd = 0.0
         _turn_model = ""
@@ -6100,7 +6114,12 @@ async def _run_chat(
                             if tcid:
                                 state.broadcast_ws(
                                     "tool_result",
-                                    {"slot": slot.key, "tool_call_id": tcid, "output": ""},
+                                    {
+                                        "slot": slot.key,
+                                        "tool_call_id": tcid,
+                                        "output": "",
+                                        "final": True,
+                                    },
                                 )
                         elif m.get("role") not in ("tool", "permission", "chunk"):
                             break
@@ -6583,6 +6602,7 @@ async def _run_chat(
                         "slot": slot.key,
                         "tool_call_id": _tcid,
                         "output": _out,
+                        "final": bool(event.tool_final),
                     },
                 )
                 # If this tool result belongs to a native sub-agent, stream its
@@ -6597,7 +6617,8 @@ async def _run_chat(
                     and event.tool_output
                     and event.tool_call_id not in _native_result_seen
                 ):
-                    _native_result_seen.add(event.tool_call_id)
+                    if event.tool_final:
+                        _native_result_seen.add(event.tool_call_id)
                     _nout, _ = redact_exfiltration_urls(_out)
                     _nout, _ = redact_credentials(_nout)
                     _native_card_output_len[_nat_card_r] = _append_native_output(
@@ -6616,7 +6637,7 @@ async def _run_chat(
                 # Iterate ALL matching messages — auto-approved tools create two
                 # tool entries (🔧 pre-approval + ✅ post-approval) with the same
                 # tool_call_id, and both pills should reflect the same output.
-                if _tcid:
+                if _tcid and event.tool_final:
                     for m in slot.messages:
                         if (
                             m.get("role") == "tool"
@@ -6625,18 +6646,27 @@ async def _run_chat(
                             _meta = m.setdefault("meta", {})
                             _meta["done"] = True
                             _meta["output"] = _out
-                # Fire PostToolUse hooks
-                _tool_name = _pending_tools.pop(event.tool_call_id, "")
-                try:
-                    _redacted_out, _ = redact_credentials(_out[:2000])
-                    _redacted_out, _ = redact_exfiltration_urls(_redacted_out)
-                    await _fire(
-                        HOOK_EVENT_POST_TOOL_USE,
-                        tool_name=_tool_name,
-                        tool_response={"output": _redacted_out},
-                    )
-                except Exception:
-                    logger.debug("PostToolUse hook error", exc_info=True)
+                # Partial results are progress, not completion. Keep the tool
+                # pending and fire PostToolUse exactly once on the terminal
+                # frame, after the full redacted output is available.
+                if event.tool_final:
+                    _tool_name = _pending_tools.pop(event.tool_call_id, "")
+                    if _tool_name:
+                        try:
+                            _redacted_out, _ = redact_credentials(_out[:2000])
+                            _redacted_out, _ = redact_exfiltration_urls(_redacted_out)
+                            await _fire(
+                                HOOK_EVENT_POST_TOOL_USE,
+                                tool_name=_tool_name,
+                                tool_response={"output": _redacted_out},
+                            )
+                        except Exception:
+                            logger.debug("PostToolUse hook error", exc_info=True)
+                        if not _pending_tools:
+                            state.broadcast_ws(
+                                "chat_stage",
+                                {"slot": slot.key, "stage": "waiting_for_model"},
+                            )
             elif event.kind == EVENT_PERMISSION_REQUEST:
                 # Permission is part of the tool group, not a break in it —
                 # leaving in_tool_group True ensures the post-tool text fallback
@@ -7760,6 +7790,7 @@ async def _run_chat(
                     _turn_cost_usd = float(_u.cost_usd or 0.0)
                 except (TypeError, ValueError):
                     _turn_elapsed_ms = int((time.monotonic() - _turn_t0) * 1000)
+                _turn_total_elapsed_ms = int((time.monotonic() - _request_t0) * 1000)
                 # Model attribution for the footer. read_turn_model reports the
                 # id the backend actually served, or the bare "auto" when the
                 # turn was handed to Auto and no concrete id came back — the
@@ -8468,6 +8499,7 @@ async def _run_chat(
                 _turn_cost_usd,
                 turn_boundary=_turn_msg_boundary,
                 model=_turn_model,
+                total_elapsed_ms=_turn_total_elapsed_ms,
             )
             # Attach accumulated file changes to last assistant message before persist
             _flush_file_changes(slot)

@@ -172,7 +172,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
       if (e.type !== 'tool') continue
       if ((toolCallId && e.tool_call_id === toolCallId) || (!toolCallId && e.tool_call_id && label.includes(e.text))) {
         const rejected = !!e.rejected || wasRejectedByPerm()
-        const isDone = e.output != null || rejected || autoDenied || !slotRunning
+        const isDone = e.done ?? (e.output != null || rejected || autoDenied || !slotRunning)
         return {
           effectiveId: e.tool_call_id || null,
           isDone, isRejected: rejected,
@@ -415,17 +415,18 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
 
   // Inline expansion state.
   //
-  // Default `expanded` mirrors `hasPendingPerm` so a tool that lands awaiting
-  // approval (or one that's still pending after a page reload) opens with its
-  // details visible — the inline panel is the only place the user can read
-  // what the agent is about to run.
+  // A live tool opens its details so partial output is genuinely visible as it
+  // streams. Approval uses the same behaviour because the panel is the only
+  // place the user can inspect what is about to run.
   //
   // `pendingAutoExpand` tracks whether the current expanded state was *driven*
   // by the pending-approval transition. We clear it on any user interaction
   // (manual toggle / focus signal) so the panel stays open if the user took
   // explicit control, and only auto-collapse when the approval resolves
   // *and* we were the ones who opened it.
-  const [localExpanded, setLocalExpanded] = useState(() => hasPendingPerm)
+  const [localExpanded, setLocalExpanded] = useState(
+    () => hasPendingPerm || (!isDone && !isWaitTool),
+  )
   // Disclosure is HOST-OWNED when `disclosure` is supplied. The transcript is
   // virtualised, so this pill is unmounted whenever its row leaves the mounted
   // window, and state kept only here dies with it. `undefined` means the host
@@ -469,6 +470,27 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
       return () => cancelAnimationFrame(raf)
     }
   }, [hasPendingPerm, pendingAutoExpand, applyExpanded])
+
+  // Streaming output opens automatically and collapses once the final result
+  // arrives. A manual toggle takes ownership, just like approval disclosure.
+  const [liveAutoExpand, setLiveAutoExpand] = useState(
+    () => !isDone && !hasPendingPerm && !isWaitTool,
+  )
+  const prevDoneRef = useRef(isDone)
+  useEffect(() => {
+    const wasDone = prevDoneRef.current
+    prevDoneRef.current = isDone
+    if (!isDone && wasDone && !hasPendingPerm && !isWaitTool) {
+      applyExpanded(true)
+      setLiveAutoExpand(true)
+    } else if (isDone && !wasDone && liveAutoExpand) {
+      const raf = requestAnimationFrame(() => {
+        applyExpanded(false)
+        setLiveAutoExpand(false)
+      })
+      return () => cancelAnimationFrame(raf)
+    }
+  }, [isDone, hasPendingPerm, isWaitTool, liveAutoExpand, applyExpanded])
 
   const containerRef = useRef<HTMLDivElement>(null)
 
@@ -651,6 +673,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
     if (hasPendingPerm) return
     applyExpanded(!expanded)
     setPendingAutoExpand(false)
+    setLiveAutoExpand(false)
   }, [hasPendingPerm, expanded, applyExpanded])
 
   const fmtTime = (t: number) => t ? fmtDateFields(t, { hour: '2-digit', minute: '2-digit' }) : ''

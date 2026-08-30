@@ -47,6 +47,22 @@ describe('sseSubagentChunk — prototype-pollution guard (bug chatSlice.ts:931)'
 })
 
 describe('sseToolResult — prefer exact tool_call_id match (bug chatSlice.ts:1213)', () => {
+  it('keeps partial output running until a final frame arrives', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('active'))
+    store.dispatch(sseToolActivity({ slot: 'active', tool: 'build', kind: 'execute', purpose: '', input_preview: '', tool_call_id: 'call-stream' }))
+
+    store.dispatch(sseToolResult({ slot: 'active', output: 'compiling 1/3', tool_call_id: 'call-stream', final: false }))
+    let entry = store.getState().chat.toolLog.find((e) => e.tool_call_id === 'call-stream')!
+    expect(entry.output).toBe('compiling 1/3')
+    expect(entry.done).toBe(false)
+
+    store.dispatch(sseToolResult({ slot: 'active', output: 'build complete', tool_call_id: 'call-stream', final: true }))
+    entry = store.getState().chat.toolLog.find((e) => e.tool_call_id === 'call-stream')!
+    expect(entry.output).toBe('build complete')
+    expect(entry.done).toBe(true)
+  })
+
   it('attaches output to the entry with the matching tid, not a later id-less tool', () => {
     const store = makeStore()
     store.dispatch(setActiveSlot('active'))

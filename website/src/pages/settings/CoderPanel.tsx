@@ -87,7 +87,7 @@ export function CoderPanel() {
     preset: '',
     profiles: {},
     remote_cwd: '/home/coder/workspace',
-    runtime_warm_minutes: 5,
+    runtime_warm_minutes: 15,
     stop_after_minutes: 30,
     delete_after_days: 30,
     max_running: 3,

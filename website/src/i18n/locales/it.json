@@ -8237,6 +8237,7 @@
         "switch_to_raw_markdown_view": "Passa alla vista del Markdown grezzo",
         "switch_to_rendered_view": "Passa alla vista formattata",
         "turn_model": "modello: {{model}}",
+        "model_run_took": "L’esecuzione del modello ha richiesto {{elapsed}}",
         "turn_took": "Il turno ha richiesto {{elapsed}}",
         "turn_took_cost": "Il turno ha richiesto {{elapsed}} ({{cost}} di costo API)",
         "turn_took_credits": "Il turno ha richiesto {{elapsed}} e ha consumato {{credits}} crediti",
@@ -8246,6 +8247,9 @@
         "unpin_message": "Rimuovi fissaggio"
       },
       "chatFooter": {
+        "connecting_session_environment": "Connessione all’ambiente della sessione",
+        "preparing_session_context": "Preparazione del contesto della sessione",
+        "waiting_for_model": "In attesa del modello",
         "compacting": "Compattazione in corso…",
         "killing": "Chiusura forzata…",
         "stopping": "Arresto in corso…"

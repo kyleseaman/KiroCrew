@@ -283,7 +283,8 @@ send time.
 | `warm_pool_size` | Property: number of warm sessions available. |
 
 Managed remote sessions override the ordinary local idle timeout with the
-configured short runtime-warm duration. The cleanup loop still skips a session
+configured short runtime-warm duration (15 minutes by default). The cleanup loop
+still skips a session
 whose semaphore is held, so a foreground turn or build driven by that turn is
 not cut off. After the warm duration, `remove()` shuts down the remote ACP/SSH
 transport while preserving the session-map entry; a later claim cold-starts the
@@ -326,6 +327,13 @@ picker occupies the same metadata shelf below the composer, between the agent an
 project controls, with a generic environment glyph. If the
 gateway disconnects during a running turn, the transcript replaces the stale thinking
 animation with a reconnecting notice rather than implying fresh model activity.
+Once the managed environment is available, the compact footer follows gateway-owned
+`chat_stage` events through session acquisition, context preparation, and model wait.
+Tool calls then own the live activity surface: `tool_result` frames carry an explicit
+`final` bit, partial results replace the visible output while the tool remains running,
+and only the terminal frame completes and persists the tool. The browser receives both
+through the existing authenticated gateway WebSocket; it never opens a direct channel
+to the managed environment.
 The session list carries remote placement as a provider-neutral server glyph on
 the existing agent/meta line. Its accessible label and tooltip identify the
 provider and generated workspace. The glyph remains present for a retained Coder

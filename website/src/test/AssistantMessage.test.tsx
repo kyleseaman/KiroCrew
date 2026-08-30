@@ -22,6 +22,20 @@ beforeEach(() => { vi.useFakeTimers() })
 afterEach(() => { act(() => { vi.runAllTimers() }); vi.useRealTimers() })
 
 describe('AssistantMessage', () => {
+  it('shows end-to-end duration while retaining provider duration in the tooltip', () => {
+    render(
+      <AssistantMessage
+        content="Done"
+        isStreaming={false}
+        slotRunning={false}
+        turnStats={{ elapsed_ms: 3200, total_elapsed_ms: 9100 }}
+      />,
+    )
+
+    expect(screen.getByTestId('turn-stats')).toHaveTextContent('9.1s')
+    expect(screen.getByTestId('turn-stats')).toHaveAttribute('title', expect.stringContaining('3.2s'))
+  })
+
   it('renders markdown content', () => {
     render(<AssistantMessage content="Hello world" isStreaming={false} slotRunning={false} />)
     expect(screen.getByTestId('md')).toHaveTextContent('Hello world')

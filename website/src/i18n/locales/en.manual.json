@@ -2897,6 +2897,7 @@
       },
       "assistantMessage": {
         "copied": "Copied!",
+        "model_run_took": "Model run took {{elapsed}}",
         "raw": "raw",
         "raw_markdown": "Raw markdown",
         "rendered": "rendered",
@@ -2904,6 +2905,11 @@
         "switch_to_raw_markdown_view": "Switch to raw markdown view",
         "switch_to_rendered_view": "Switch to rendered view",
         "use_as_plan_count": "Use as Plan ({{count}} steps)"
+      },
+      "chatFooter": {
+        "connecting_session_environment": "Connecting to session environment",
+        "preparing_session_context": "Preparing session context",
+        "waiting_for_model": "Waiting for the model"
       },
       "chatNavPanel": {
         "link": "Link"

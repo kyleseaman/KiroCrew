@@ -23,7 +23,7 @@ import { fmtCurrency, fmtDuration, fmtNumber, fmtUnit } from '../../i18n/format'
  *  completed turn (chat_runner._attach_turn_stats). Parity with the end-of-turn
  *  line kiro-cli prints natively: elapsed wall clock + credits (kiro) or
  *  API cost (claude_code). Zero fields are omitted by the backend. */
-export interface TurnStats { elapsed_ms: number; credits?: number; cost_usd?: number; model?: string }
+export interface TurnStats { elapsed_ms: number; total_elapsed_ms?: number; credits?: number; cost_usd?: number; model?: string }
 
 /** Trim a served model id to a compact footer label: drop region/vendor
  *  routing prefixes ("global.anthropic.claude-opus-4-8[1m]" → "claude-opus-4-8[1m]").
@@ -194,7 +194,8 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
   // already locale-formatted by the `format.ts` seam.
   const turnStatsTitle = (() => {
     if (!turnStats) return undefined
-    const elapsed = fmtTurnElapsed(turnStats.elapsed_ms)
+    const displayElapsedMs = turnStats.total_elapsed_ms ?? turnStats.elapsed_ms
+    const elapsed = fmtTurnElapsed(displayElapsedMs)
     const hasCredits = (turnStats.credits ?? 0) > 0
     const hasCost = (turnStats.cost_usd ?? 0) > 0
     const credits = hasCredits ? fmtCredits(turnStats.credits!) : ''
@@ -205,10 +206,19 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
       : hasCredits ? i18nT('pages.chat.assistantMessage.turn_took_credits', { elapsed, credits })
       : hasCost ? i18nT('pages.chat.assistantMessage.turn_took_cost', { elapsed, cost })
       : i18nT('pages.chat.assistantMessage.turn_took', { elapsed })
+    const details = [base]
+    if (turnStats.total_elapsed_ms && turnStats.total_elapsed_ms !== turnStats.elapsed_ms) {
+      details.push(i18nT('pages.chat.assistantMessage.model_run_took', {
+        elapsed: fmtTurnElapsed(turnStats.elapsed_ms),
+      }))
+    }
     // The tooltip carries the FULL untrimmed model id (the inline label is
     // shortened by fmtTurnModel), so the profile/region routing detail stays
     // one hover away instead of widening the footer line.
-    return turnStats.model ? `${base} · ${i18nT('pages.chat.assistantMessage.turn_model', { model: turnStats.model })}` : base
+    if (turnStats.model) {
+      details.push(i18nT('pages.chat.assistantMessage.turn_model', { model: turnStats.model }))
+    }
+    return details.join(' · ')
   })()
 
   return <div data-role="assistant" className="group/msg">
@@ -258,7 +268,7 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
             {turnStats.model && <span className="font-mono" data-testid="turn-model">{fmtTurnModel(turnStats.model)} ·</span>}
             {billed && <span>{billed} ·</span>}
             <Clock size={11} aria-hidden="true" />
-            <span>{fmtTurnElapsed(turnStats.elapsed_ms)}</span>
+            <span>{fmtTurnElapsed(turnStats.total_elapsed_ms ?? turnStats.elapsed_ms)}</span>
           </>
         })()}
       </div>

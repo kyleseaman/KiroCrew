@@ -8134,6 +8134,7 @@
         "switch_to_raw_markdown_view": "Zur Roh-Markdown-Ansicht wechseln",
         "switch_to_rendered_view": "Zur gerenderten Ansicht wechseln",
         "turn_model": "Modell: {{model}}",
+        "model_run_took": "Modelllauf dauerte {{elapsed}}",
         "turn_took": "Zug dauerte {{elapsed}}",
         "turn_took_cost": "Zug dauerte {{elapsed}} ({{cost}} API-Kosten)",
         "turn_took_credits": "Zug dauerte {{elapsed}} und verbrauchte {{credits}} Credits",
@@ -8143,6 +8144,9 @@
         "unpin_message": "Nachricht loslösen"
       },
       "chatFooter": {
+        "connecting_session_environment": "Verbindung mit der Sitzungsumgebung wird hergestellt",
+        "preparing_session_context": "Sitzungskontext wird vorbereitet",
+        "waiting_for_model": "Warten auf das Modell",
         "compacting": "Wird verdichtet…",
         "killing": "Wird beendet…",
         "stopping": "Wird gestoppt…"

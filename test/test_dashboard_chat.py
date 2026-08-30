@@ -5026,14 +5026,21 @@ class TestRunChatNativeSubagentAttribution:
                 tool_kind="read",
                 tool_call_id="tc-1",
             ),
-            # 4) flat tool_result (real output) → attributed + accumulated
+            # 4) partial output streams without completing the tool
+            LLMEvent(
+                kind=EVENT_TOOL_RESULT,
+                tool_call_id="tc-1",
+                tool_output="file body X",
+                tool_final=False,
+            ),
+            # 5) final tool_result (real output) → attributed + accumulated
             LLMEvent(
                 kind=EVENT_TOOL_RESULT,
                 tool_call_id="tc-1",
                 tool_output="file body XYZ",
                 tool_final=True,
             ),
-            # 5) duplicate tool_result (kiro sends content + rawOutput) → deduped
+            # 6) duplicate tool_result (kiro sends content + rawOutput) → deduped
             LLMEvent(
                 kind=EVENT_TOOL_RESULT,
                 tool_call_id="tc-1",
@@ -5060,6 +5067,16 @@ class TestRunChatNativeSubagentAttribution:
 
         calls = [(c.args[0], c.args[1]) for c in state.broadcast_ws.call_args_list]
         card = "native:sess-1"
+
+        tool_results = [d for t, d in calls if t == "tool_result"]
+        assert [d["final"] for d in tool_results] == [False, True, True]
+        stages = [d["stage"] for t, d in calls if t == "chat_stage"]
+        assert stages == [
+            "preparing_session",
+            "preparing_context",
+            "waiting_for_model",
+            "waiting_for_model",
+        ]
 
         # Card spawned with agent + task.
         spawns = [d for t, d in calls if t == "subagent_spawn" and d.get("id") == card]

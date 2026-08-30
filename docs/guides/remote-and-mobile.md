@@ -222,7 +222,7 @@ tailnet Coder URL (`https://kirocrew-coder.example.ts.net`), template
 defaults), remote directory (`/home/coder/workspace`), and automation token.
 Add named profiles when sessions should be able to choose another Coder
 template or preset, such as a larger CPU profile or a memory-heavy profile.
-The POC defaults keep a remote runtime warm for 5 minutes, request Coder
+The POC defaults keep a remote runtime warm for 15 minutes, request Coder
 autostop after 30 minutes, retain an inactive stopped workspace for 30 days,
 allow three running parent workspaces, and use the `crew-session` name prefix.
 Use **Test connection**, then save and enable the default. The probe authenticates

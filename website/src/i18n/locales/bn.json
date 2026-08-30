@@ -8134,6 +8134,7 @@
         "switch_to_raw_markdown_view": "মূল markdown ভিউতে যাও",
         "switch_to_rendered_view": "রেন্ডার করা ভিউতে যাও",
         "turn_model": "মডেল: {{model}}",
+        "model_run_took": "মডেল চলতে {{elapsed}} সময় লেগেছে",
         "turn_took": "টার্নে সময় লেগেছে {{elapsed}}",
         "turn_took_cost": "টার্নে সময় লেগেছে {{elapsed}} ({{cost}} API ব্যয়)",
         "turn_took_credits": "টার্নে সময় লেগেছে {{elapsed}} এবং খরচ হয়েছে {{credits}} ক্রেডিট",
@@ -8143,6 +8144,9 @@
         "unpin_message": "বার্তা আনপিন করুন"
       },
       "chatFooter": {
+        "connecting_session_environment": "সেশন এনভায়রনমেন্টে সংযোগ করা হচ্ছে",
+        "preparing_session_context": "সেশনের প্রসঙ্গ প্রস্তুত করা হচ্ছে",
+        "waiting_for_model": "মডেলের জন্য অপেক্ষা করা হচ্ছে",
         "compacting": "কম্প্যাক্ট করা হচ্ছে…",
         "killing": "জোর করে বন্ধ করা হচ্ছে…",
         "stopping": "থামানো হচ্ছে…"

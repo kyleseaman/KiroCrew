@@ -3430,7 +3430,7 @@ const chatSlice = createSlice({
       if (action.payload.approval_type) entry.approval_type = action.payload.approval_type
       log.push(entry)
     },
-    sseToolResult(state, action: PayloadAction<{ slot: string; output: string; tool_call_id?: string }>) {
+    sseToolResult(state, action: PayloadAction<{ slot: string; output: string; tool_call_id?: string; final?: boolean }>) {
       const tid = action.payload.tool_call_id
       // Land the output on the tool MESSAGE's meta as well as the tool log, for
       // the one consumer that reads scrollback rather than the tool log: the
@@ -3477,7 +3477,13 @@ const chatSlice = createSlice({
           if (log[i].type === 'tool' && (!tid || !log[i].tool_call_id)) { target = i; break }
         }
       }
-      if (target >= 0) log[target].output = action.payload.output
+      if (target >= 0) {
+        log[target].output = action.payload.output
+        // Old gateways emitted only terminal tool_result frames, so an absent
+        // flag remains terminal. New gateways explicitly mark partial output
+        // false, keeping the row live while stdout/results stream in.
+        log[target].done = action.payload.final !== false
+      }
     },
     /** Store an MCP App (SEP-1865) render payload, keyed by BOTH its session
      *  and tool_call_id (see mcpAppKey): the session scope means an ACP

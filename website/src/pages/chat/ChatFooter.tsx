@@ -1,5 +1,5 @@
 import { memo, useState, useEffect, useMemo, useRef, type ComponentType } from 'react'
-import { Hourglass, WifiOff } from 'lucide-react'
+import { Hourglass, LoaderCircle, WifiOff } from 'lucide-react'
 import { motion } from 'framer-motion'
 
 import { i18nT } from '../../i18n/t'
@@ -226,6 +226,7 @@ interface ChatFooterProps {
   executionProvider?: string
   hasCompletedTurn?: boolean
   connected?: boolean
+  statusKind?: string
 }
 
 const ChatFooter = memo(function ChatFooter({
@@ -241,6 +242,7 @@ const ChatFooter = memo(function ChatFooter({
   executionProvider,
   hasCompletedTurn = false,
   connected = true,
+  statusKind,
 }: ChatFooterProps) {
   const loader = resolveLoader(useThemeSlug())
   // A managed runtime can reconnect to an already-provisioned environment after
@@ -256,6 +258,13 @@ const ChatFooter = memo(function ChatFooter({
   // "still streaming", so the loader stayed hidden with nothing else moving.
   const streamingText = lastRole === 'streaming' && state === 'streaming'
   const streamQuiet = useStreamIdle(streamTick, streamingText)
+  const stageLabel = statusKind === 'preparing_session'
+    ? i18nT('pages.chat.chatFooter.connecting_session_environment')
+    : statusKind === 'preparing_context'
+      ? i18nT('pages.chat.chatFooter.preparing_session_context')
+      : statusKind === 'waiting_for_model'
+        ? i18nT('pages.chat.chatFooter.waiting_for_model')
+        : ''
   // Hidden once the turn is inactive. While the turn RUNS the indicator shows for
   // thinking, tool calls, AND the gaps between steps: the backend keeps
   // slot.running true for the whole turn, so the post-tool gap stays covered
@@ -304,6 +313,11 @@ const ChatFooter = memo(function ChatFooter({
           <span className="text-muted text-[13px] font-mono animate-pulse">{i18nT('pages.chat.chatFooter.stopping')}</span>
         ) : !regenerating && state === 'compacting' ? (
           <span className="text-muted text-[13px] font-mono animate-pulse"><Hourglass className="lucide-inline" /> {i18nT('pages.chat.chatFooter.compacting')}</span>
+        ) : stageLabel ? (
+          <div role="status" aria-live="polite" className="inline-flex items-center gap-2 text-[13px] leading-5 text-muted">
+            <LoaderCircle size={14} className="lucide-inline animate-spin text-accent" aria-hidden="true" />
+            <span>{stageLabel}</span>
+          </div>
         ) : (
           // Both branches render THEME-SUPPLIED components (a whole replacement
           // loader, or the icons the carousel cycles). A throwing one must not

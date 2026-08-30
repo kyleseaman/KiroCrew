@@ -8,6 +8,25 @@ function makeTurn(items: TurnItem[], complete = true): Extract<DisplayItem, {kin
 }
 
 describe('TurnBlock — file role visibility', () => {
+  it('keeps the completed tool-call count explicit in collapse-all mode', () => {
+    const items: TurnItem[] = [
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: read', ts: '1' }, idx: 0 },
+      { kind: 'single', msg: { role: 'assistant', content: 'Checking the result.', ts: '2' }, idx: 1 },
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: test', ts: '3' }, idx: 2 },
+      { kind: 'single', msg: { role: 'assistant', content: 'The verification completed successfully.', ts: '4' }, idx: 3 },
+    ]
+
+    render(
+      <TurnBlock
+        turn={makeTurn(items)}
+        collapseAll
+        renderItem={() => null}
+      />,
+    )
+
+    expect(screen.getByRole('button')).toHaveTextContent('2 tool calls')
+  })
+
   it('file messages are not collapsed behind reasoning toggle', () => {
     const items: TurnItem[] = [
       { kind: 'single', msg: { role: 'tool', content: '🔧 Running: file_send', ts: '1' }, idx: 0 },
@@ -286,8 +305,8 @@ describe('TurnBlock — diff-card tool rows', () => {
 
   it('collapseAll mode: the diff row stays visible-inline', () => {
     renderDiffTurn(true)
-    // The plain read folds ("Worked through 1 step"), the edit row does not.
-    expect(screen.getByText('Worked through 1 step')).toBeInTheDocument()
+    // The plain read folds as one explicit tool call; the edit row does not.
+    expect(screen.getByText('1 tool call')).toBeInTheDocument()
     expect(screen.getByTestId('item-tool-tc-edit')).toBeInTheDocument()
     expect(screen.getByTestId('item-assistant-x')).toBeInTheDocument()
   })
@@ -424,9 +443,9 @@ describe('TurnBlock — mid-turn hand-back ([OPTIONS:]) visibility', () => {
         collapseAll={true}
       />
     )
-    // Two tool calls collapse (2 steps); the hand-back at idx 1 is surfaced
+    // Two tool calls collapse; the hand-back at idx 1 is surfaced
     // inline and must NOT inflate the count to 3.
-    expect(screen.getByRole('button', { name: /Worked through 2 steps/ })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /Worked through 3 steps/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /2 tool calls/ })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /3 tool calls/ })).not.toBeInTheDocument()
   })
 })

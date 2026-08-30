@@ -8237,6 +8237,7 @@
         "switch_to_raw_markdown_view": "Cambiar a la vista de Markdown sin formato",
         "switch_to_rendered_view": "Cambiar a la vista renderizada",
         "turn_model": "modelo: {{model}}",
+        "model_run_took": "La ejecución del modelo tardó {{elapsed}}",
         "turn_took": "El turno tardó {{elapsed}}",
         "turn_took_cost": "El turno tardó {{elapsed}} ({{cost}} de coste de API)",
         "turn_took_credits": "El turno tardó {{elapsed}} y consumió {{credits}} créditos",
@@ -8246,6 +8247,9 @@
         "unpin_message": "Desfijar mensaje"
       },
       "chatFooter": {
+        "connecting_session_environment": "Conectando con el entorno de la sesión",
+        "preparing_session_context": "Preparando el contexto de la sesión",
+        "waiting_for_model": "Esperando al modelo",
         "compacting": "Compactando…",
         "killing": "Forzando el cierre…",
         "stopping": "Deteniendo…"

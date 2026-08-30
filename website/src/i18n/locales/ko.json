@@ -8031,6 +8031,7 @@
         "switch_to_raw_markdown_view": "Markdown 원문 보기로 전환",
         "switch_to_rendered_view": "렌더링 보기로 전환",
         "turn_model": "모델: {{model}}",
+        "model_run_took": "모델 실행에 {{elapsed}} 걸렸습니다",
         "turn_took": "턴에 {{elapsed}} 걸렸습니다",
         "turn_took_cost": "턴에 {{elapsed}} 걸렸습니다(API 비용 {{cost}})",
         "turn_took_credits": "턴에 {{elapsed}} 걸렸고 크레딧 {{credits}}을(를) 사용했습니다",
@@ -8040,6 +8041,9 @@
         "unpin_message": "Unpin message"
       },
       "chatFooter": {
+        "connecting_session_environment": "세션 환경에 연결 중",
+        "preparing_session_context": "세션 컨텍스트 준비 중",
+        "waiting_for_model": "모델을 기다리는 중",
         "compacting": "압축 중…",
         "killing": "강제 종료 중…",
         "stopping": "중지 중…"

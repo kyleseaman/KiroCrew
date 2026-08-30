@@ -67,14 +67,14 @@ describe('turn disclosure survives virtualizer unmount', () => {
     const m = aTurn()
     const { rerender } = render(<Transcript messages={m} running={false} mounted={true} />)
     fireEvent.click(screen.getByRole('button'))
-    expect(label()).toContain('Hide')
+    expect(label()).toContain('Collapse')
 
     // Row leaves the mounted window, then the user scrolls back to it.
     rerender(<Transcript messages={m} running={false} mounted={false} />)
     expect(screen.queryAllByRole('button')).toHaveLength(0)
     rerender(<Transcript messages={m} running={false} mounted={true} />)
 
-    expect(label()).toContain('Hide')
+    expect(label()).toContain('Collapse')
   })
 
   it('keeps an explicit collapse across an unmount too', () => {
@@ -102,7 +102,7 @@ describe('turn disclosure survives virtualizer unmount', () => {
     rerender(<Transcript messages={m} running={false} mounted={false} />)
     rerender(<Transcript messages={m} running={false} mounted={true} />)
 
-    expect(label()).toContain('Hide')
+    expect(label()).toContain('Collapse')
   })
 
   it('still auto-collapses on completion when the user never touched it', () => {

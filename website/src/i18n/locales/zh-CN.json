@@ -8031,6 +8031,7 @@
         "switch_to_raw_markdown_view": "切换到原始 Markdown 视图",
         "switch_to_rendered_view": "切换到渲染视图",
         "turn_model": "模型：{{model}}",
+        "model_run_took": "模型运行耗时 {{elapsed}}",
         "turn_took": "本轮次耗时 {{elapsed}}",
         "turn_took_cost": "本轮次耗时 {{elapsed}}（API 成本 {{cost}}）",
         "turn_took_credits": "本轮次耗时 {{elapsed}}，消耗 {{credits}} 额度",
@@ -8040,6 +8041,9 @@
         "unpin_message": "取消置顶"
       },
       "chatFooter": {
+        "connecting_session_environment": "正在连接会话环境",
+        "preparing_session_context": "正在准备会话上下文",
+        "waiting_for_model": "正在等待模型",
         "compacting": "压缩中…",
         "killing": "正在终止…",
         "stopping": "正在停止…"
