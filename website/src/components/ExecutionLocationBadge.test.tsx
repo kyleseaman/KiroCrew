@@ -13,10 +13,11 @@ describe('ExecutionLocationBadge', () => {
     vi.mocked(copyToClipboard).mockResolvedValue()
   })
 
-  it('identifies the live remote workspace without exposing its working directory', () => {
+  it('keeps the live remote workspace compact until its details are expanded', async () => {
+    const user = userEvent.setup()
     render(
       <ExecutionLocationBadge
-        detailLabel="Coder profile · gpu"
+        configurationLabel="gpu"
         location={{
           kind: 'coder',
           workspace: 'crew-dogfood',
@@ -26,17 +27,24 @@ describe('ExecutionLocationBadge', () => {
       />,
     )
 
-    expect(screen.getByText('Coder workspace · crew-dogfood')).toBeInTheDocument()
-    expect(screen.getByText('Coder profile · gpu')).toBeInTheDocument()
+    const control = screen.getByRole('button', { name: 'Session Environments' })
+    expect(control).toHaveTextContent('Coder')
+    expect(control).not.toHaveTextContent('crew-dogfood')
     expect(screen.getByTestId('execution-location-badge')).toHaveAttribute(
       'title',
-      'Coder workspace · crew-dogfood · Coder profile · gpu',
+      'Coder workspace · crew-dogfood',
     )
     expect(screen.getByTestId('execution-location-ready')).toBeInTheDocument()
+
+    await user.click(control)
+
+    expect(screen.getByText('gpu')).toBeInTheDocument()
+    expect(screen.getByText('crew-dogfood')).toBeInTheDocument()
     expect(document.body.textContent).not.toContain('/home/coder/private-project')
   })
 
-  it('does not claim a retained workspace is currently awake', () => {
+  it('does not claim a retained workspace is currently awake', async () => {
+    const user = userEvent.setup()
     render(
       <ExecutionLocationBadge
         location={{
@@ -48,8 +56,9 @@ describe('ExecutionLocationBadge', () => {
       />,
     )
 
-    expect(screen.getByText('Coder workspace · crew-retained')).toBeInTheDocument()
     expect(screen.queryByTestId('execution-location-ready')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Session Environments' }))
+    expect(screen.getByText('crew-retained')).toBeInTheDocument()
   })
 
   it('renders nothing when the slot has no live remote location', () => {
@@ -57,7 +66,8 @@ describe('ExecutionLocationBadge', () => {
     expect(container).toBeEmptyDOMElement()
   })
 
-  it('shows a spinner and generated name while an environment starts', () => {
+  it('shows a compact spinner while an existing environment reconnects', async () => {
+    const user = userEvent.setup()
     render(
       <ExecutionLocationBadge
         location={{
@@ -69,12 +79,16 @@ describe('ExecutionLocationBadge', () => {
       />,
     )
 
-    const status = screen.getByRole('status')
-    expect(status).toHaveTextContent('Starting test-sandbox workspace · sandbox-opaque')
-    expect(status.querySelector('.animate-spin')).toBeInTheDocument()
+    const control = screen.getByRole('button', { name: 'Session Environments' })
+    expect(control).toHaveTextContent('test-sandbox')
+    expect(control).not.toHaveTextContent('sandbox-opaque')
+    expect(control.querySelector('.animate-spin')).toBeInTheDocument()
+    await user.click(control)
+    expect(screen.getByText('sandbox-opaque')).toBeInTheDocument()
   })
 
-  it('falls back to the environment kind for non-Coder workspaces', () => {
+  it('falls back to the environment kind for non-Coder workspaces', async () => {
+    const user = userEvent.setup()
     render(
       <ExecutionLocationBadge
         location={{
@@ -86,7 +100,10 @@ describe('ExecutionLocationBadge', () => {
       />,
     )
 
-    expect(screen.getByText('test-sandbox workspace · sandbox-opaque')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Session Environments' }))
+      .toHaveTextContent('test-sandbox')
+    await user.click(screen.getByRole('button', { name: 'Session Environments' }))
+    expect(screen.getByText('sandbox-opaque')).toBeInTheDocument()
   })
 
   it('copies the generated workspace ID and confirms the completed action', async () => {
@@ -102,6 +119,7 @@ describe('ExecutionLocationBadge', () => {
       />,
     )
 
+    await user.click(screen.getByRole('button', { name: 'Session Environments' }))
     await user.click(screen.getByRole('button', { name: 'Copy workspace ID' }))
 
     expect(copyToClipboard).toHaveBeenCalledWith('crew-session-kyle-opaque')

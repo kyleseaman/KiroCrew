@@ -73,7 +73,6 @@
     "settings_tab_label": "Session Environments",
     "session_configuration_label": "Environment configuration for this session",
     "startup_description": "An isolated environment is being created and connected to this session. This can take a few minutes.",
-    "startup_progress_label": "Workspace startup progress",
     "startup_queued": "Your message is queued. You can keep adding instructions.",
     "startup_title": "Preparing your workspace",
     "workspace_label": "Workspace",

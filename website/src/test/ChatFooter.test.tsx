@@ -139,6 +139,27 @@ describe('ChatFooter', () => {
     expect(screen.queryByTestId('execution-location-startup')).not.toBeInTheDocument()
   })
 
+  it('does not restore the cold-start card when an existing session reconnects', () => {
+    const { container } = render(
+      <ChatFooter
+        {...base}
+        running={true}
+        lastRole="user"
+        hasCompletedTurn={true}
+        executionLocation={{
+          kind: 'coder',
+          workspace: 'crew-session-opaque',
+          remote_cwd: '/workspace',
+          state: 'starting',
+          phase: 'connecting',
+        }}
+      />,
+    )
+
+    expect(screen.queryByTestId('execution-location-startup')).not.toBeInTheDocument()
+    expect(container.querySelector('.csb4')).toBeInTheDocument()
+  })
+
   it('replaces a stale thinking loader with a gateway disconnect notice', () => {
     render(
       <ChatFooter

@@ -67,9 +67,11 @@ describe('SessionEnvironmentControl', () => {
     expect(screen.queryByRole('combobox')).not.toBeInTheDocument()
   })
 
-  it('shows the live workspace instead of a mutable selector after allocation', async () => {
+  it('shows one compact environment control beside the composer after allocation', async () => {
+    const user = userEvent.setup()
     renderWithProviders(
       <SessionEnvironmentControl
+        placement="composer"
         slot={{
           ...slot,
           messages: 1,
@@ -84,13 +86,14 @@ describe('SessionEnvironmentControl', () => {
       />,
     )
 
-    expect(screen.getByText('Coder workspace · crew-opaque')).toBeInTheDocument()
-    expect(screen.getByText('Environment configuration · gpu')).toBeInTheDocument()
-    expect(screen.getAllByTestId('execution-location-badge')).toHaveLength(1)
-    expect(screen.getByTestId('execution-location-badge')).toHaveAttribute(
-      'title',
-      'Coder workspace · crew-opaque · Environment configuration · gpu',
-    )
+    const control = screen.getByRole('button', { name: 'Session Environments' })
+    expect(control).toHaveTextContent('Coder')
+    expect(control).not.toHaveTextContent('crew-opaque')
+    expect(screen.queryByText('Environment configuration · gpu')).not.toBeInTheDocument()
+
+    await user.click(control)
+    expect(screen.getByText('crew-opaque')).toBeInTheDocument()
+    expect(screen.getByText('gpu')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Copy workspace ID' })).toBeInTheDocument()
     expect(screen.queryByRole('combobox')).not.toBeInTheDocument()
   })
@@ -98,6 +101,7 @@ describe('SessionEnvironmentControl', () => {
   it('keeps the durable workspace ID visible after the live runtime idles', async () => {
     renderWithProviders(
       <SessionEnvironmentControl
+        placement="composer"
         slot={{
           ...slot,
           messages: 1,
@@ -110,22 +114,23 @@ describe('SessionEnvironmentControl', () => {
       />,
     )
 
-    expect(await screen.findByText('Coder workspace · crew-session-kyle-retained')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Copy workspace ID' })).toBeInTheDocument()
-    expect(screen.getByText('Environment configuration · gpu')).toBeInTheDocument()
-    expect(screen.getAllByTestId('execution-location-badge')).toHaveLength(1)
+    expect(await screen.findByRole('button', { name: 'Session Environments' })).toHaveTextContent(
+      'Coder',
+    )
+    expect(screen.queryByText('crew-session-kyle-retained')).not.toBeInTheDocument()
   })
 
-  it('leaves all startup progress to the transcript card', async () => {
-    renderWithProviders(
+  it('uses a compact reconnecting control after a prior turn', async () => {
+    const { container } = renderWithProviders(
       <SessionEnvironmentControl
+        placement="composer"
         slot={{
           ...slot,
-          messages: 1,
+          messages: 2,
           environment: { provider: 'coder', configuration: 'gpu', resource_name: '' },
           execution_location: {
             kind: 'coder',
-            workspace: '',
+            workspace: 'crew-opaque',
             remote_cwd: '/home/coder/workspace',
             state: 'starting',
           },
@@ -133,13 +138,15 @@ describe('SessionEnvironmentControl', () => {
       />,
     )
 
-    expect(screen.queryByTestId('execution-location-badge')).not.toBeInTheDocument()
-    expect(screen.queryByText('Environment configuration · gpu')).not.toBeInTheDocument()
+    const control = screen.getByRole('button', { name: 'Session Environments' })
+    expect(control).toHaveTextContent('Coder')
+    expect(container.querySelector('.lucide-loader-circle')).toBeInTheDocument()
   })
 
   it('uses provider catalog metadata for an already hosted session', async () => {
     renderWithProviders(
       <SessionEnvironmentControl
+        placement="composer"
         slot={{
           ...slot,
           messages: 1,
@@ -169,6 +176,7 @@ describe('SessionEnvironmentControl', () => {
 
     renderWithProviders(
       <SessionEnvironmentControl
+        placement="composer"
         slot={{
           ...slot,
           messages: 1,
@@ -181,7 +189,9 @@ describe('SessionEnvironmentControl', () => {
       />,
     )
 
-    expect(await screen.findByText('Kubernetes workspace · crew-pod-opaque')).toBeInTheDocument()
-    expect(screen.getByText('Environment configuration · standard')).toBeInTheDocument()
+    expect(await screen.findByText('Kubernetes')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Session Environments' })).toHaveTextContent(
+      'Kubernetes',
+    )
   })
 })

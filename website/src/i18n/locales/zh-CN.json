@@ -73,7 +73,6 @@
     "settings_tab_label": "会话环境",
     "session_configuration_label": "此会话的环境配置",
     "startup_description": "正在创建隔离环境并连接到此会话，可能需要几分钟。",
-    "startup_progress_label": "工作区启动进度",
     "startup_queued": "消息已加入队列。你可以继续添加指令。",
     "startup_title": "正在准备工作区…",
     "workspace_label": "工作区",

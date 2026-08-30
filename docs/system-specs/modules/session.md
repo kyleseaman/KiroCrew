@@ -312,35 +312,37 @@ provider-specific controls inside that destination. The legacy `?tab=coder`
 deep link redirects to the canonical destination so bookmarks, documentation,
 and saved command-palette entries continue to work.
 
-The dashboard's active-session execution UI is provider-neutral. While the
-descriptor is `starting`, the transcript replaces the decorative model loader
-with a staged startup card that explains the isolated environment, shows the
-provider, selected profile, generated workspace name, and current provider-neutral
-phase as each becomes available. The card renders all startup milestones as a
-completed/current/pending sequence instead of deriving a percentage from coarse
-provider events, and keeps the composer available for queued instructions. A fresh
-session's profile picker sits directly above the composer with a generic environment
-glyph; the header is reserved for a running or durable environment identity. If the
-gateway disconnects during a running turn, the transcript replaces the stale
-thinking animation with a reconnecting notice rather than implying fresh model
-activity.
+The dashboard's active-session execution UI is provider-neutral. Before a session
+completes its first turn, a `starting` descriptor makes the transcript replace the
+decorative model loader with a staged startup card that explains the isolated
+environment, shows the provider, selected profile, generated workspace name, and
+current provider-neutral phase as each becomes available. The card renders all
+startup milestones as a completed/current/pending sequence instead of deriving a
+percentage from coarse provider events, and keeps the composer available for queued
+instructions. After the first completed turn, a later agent-runtime reconnect never
+resurrects the workspace-boot card; the ordinary turn loader remains in the transcript
+and the compact environment control reports the reconnect. A fresh session's profile
+picker sits directly above the composer with a generic environment glyph. If the
+gateway disconnects during a running turn, the transcript replaces the stale thinking
+animation with a reconnecting notice rather than implying fresh model activity.
 The session list carries remote placement as a provider-neutral server glyph on
 the existing agent/meta line. Its accessible label and tooltip identify the
 provider and generated workspace. The glyph remains present for a retained Coder
 binding after compute stops, but it never claims that the workspace is awake;
 startup and turn state remain on their dedicated surfaces. Gateway-local sessions
 have no placement glyph.
-The large card remains the single startup surface through `allocating`,
-`provisioning`, and `connecting`; the header never duplicates it with a loading
-badge. A live `running` descriptor removes the card and adds a ready mark to the
-single header badge. When no
+The large card remains the single first-startup surface through `allocating`,
+`provisioning`, and `connecting`; no second surface duplicates it. A live `running`
+descriptor removes the card and adds a ready mark to the compact environment control
+above the composer. When no
 provider is live, the dashboard may reconstruct the durable Coder workspace label
 as client-only `retained` metadata; it carries no ready mark and makes no claim
 that compute is awake.
-The header uses one compact execution badge for the environment identity and its
-provider profile, with a full-value tooltip and a copy action for generated workspace
-names. Profile metadata is omitted while the descriptor is `starting`; live and
-retained identities include their immutable profile. The session manager
+The composer footer uses one compact provider-labeled environment control. Its trigger
+does not expose the long generated resource name; an expandable detail panel contains
+the provider, immutable configuration, full workspace name, and copy action. A later
+`starting` descriptor changes that same compact control into a reconnecting state.
+The session manager
 keeps a starting provider outside the claimable session registry, emits slot
 updates on its phase plus `starting`/`running`/failed transitions, and copies only the
 descriptor allowlist above from the provider's session host. A Coder host supplies

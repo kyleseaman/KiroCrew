@@ -73,7 +73,6 @@
     "settings_tab_label": "Entornos de sesión",
     "session_configuration_label": "Configuración del entorno para esta sesión",
     "startup_description": "Se está creando un entorno aislado y conectándolo a esta sesión. Esto puede tardar unos minutos.",
-    "startup_progress_label": "Progreso de inicio del espacio de trabajo",
     "startup_queued": "Tu mensaje está en cola. Puedes seguir añadiendo instrucciones.",
     "startup_title": "Preparando tu espacio de trabajo",
     "workspace_label": "Espacio de trabajo",

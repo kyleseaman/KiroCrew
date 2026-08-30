@@ -1,17 +1,18 @@
 import { useEffect, useRef, useState } from 'react'
-import { Check, Copy, Loader2, Server } from 'lucide-react'
+import { Box, Check, ChevronDown, Copy, Layers3, Loader2, Server } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import type { ExecutionLocation } from '../types'
 import { copyToClipboard } from '../utils/clipboard'
-import { IconButton } from './ui'
+import { Btn, IconButton } from './ui'
+import { Popover, PopoverContent, PopoverTrigger } from './ui/popover'
 
 export function ExecutionLocationBadge({
-  detailLabel,
+  configurationLabel,
   location,
   providerLabel,
 }: {
-  detailLabel?: string
+  configurationLabel?: string
   location?: ExecutionLocation
   providerLabel?: string
 }) {
@@ -25,22 +26,14 @@ export function ExecutionLocationBadge({
 
   const starting = location.state === 'starting'
   const ready = location.state === 'running'
-  let label: string
   const kind = providerLabel || (location.kind === 'coder' ? t('coder.tab_label') : location.kind)
-  if (starting) {
-    label = location.workspace
-      ? t('execution_environment.badge_starting_named', {
-          kind,
-          workspace: location.workspace,
-        })
-      : t('execution_environment.badge_starting', { kind })
-  } else {
-    label = t('execution_environment.badge_running', {
-      kind,
-      workspace: location.workspace,
-    })
-  }
-  const tooltip = detailLabel ? `${label} · ${detailLabel}` : label
+  const workspaceLabel = location.workspace || t('execution_environment.workspace_pending')
+  const configurationTooltip = configurationLabel
+    ? t('execution_environment.configuration_badge', { configuration: configurationLabel })
+    : t('execution_environment.default_configuration')
+  const tooltip = starting
+    ? t('execution_environment.phase_connecting')
+    : t('execution_environment.badge_running', { kind, workspace: workspaceLabel })
 
   const copyLabel = copied
     ? t('execution_environment.workspace_id_copied')
@@ -58,17 +51,21 @@ export function ExecutionLocationBadge({
   }
 
   return (
-    <span
-      className="pointer-events-auto inline-flex max-w-[70vw] min-w-0 shrink items-center gap-1 rounded-full border border-accent/30 bg-accent-subtle px-2 py-0.5 text-[11px] font-medium text-accent md:max-w-[40vw]"
-      title={tooltip}
-      data-testid="execution-location-badge"
-      role={starting ? 'status' : undefined}
-      aria-live={starting ? 'polite' : undefined}
-    >
-      {starting ? (
-        <Loader2 className="lucide-inline animate-spin motion-reduce:animate-none" />
-      ) : (
-        <>
+    <Popover>
+      <PopoverTrigger asChild>
+        <Btn
+          className="pointer-events-auto inline-flex min-w-0 max-w-[min(16rem,75vw)] items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[12px] font-medium text-muted shadow-sm transition-colors hover:border-border-strong hover:bg-bg-hover hover:text-text"
+          title={tooltip}
+          aria-label={t('execution_environment.settings_tab_label')}
+          aria-live={starting ? 'polite' : undefined}
+          data-testid="execution-location-badge"
+        >
+          {starting ? (
+            <Loader2 className="lucide-inline shrink-0 animate-spin text-accent motion-reduce:animate-none" />
+          ) : (
+            <Server className="lucide-inline shrink-0" />
+          )}
+          <span className="truncate text-text">{kind}</span>
           {ready ? (
             <span
               className="h-1.5 w-1.5 shrink-0 rounded-full bg-ok"
@@ -76,31 +73,54 @@ export function ExecutionLocationBadge({
               aria-hidden="true"
             />
           ) : null}
-          <Server className="lucide-inline" />
-        </>
-      )}
-      <span className="min-w-0 truncate">{label}</span>
-      {detailLabel ? (
-        <>
-          <span className="shrink-0 text-muted" aria-hidden="true">·</span>
-          <span className="max-w-[24vw] shrink truncate text-muted md:max-w-[16vw]">
-            {detailLabel}
-          </span>
-        </>
-      ) : null}
-      {location.workspace ? (
-        <IconButton
-          className="-my-1 -mr-1 ml-0.5 shrink-0"
-          aria-label={copyLabel}
-          aria-live="polite"
-          title={copyLabel}
-          onClick={copyWorkspace}
-        >
-          {copied
-            ? <Check className="lucide-inline text-ok" />
-            : <Copy className="lucide-inline" />}
-        </IconButton>
-      ) : null}
-    </span>
+          <ChevronDown className="lucide-inline shrink-0" aria-hidden="true" />
+        </Btn>
+      </PopoverTrigger>
+      <PopoverContent
+        side="top"
+        align="end"
+        className="w-[min(22rem,calc(100vw-2rem))] p-3"
+      >
+        <dl className="grid min-w-0 gap-2.5 text-[12px]">
+          <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2">
+            <dt className="flex items-center gap-1.5 text-muted">
+              <Server className="lucide-inline" />
+              {t('execution_environment.provider_label')}
+            </dt>
+            <dd className="truncate text-right font-medium text-text" title={kind}>{kind}</dd>
+          </div>
+          <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2">
+            <dt className="flex items-center gap-1.5 text-muted">
+              <Layers3 className="lucide-inline" />
+              {t('execution_environment.configuration_label')}
+            </dt>
+            <dd className="truncate text-right font-medium text-text" title={configurationTooltip}>
+              {configurationLabel || t('execution_environment.default_configuration')}
+            </dd>
+          </div>
+          <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-2">
+            <dt className="flex items-center gap-1.5 text-muted">
+              <Box className="lucide-inline" />
+              {t('execution_environment.workspace_label')}
+            </dt>
+            <dd className="truncate text-right font-medium text-text" title={workspaceLabel}>
+              {workspaceLabel}
+            </dd>
+            {location.workspace ? (
+              <IconButton
+                aria-label={copyLabel}
+                aria-live="polite"
+                title={copyLabel}
+                onClick={copyWorkspace}
+              >
+                {copied
+                  ? <Check className="lucide-inline text-ok" />
+                  : <Copy className="lucide-inline" />}
+              </IconButton>
+            ) : <span />}
+          </div>
+        </dl>
+      </PopoverContent>
+    </Popover>
   )
 }

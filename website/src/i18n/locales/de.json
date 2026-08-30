@@ -73,7 +73,6 @@
     "settings_tab_label": "Sitzungsumgebungen",
     "session_configuration_label": "Umgebungskonfiguration für diese Sitzung",
     "startup_description": "Eine isolierte Umgebung wird erstellt und mit dieser Sitzung verbunden. Das kann einige Minuten dauern.",
-    "startup_progress_label": "Fortschritt beim Starten des Arbeitsbereichs",
     "startup_queued": "Deine Nachricht ist in der Warteschlange. Du kannst weitere Anweisungen hinzufügen.",
     "startup_title": "Arbeitsbereich wird vorbereitet",
     "workspace_label": "Arbeitsbereich",

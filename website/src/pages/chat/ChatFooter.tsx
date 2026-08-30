@@ -224,6 +224,7 @@ interface ChatFooterProps {
   executionLocation?: ExecutionLocation
   executionConfiguration?: string
   executionProvider?: string
+  hasCompletedTurn?: boolean
   connected?: boolean
 }
 
@@ -238,10 +239,15 @@ const ChatFooter = memo(function ChatFooter({
   executionLocation,
   executionConfiguration,
   executionProvider,
+  hasCompletedTurn = false,
   connected = true,
 }: ChatFooterProps) {
   const loader = resolveLoader(useThemeSlug())
-  const startingLocation = executionLocation?.state === 'starting'
+  // A managed runtime can reconnect to an already-provisioned environment after
+  // its local process idles out. That transient state is not another workspace
+  // boot: once this conversation has completed a turn, keep the large startup
+  // card retired and let the compact composer control report the reconnect.
+  const startingLocation = executionLocation?.state === 'starting' && !hasCompletedTurn
   // Text is only ACTIVELY streaming while the slot says so AND chunks keep
   // arriving. `lastRole` alone cannot tell the two apart: the trailing
   // 'streaming' message is deliberately left unfinalized across a whole tool

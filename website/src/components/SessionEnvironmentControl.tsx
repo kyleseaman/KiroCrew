@@ -38,14 +38,20 @@ function ProviderIcon() {
 }
 
 export function SessionEnvironmentControl({
+  hasCompletedTurn = false,
   slot,
   placement = 'header',
 }: {
+  hasCompletedTurn?: boolean
   slot?: ChatSlot
   placement?: 'header' | 'composer'
 }) {
   const binding = sessionEnvironment(slot)
   const executionLocation = sessionExecutionLocation(slot)
+  // Slot summaries arrive before full chat history on a reload. Two persisted
+  // messages prove this is not an untouched first turn, so they keep a runtime
+  // reconnect compact even while completed-turn history is still loading.
+  const environmentWasReady = hasCompletedTurn || (slot?.messages ?? 0) > 1
   const catalog = useQuery({
     queryKey: ['session-environments'],
     queryFn: api.getSessionEnvironments,
@@ -65,33 +71,21 @@ export function SessionEnvironmentControl({
   })
 
   if (executionLocation) {
-    if (placement === 'composer') return null
-    if (executionLocation.state === 'starting') return null
+    if (placement === 'header') return null
+    if (executionLocation.state === 'starting' && !environmentWasReady) return null
     const configuration = binding?.configuration || executionLocation.profile || ''
-    const detailLabel = configuration
-      ? i18nT('execution_environment.configuration_badge', { configuration })
-      : i18nT('execution_environment.default_configuration')
     return (
-      <ExecutionLocationBadge
-        location={executionLocation}
-        providerLabel={providerLabel || undefined}
-        detailLabel={detailLabel}
-      />
+      <div className="pointer-events-auto flex items-center justify-end pt-1.5">
+        <ExecutionLocationBadge
+          location={executionLocation}
+          providerLabel={providerLabel || undefined}
+          configurationLabel={configuration || undefined}
+        />
+      </div>
     )
   }
   if (placement === 'header') {
-    if (!slot || slot.messages === 0 || !binding) return null
-    const configuration = binding.configuration
-      ? i18nT('execution_environment.configuration_badge', {
-          configuration: binding.configuration,
-        })
-      : i18nT('execution_environment.default_configuration')
-    return (
-      <span className="pointer-events-auto inline-flex shrink-0 items-center gap-1 rounded-full border border-accent/30 bg-accent-subtle px-2 py-0.5 text-[11px] font-medium text-accent">
-        <ProviderIcon />
-        {providerLabel} · {configuration}
-      </span>
-    )
+    return null
   }
 
   const providers = catalog.data?.providers ?? []

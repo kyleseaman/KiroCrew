@@ -6826,7 +6826,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               )}
                 </div>
               {effectiveMode === 'orchestrator' && <span className="pointer-events-auto"><InfoTip text={i18nT('pages.chatPage.autopilot_plans_before_executing_each_stage_need')} /></span>}
-              <SessionEnvironmentControl slot={currentSlot} placement="header" />
               <InboundLinkChip slotKey={activeSlot} />
               {/* Trailing controls grouped under a single ml-auto so multiple
                   right-aligned items don't each absorb free space (two ml-auto
@@ -7132,6 +7131,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   ?? currentSlot?.execution_location?.profile}
                 executionProvider={currentSlot?.environment?.provider
                   ?? currentSlot?.execution_location?.kind}
+                hasCompletedTurn={completedTurnCount > 0 || (currentSlot?.messages ?? 0) > 1}
                 connected={connected}
               />
               {activeSlot && !slotLoading && !embedded && !popout && slotSwitchTarget !== activeSlot && (
@@ -7327,7 +7327,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                       </div>
                     )}
                   </AnimatePresence>
-                  <SessionEnvironmentControl slot={currentSlot} placement="composer" />
+                  <SessionEnvironmentControl
+                    slot={currentSlot}
+                    placement="composer"
+                    hasCompletedTurn={completedTurnCount > 0 || (currentSlot?.messages ?? 0) > 1}
+                  />
                 </>
               }
               value={input}

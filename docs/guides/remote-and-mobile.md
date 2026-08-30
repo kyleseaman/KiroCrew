@@ -230,8 +230,9 @@ and checks template visibility but does not create or start a workspace. The
 bearer is written only to the gateway's
 encrypted vault; later GETs return presence, not value. Active sessions keep
 their current location, so reset or restart an existing chat to adopt the new
-default. The chat header shows `Coder workspace · <opaque-name>` only after the
-live provider has actually connected remotely.
+default. After the live provider connects remotely, the compact environment control
+above the composer shows the provider and ready state; expand it to see and copy the
+generated workspace name and inspect the selected configuration.
 
 Before a new chat's first workspace allocation, its execution selector offers
 the default Coder configuration and every named profile. Selection is persisted
