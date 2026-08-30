@@ -7327,12 +7327,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                       </div>
                     )}
                   </AnimatePresence>
-                  <SessionEnvironmentControl
-                    slot={currentSlot}
-                    placement="composer"
-                    hasCompletedTurn={completedTurnCount > 0 || (currentSlot?.messages ?? 0) > 1}
-                  />
                 </>
+              }
+              shelfAccessory={
+                <SessionEnvironmentControl
+                  slot={currentSlot}
+                  placement="composer"
+                  hasCompletedTurn={completedTurnCount > 0 || (currentSlot?.messages ?? 0) > 1}
+                />
               }
               value={input}
               onChange={setInput}

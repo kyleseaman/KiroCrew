@@ -242,6 +242,9 @@ interface ChatInputProps {
    * surfaces like the feature tip can never drift out of alignment the way
    * parallel sibling containers with percentage widths do. */
   aboveComposer?: React.ReactNode
+  /** Provider-neutral session metadata rendered in the context shelf below
+   * the composer, between the agent and project controls. */
+  shelfAccessory?: React.ReactNode
   /** When true (composer is busy — a running turn, or background sub-agents
    * still running for the slot), show the split Steer/Queue send button.
    * Steer's meaning follows the state: mid-turn it injects into the live turn;
@@ -629,6 +632,7 @@ const noopSelectDevice = () => {}
 
 function ChatInput({
   aboveComposer,
+  shelfAccessory,
   value,
   onChange,
   onSend,
@@ -2995,7 +2999,7 @@ function ChatInput({
       </AnimatePresence>
 
       {/* Context shelf — plain full-width row below input */}
-      {!showGhost && (onProjectClick || (onModelClick && modelName)) && (
+      {!showGhost && (shelfAccessory || onProjectClick || (onModelClick && modelName)) && (
         <div ref={shelfRef} className="pt-1 flex items-center gap-2 min-w-0">
           <div className="flex items-center gap-2 min-w-0 flex-1">
           {onAgentClick && agentName && (
@@ -3013,6 +3017,7 @@ function ChatInput({
               {!shelfCompact && <span className="truncate max-w-[160px]">{agentName}</span>}
             </button>
           )}
+          {shelfAccessory}
           {onProjectClick && (
           /* Two sibling buttons inside one visual pill, NOT a nested button:
              the folder segment opens the project picker and the branch segment

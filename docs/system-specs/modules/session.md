@@ -322,7 +322,8 @@ percentage from coarse provider events, and keeps the composer available for que
 instructions. After the first completed turn, a later agent-runtime reconnect never
 resurrects the workspace-boot card; the ordinary turn loader remains in the transcript
 and the compact environment control reports the reconnect. A fresh session's profile
-picker sits directly above the composer with a generic environment glyph. If the
+picker occupies the same metadata shelf below the composer, between the agent and
+project controls, with a generic environment glyph. If the
 gateway disconnects during a running turn, the transcript replaces the stale thinking
 animation with a reconnecting notice rather than implying fresh model activity.
 The session list carries remote placement as a provider-neutral server glyph on
@@ -334,12 +335,13 @@ have no placement glyph.
 The large card remains the single first-startup surface through `allocating`,
 `provisioning`, and `connecting`; no second surface duplicates it. A live `running`
 descriptor removes the card and adds a ready mark to the compact environment control
-above the composer. When no
+in the metadata shelf below the composer. When no
 provider is live, the dashboard may reconstruct the durable Coder workspace label
 as client-only `retained` metadata; it carries no ready mark and makes no claim
 that compute is awake.
-The composer footer uses one compact provider-labeled environment control. Its trigger
-does not expose the long generated resource name; an expandable detail panel contains
+The composer metadata shelf uses one compact provider-labeled environment control,
+styled consistently with its agent and project peers. Its trigger does not expose the
+long generated resource name; an expandable detail panel contains
 the provider, immutable configuration, full workspace name, and copy action. A later
 `starting` descriptor changes that same compact control into a reconnecting state.
 The session manager

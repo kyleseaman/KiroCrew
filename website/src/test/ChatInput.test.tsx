@@ -120,6 +120,31 @@ describe('ChatInput', () => {
     })
   })
 
+  describe('context shelf composition', () => {
+    const FOLLOWING = Node.DOCUMENT_POSITION_FOLLOWING
+
+    it('places the environment control below the composer between agent and project', () => {
+      renderWithProviders(
+        <ChatInput
+          {...defaultProps}
+          agentName="default"
+          onAgentClick={vi.fn()}
+          onProjectClick={vi.fn()}
+          shelfAccessory={<div data-testid="environment-control">Coder</div>}
+        />
+      )
+
+      const textarea = screen.getByLabelText('Message input')
+      const agent = screen.getByRole('button', { name: 'Agent: default' })
+      const environment = screen.getByTestId('environment-control')
+      const project = screen.getByRole('button', { name: 'Select project' })
+
+      expect(textarea.compareDocumentPosition(environment) & FOLLOWING).toBe(FOLLOWING)
+      expect(agent.compareDocumentPosition(environment) & FOLLOWING).toBe(FOLLOWING)
+      expect(environment.compareDocumentPosition(project) & FOLLOWING).toBe(FOLLOWING)
+    })
+  })
+
   describe('offline state', () => {
     it('disables Send button when connected=false even with text', () => {
       renderWithProviders(<ChatInput {...defaultProps} value="hello" connected={false} />)

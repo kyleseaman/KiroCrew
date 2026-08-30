@@ -75,7 +75,7 @@ export function SessionEnvironmentControl({
     if (executionLocation.state === 'starting' && !environmentWasReady) return null
     const configuration = binding?.configuration || executionLocation.profile || ''
     return (
-      <div className="pointer-events-auto flex items-center justify-end pt-1.5">
+      <div className="pointer-events-auto min-w-0 shrink-0">
         <ExecutionLocationBadge
           location={executionLocation}
           providerLabel={providerLabel || undefined}
@@ -103,18 +103,21 @@ export function SessionEnvironmentControl({
     ? selectionValue(binding.provider, binding.configuration)
     : options[0].value
   return (
-    <div className="pointer-events-auto flex items-center justify-end gap-2 pt-1.5" data-testid="composer-execution-profile">
-      <ProviderIcon />
-      <div className="w-[260px] max-w-[75vw] shrink-0">
+    <div
+      className="pointer-events-auto flex min-w-0 shrink items-center"
+      data-testid="composer-execution-profile"
+    >
+      <div className="w-[180px] max-w-[36vw] min-w-0">
         <Select
           value={selectedValue}
           disabled={slot.running || selectEnvironment.isPending}
           onValueChange={value => selectEnvironment.mutate(value)}
         >
           <SelectTrigger
-            className="h-7 text-[11px]"
+            className="h-7 gap-1.5 border-none bg-transparent px-2.5 py-0 text-[12px] text-muted shadow-none hover:border-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] hover:text-text"
             aria-label={i18nT('execution_environment.session_configuration_label')}
           >
+            <ProviderIcon />
             <SelectValue />
           </SelectTrigger>
           <SelectContent>

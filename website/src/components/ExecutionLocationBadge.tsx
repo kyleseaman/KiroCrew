@@ -54,7 +54,7 @@ export function ExecutionLocationBadge({
     <Popover>
       <PopoverTrigger asChild>
         <Btn
-          className="pointer-events-auto inline-flex min-w-0 max-w-[min(16rem,75vw)] items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[12px] font-medium text-muted shadow-sm transition-colors hover:border-border-strong hover:bg-bg-hover hover:text-text"
+          className="pointer-events-auto inline-flex h-7 min-w-0 max-w-[11rem] items-center gap-1.5 rounded-md border-none bg-transparent px-2.5 py-0 text-[12px] font-medium text-muted shadow-none transition-colors hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] hover:text-text"
           title={tooltip}
           aria-label={t('execution_environment.settings_tab_label')}
           aria-live={starting ? 'polite' : undefined}
