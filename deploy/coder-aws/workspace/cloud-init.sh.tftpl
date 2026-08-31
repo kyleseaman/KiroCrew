@@ -12,7 +12,7 @@ install -d -m 0755 /etc/systemd/system/tailscaled.service.d
 cat > /etc/systemd/system/tailscaled.service.d/kirocrew-ephemeral.conf <<'EOF'
 [Service]
 ExecStart=
-ExecStart=/usr/sbin/tailscaled --state=mem: --socket=/run/tailscale/tailscaled.sock --port=$${PORT} $$FLAGS
+ExecStart=/usr/sbin/tailscaled --state=mem: --socket=/run/tailscale/tailscaled.sock --port=$${PORT} $FLAGS
 EOF
 
 cat > /usr/local/libexec/kirocrew-tailscale-up <<'EOF'
