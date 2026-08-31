@@ -201,7 +201,7 @@ _TIER0_ALWAYS = frozenset({
 
 _SLOT_SCOPED_EVENTS = frozenset({
     # Chat content
-    "chat_chunk", "chat_thinking", "chat_status", "chat_message", "chat_done",
+    "chat_chunk", "chat_thinking", "chat_status", "chat_stage", "chat_message", "chat_done",
     "chat_segment", "chat_append", "chat_message_update", "chat_variant_switch",
     # Side-conversation channel (``broadcast_side_result``); carries ``slot``.
     "chat.side_result",

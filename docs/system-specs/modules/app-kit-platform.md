@@ -528,7 +528,9 @@ that would silently cut existing apps off from the upgrade signal. Tier 1 is slo
 the slot's `SlotOrigin` and the app's `slots:*` declarations (`slots:own` is the
 default, then `slots:user`, `slots:app:<name>`, `slots:all`), with `subagent:*` an
 independent dimension so an app can watch subagent status without receiving chat
-content. Tier 2 is global and needs an explicit declaration; notifications split
+content. Turn-progress `chat_stage` frames carry the slot and follow this same
+filter; they never become dashboard-global merely because the compact footer is
+their primary owner-client surface. Tier 2 is global and needs an explicit declaration; notifications split
 by source, so `notification` covers the app's own pushes while gateway-internal
 ones (cron output, `send_message`, watchlist results) require
 `notification:system` — bundling them would make one declaration a broad grant.
