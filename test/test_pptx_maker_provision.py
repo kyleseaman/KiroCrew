@@ -506,8 +506,11 @@ class TestRenderAgents:
         tool = _fake_tool(managed, "pdftoppm")
 
         install_dir = tmp_path / "install"
+        inherited = tmp_path / "inherited-bin"
+        inherited.mkdir()
         with mock.patch.object(provision.paths, "preview_tools_bin", return_value=managed):
-            assert provision._render_agents(install_dir, log=[]) > 0
+            with mock.patch.dict(os.environ, {"PATH": str(inherited)}, clear=False):
+                assert provision._render_agents(install_dir, log=[]) > 0
 
         for rendered in sorted((install_dir / "agents").glob("*.json")):
             env = json.loads(rendered.read_text(encoding="utf-8"))["mcpServers"]["sdpm"]["env"]
