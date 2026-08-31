@@ -114,7 +114,7 @@ data "aws_ssm_parameter" "al2023_arm64" {
 resource "coder_agent" "main" {
   arch               = "arm64"
   os                 = "linux"
-  auth               = "token"
+  auth               = "aws-instance-identity"
   connection_timeout = 0
 
   metadata {
@@ -159,7 +159,6 @@ data "cloudinit_config" "gateway" {
     content = templatefile("${path.module}/cloud-init.sh.tftpl", {
       region                       = var.region
       coder_init_script_b64        = base64encode(coder_agent.main.init_script)
-      coder_agent_token_b64        = base64encode(coder_agent.main.token)
       tailscale_auth_parameter     = var.tailscale_auth_parameter
       kiro_api_key_parameter       = var.kiro_api_key_parameter
       tailscale_gateway_hostname   = lower(data.coder_workspace.me.name)

@@ -278,8 +278,9 @@ someone deciding which bucket it belongs in.
 - `redact_credentials()` recognizes credential families in plaintext and
   base64-encoded form (it decodes base64-looking chunks and re-checks the decoded
   bytes), including cloud access keys and secrets, private-key headers, chat and
-  forge tokens, package-registry tokens, and database connection URIs carrying
-  embedded credentials. Key-value matching is JSON-aware and value classes are
+  forge tokens, package-registry tokens, Coder agent/session token key-value
+  forms, and database connection URIs carrying embedded credentials. Key-value
+  matching is JSON-aware and value classes are
   bounded at JSON structural delimiters, so a match in compact JSON cannot
   over-capture and mask the next credential.
 - `redact_exfiltration_urls()` / `scan_exfiltration_urls()` are

@@ -168,7 +168,11 @@ their bounded lifecycle policy. Its first start installs the checksummed Coder C
 and the Kiro CLI. Its root EBS volume has `delete_on_termination = false`, so a
 replacement or workspace deletion leaves the gateway state available for
 recovery. Session workspaces are created lazily by Kiro Crew; stopping one
-preserves its full root disk:
+preserves its full root disk. Their Tailscale identity is deliberately ephemeral:
+the daemon stores state in memory, removes the node when the VM stops, and rejoins
+on the next boot with the reusable tagged auth key. This keeps stopped and deleted
+session nodes out of the tailnet without coupling workspace identity to a
+Tailscale IP:
 
 ```bash
 coder stop crew-session-user-opaqueid --yes

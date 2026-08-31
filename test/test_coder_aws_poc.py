@@ -63,9 +63,10 @@ def test_workspace_bootstrap_verifies_kiro_and_reads_secrets_from_ssm() -> None:
 
     assert "useradd --create-home --shell /bin/bash coder" in bootstrap
     assert "--uid 1000" not in bootstrap
-    assert "coder_agent_token_b64" in terraform
-    assert "CODER_AGENT_TOKEN_FILE=/etc/coder-agent-token" in bootstrap
-    assert "chmod 600 /etc/coder-agent-token" in bootstrap
+    assert 'auth               = "aws-instance-identity"' in terraform
+    assert "coder_agent_token_b64" not in terraform
+    assert "coder-agent-token" not in bootstrap
+    assert "CODER_AGENT_TOKEN_FILE" not in bootstrap
     assert 'KIRO_ARCH="aarch64"' in bootstrap
     assert "manifest.json" in bootstrap
     assert "sha256sum -c -" in bootstrap
@@ -81,6 +82,17 @@ def test_workspace_bootstrap_verifies_kiro_and_reads_secrets_from_ssm() -> None:
     assert "User=coder" in bootstrap
     assert "User=root" not in bootstrap
     assert "chown coder:coder /etc/kiro-api-key.b64" in bootstrap
+    assert 'KIRO_API_KEY="$(base64 -d /etc/kiro-api-key.b64)"' in bootstrap
+    assert "ExecStart=/usr/local/libexec/coder-agent-start" in bootstrap
+
+
+def test_session_workspace_uses_ephemeral_tailnet_identity_on_every_boot() -> None:
+    bootstrap = _read("workspace/cloud-init.sh.tftpl")
+
+    assert "--state=mem:" in bootstrap
+    assert "kirocrew-tailscale-up.service" in bootstrap
+    assert "systemctl enable --now kirocrew-tailscale-up.service" in bootstrap
+    assert "After=network-online.target kirocrew-tailscale-up.service" in bootstrap
 
 
 def test_gateway_is_a_dedicated_persistent_coder_workspace() -> None:
@@ -98,7 +110,10 @@ def test_gateway_is_a_dedicated_persistent_coder_workspace() -> None:
     assert "aws_nat_gateway" not in terraform
     assert "kirocrew-install-wheel" in bootstrap
     assert "tailscale serve --bg --https=8443 http://127.0.0.1:8443" in bootstrap
-    assert "CODER_AGENT_TOKEN_FILE=/etc/coder-agent-token" in bootstrap
+    assert 'auth               = "aws-instance-identity"' in terraform
+    assert "coder_agent_token_b64" not in terraform
+    assert "coder-agent-token" not in bootstrap
+    assert "CODER_AGENT_TOKEN_FILE" not in bootstrap
     assert "KIRO_API_KEY=" in bootstrap
     assert "coder_${coder_version}_linux_arm64.rpm" in bootstrap
     assert "coder_rpm_sha256" in bootstrap

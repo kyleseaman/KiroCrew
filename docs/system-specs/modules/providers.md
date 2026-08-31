@@ -181,8 +181,11 @@ Preparation probes a bounded random set of high workspace-loopback ports; a
 forwarding failure aborts startup rather than falling back to local ACP.
 Only Coder URL/token, PATH, certificate, and proxy variables reach the transport
 process; AWS, SSH, channel, Kiro API-key, and Kiro Crew variables are not copied
-from the gateway. Workspace and agent names use a strict identifier grammar,
-and the remote cwd must be an absolute normalized POSIX path.
+from the gateway. Coder's workspace agent injects its own live token into remote
+commands, so every gateway-controlled preparation, cleanup, and ACP command
+explicitly unsets both `CODER_AGENT_TOKEN` and `CODER_AGENT_TOKEN_FILE` before
+the target process starts. Workspace and agent names use a strict identifier
+grammar, and the remote cwd must be an absolute normalized POSIX path.
 
 Before spawn, the host materializes the local agent, resolves a `file://` prompt
 through the existing sensitive-path-aware resolver, and streams an owner-only

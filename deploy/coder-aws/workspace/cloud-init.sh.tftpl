@@ -7,8 +7,17 @@ command -v aws >/dev/null
 dnf config-manager --add-repo \
   https://pkgs.tailscale.com/stable/amazon-linux/2023/tailscale.repo
 dnf install -y tailscale
-systemctl enable --now tailscaled
 
+install -d -m 0755 /etc/systemd/system/tailscaled.service.d
+cat > /etc/systemd/system/tailscaled.service.d/kirocrew-ephemeral.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/tailscaled --state=mem: --socket=/run/tailscale/tailscaled.sock --port=$${PORT} $${FLAGS}
+EOF
+
+cat > /usr/local/libexec/kirocrew-tailscale-up <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
 TAILSCALE_KEY="$(aws ssm get-parameter \
   --region "${region}" \
   --name "${tailscale_auth_parameter}" \
@@ -20,6 +29,28 @@ tailscale up \
   --hostname="${tailscale_workspace_hostname}" \
   --accept-dns=true
 unset TAILSCALE_KEY
+EOF
+chmod 700 /usr/local/libexec/kirocrew-tailscale-up
+
+cat > /etc/systemd/system/kirocrew-tailscale-up.service <<'EOF'
+[Unit]
+Description=Join the Kiro Crew session workspace to Tailscale
+After=network-online.target tailscaled.service
+Wants=network-online.target
+Requires=tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/kirocrew-tailscale-up
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now tailscaled.service
+systemctl enable --now kirocrew-tailscale-up.service
 
 id coder >/dev/null 2>&1 || useradd --create-home --shell /bin/bash coder
 install -d -m 0700 -o coder -g coder /home/coder/workspace
@@ -87,16 +118,11 @@ printf '%s' '${coder_init_script_b64}' | base64 -d > /usr/local/libexec/coder-ag
 chmod 700 /usr/local/libexec/coder-agent-init
 chown coder:coder /usr/local/libexec/coder-agent-init
 
-printf '%s' '${coder_agent_token_b64}' | base64 -d > /etc/coder-agent-token
-chmod 600 /etc/coder-agent-token
-chown coder:coder /etc/coder-agent-token
-
 cat > /usr/local/libexec/coder-agent-start <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 KIRO_API_KEY="$(base64 -d /etc/kiro-api-key.b64)"
 export KIRO_API_KEY
-export CODER_AGENT_TOKEN_FILE=/etc/coder-agent-token
 exec /usr/local/libexec/coder-agent-init
 EOF
 chmod 700 /usr/local/libexec/coder-agent-start
@@ -105,8 +131,8 @@ chown coder:coder /usr/local/libexec/coder-agent-start
 cat > /etc/systemd/system/coder-agent.service <<'EOF'
 [Unit]
 Description=Coder workspace agent
-After=network-online.target tailscaled.service
-Wants=network-online.target
+After=network-online.target kirocrew-tailscale-up.service
+Wants=network-online.target kirocrew-tailscale-up.service
 
 [Service]
 Type=simple

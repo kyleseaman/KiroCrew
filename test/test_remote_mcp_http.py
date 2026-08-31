@@ -157,8 +157,11 @@ def test_http_adapter_has_bounded_public_failure_codes() -> None:
 @pytest.mark.asyncio
 async def test_http_adapter_derives_modern_routing_headers_from_mcp_state() -> None:
     seen: list[dict[str, str]] = []
+    connections: set[int] = set()
 
     async def handler(request: web.Request) -> web.Response:
+        assert request.transport is not None
+        connections.add(id(request.transport))
         payload = await request.json()
         seen.append(
             {
@@ -245,6 +248,7 @@ async def test_http_adapter_derives_modern_routing_headers_from_mcp_state() -> N
     assert seen[2]["Mcp-Method"] == "tools/call"
     assert seen[2]["Mcp-Name"] == "lookup"
     assert seen[2]["Mcp-Param-Tenant"] == "acme"
+    assert len(connections) == 1
 
 
 @pytest.mark.asyncio

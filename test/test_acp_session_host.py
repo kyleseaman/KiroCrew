@@ -65,6 +65,11 @@ class TestCoderWorkspaceSessionHost:
             ]
             assert argv[5:] == [
                 "--",
+                "env",
+                "-u",
+                "CODER_AGENT_TOKEN",
+                "-u",
+                "CODER_AGENT_TOKEN_FILE",
                 "kiro-cli",
                 "acp",
                 "--agent",
@@ -72,7 +77,6 @@ class TestCoderWorkspaceSessionHost:
                 "--model",
                 "auto",
             ]
-            assert "env" not in argv
         finally:
             await host.close()
 
@@ -153,6 +157,11 @@ class TestCoderWorkspaceSessionHost:
         ]
         assert len(argv) == 5
         assert shlex.split(argv[4]) == [
+            "env",
+            "-u",
+            "CODER_AGENT_TOKEN",
+            "-u",
+            "CODER_AGENT_TOKEN_FILE",
             "python3",
             "-c",
             host_mod._REMOTE_PREPARE_SCRIPT,
@@ -742,6 +751,11 @@ async def test_runtime_remote_spawn_skips_local_confinement_and_gateway_env(
         assert argv[:4] == ("/opt/coder", "ssh", "crew-dogfood", "--remote-forward")
         assert argv[5:] == (
             "--",
+            "env",
+            "-u",
+            "CODER_AGENT_TOKEN",
+            "-u",
+            "CODER_AGENT_TOKEN_FILE",
             "kiro-cli",
             "acp",
             "--agent",
@@ -1016,6 +1030,7 @@ async def test_managed_host_resolves_parent_workspace_before_remote_prepare(
     assert argv[6] == (
         'user_id="$(id -u)" && export XDG_RUNTIME_DIR="/run/user/$user_id" && '
         'export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus" && exec '
+        "env -u CODER_AGENT_TOKEN -u CODER_AGENT_TOKEN_FILE "
         "systemd-run --user --scope --quiet --collect "
         f"--unit=kirocrew-crew-opaque123-{host._runtime_id} "
         "kiro-cli acp --agent kirocrew --model auto"

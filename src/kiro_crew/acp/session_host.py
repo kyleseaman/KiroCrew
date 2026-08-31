@@ -55,6 +55,10 @@ _TRANSPORT_ENV_KEYS = (
     "NO_PROXY",
     "ALL_PROXY",
 )
+_CODER_REMOTE_AGENT_ENV_KEYS = (
+    "CODER_AGENT_TOKEN",
+    "CODER_AGENT_TOKEN_FILE",
+)
 CODER_SESSION_TOKEN_SECRET = "coder.session_token.v1"
 _REMOTE_AGENT_TEXT_KEYS = ("name", "description", "model", "prompt")
 _CODER_URL_MAX_BYTES = 4 * 1024
@@ -365,6 +369,12 @@ class CoderWorkspaceSessionHost(RemoteSessionHost):
                 f"--unit={unit}",
                 *remote_argv,
             ]
+        remote_argv = [
+            "env",
+            *(item for key in _CODER_REMOTE_AGENT_ENV_KEYS for item in ("-u", key)),
+            *remote_argv,
+        ]
+        if self._workload_scope_prefix:
             remote_argv = [user_bus_command(remote_argv)]
         return [
             self._coder_bin,
@@ -386,6 +396,8 @@ class CoderWorkspaceSessionHost(RemoteSessionHost):
             raise ValueError("agent must be one safe Kiro agent name")
         remote_command = shlex.join(
             [
+                "env",
+                *(item for key in _CODER_REMOTE_AGENT_ENV_KEYS for item in ("-u", key)),
                 "python3",
                 "-c",
                 _REMOTE_PREPARE_SCRIPT,
@@ -401,7 +413,16 @@ class CoderWorkspaceSessionHost(RemoteSessionHost):
         return [self._coder_bin, "ssh", self._workspace, "--", remote_command]
 
     def _remote_python_argv(self, script: str, *args: str) -> list[str]:
-        command = shlex.join(["python3", "-c", script, *args])
+        command = shlex.join(
+            [
+                "env",
+                *(item for key in _CODER_REMOTE_AGENT_ENV_KEYS for item in ("-u", key)),
+                "python3",
+                "-c",
+                script,
+                *args,
+            ]
+        )
         return [self._coder_bin, "ssh", self._workspace, "--", command]
 
     async def _run_remote_python(
