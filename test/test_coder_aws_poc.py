@@ -90,6 +90,8 @@ def test_session_workspace_uses_ephemeral_tailnet_identity_on_every_boot() -> No
     bootstrap = _read("workspace/cloud-init.sh.tftpl")
 
     assert "--state=mem:" in bootstrap
+    assert "--port=$${PORT} $$FLAGS" in bootstrap
+    assert "$${FLAGS}" not in bootstrap
     assert "kirocrew-tailscale-up.service" in bootstrap
     assert "systemctl enable --now kirocrew-tailscale-up.service" in bootstrap
     assert "After=network-online.target kirocrew-tailscale-up.service" in bootstrap
