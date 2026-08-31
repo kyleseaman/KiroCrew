@@ -944,7 +944,7 @@
           "preset": "",
           "profiles": {},
           "remote_cwd": "/home/coder/workspace",
-          "runtime_warm_minutes": 5,
+          "runtime_warm_minutes": 15,
           "stop_after_minutes": 30,
           "delete_after_days": 30,
           "max_running": 3,
@@ -1098,7 +1098,7 @@
         "preset": "",
         "profiles": {},
         "remote_cwd": "/home/coder/workspace",
-        "runtime_warm_minutes": 5,
+        "runtime_warm_minutes": 15,
         "stop_after_minutes": 30,
         "delete_after_days": 30,
         "max_running": 3,
@@ -1244,7 +1244,7 @@
       "help": "Minutes to keep an idle remote ACP runtime warm.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 5
+      "defaultValue": 15
     },
     {
       "path": "session.coder.stop_after_minutes",
