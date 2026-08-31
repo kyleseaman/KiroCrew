@@ -20,6 +20,21 @@ describe('ChatFooter', () => {
     expect(document.querySelector('.csb4')).not.toBeInTheDocument()
   })
 
+  it('keeps later turns on the ordinary loader instead of replaying startup stages', () => {
+    const { container } = render(
+      <ChatFooter
+        {...base}
+        running
+        lastRole="user"
+        hasCompletedTurn
+        statusKind="waiting_for_model"
+      />,
+    )
+
+    expect(container.querySelector('.csb4')).toBeInTheDocument()
+    expect(screen.queryByText('Waiting for the model')).not.toBeInTheDocument()
+  })
+
   it('returns null when not running', () => {
     const { container } = render(<ChatFooter {...base} />)
     expect(container.innerHTML).toBe('')

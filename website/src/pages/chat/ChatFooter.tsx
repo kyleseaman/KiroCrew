@@ -258,13 +258,15 @@ const ChatFooter = memo(function ChatFooter({
   // "still streaming", so the loader stayed hidden with nothing else moving.
   const streamingText = lastRole === 'streaming' && state === 'streaming'
   const streamQuiet = useStreamIdle(streamTick, streamingText)
-  const stageLabel = statusKind === 'preparing_session'
-    ? i18nT('pages.chat.chatFooter.connecting_session_environment')
-    : statusKind === 'preparing_context'
-      ? i18nT('pages.chat.chatFooter.preparing_session_context')
-      : statusKind === 'waiting_for_model'
-        ? i18nT('pages.chat.chatFooter.waiting_for_model')
-        : ''
+  const stageLabel = !hasCompletedTurn
+    ? statusKind === 'preparing_session'
+      ? i18nT('pages.chat.chatFooter.connecting_session_environment')
+      : statusKind === 'preparing_context'
+        ? i18nT('pages.chat.chatFooter.preparing_session_context')
+        : statusKind === 'waiting_for_model'
+          ? i18nT('pages.chat.chatFooter.waiting_for_model')
+          : ''
+    : ''
   // Hidden once the turn is inactive. While the turn RUNS the indicator shows for
   // thinking, tool calls, AND the gaps between steps: the backend keeps
   // slot.running true for the whole turn, so the post-tool gap stays covered
