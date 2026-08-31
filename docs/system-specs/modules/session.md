@@ -344,7 +344,8 @@ animation with a reconnecting notice rather than implying fresh model activity.
 Once the managed environment is available on the first turn, the compact footer follows
 gateway-owned `chat_stage` events through session acquisition, context preparation, and
 model wait. Later turns use the ordinary mascot loader instead of replaying startup-stage
-copy; the stage events still feed the session list and diagnostics.
+copy. The stage events remain available to the active transcript and diagnostics, while
+the session list collapses them into its ordinary turn-activity label.
 Tool calls then own the live activity surface: `tool_result` frames carry an explicit
 `final` bit, partial results replace the visible output while the tool remains running,
 and only the terminal frame completes and persists the tool. The browser receives both

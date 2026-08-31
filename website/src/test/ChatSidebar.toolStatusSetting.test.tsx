@@ -138,6 +138,19 @@ describe('chat sidebar — tool status honors simplifiedToolNames', () => {
     expect(getByText(/Thinking…/)).toBeTruthy()
   })
 
+  it.each([
+    ['preparing_session', 'Connecting to session environment'],
+    ['preparing_context', 'Preparing session context'],
+    ['waiting_for_model', 'Waiting for the model'],
+  ])('keeps the %s gateway stage out of the session row', (kind, stageText) => {
+    const { getByText, queryByText } = renderSidebar(slots, {
+      slotStatusDetail: { k: { kind, text: stageText, ts: 1 } },
+    })
+
+    expect(getByText(/Thinking…/)).toBeTruthy()
+    expect(queryByText(stageText)).toBeNull()
+  })
+
   it('composes the goal-loop detail from the same setting-aware label', () => {
     cfg.value = { ...cfg.value, simplifiedToolNames: false }
     const { getByText } = renderSidebar(slots, {

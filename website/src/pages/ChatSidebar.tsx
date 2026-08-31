@@ -138,6 +138,14 @@ const ROW_STATUS_LINE_MUTED_CLS = `${ROW_STATUS_CLS} text-muted flex items-cente
  *  glyphs outranks another. */
 const ROW_ICON_PX = 10
 
+/** Gateway stages refine the active transcript's first-turn loader and diagnostics.
+ *  Session rows deliberately collapse them into ordinary turn activity. */
+const TRANSCRIPT_ONLY_STATUS_KINDS = new Set([
+  'preparing_session',
+  'preparing_context',
+  'waiting_for_model',
+])
+
 /** Translate a slot's running-status line. The status `text` is stored as a raw
  *  English literal by the websocket layer (a plain `.ts` module the i18n codemod
  *  never scans), so it must be localized at render time. The two fixed phases
@@ -150,6 +158,7 @@ const ROW_ICON_PX = 10
 function slotStatusText(detail: { kind?: string; text?: string; toolName?: string } | undefined, simplifiedToolNames: boolean, uiLang: string): string {
   if (detail?.kind === 'streaming') return i18nT('pages.chatSidebar.streaming')
   if (detail?.kind === 'thinking' && detail.text === 'Thinking…') return i18nT('pages.chatSidebar.thinking')
+  if (detail?.kind && TRANSCRIPT_ONLY_STATUS_KINDS.has(detail.kind)) return i18nT('pages.chatSidebar.thinking')
   return toolStatusLabel(detail, simplifiedToolNames, uiLang) || i18nT('pages.chatSidebar.thinking')
 }
 
