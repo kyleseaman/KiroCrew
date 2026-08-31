@@ -63,9 +63,11 @@ class TestRedactCredentials:
         result, _ = redact_credentials(text)
         assert "FwoGZXIvYXdzEBYaDH" not in result
 
-    @pytest.mark.parametrize("key", ("CODER_AGENT_TOKEN", "CODER_SESSION_TOKEN"))
-    def test_redacts_coder_tokens_by_environment_key(self, key: str) -> None:
-        token = "fake-coder-token-without-a-distinctive-prefix"
+    @pytest.mark.parametrize(
+        "key", ("CODER_AGENT_TOKEN", "CODER_SESSION_TOKEN", "KIRO_API_KEY")
+    )
+    def test_redacts_session_host_credentials_by_environment_key(self, key: str) -> None:
+        token = "fake-session-credential-without-a-distinctive-prefix"
         text = f'{{"{key}":"{token}"}}'
 
         result, warnings = redact_credentials(text)

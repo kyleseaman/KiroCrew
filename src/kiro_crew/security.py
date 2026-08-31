@@ -8420,7 +8420,7 @@ _HARD_CREDENTIAL_RE = re.compile(
     # agent authenticates with cloud instance identity. Catch both that runtime
     # token and the gateway's Coder API bearer if an environment or JSON dump
     # reaches any persisted/output surface.
-    r'|(?:CODER_AGENT_TOKEN|CODER_SESSION_TOKEN)["\']?\s*[:=]\s*["\']?[^\s"\',}]+'
+    r'|(?:CODER_AGENT_TOKEN|CODER_SESSION_TOKEN|KIRO_API_KEY)["\']?\s*[:=]\s*["\']?[^\s"\',}]+'
     r"|(?:ssh-rsa|ssh-ed25519)[\s+%]"  # SSH public key
     r"|BEGIN[\s+%](?:RSA|DSA|EC|OPENSSH)[\s+%]PRIVATE[\s+%]KEY"  # private key header
     r"|xox[bpas]-[0-9a-zA-Z-]+"  # Slack token
@@ -8820,9 +8820,9 @@ _CREDENTIAL_PATTERNS = re.compile(
     r'|(?:SecretAccessKey|aws_secret_access_key)["\']?\s*[:=]\s*["\']?[^\s"\',}]+'
     r'|(?:SessionToken|aws_session_token)["\']?\s*[:=]\s*["\']?[^\s"\',}]+'
     r'|(?:AccessKeyId|aws_access_key_id)["\']?\s*[:=]\s*["\']?[^\s"\',}]+'
-    # Coder injects a live session token into workspace subprocesses. Its
-    # opaque value has no stable prefix, so the environment key is the anchor.
-    r'|(?:CODER_AGENT_TOKEN|CODER_SESSION_TOKEN)["\']?\s*[:=]\s*["\']?[^\s"\',}]+'
+    # Session-host credentials have opaque values with no stable prefix, so
+    # their bounded environment keys are the credential anchors.
+    r'|(?:CODER_AGENT_TOKEN|CODER_SESSION_TOKEN|KIRO_API_KEY)["\']?\s*[:=]\s*["\']?[^\s"\',}]+'
     # PEM private key: match the ENTIRE block (header + base64 body), not just
     # the header phrase. redact_credentials() replaces the matched SPAN, so a
     # header-only match (the original form) left the secret base64 body verbatim.
