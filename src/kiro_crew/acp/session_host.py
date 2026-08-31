@@ -21,8 +21,8 @@ from kiro_crew.coder.manager import CoderWorkspaceManager, ManagedWorkspacePolic
 from kiro_crew.coder.registry import WorkspaceBindingRegistry
 from kiro_crew.coder.user_bus import user_bus_command
 from kiro_crew.constants import (
-    CODER_DEFAULT_RUNTIME_WARM_MINUTES,
     CODER_DEFAULT_REMOTE_CWD,
+    CODER_DEFAULT_RUNTIME_WARM_MINUTES,
     EXECUTION_LOCATION_PHASES,
     EXECUTION_PHASE_ALLOCATING,
     EXECUTION_PHASE_CONNECTING,
