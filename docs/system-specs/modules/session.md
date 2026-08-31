@@ -4,7 +4,7 @@
 
 Maps thread keys to LLMProvider instances (`session.py`). Each thread gets
 its own kiro-cli session with idle expiry, context compaction, circuit
-breaker, per-session semaphore, and persistent background session.
+breaker, per-session semaphore, and reusable background capacity.
 
 Chat sessions are served from the warm pool when eligible (default pool
 agent, default cwd, no resume mapping); otherwise they cold-start on first
@@ -12,18 +12,25 @@ message via `get_or_create()`.
 
 ## Background Session
 
-`BACKGROUND_KEY = "_bg"` is a persistent shared session for lightweight
-background work. It is:
+`BACKGROUND_KEY = "_bg"` is a shared session for lightweight background
+work. It is:
 
-- **Created on startup** by `start_pool()` alongside the warm pool
-- **Never expired** by idle cleanup (`_expire_idle` skips it)
+- **Created on startup** by `start_pool()` on a local-only gateway, but left
+  lazy when any managed session-environment provider is configured. The first
+  background turn creates it normally. This keeps a remote-session gateway
+  from paying for an unused local kiro-cli process at boot.
+- **Expired normally** by idle cleanup. Background turns are stateless, so a
+  later caller can cold-start it without losing conversation state; keeping it
+  warm across nearby calls still avoids per-task startup cost. Expiry skips
+  history consolidation so cleanup cannot recreate the runtime it just reclaimed.
 - **Serialized** by the per-session semaphore (one background task at a time)
   — applies to the **non-kiro** `_bg` path only; see "Multiplexed _bg runtime"
 - **Shared by**: heartbeat tasks, lesson extraction (NOT cron — see below)
 
-This eliminates the cost of spawning/tearing down a kiro-cli process for
-every cron job or heartbeat tick. Background tasks acquire the semaphore,
-do their work, and release — the process stays warm.
+This eliminates the cost of spawning/tearing down a kiro-cli process for every
+nearby cron job or heartbeat tick without making a 24/7 managed-environment
+gateway retain that process forever. Background tasks acquire the semaphore,
+do their work, and release; normal idle expiry eventually reclaims it.
 
 ### Context Overflow Protection
 
@@ -783,7 +790,7 @@ dashboard-turn-loop refactor.
 start_pool()
   ├── _enforce_denied_commands()  → inject deniedCommands into ALL agent configs
   ├── _spawn_warm() × pool_size   → warm pool queue (instant assignment)
-  └── _ensure_background()        → BACKGROUND_KEY session (persistent)
+  └── _ensure_background()        → eager on local-only gateways; lazy with managed environments
 ```
 
 ## Security: deniedCommands Enforcement

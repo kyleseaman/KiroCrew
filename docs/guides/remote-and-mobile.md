@@ -195,7 +195,13 @@ The helper copies a verified wheel, installs it into the stable
 `/home/coder/kirocrew-venv`, configures the external dashboard URL, and installs
 the main gateway as a `coder`-owned systemd service on port 8443. Deployment
 fails unless the service is active and `http://127.0.0.1:8443/api/health`
-responds. Run the same command for later wheel updates.
+responds. It also enables lingering for the `coder` systemd user manager so
+rootless cgroup process and memory ceilings remain available after terminals
+disconnect, and provisions a persistent 2 GiB swap file on the existing root
+volume. Agent cgroups retain `MemorySwapMax=0`; the swap is bounded headroom for
+the gateway and operating system on the deliberately small `t4g.small`, not an
+escape from the sandbox resource ceiling. Run the same command for later wheel
+updates.
 
 The gateway template provides `/usr/local/bin/kirocrew` for gateway
 administration. It delegates to the stable virtual environment above as the

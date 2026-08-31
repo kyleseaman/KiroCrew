@@ -8,9 +8,10 @@ Warm session pool: ``start_pool()`` pre-spawns kiro-cli processes so
 ``get_or_create()`` returns instantly.  After handing out a warm session,
 a replacement is created in the background to maintain the target count.
 
-Background session: ``BACKGROUND_KEY`` is a persistent shared session for
-lightweight background work (cron, heartbeat, lesson extraction).  It
-stays alive between uses, serialized by the per-session semaphore.
+Background session: ``BACKGROUND_KEY`` is a shared session for lightweight
+background work (cron, heartbeat, lesson extraction).  It is created lazily on
+managed-environment gateways, stays alive between nearby uses, and is serialized
+by the per-session semaphore.
 
 At >= ``cfg.session.autocompact_pct`` context usage, fires a background
 compaction task. Both backends compact **in place** so the session — and
@@ -63,12 +64,12 @@ Four mechanisms clean up processes. They are complementary — not redundant.
 3. ``_expire_idle()`` — **periodic** (every ~5 min).
    Kills sessions idle for >``timeout_secs`` (default 30 min) via
    ``reset()`` → ``provider.shutdown()`` → SIGKILL process tree.
-   Protected keys: ``_PERSISTENT_KEYS`` (``_bg`` and ``_hb``).
-   **Known limitation**: ``last_used`` is only bumped on ``get_or_create()``,
-   not on every LLM round-trip. A task runner step doing continuous work for
-   >30 min without a new ``get_or_create()`` call could be swept. This is
-   accepted for now to prevent runaway tasks, but may need a heartbeat or
-   persistent-key mechanism if longer steps become common.
+   Protected keys: ``_PERSISTENT_KEYS`` (``_hb``). The stateless ``_bg``
+   session expires normally so an idle gateway can reclaim its local runtime.
+   ``last_used`` is only bumped on ``get_or_create()``, not on every LLM
+   round-trip. The per-session semaphore therefore remains the authoritative
+   active-turn guard: a turn that outlives the idle timeout is not swept, and
+   becomes eligible only after it releases the session.
 
 """
 
@@ -514,8 +515,10 @@ _BG_BLIND_RECYCLE_PROMPTS = 40  # recycle after 40 prompts if no metadata
 # does not bump the agents-dir mtime.
 _AGENT_MODEL_CACHE_TTL = 30.0
 
-# Persistent session keys — never expired by idle cleanup
-_PERSISTENT_KEYS = frozenset({BACKGROUND_KEY, HEARTBEAT_KEY})
+# Persistent session keys — never expired by idle cleanup. Background work is
+# stateless and may be cold-started again, so keeping its full local Kiro process
+# forever only burns memory on gateways whose interactive sessions run remotely.
+_PERSISTENT_KEYS = frozenset({HEARTBEAT_KEY})
 
 # Sentinel model values that mean "let kiro-cli resolve from agent JSON".
 # When the global agent.model config is one of these, get_or_create() skips
@@ -1353,9 +1356,12 @@ class SessionManager:
     # ── Background Session ──
 
     async def start_pool(self, *, blocking: bool = True) -> None:
-        """Create the background session for cron/heartbeat.
+        """Start background capacity and the optional interactive warm pool.
 
-        Chat sessions cold-start on first message via get_or_create().
+        Chat sessions cold-start on first message via get_or_create(). A gateway
+        with a managed environment provider leaves its local background session
+        lazy: remote interactive work should not pay one always-resident Kiro
+        process before a background task actually needs it.
         """
         if self._pool_started or not self._provider_factory:
             return
@@ -1364,11 +1370,15 @@ class SessionManager:
         self._session_map.prune()
 
         self._pool_started = True
+        registry = self.environment_registry()
+        providers = getattr(registry, "providers", None)
+        managed_environments = bool(providers()) if callable(providers) else False
 
         if not blocking:
 
             async def _start_bg_and_pool() -> None:
-                await self._ensure_background()
+                if not managed_environments:
+                    await self._ensure_background()
                 await self._fill_warm_pool()
                 if self._pool_size:
                     self._pool_health_task = asyncio.create_task(self._pool_health_loop())
@@ -1378,11 +1388,17 @@ class SessionManager:
             t = asyncio.create_task(_start_bg_and_pool())
             self._background_tasks.add(t)
             t.add_done_callback(self._background_tasks.discard)
-            logger.info("Background session starting (non-blocking)")
+            logger.info(
+                "Background capacity starting (non-blocking, local session=%s)",
+                "lazy" if managed_environments else "eager",
+            )
             return
 
-        await self._ensure_background()
-        logger.info("Background session ready")
+        if not managed_environments:
+            await self._ensure_background()
+            logger.info("Background session ready")
+        else:
+            logger.info("Managed environment configured; local background session is lazy")
 
         # Fill warm pool after background session is ready
         if self._pool_size:
@@ -6219,8 +6235,10 @@ class SessionManager:
                 _turn_active = _prov is not None and _provider_has_active_turn(_prov)
             except Exception:
                 _turn_active = False
-            # Notify consolidator before reset so it can extract skills.
-            if self.on_session_expire:
+            # Notify consolidator before reset so it can extract skills. The
+            # shared background runtime is stateless; consolidating it can
+            # immediately recreate the process that this sweep is reclaiming.
+            if self.on_session_expire and key != BACKGROUND_KEY:
                 try:
                     sel().log_api_access(
                         caller="session_manager",

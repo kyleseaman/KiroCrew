@@ -347,8 +347,8 @@ class TestProviderBgSession:
 
     @pytest.mark.asyncio
     async def test_destroy_releases_the_shared_semaphore_but_keeps_the_session(self) -> None:
-        """The BACKGROUND_KEY session is persistent and shared: destroy must
-        release the turn lock without tearing the provider down."""
+        """The resident BACKGROUND_KEY session is shared: destroy must release
+        the turn lock without tearing the provider down before idle cleanup."""
         provider = _StreamingProvider()
         sess = _Session(provider=provider)
         handle = _ProviderBgSession(sess)
@@ -656,8 +656,8 @@ class TestRecycleHeartbeat:
 
 class TestExpireIdle:
     @pytest.mark.asyncio
-    async def test_persistent_and_channel_sessions_are_never_swept(self, mgr) -> None:
-        for key in (BACKGROUND_KEY, HEARTBEAT_KEY, "channel:slack:C1"):
+    async def test_heartbeat_and_channel_sessions_are_never_swept(self, mgr) -> None:
+        for key in (HEARTBEAT_KEY, "channel:slack:C1"):
             _register(mgr, key, last_used=0.0)
         with patch.object(mgr, "reset", AsyncMock(return_value=True)) as reset:
             await mgr._expire_idle(1)

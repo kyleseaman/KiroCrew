@@ -53,10 +53,36 @@ verified_wheel=$verified_dir/$wheel_name
 /usr/sbin/runuser -u coder -- env \
   HOME=/home/coder USER=coder LOGNAME=coder \
   /bin/sh -c 'cd /home/coder && exec /home/coder/kirocrew-venv/bin/kirocrew setup --agent-only'
+# The inner shell expands $1 from the positional argument passed below.
+# shellcheck disable=SC2016
 /usr/sbin/runuser -u coder -- env \
   HOME=/home/coder USER=coder LOGNAME=coder \
   /bin/sh -c 'cd /home/coder && exec /home/coder/kirocrew-venv/bin/kirocrew config set dashboard.url "$1"' \
   sh "$dashboard_url"
+
+# Kiro Crew's rootless cgroup scopes use the coder systemd user manager. Keep
+# that manager alive across web-terminal and SSH disconnects so agent process
+# and memory ceilings remain enforceable on this 24/7 gateway.
+/usr/bin/loginctl enable-linger coder
+
+# The sample gateway intentionally starts at 2 GiB. Its local embedding model
+# and a warm Kiro runtime can briefly consume most of that, so provide bounded
+# disk-backed headroom rather than letting a transient peak freeze the host.
+# Agent scopes still carry MemorySwapMax=0; this swap protects the gateway and
+# operating system, not untrusted agent trees.
+swap_file=/var/lib/kirocrew/swapfile
+/usr/bin/install -d -m 0700 /var/lib/kirocrew
+if [ ! -f "$swap_file" ]; then
+  /usr/bin/fallocate -l 2G "$swap_file"
+  /usr/bin/chmod 0600 "$swap_file"
+  /usr/sbin/mkswap "$swap_file" >/dev/null
+fi
+if ! /usr/bin/grep -Fq "$swap_file none swap defaults,nofail 0 0" /etc/fstab; then
+  printf '%s none swap defaults,nofail 0 0\n' "$swap_file" >> /etc/fstab
+fi
+if ! /usr/sbin/swapon --show=NAME --noheadings | /usr/bin/grep -Fxq "$swap_file"; then
+  /usr/sbin/swapon "$swap_file"
+fi
 
 env SUDO_USER=coder USER=coder LOGNAME=coder HOME=/home/coder KIROCREW_PORT=8443 \
   KIROCREW_SERVICE_BIN=/home/coder/kirocrew-venv/bin/kirocrew \

@@ -352,6 +352,10 @@ def test_gateway_remote_installer_is_identity_scoped_and_health_checked() -> Non
     assert "KIROCREW_SERVICE_BIN=/home/coder/kirocrew-venv/bin/kirocrew" in installer
     assert "kirocrew setup --agent-only" in installer
     assert "kirocrew service install" in installer
+    assert "loginctl enable-linger coder" in installer
+    assert "/var/lib/kirocrew/swapfile" in installer
+    assert "mkswap" in installer
+    assert "swapon" in installer
     assert 'pip install --force-reinstall --no-deps "$verified_wheel"' in installer
     assert "systemctl is-active --quiet kirocrew.service" in installer
     assert "http://127.0.0.1:8443/api/health" in installer

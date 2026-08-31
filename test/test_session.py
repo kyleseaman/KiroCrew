@@ -450,6 +450,29 @@ class TestWarmPool:
     """Tests for warm session pool and background session."""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("blocking", [True, False])
+    async def test_managed_environment_keeps_background_session_lazy(self, cfg, blocking):
+        """A remote-session gateway should not pay for an unused local runtime."""
+        from kiro_crew.session_environment import SessionEnvironmentRegistry
+
+        factory = _mock_provider_factory()
+        environment = SimpleNamespace(provider_id="test-environment")
+        setattr(
+            factory,
+            "_session_environment_registry",
+            SessionEnvironmentRegistry([environment]),
+        )
+        mgr = SessionManager(cfg, provider_factory=factory)
+
+        await mgr.start_pool(blocking=blocking)
+        if not blocking:
+            await asyncio.sleep(0)
+
+        assert BACKGROUND_KEY not in mgr._sessions
+        assert mgr.count == 0
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
     async def test_start_pool_creates_background(self, cfg):
         """start_pool() creates background session."""
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
@@ -486,17 +509,20 @@ class TestWarmPool:
         await mgr.close_all()
 
     @pytest.mark.asyncio
-    async def test_background_session_not_expired(self, cfg):
-        """Background session is never expired by idle cleanup."""
+    async def test_background_session_expires_when_idle(self, cfg):
+        """A stateless background runtime must not consume memory forever."""
         import time
 
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
         await mgr.start_pool()
+        on_expire = MagicMock()
+        mgr.on_session_expire = on_expire
 
         mgr._sessions[BACKGROUND_KEY].last_used = time.monotonic() - 9999
         await mgr._expire_idle(1)
 
-        assert BACKGROUND_KEY in mgr._sessions
+        assert BACKGROUND_KEY not in mgr._sessions
+        on_expire.assert_not_called()
         await mgr.close_all()
 
     @pytest.mark.asyncio
