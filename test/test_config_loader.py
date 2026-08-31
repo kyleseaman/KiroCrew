@@ -15,6 +15,7 @@ import re
 import tempfile
 import unittest.mock
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from hypothesis import assume, given, settings
@@ -3922,6 +3923,49 @@ class TestOrchestratorWatchdogThemeAreParsed:
         host = captured[0]["session_host"]
         assert isinstance(host, host_mod.ManagedCoderWorkspaceSessionHost)
         assert (host._template, host._preset) == ("kirocrew-gpu", "gpu-medium")
+
+    def test_factory_threads_no_start_host_for_managed_prefetch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kiro_crew.acp.session_host as host_mod
+        import kiro_crew.config.loader as loader_mod
+        import kiro_crew.providers.acp as acp_mod
+        from kiro_crew.secrets import SecretVault
+
+        captured: list[dict] = []
+
+        class _FakeProvider:
+            def __init__(self, **kwargs: object) -> None:
+                captured.append(kwargs)
+
+        monkeypatch.setattr(acp_mod, "AcpProvider", _FakeProvider)
+        monkeypatch.setattr(loader_mod, "config_dir", lambda: tmp_path)
+        monkeypatch.setattr(host_mod.shutil, "which", lambda command, path=None: "/opt/coder")
+        SecretVault(tmp_path)._set_sync(host_mod.CODER_SESSION_TOKEN_SECRET, "vault-token")
+        cfg = _load_from_dict(
+            {
+                "session": {
+                    "coder": {
+                        "enabled": True,
+                        "url": "https://coder.example",
+                        "template": "kirocrew-arm",
+                    }
+                }
+            }
+        )
+        factory = cfg.create_provider_factory()
+        binding = SimpleNamespace(
+            workspace_name="crew-session-kyle-opaque",
+            workspace_uuid="workspace-uuid",
+            state="running",
+        )
+        monkeypatch.setattr(factory._coder_manager.registry, "get_by_session", lambda _key: binding)
+
+        factory("dashboard:one", agent="kirocrew", environment_prefetch=True)
+
+        host = captured[0]["session_host"]
+        assert isinstance(host, host_mod.ManagedCoderWorkspaceSessionHost)
+        assert host._allow_start is False
 
     def test_factory_prefers_explicit_inherited_session_host(
         self, monkeypatch: pytest.MonkeyPatch

@@ -15,6 +15,10 @@ class SessionEnvironmentUnavailable(RuntimeError):
     """A persisted or selected environment provider cannot serve a session."""
 
 
+class SessionEnvironmentPrefetchUnavailable(SessionEnvironmentUnavailable):
+    """A speculative reconnect cannot safely reuse an existing environment."""
+
+
 @dataclass(frozen=True)
 class SessionEnvironmentConfiguration:
     """One public, selectable configuration owned by an environment provider."""
@@ -130,16 +134,44 @@ class SessionEnvironmentLifecycleProvider:
         return None
 
 
+class SessionEnvironmentPrefetchProvider:
+    """Positive opt-in for reconnecting without allocating or starting compute.
+
+    Prefetch is intentionally a separate capability from the public provider
+    catalog. Adapters must first prove synchronously that a session has an
+    already-running binding, then return a host whose provider boundary still
+    refuses every create/start path in case that state changes mid-reconnect.
+    """
+
+    def can_prefetch_session(self, session_key: str) -> bool:
+        return False
+
+    def create_prefetch_session_host(self, session_key: str, configuration: str) -> Any:
+        raise SessionEnvironmentPrefetchUnavailable(
+            "session environment cannot be safely prefetched"
+        )
+
+
 class SessionEnvironmentRegistry:
     """Lookup and public catalog for enabled environment providers."""
 
-    def __init__(self, providers: Sequence[SessionEnvironmentProvider]) -> None:
+    def __init__(
+        self,
+        providers: Sequence[SessionEnvironmentProvider],
+        *,
+        default_provider_id: str = "",
+    ) -> None:
         self._providers: dict[str, SessionEnvironmentProvider] = {}
         for provider in providers:
             _validate_provider(provider.provider_id)
             if provider.provider_id in self._providers:
                 raise ValueError(f"duplicate environment provider: {provider.provider_id}")
             self._providers[provider.provider_id] = provider
+        if default_provider_id:
+            _validate_provider(default_provider_id)
+            if default_provider_id not in self._providers:
+                raise ValueError("default environment provider is unavailable")
+        self._default_provider_id = default_provider_id
 
     def get(self, provider_id: str) -> SessionEnvironmentProvider | None:
         return self._providers.get(provider_id)
@@ -166,8 +198,40 @@ class SessionEnvironmentRegistry:
     def providers(self) -> tuple[SessionEnvironmentProvider, ...]:
         return tuple(self._providers.values())
 
+    def supports_prefetch(
+        self,
+        session_key: str,
+        selection: SessionEnvironmentSelection | None,
+    ) -> bool:
+        """Return whether a bound session can reconnect without new compute."""
+        provider_id = selection.provider if selection is not None else self._default_provider_id
+        provider = self.get(provider_id) if provider_id else None
+        return isinstance(
+            provider, SessionEnvironmentPrefetchProvider
+        ) and provider.can_prefetch_session(session_key)
 
-class CoderSessionEnvironmentProvider(SessionEnvironmentLifecycleProvider):
+    def prefetch_host(
+        self,
+        session_key: str,
+        selection: SessionEnvironmentSelection | None,
+    ) -> Any:
+        """Create a fail-closed reconnect host for one positively opted-in provider."""
+        provider_id = selection.provider if selection is not None else self._default_provider_id
+        provider = self.require(provider_id) if provider_id else None
+        if not isinstance(provider, SessionEnvironmentPrefetchProvider):
+            raise SessionEnvironmentPrefetchUnavailable(
+                "session environment cannot be safely prefetched"
+            )
+        configuration = provider.validate_configuration(
+            selection.configuration if selection is not None else ""
+        )
+        return provider.create_prefetch_session_host(session_key, configuration)
+
+
+class CoderSessionEnvironmentProvider(
+    SessionEnvironmentLifecycleProvider,
+    SessionEnvironmentPrefetchProvider,
+):
     """Managed Coder lifecycle exposed through the environment contract."""
 
     provider_id = "coder"
@@ -221,7 +285,13 @@ class CoderSessionEnvironmentProvider(SessionEnvironmentLifecycleProvider):
             resource_name=binding.workspace_name,
         )
 
-    def create_session_host(self, session_key: str, configuration: str) -> Any:
+    def _create_session_host(
+        self,
+        session_key: str,
+        configuration: str,
+        *,
+        allow_start: bool,
+    ) -> Any:
         from kiro_crew.acp.session_host import ManagedCoderWorkspaceSessionHost
 
         try:
@@ -247,7 +317,20 @@ class CoderSessionEnvironmentProvider(SessionEnvironmentLifecycleProvider):
             runtime_warm_minutes=self._runtime_warm_minutes,
             template=template,
             preset=preset,
+            allow_start=allow_start,
         )
+
+    def create_session_host(self, session_key: str, configuration: str) -> Any:
+        return self._create_session_host(session_key, configuration, allow_start=True)
+
+    def can_prefetch_session(self, session_key: str) -> bool:
+        binding = self.manager.registry.get_by_session(session_key)
+        return bool(binding is not None and binding.workspace_uuid and binding.state == "running")
+
+    def create_prefetch_session_host(self, session_key: str, configuration: str) -> Any:
+        if not self.can_prefetch_session(session_key):
+            raise SessionEnvironmentPrefetchUnavailable("Coder workspace is not already running")
+        return self._create_session_host(session_key, configuration, allow_start=False)
 
     async def stop_for_session(self, session_key: str) -> str | None:
         return await self.manager.stop_for_session(session_key)

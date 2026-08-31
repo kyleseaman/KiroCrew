@@ -115,7 +115,69 @@ def test_coder_adapter_creates_managed_host_for_selected_configuration() -> None
 
     assert isinstance(host, ManagedCoderWorkspaceSessionHost)
     assert (host._template, host._preset) == ("kirocrew-gpu", "gpu-medium")
+    assert host._allow_start is True
     assert provider.runtime_warm_seconds == 300
+
+
+def test_coder_adapter_prefetch_host_cannot_start_compute() -> None:
+    from kiro_crew.acp.session_host import ManagedCoderWorkspaceSessionHost
+    from kiro_crew.session_environment import CoderSessionEnvironmentProvider
+
+    manager = MagicMock()
+    manager.registry.get_by_session.return_value = SimpleNamespace(
+        workspace_name="crew-session-kyle-opaque",
+        workspace_uuid="workspace-uuid",
+        state="running",
+    )
+    provider = CoderSessionEnvironmentProvider(
+        manager=manager,
+        configurations={},
+        default_template="kirocrew-arm",
+        default_preset="",
+        remote_cwd="/home/coder/workspace",
+        coder_bin="/opt/coder",
+        coder_url="https://coder.example",
+        session_token="secret",
+        runtime_warm_minutes=5,
+    )
+
+    host = provider.create_prefetch_session_host("dashboard:chat-1", "")
+
+    assert isinstance(host, ManagedCoderWorkspaceSessionHost)
+    assert host._allow_start is False
+
+
+def test_registry_prefetch_support_is_positive_opt_in() -> None:
+    from kiro_crew.session_environment import (
+        SessionEnvironmentPrefetchProvider,
+        SessionEnvironmentRegistry,
+        SessionEnvironmentSelection,
+    )
+
+    class GenericProvider:
+        provider_id = "generic"
+
+    class PrefetchProvider(SessionEnvironmentPrefetchProvider):
+        provider_id = "prefetch"
+
+        def can_prefetch_session(self, session_key: str) -> bool:
+            return session_key == "dashboard:ready"
+
+    registry = SessionEnvironmentRegistry(
+        [GenericProvider(), PrefetchProvider()],  # type: ignore[list-item]
+        default_provider_id="prefetch",
+    )
+
+    assert registry.supports_prefetch("dashboard:ready", None) is True
+    assert (
+        registry.supports_prefetch("dashboard:ready", SessionEnvironmentSelection("prefetch"))
+        is True
+    )
+    assert registry.supports_prefetch("dashboard:cold", None) is False
+    assert (
+        registry.supports_prefetch("dashboard:ready", SessionEnvironmentSelection("generic"))
+        is False
+    )
 
 
 def test_coder_adapter_projects_only_safe_binding_identity() -> None:

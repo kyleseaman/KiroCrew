@@ -19,7 +19,10 @@ from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.chat_runner import _eager_spawn, schedule_eager_spawn
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 from kiro_crew.session import FirstTurnState
-from kiro_crew.session_environment import SessionEnvironmentRegistry
+from kiro_crew.session_environment import (
+    SessionEnvironmentPrefetchProvider,
+    SessionEnvironmentRegistry,
+)
 
 
 def _mock_state(slot: _ChatSlot) -> DashboardState:
@@ -87,7 +90,7 @@ class TestScheduleEagerSpawn:
         assert slot._eager_spawn_task is None
 
     @pytest.mark.asyncio
-    async def test_noop_for_managed_environment_until_the_first_real_turn(self):
+    async def test_noop_for_managed_environment_without_prefetch_opt_in(self):
         slot = _ChatSlot("t1")
         state = _mock_state(slot)
         cfg = MagicMock()
@@ -98,6 +101,32 @@ class TestScheduleEagerSpawn:
         with patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg):
             schedule_eager_spawn(state, slot)
         assert slot._eager_spawn_task is None
+
+    @pytest.mark.asyncio
+    async def test_prefetch_provider_schedules_without_allocating_in_scheduler(self):
+        class PrefetchProvider(SessionEnvironmentPrefetchProvider):
+            provider_id = "coder"
+
+            def can_prefetch_session(self, session_key: str) -> bool:
+                return session_key == "dashboard:t1"
+
+        slot = _ChatSlot("t1")
+        state = _mock_state(slot)
+        cfg = MagicMock()
+        cfg.session.eager_spawn = True
+        state.sessions.environment_registry.return_value = SessionEnvironmentRegistry(
+            [PrefetchProvider()],  # type: ignore[list-item]
+            default_provider_id="coder",
+        )
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg),
+            patch.object(chat_runner, "_eager_spawn", new=AsyncMock()),
+        ):
+            task = schedule_eager_spawn(state, slot)
+            await asyncio.sleep(0)
+
+        assert task is not None
+        task.cancel()
 
     @pytest.mark.asyncio
     async def test_newer_signal_cancels_older_task(self):
@@ -215,6 +244,15 @@ class TestEagerSpawn:
         with patch.object(chat_runner.KiroCrewConfig, "load", _cfg(True)):
             await _eager_spawn(state, slot)
         assert state.sessions.get_or_create.await_args.kwargs["speculative"] is True
+        assert "environment_prefetch" not in state.sessions.get_or_create.await_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_managed_prefetch_passes_no_start_factory_intent(self):
+        slot = _ChatSlot("t1")
+        state = _mock_state(slot)
+        with patch.object(chat_runner.KiroCrewConfig, "load", _cfg(True)):
+            await _eager_spawn(state, slot, environment_prefetch=True)
+        assert state.sessions.get_or_create.await_args.kwargs["environment_prefetch"] is True
 
     @pytest.mark.asyncio
     async def test_resumable_key_refusal_is_clean(self):

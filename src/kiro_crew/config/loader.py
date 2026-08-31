@@ -8293,7 +8293,10 @@ class KiroCrewConfig:
                     runtime_warm_minutes=coder_cfg.runtime_warm_minutes,
                 )
             )
-        environment_registry = SessionEnvironmentRegistry(environment_providers)
+        environment_registry = SessionEnvironmentRegistry(
+            environment_providers,
+            default_provider_id="coder" if coder_cfg.enabled is True else "",
+        )
 
         # MCP gateway: resolve overlay + socket once, iff some server is stubbed
         # through the gateway. Routing is what puts a stub in the path, and the
@@ -8323,6 +8326,7 @@ class KiroCrewConfig:
             crew_agent: str | None = None,
             coder_profile_override: str | None = None,
             environment_selection: SessionEnvironmentSelection | None = None,
+            environment_prefetch: bool = False,
             session_host_override: Any = None,
             **_kwargs: object,
         ) -> AcpProvider:
@@ -8406,7 +8410,12 @@ class KiroCrewConfig:
                         provider="coder",
                         configuration=coder_profile_override,
                     )
-                if selected_environment is not None:
+                if environment_prefetch:
+                    session_host = environment_registry.prefetch_host(
+                        session_key or "main",
+                        selected_environment,
+                    )
+                elif selected_environment is not None:
                     environment_provider = environment_registry.require(
                         selected_environment.provider
                     )

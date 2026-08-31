@@ -943,6 +943,7 @@ async def test_managed_host_resolves_parent_workspace_before_remote_prepare(
     class _Manager:
         def __init__(self) -> None:
             self.sessions: list[str] = []
+            self.allow_start: list[bool] = []
             self.registry = SimpleNamespace(get_by_session=lambda _key: None)
 
         async def ensure_ready(
@@ -952,8 +953,10 @@ async def test_managed_host_resolves_parent_workspace_before_remote_prepare(
             template: str | None = None,
             preset: str | None = None,
             on_progress=None,
+            allow_start: bool = True,
         ) -> CoderWorkspace:
             self.sessions.append(session_key)
+            self.allow_start.append(allow_start)
             if on_progress is not None:
                 on_progress("provisioning", "crew-opaque123")
                 on_progress("connecting", "crew-opaque123")
@@ -998,6 +1001,7 @@ async def test_managed_host_resolves_parent_workspace_before_remote_prepare(
     )
 
     assert manager.sessions == ["dashboard:one"]
+    assert manager.allow_start == [True]
     assert host.execution_location["workspace"] == "crew-opaque123"
     assert host.prepare_argv(agent="kirocrew")[2] == "crew-opaque123"
     argv = host.spawn_argv(agent="kirocrew", model="auto")

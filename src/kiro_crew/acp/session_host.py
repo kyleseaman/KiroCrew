@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import secrets
 import shlex
 import shutil
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from pathlib import Path, PurePosixPath
@@ -37,6 +39,8 @@ from kiro_crew.mcp_gateway.remote_proxy import (
 )
 from kiro_crew.mcp_utils import kiro_entry_client_id, kiro_entry_scopes
 from kiro_crew.sandbox import RLIMIT_PROFILE_SESSION_HOST, create_subprocess_limited
+
+logger = logging.getLogger(__name__)
 
 _WORKSPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -625,6 +629,7 @@ class ManagedCoderWorkspaceSessionHost(CoderWorkspaceSessionHost):
         runtime_warm_minutes: int = CODER_DEFAULT_RUNTIME_WARM_MINUTES,
         template: str | None = None,
         preset: str | None = None,
+        allow_start: bool = True,
     ) -> None:
         super().__init__(
             workspace="crew-pending",
@@ -637,6 +642,7 @@ class ManagedCoderWorkspaceSessionHost(CoderWorkspaceSessionHost):
         self._manager = manager
         self._template = template
         self._preset = preset
+        self._allow_start = allow_start
         self._managed_ready = False
         binding = manager.registry.get_by_session(session_key)
         if binding is None or binding.state == "deleted":
@@ -686,12 +692,15 @@ class ManagedCoderWorkspaceSessionHost(CoderWorkspaceSessionHost):
         environ: Mapping[str, str],
         local_cwd: str | Path,
     ) -> None:
+        prepare_started = time.monotonic()
         workspace = await self._manager.ensure_ready(
             self._parent_session_key,
             template=self._template,
             preset=self._preset,
             on_progress=self._set_startup_progress,
+            allow_start=self._allow_start,
         )
+        control_plane_ms = (time.monotonic() - prepare_started) * 1000.0
         if not _WORKSPACE_RE.fullmatch(workspace.name):
             raise SessionHostError("Managed Coder workspace returned an invalid name")
         self._workspace = workspace.name
@@ -700,11 +709,21 @@ class ManagedCoderWorkspaceSessionHost(CoderWorkspaceSessionHost):
         if self._execution_location_callback is not None:
             self._execution_location_callback()
         try:
+            transport_started = time.monotonic()
             await super().prepare(
                 agent=agent,
                 projected_spec=projected_spec,
                 environ=environ,
                 local_cwd=local_cwd,
+            )
+            logger.info(
+                "Coder session host ready workspace=%s prefetch=%s "
+                "control_plane_ms=%.0f transport_ms=%.0f total_ms=%.0f",
+                self._workspace,
+                not self._allow_start,
+                control_plane_ms,
+                (time.monotonic() - transport_started) * 1000.0,
+                (time.monotonic() - prepare_started) * 1000.0,
             )
         except BaseException:
             self._managed_ready = False

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,7 @@ from kiro_crew.constants import (
     EXECUTION_PHASE_CONNECTING,
     EXECUTION_PHASE_PROVISIONING,
 )
+from kiro_crew.session_environment import SessionEnvironmentPrefetchUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +70,10 @@ class CoderWorkspaceManager:
         template: str | None = None,
         preset: str | None = None,
         on_progress: WorkspaceProgressCallback | None = None,
+        allow_start: bool = True,
     ) -> CoderWorkspace:
+        ready_started = time.monotonic()
+        identity_lookup = False
         last_progress: tuple[str, str] | None = None
 
         def report(phase: str, workspace: str) -> None:
@@ -82,25 +87,41 @@ class CoderWorkspaceManager:
         selected_template = self.policy.template if template is None else template
         selected_preset = self.policy.preset if preset is None else preset
         existing = await asyncio.to_thread(self.registry.get_by_session, session_key)
+        if existing is None and not allow_start:
+            raise SessionEnvironmentPrefetchUnavailable(
+                "Coder workspace is not allocated for this session"
+            )
         if existing is None:
             report(EXECUTION_PHASE_ALLOCATING, "")
         elif existing.state == "stopped" or not existing.workspace_uuid:
             report(EXECUTION_PHASE_PROVISIONING, existing.workspace_name)
         else:
             report(EXECUTION_PHASE_CONNECTING, existing.workspace_name)
-        owner_name, _owner_id = await self.client.current_user()
-        binding = await asyncio.to_thread(
-            self.registry.allocate,
-            session_key,
-            template=selected_template,
-            preset=selected_preset,
-            prefix=self.policy.prefix,
-            owner_name=owner_name,
-        )
+        owner_name = ""
+        if existing is None:
+            owner_name, _owner_id = await self.client.current_user()
+            identity_lookup = True
+            binding = await asyncio.to_thread(
+                self.registry.allocate,
+                session_key,
+                template=selected_template,
+                preset=selected_preset,
+                prefix=self.policy.prefix,
+                owner_name=owner_name,
+            )
+        else:
+            binding = existing
         async with self._lock_for(session_key):
             current_binding = await asyncio.to_thread(self.registry.get, binding.binding_id)
             if current_binding is None:
                 raise CoderWorkspaceIdentityError("Coder workspace binding disappeared")
+            if not current_binding.workspace_uuid and not owner_name:
+                if not allow_start:
+                    raise SessionEnvironmentPrefetchUnavailable(
+                        "Coder workspace is not provisioned for this session"
+                    )
+                owner_name, _owner_id = await self.client.current_user()
+                identity_lookup = True
             binding = await asyncio.to_thread(
                 self.registry.repair_unprovisioned_name,
                 current_binding.binding_id,
@@ -111,6 +132,10 @@ class CoderWorkspaceManager:
                 report(EXECUTION_PHASE_PROVISIONING, binding.workspace_name)
             workspace = await self.client.get_workspace(binding.workspace_name)
             if workspace is None:
+                if not allow_start:
+                    raise SessionEnvironmentPrefetchUnavailable(
+                        "Coder workspace is no longer available"
+                    )
                 report(EXECUTION_PHASE_PROVISIONING, binding.workspace_name)
                 if binding.workspace_uuid:
                     binding = await asyncio.to_thread(
@@ -134,6 +159,10 @@ class CoderWorkspaceManager:
                             preset=binding.preset,
                             stop_after_minutes=self.policy.stop_after_minutes,
                         )
+            elif not allow_start and workspace.status != "running":
+                raise SessionEnvironmentPrefetchUnavailable(
+                    "Coder workspace is not already running"
+                )
             elif workspace.status == "stopped":
                 report(EXECUTION_PHASE_PROVISIONING, binding.workspace_name)
                 async with self._capacity_lock:
@@ -158,6 +187,14 @@ class CoderWorkspaceManager:
                 ),
             )
             report(EXECUTION_PHASE_CONNECTING, workspace.name)
+            logger.info(
+                "Coder workspace ready name=%s prefetch=%s identity_lookup=%s "
+                "control_plane_ms=%.0f",
+                workspace.name,
+                not allow_start,
+                identity_lookup,
+                (time.monotonic() - ready_started) * 1000.0,
+            )
             return workspace
 
     @staticmethod

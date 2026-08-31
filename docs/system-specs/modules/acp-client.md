@@ -67,6 +67,16 @@ do not consume another slot. Releasing an idle managed runtime closes SSH after
 the short Coder warm window while retaining the session map and workspace disk
 for lossless resume.
 
+Focusing a resumable session may reconnect its ACP runtime ahead of the next
+message only when the provider's protected binding already says the exact
+workspace is running. The Coder host carries a second `allow_start=False` guard
+through the live control-plane lookup, so a stop or deletion racing the focus
+event refuses the prefetch instead of creating or waking compute. Existing
+provisioned bindings also skip the redundant Coder identity lookup; exact
+workspace identity is still verified from the returned workspace record. Logs
+separate Coder control-plane time from SSH/runtime preparation time so reconnect
+latency can be attributed without exposing credentials or session keys.
+
 **Kiro executable resolution at spawn.** Trust is "the CLI runs": any resolvable
 executable Kiro CLI launches for ACP, regardless of install source, owner, or
 fixed path — KiroCrew is not the authority on where Kiro CLI is installed, and

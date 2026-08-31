@@ -28,8 +28,10 @@ class _FakeClient:
         self.stopped: list[str] = []
         self.active_scopes: set[str] = set()
         self.extended: list[tuple[str, int]] = []
+        self.current_user_calls = 0
 
     async def current_user(self) -> tuple[str, str]:
+        self.current_user_calls += 1
         return "kyleseaman", "owner-kyleseaman"
 
     async def get_workspace(self, name: str) -> CoderWorkspace | None:
@@ -161,6 +163,66 @@ async def test_running_workspace_reports_only_connection_progress(tmp_path: Path
     assert progress == [("connecting", workspace.name)]
     assert client.created == [workspace.name]
     assert client.started == []
+
+
+@pytest.mark.asyncio
+async def test_running_binding_reconnect_skips_redundant_identity_lookup(tmp_path: Path) -> None:
+    """The immutable binding already owns the allocation identity on reconnect."""
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    workspace = await manager.ensure_ready("dashboard:one")
+    assert client.current_user_calls == 1
+
+    reused = await manager.ensure_ready("dashboard:one")
+
+    assert reused == workspace
+    assert client.current_user_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_prefetch_reuses_running_workspace_without_starting_compute(tmp_path: Path) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    workspace = await manager.ensure_ready("dashboard:one")
+
+    reused = await manager.ensure_ready("dashboard:one", allow_start=False)
+
+    assert reused == workspace
+    assert client.created == [workspace.name]
+    assert client.started == []
+
+
+@pytest.mark.asyncio
+async def test_prefetch_refuses_stopped_workspace_without_starting_compute(tmp_path: Path) -> None:
+    from kiro_crew.session_environment import SessionEnvironmentPrefetchUnavailable
+
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    workspace = await manager.ensure_ready("dashboard:one")
+    client.workspaces[workspace.name] = CoderWorkspace(
+        **{**workspace.__dict__, "status": "stopped"}
+    )
+
+    with pytest.raises(SessionEnvironmentPrefetchUnavailable):
+        await manager.ensure_ready("dashboard:one", allow_start=False)
+
+    assert client.started == []
+
+
+@pytest.mark.asyncio
+async def test_prefetch_refuses_unallocated_session_without_creating_compute(
+    tmp_path: Path,
+) -> None:
+    from kiro_crew.session_environment import SessionEnvironmentPrefetchUnavailable
+
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+
+    with pytest.raises(SessionEnvironmentPrefetchUnavailable):
+        await manager.ensure_ready("dashboard:absent", allow_start=False)
+
+    assert client.current_user_calls == 0
+    assert client.created == []
 
 
 @pytest.mark.asyncio
