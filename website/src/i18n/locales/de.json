@@ -74,7 +74,7 @@
     "phase_allocating": "Arbeitsbereich wird zugewiesen",
     "phase_connecting": "Kiro Crew wird mit dem Arbeitsbereich verbunden",
     "phase_provisioning": "Compute wird gestartet und auf den Arbeitsbereich-Agent gewartet",
-    "provider_label": "Anbieter",
+    "session_environment_label": "Sitzungsumgebung",
     "settings_tab_description": "Lege fest, wo neue Sitzungen ausgeführt werden.",
     "settings_tab_label": "Sitzungsumgebungen",
     "state_running": "Wird ausgeführt",

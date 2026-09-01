@@ -74,7 +74,7 @@
     "phase_allocating": "ワークスペースを割り当てています",
     "phase_connecting": "Kiro Crew をワークスペースに接続しています",
     "phase_provisioning": "コンピュートを起動し、ワークスペースエージェントを待機しています",
-    "provider_label": "プロバイダー",
+    "session_environment_label": "セッション環境",
     "settings_tab_description": "新しいセッションの実行場所を選択します。",
     "settings_tab_label": "セッション環境",
     "state_running": "実行中",

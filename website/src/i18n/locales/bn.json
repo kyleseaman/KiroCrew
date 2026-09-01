@@ -74,7 +74,7 @@
     "phase_allocating": "ওয়ার্কস্পেস বরাদ্দ হচ্ছে",
     "phase_connecting": "Kiro Crew ওয়ার্কস্পেসে সংযুক্ত হচ্ছে",
     "phase_provisioning": "কম্পিউট চালু হচ্ছে এবং ওয়ার্কস্পেস এজেন্টের জন্য অপেক্ষা করা হচ্ছে",
-    "provider_label": "প্রদানকারী",
+    "session_environment_label": "সেশন পরিবেশ",
     "settings_tab_description": "নতুন সেশন কোথায় চলবে তা বেছে নিন।",
     "settings_tab_label": "সেশন পরিবেশ",
     "state_running": "চলছে",

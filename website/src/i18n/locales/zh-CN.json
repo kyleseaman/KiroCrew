@@ -74,7 +74,7 @@
     "phase_allocating": "正在分配工作区",
     "phase_connecting": "正在将 Kiro Crew 连接到工作区",
     "phase_provisioning": "正在启动计算资源并等待工作区代理",
-    "provider_label": "提供商",
+    "session_environment_label": "会话环境",
     "settings_tab_description": "选择新会话的运行位置。",
     "settings_tab_label": "会话环境",
     "state_running": "运行中",

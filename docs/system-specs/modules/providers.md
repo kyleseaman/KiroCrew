@@ -133,7 +133,9 @@ the allowlisted state (`starting`, `running`, `stopped`, or `unavailable`), and
 optional bounded memory telemetry. The public catalog does not imply health
 authority. Unsupported adapters return no sample, and health snapshots never
 enter slot metadata, WebSocket frames, transcripts, memory, prompt context, or
-MCP results.
+MCP results. Provider state and optional telemetry are independent: a telemetry
+probe failure omits that telemetry without erasing an already verified
+control-plane state.
 
 #### Coder session environment
 
@@ -190,8 +192,10 @@ plane reports that exact workspace running. The fixed stdlib probe runs through
 `CODER_AGENT_TOKEN_FILE`, reads `/proc/meminfo`, and clamps availability to a
 finite cgroup v2 or v1 memory limit. Execution time and output are bounded;
 numeric output is validated before pressure is classified as elevated at 80%
-used or critical at 90%. Failures become `unavailable` without returning raw
-command output or diagnostics. Workload-scope inspection also uses
+used or critical at 90%. A control-plane or identity failure becomes
+`unavailable`; a memory-probe failure retains the verified workspace state and
+omits memory, without returning raw command output or diagnostics.
+Workload-scope inspection also uses
 `--disable-autostart`, so a status race cannot wake stopped compute.
 
 The runtime invokes `coder ssh <workspace> --remote-forward

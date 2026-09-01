@@ -274,7 +274,13 @@ class CoderWorkspaceManager:
             self._verify_destructive_identity(binding, workspace)
             if workspace.status != "running":
                 return workspace, None
-            return workspace, await self.client.workspace_memory(workspace.name)
+            try:
+                memory = await self.client.workspace_memory(workspace.name)
+            except CoderClientError:
+                # Memory is an optional diagnostic. A failed in-workspace probe
+                # must not erase the independently verified control-plane state.
+                memory = None
+            return workspace, memory
 
     @staticmethod
     def _parse_time(value: str) -> datetime:

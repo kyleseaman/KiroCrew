@@ -373,7 +373,9 @@ Opening the detail panel also enables an owner-only provider-health query. The
 browser polls it every ten seconds only while the panel is visible and stops
 polling when the panel closes or the tab is hidden. Providers that opt in may add
 live state and memory pressure to the expanded panel; the compact control remains
-unchanged. The handler derives provider and resource identity from the trusted
+unchanged. The first detail row is labelled **Session Environment** and names the
+selected implementation (for example, Coder) rather than exposing the internal
+provider abstraction. The handler derives provider and resource identity from the trusted
 slot binding, rechecks the returned identity, and never accepts either coordinate
 from the browser. The snapshot is ephemeral dashboard diagnostics and is not
 copied into session state or model-visible context.

@@ -129,7 +129,7 @@ export function ExecutionLocationBadge({
           <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2">
             <dt className="flex items-center gap-1.5 text-muted">
               <Server className="lucide-inline" />
-              {t('execution_environment.provider_label')}
+              {t('execution_environment.session_environment_label')}
             </dt>
             <dd className="truncate text-right font-medium text-text" title={kind}>{kind}</dd>
           </div>

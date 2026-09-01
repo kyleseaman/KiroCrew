@@ -74,7 +74,7 @@
     "phase_allocating": "वर्कस्पेस आवंटित किया जा रहा है",
     "phase_connecting": "Kiro Crew को वर्कस्पेस से जोड़ा जा रहा है",
     "phase_provisioning": "कंप्यूट शुरू हो रहा है और वर्कस्पेस एजेंट की प्रतीक्षा की जा रही है",
-    "provider_label": "प्रदाता",
+    "session_environment_label": "सत्र परिवेश",
     "settings_tab_description": "चुनें कि नए सत्र कहाँ चलें।",
     "settings_tab_label": "सत्र परिवेश",
     "state_running": "चल रहा है",

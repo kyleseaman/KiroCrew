@@ -38,6 +38,8 @@ describe('ExecutionLocationBadge', () => {
 
     await user.click(control)
 
+    expect(screen.getByText('Session Environment')).toBeInTheDocument()
+    expect(screen.queryByText('Provider')).not.toBeInTheDocument()
     expect(screen.getByText('gpu')).toBeInTheDocument()
     expect(screen.getByText('crew-dogfood')).toBeInTheDocument()
     expect(document.body.textContent).not.toContain('/home/coder/private-project')

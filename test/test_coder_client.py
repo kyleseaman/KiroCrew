@@ -203,21 +203,19 @@ async def test_workspace_memory_uses_no_autostart_and_scrubs_agent_tokens(
         used_percent=50.0,
         pressure="normal",
     )
-    assert calls[0][:6] == [
+    assert calls[0][:5] == [
         "/opt/coder",
         "ssh",
         "--disable-autostart",
         "crew-abc123",
         "--",
-        "env",
     ]
-    assert calls[0][6:10] == [
-        "-u",
-        "CODER_AGENT_TOKEN",
-        "-u",
-        "CODER_AGENT_TOKEN_FILE",
-    ]
-    assert calls[0][10:12] == ["python3", "-c"]
+    assert len(calls[0]) == 6
+    remote_command = calls[0][5]
+    assert remote_command.startswith(
+        "env -u CODER_AGENT_TOKEN -u CODER_AGENT_TOKEN_FILE python3 -c "
+    )
+    assert "'import json" in remote_command
 
 
 @pytest.mark.asyncio

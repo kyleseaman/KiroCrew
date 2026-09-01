@@ -85,7 +85,7 @@ export function ExecutionLocationStartup({
         <div className="min-w-0 rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
           <dt className="flex items-center gap-1 text-[11px] font-medium text-muted">
             <Server className="lucide-inline" />
-            {t('execution_environment.provider_label')}
+            {t('execution_environment.session_environment_label')}
           </dt>
           <dd className="mt-0.5 truncate text-[13px] font-medium text-text" title={provider}>
             {provider}

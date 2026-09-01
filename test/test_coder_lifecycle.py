@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from kiro_crew.coder.client import CoderWorkspace, CoderWorkspaceMemory
+from kiro_crew.coder.client import CoderClientError, CoderWorkspace, CoderWorkspaceMemory
 from kiro_crew.coder.manager import (
     CoderCapacityError,
     CoderWorkspaceManager,
@@ -419,3 +419,22 @@ async def test_inspect_session_health_does_not_probe_stopped_compute(tmp_path: P
     assert inspected.status == "stopped"
     assert memory is None
     assert client.memory_probes == []
+
+
+@pytest.mark.asyncio
+async def test_inspect_session_health_keeps_running_state_when_memory_probe_fails(
+    tmp_path: Path,
+) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    workspace = await manager.ensure_ready("dashboard:one")
+
+    async def unavailable_memory(_name: str) -> CoderWorkspaceMemory:
+        raise CoderClientError("memory probe unavailable")
+
+    client.workspace_memory = unavailable_memory  # type: ignore[method-assign]
+
+    inspected, memory = await manager.inspect_session_health("dashboard:one")
+
+    assert inspected == workspace
+    assert memory is None

@@ -74,7 +74,7 @@
     "phase_allocating": "Allocazione dello spazio di lavoro",
     "phase_connecting": "Connessione di Kiro Crew allo spazio di lavoro",
     "phase_provisioning": "Avvio delle risorse di calcolo e attesa dell’agente dello spazio di lavoro",
-    "provider_label": "Provider",
+    "session_environment_label": "Ambiente di sessione",
     "settings_tab_description": "Scegli dove eseguire le nuove sessioni.",
     "settings_tab_label": "Ambienti di sessione",
     "state_running": "In esecuzione",

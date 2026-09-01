@@ -74,7 +74,7 @@
     "phase_allocating": "Выделение рабочего пространства",
     "phase_connecting": "Подключение Kiro Crew к рабочему пространству",
     "phase_provisioning": "Запуск вычислительных ресурсов и ожидание агента рабочего пространства",
-    "provider_label": "Поставщик",
+    "session_environment_label": "Среда сеанса",
     "settings_tab_description": "Выберите, где будут выполняться новые сеансы.",
     "settings_tab_label": "Среды сеансов",
     "state_running": "Работает",

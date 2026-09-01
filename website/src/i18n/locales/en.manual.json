@@ -74,7 +74,7 @@
     "phase_allocating": "Allocating workspace",
     "phase_connecting": "Connecting Kiro Crew to the workspace",
     "phase_provisioning": "Starting compute and waiting for the workspace agent",
-    "provider_label": "Provider",
+    "session_environment_label": "Session Environment",
     "settings_tab_description": "Choose where new sessions run.",
     "settings_tab_label": "Session Environments",
     "state_running": "Running",

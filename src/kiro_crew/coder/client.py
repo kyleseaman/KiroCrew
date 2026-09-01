@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -321,6 +322,18 @@ class CoderClient:
     async def workspace_memory(self, name: str) -> CoderWorkspaceMemory:
         """Read bounded memory telemetry without starting a stopped workspace."""
         workspace = self._validated_workspace_name(name)
+        remote_command = shlex.join(
+            [
+                "env",
+                "-u",
+                "CODER_AGENT_TOKEN",
+                "-u",
+                "CODER_AGENT_TOKEN_FILE",
+                "python3",
+                "-c",
+                _WORKSPACE_MEMORY_SCRIPT,
+            ]
+        )
         try:
             output = await asyncio.wait_for(
                 self._call(
@@ -328,14 +341,7 @@ class CoderClient:
                     "--disable-autostart",
                     workspace,
                     "--",
-                    "env",
-                    "-u",
-                    "CODER_AGENT_TOKEN",
-                    "-u",
-                    "CODER_AGENT_TOKEN_FILE",
-                    "python3",
-                    "-c",
-                    _WORKSPACE_MEMORY_SCRIPT,
+                    remote_command,
                 ),
                 timeout=_HEALTH_TIMEOUT_SECS,
             )
