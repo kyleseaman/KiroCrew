@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from kiro_crew.coder.client import CoderClient, CoderWorkspace
+from kiro_crew.coder.client import (
+    CoderClient,
+    CoderClientError,
+    CoderWorkspace,
+    CoderWorkspaceMemory,
+)
 
 
 @pytest.mark.asyncio
@@ -166,6 +171,7 @@ async def test_scope_probe_and_deadline_extension_use_bounded_coder_commands(
         [
             "/opt/coder",
             "ssh",
+            "--disable-autostart",
             "crew-abc123",
             "--",
             'user_id="$(id -u)" && export XDG_RUNTIME_DIR="/run/user/$user_id" && '
@@ -175,3 +181,88 @@ async def test_scope_probe_and_deadline_extension_use_bounded_coder_commands(
         ],
         ["/opt/coder", "schedule", "extend", "crew-abc123", "30m"],
     ]
+
+
+@pytest.mark.asyncio
+async def test_workspace_memory_uses_no_autostart_and_scrubs_agent_tokens(
+    tmp_path: Path,
+) -> None:
+    calls: list[list[str]] = []
+
+    async def run(argv: list[str], env: dict[str, str], cwd: Path) -> bytes:
+        calls.append(argv)
+        return b'{"available_bytes":4294967296,"total_bytes":8589934592}'
+
+    client = CoderClient("/opt/coder", "https://coder.example", "token", tmp_path, run)
+
+    memory = await client.workspace_memory("crew-abc123")
+
+    assert memory == CoderWorkspaceMemory(
+        available_gb=4.0,
+        total_gb=8.0,
+        used_percent=50.0,
+        pressure="normal",
+    )
+    assert calls[0][:6] == [
+        "/opt/coder",
+        "ssh",
+        "--disable-autostart",
+        "crew-abc123",
+        "--",
+        "env",
+    ]
+    assert calls[0][6:10] == [
+        "-u",
+        "CODER_AGENT_TOKEN",
+        "-u",
+        "CODER_AGENT_TOKEN_FILE",
+    ]
+    assert calls[0][10:12] == ["python3", "-c"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "output",
+    [
+        b"not-json",
+        b'{"available_bytes":-1,"total_bytes":1024}',
+        b'{"available_bytes":2048,"total_bytes":1024}',
+        b'{"available_bytes":0,"total_bytes":0}',
+        b'{"available_bytes":"1","total_bytes":1024}',
+        b'{"available_bytes":0,"total_bytes":1152921504606846977}',
+        b"x" * 4097,
+    ],
+)
+async def test_workspace_memory_rejects_untrusted_probe_output(
+    tmp_path: Path,
+    output: bytes,
+) -> None:
+    async def run(argv: list[str], env: dict[str, str], cwd: Path) -> bytes:
+        return output
+
+    client = CoderClient("/opt/coder", "https://coder.example", "token", tmp_path, run)
+
+    with pytest.raises(CoderClientError):
+        await client.workspace_memory("crew-abc123")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("available_bytes", "total_bytes", "pressure"),
+    [
+        (2_147_483_648, 10_737_418_240, "elevated"),
+        (1_073_741_824, 10_737_418_240, "critical"),
+    ],
+)
+async def test_workspace_memory_classifies_pressure(
+    tmp_path: Path,
+    available_bytes: int,
+    total_bytes: int,
+    pressure: str,
+) -> None:
+    async def run(argv: list[str], env: dict[str, str], cwd: Path) -> bytes:
+        return json.dumps({"available_bytes": available_bytes, "total_bytes": total_bytes}).encode()
+
+    client = CoderClient("/opt/coder", "https://coder.example", "token", tmp_path, run)
+
+    assert (await client.workspace_memory("crew-abc123")).pressure == pressure

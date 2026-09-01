@@ -369,6 +369,15 @@ styled consistently with its agent and project peers. Its trigger does not expos
 long generated resource name; an expandable detail panel contains
 the provider, immutable configuration, full workspace name, and copy action. A later
 `starting` descriptor changes that same compact control into a reconnecting state.
+Opening the detail panel also enables an owner-only provider-health query. The
+browser polls it every ten seconds only while the panel is visible and stops
+polling when the panel closes or the tab is hidden. Providers that opt in may add
+live state and memory pressure to the expanded panel; the compact control remains
+unchanged. The handler derives provider and resource identity from the trusted
+slot binding, rechecks the returned identity, and never accepts either coordinate
+from the browser. The snapshot is ephemeral dashboard diagnostics and is not
+copied into session state or model-visible context.
+
 The session manager
 keeps a starting provider outside the claimable session registry, emits slot
 updates on its phase plus `starting`/`running`/failed transitions, and copies only the

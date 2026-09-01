@@ -74,6 +74,10 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/chat/slots/{slot}/agent", chat.api_chat_slot_agent)
     app.router.add_get("/api/session-environments", chat.api_session_environments)
     app.router.add_post("/api/chat/slots/{slot}/environment", chat.api_chat_slot_environment)
+    app.router.add_get(
+        "/api/chat/slots/{slot}/environment/health",
+        chat.api_chat_slot_environment_health,
+    )
     app.router.add_post("/api/chat/slots/{slot}/coder-profile", chat.api_chat_slot_coder_profile)
 
     # Optimizer

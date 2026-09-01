@@ -102,6 +102,8 @@ from kiro_crew.security import (
 from kiro_crew.sel import SecurityEvent, sel
 from kiro_crew.session_environment import (
     SessionEnvironmentBinding,
+    SessionEnvironmentHealth,
+    SessionEnvironmentHealthProvider,
     SessionEnvironmentUnavailable,
 )
 from kiro_crew.session_summary import count_user_turns_in_records
@@ -2068,6 +2070,51 @@ async def api_chat_slot_environment(request: web.Request) -> web.Response:
     state.push_slots_update()
     await save_slot_off_loop(state, slot, force=True)
     return web.json_response({"ok": True, "environment": slot.environment.to_dict()})
+
+
+async def api_chat_slot_environment_health(request: web.Request) -> web.Response:
+    """Return ephemeral health for the exact environment bound to an owner slot."""
+    if request.get("app", ""):
+        return web.json_response(
+            {"error": "owner access required", "code": "owner_only"}, status=403
+        )
+    state: DashboardState = request.app["state"]
+    slot = state.get_slot(request.match_info["slot"])
+    if slot is None:
+        return web.json_response({"error": "slot not found", "code": "slot_not_found"}, status=404)
+    binding = slot.environment
+    if binding is None or not binding.provider or not binding.resource_name:
+        return web.json_response(
+            {
+                "error": "session environment is not allocated",
+                "code": "session_environment_not_allocated",
+            },
+            status=404,
+        )
+    registry_getter = getattr(state.sessions, "environment_registry", None)
+    registry = registry_getter() if callable(registry_getter) else None
+    provider = registry.get(binding.provider) if registry is not None else None
+    unavailable = SessionEnvironmentHealth(
+        provider=binding.provider,
+        resource_name=binding.resource_name,
+        state="unavailable",
+    )
+    if not isinstance(provider, SessionEnvironmentHealthProvider):
+        return web.json_response(unavailable.to_dict())
+    try:
+        health = await provider.health_for_session(effective_session_key(slot))
+    except Exception:
+        logger.warning("Session environment health inspection failed provider=%s", binding.provider)
+        return web.json_response(unavailable.to_dict())
+    if health.provider != binding.provider or health.resource_name != binding.resource_name:
+        return web.json_response(
+            {
+                "error": "session environment identity changed during inspection",
+                "code": "session_environment_identity_mismatch",
+            },
+            status=409,
+        )
+    return web.json_response(health.to_dict())
 
 
 async def api_session_environments(request: web.Request) -> web.Response:

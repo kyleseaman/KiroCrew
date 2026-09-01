@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from kiro_crew.coder.client import CoderWorkspace
+from kiro_crew.coder.client import CoderWorkspace, CoderWorkspaceMemory
 from kiro_crew.coder.manager import (
     CoderCapacityError,
     CoderWorkspaceManager,
@@ -29,6 +29,7 @@ class _FakeClient:
         self.active_scopes: set[str] = set()
         self.extended: list[tuple[str, int]] = []
         self.current_user_calls = 0
+        self.memory_probes: list[str] = []
 
     async def current_user(self) -> tuple[str, str]:
         self.current_user_calls += 1
@@ -79,6 +80,10 @@ class _FakeClient:
 
     async def extend_workspace_deadline(self, name: str, minutes: int) -> None:
         self.extended.append((name, minutes))
+
+    async def workspace_memory(self, name: str) -> CoderWorkspaceMemory:
+        self.memory_probes.append(name)
+        return CoderWorkspaceMemory(2.0, 8.0, 75.0, "normal")
 
 
 def _manager(tmp_path: Path, client: _FakeClient) -> CoderWorkspaceManager:
@@ -387,3 +392,30 @@ async def test_no_scope_does_not_renew_running_workspace(tmp_path: Path) -> None
 
     assert await manager.reconcile_active_scopes() == ()
     assert client.extended == []
+
+
+@pytest.mark.asyncio
+async def test_inspect_session_health_probes_only_exact_running_binding(tmp_path: Path) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    workspace = await manager.ensure_ready("dashboard:one")
+
+    inspected, memory = await manager.inspect_session_health("dashboard:one")
+
+    assert inspected == workspace
+    assert memory == CoderWorkspaceMemory(2.0, 8.0, 75.0, "normal")
+    assert client.memory_probes == [workspace.name]
+
+
+@pytest.mark.asyncio
+async def test_inspect_session_health_does_not_probe_stopped_compute(tmp_path: Path) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    await manager.ensure_ready("dashboard:one")
+    await manager.stop_for_session("dashboard:one")
+
+    inspected, memory = await manager.inspect_session_health("dashboard:one")
+
+    assert inspected.status == "stopped"
+    assert memory is None
+    assert client.memory_probes == []

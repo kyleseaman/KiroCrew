@@ -2161,6 +2161,10 @@ export const api = {
       provider,
       configuration,
     }).then(j) as Promise<{ ok: boolean; environment: import('../types').SessionEnvironmentBinding }>,
+  getSessionEnvironmentHealth: (slot: string) =>
+    get('/api/chat/slots/' + encodeURIComponent(slot) + '/environment/health').then(j) as Promise<
+      import('../types').SessionEnvironmentHealth
+    >,
   chatSlotWorkspace: (slot: string, workspace: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/workspace', { workspace }).then(j),
   // Relaunch the slot's agent process in place (fresh agent spec, env, and MCP

@@ -9,7 +9,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
-from kiro_crew.coder.client import CoderClient, CoderClientError, CoderWorkspace
+from kiro_crew.coder.client import (
+    CoderClient,
+    CoderClientError,
+    CoderWorkspace,
+    CoderWorkspaceMemory,
+)
 from kiro_crew.coder.registry import WorkspaceBinding, WorkspaceBindingRegistry
 from kiro_crew.constants import (
     EXECUTION_PHASE_ALLOCATING,
@@ -251,6 +256,25 @@ class CoderWorkspaceManager:
                 replace(binding, state="stopped"),
             )
             return binding.workspace_name
+
+    async def inspect_session_health(
+        self, session_key: str
+    ) -> tuple[CoderWorkspace | None, CoderWorkspaceMemory | None]:
+        """Inspect an exact bound workspace without creating or starting compute."""
+        snapshot = await asyncio.to_thread(self.registry.get_by_session, session_key)
+        if snapshot is None or not snapshot.workspace_uuid or snapshot.state == "deleted":
+            return None, None
+        async with self._lock_for(session_key):
+            binding = await asyncio.to_thread(self.registry.get, snapshot.binding_id)
+            if binding is None or not binding.workspace_uuid or binding.state == "deleted":
+                return None, None
+            workspace = await self.client.get_workspace(binding.workspace_name)
+            if workspace is None:
+                return None, None
+            self._verify_destructive_identity(binding, workspace)
+            if workspace.status != "running":
+                return workspace, None
+            return workspace, await self.client.workspace_memory(workspace.name)
 
     @staticmethod
     def _parse_time(value: str) -> datetime:

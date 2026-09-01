@@ -17,8 +17,51 @@ from kiro_crew.sandbox import RLIMIT_PROFILE_SESSION_HOST, create_subprocess_lim
 
 _COMMAND_TIMEOUT_SECS = 600.0
 _OUTPUT_MAX_BYTES = 4 * 1024 * 1024
+_HEALTH_OUTPUT_MAX_BYTES = 4 * 1024
+_HEALTH_TIMEOUT_SECS = 30.0
+_MEMORY_ELEVATED_PERCENT = 80.0
+_MEMORY_CRITICAL_PERCENT = 90.0
+_BYTES_PER_GIB = 1024**3
+_MEMORY_BYTES_MAX = 1 << 60
 _WORKSPACE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _CODER_DEADLINE_EXTENSION_MINUTES_MIN = 30
+_WORKSPACE_MEMORY_SCRIPT = r"""
+import json
+from pathlib import Path
+
+
+def read_int(path):
+    try:
+        value = Path(path).read_text(encoding="utf-8").strip()
+        return None if value == "max" else int(value)
+    except (OSError, ValueError):
+        return None
+
+
+meminfo = {}
+for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+    key, value = line.split(":", 1)
+    meminfo[key] = int(value.strip().split()[0]) * 1024
+
+total = meminfo["MemTotal"]
+available = meminfo["MemAvailable"]
+for limit_path, current_path in (
+    ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+    (
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+    ),
+):
+    limit = read_int(limit_path)
+    current = read_int(current_path)
+    if limit is None or current is None or limit <= 0 or limit >= total:
+        continue
+    total = limit
+    available = min(available, max(0, limit - current))
+    break
+
+print(json.dumps({"available_bytes": min(available, total), "total_bytes": total}, separators=(",", ":")))
+""".strip()
 
 
 class CoderClientError(RuntimeError):
@@ -33,6 +76,14 @@ class CoderWorkspace:
     template: str
     status: str
     last_used_at: str
+
+
+@dataclass(frozen=True)
+class CoderWorkspaceMemory:
+    available_gb: float
+    total_gb: float
+    used_percent: float
+    pressure: str
 
 
 Runner = Callable[[list[str], dict[str, str], Path], Awaitable[bytes]]
@@ -92,6 +143,10 @@ class CoderClient:
             platform_compat.kill_process_tree(process.pid, platform_compat.SIGKILL)
             await process.wait()
             raise CoderClientError("Coder lifecycle command timed out") from exc
+        except asyncio.CancelledError:
+            platform_compat.kill_process_tree(process.pid, platform_compat.SIGKILL)
+            await process.wait()
+            raise
         if process.returncode:
             raise CoderClientError(f"Coder lifecycle command failed (exit {process.returncode})")
         if len(stdout) > _OUTPUT_MAX_BYTES:
@@ -260,8 +315,63 @@ class CoderClient:
                 pattern,
             ]
         )
-        output = await self._call("ssh", workspace, "--", command)
+        output = await self._call("ssh", "--disable-autostart", workspace, "--", command)
         return bool(output.strip())
+
+    async def workspace_memory(self, name: str) -> CoderWorkspaceMemory:
+        """Read bounded memory telemetry without starting a stopped workspace."""
+        workspace = self._validated_workspace_name(name)
+        try:
+            output = await asyncio.wait_for(
+                self._call(
+                    "ssh",
+                    "--disable-autostart",
+                    workspace,
+                    "--",
+                    "env",
+                    "-u",
+                    "CODER_AGENT_TOKEN",
+                    "-u",
+                    "CODER_AGENT_TOKEN_FILE",
+                    "python3",
+                    "-c",
+                    _WORKSPACE_MEMORY_SCRIPT,
+                ),
+                timeout=_HEALTH_TIMEOUT_SECS,
+            )
+        except asyncio.TimeoutError as exc:
+            raise CoderClientError("Coder workspace health probe timed out") from exc
+        if len(output) > _HEALTH_OUTPUT_MAX_BYTES:
+            raise CoderClientError("Coder workspace health probe returned too much data")
+        raw = self._json(output, "workspace health probe")
+        if not isinstance(raw, dict):
+            raise CoderClientError("Coder workspace health probe returned an invalid shape")
+        available = raw.get("available_bytes")
+        total = raw.get("total_bytes")
+        if (
+            not isinstance(available, int)
+            or isinstance(available, bool)
+            or not isinstance(total, int)
+            or isinstance(total, bool)
+            or total <= 0
+            or total > _MEMORY_BYTES_MAX
+            or available < 0
+            or available > total
+        ):
+            raise CoderClientError("Coder workspace health probe returned invalid memory data")
+        used_percent = (total - available) / total * 100
+        if used_percent >= _MEMORY_CRITICAL_PERCENT:
+            pressure = "critical"
+        elif used_percent >= _MEMORY_ELEVATED_PERCENT:
+            pressure = "elevated"
+        else:
+            pressure = "normal"
+        return CoderWorkspaceMemory(
+            available_gb=round(available / _BYTES_PER_GIB, 2),
+            total_gb=round(total / _BYTES_PER_GIB, 2),
+            used_percent=round(used_percent, 1),
+            pressure=pressure,
+        )
 
     async def extend_workspace_deadline(self, name: str, minutes: int) -> None:
         """Renew a running workspace deadline without reprovisioning it."""

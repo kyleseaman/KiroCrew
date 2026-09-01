@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence
@@ -9,6 +10,8 @@ from typing import Any, Mapping, Protocol, Sequence
 _PROVIDER_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 _CONFIGURATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _RESOURCE_NAME_MAX_CHARS = 255
+_ENVIRONMENT_STATES = frozenset({"starting", "running", "stopped", "unavailable"})
+_MEMORY_PRESSURES = frozenset({"normal", "elevated", "critical"})
 
 
 class SessionEnvironmentUnavailable(RuntimeError):
@@ -96,6 +99,67 @@ class SessionEnvironmentBinding:
         }
 
 
+@dataclass(frozen=True)
+class SessionEnvironmentMemoryHealth:
+    """Provider-neutral memory pressure projected for dashboard display only."""
+
+    available_gb: float
+    total_gb: float
+    used_percent: float
+    pressure: str
+
+    def __post_init__(self) -> None:
+        if (
+            not math.isfinite(self.available_gb)
+            or not math.isfinite(self.total_gb)
+            or not math.isfinite(self.used_percent)
+            or self.available_gb < 0
+            or self.total_gb <= 0
+            or self.available_gb > self.total_gb
+            or self.used_percent < 0
+            or self.used_percent > 100
+            or self.pressure not in _MEMORY_PRESSURES
+        ):
+            raise ValueError("session environment memory health is invalid")
+
+    def to_dict(self) -> dict[str, float | str]:
+        return {
+            "available_gb": self.available_gb,
+            "total_gb": self.total_gb,
+            "used_percent": self.used_percent,
+            "pressure": self.pressure,
+        }
+
+
+@dataclass(frozen=True)
+class SessionEnvironmentHealth:
+    """Ephemeral provider-neutral health for one session-bound environment."""
+
+    provider: str
+    resource_name: str
+    state: str
+    memory: SessionEnvironmentMemoryHealth | None = None
+
+    def __post_init__(self) -> None:
+        _validate_provider(self.provider)
+        if self.state not in _ENVIRONMENT_STATES:
+            raise ValueError("session environment state is invalid")
+        if len(self.resource_name) > _RESOURCE_NAME_MAX_CHARS or any(
+            char in self.resource_name for char in "\r\n\x00"
+        ):
+            raise ValueError("resource_name must be one bounded display value")
+
+    def to_dict(self) -> dict[str, object]:
+        value: dict[str, object] = {
+            "provider": self.provider,
+            "resource_name": self.resource_name,
+            "state": self.state,
+        }
+        if self.memory is not None:
+            value["memory"] = self.memory.to_dict()
+        return value
+
+
 class SessionEnvironmentProvider(Protocol):
     """Lifecycle adapter for one managed session-environment system."""
 
@@ -150,6 +214,13 @@ class SessionEnvironmentPrefetchProvider:
         raise SessionEnvironmentPrefetchUnavailable(
             "session environment cannot be safely prefetched"
         )
+
+
+class SessionEnvironmentHealthProvider:
+    """Positive opt-in for bounded, on-demand environment health inspection."""
+
+    async def health_for_session(self, session_key: str) -> SessionEnvironmentHealth:
+        raise SessionEnvironmentUnavailable("session environment health is unavailable")
 
 
 class SessionEnvironmentRegistry:
@@ -231,6 +302,7 @@ class SessionEnvironmentRegistry:
 class CoderSessionEnvironmentProvider(
     SessionEnvironmentLifecycleProvider,
     SessionEnvironmentPrefetchProvider,
+    SessionEnvironmentHealthProvider,
 ):
     """Managed Coder lifecycle exposed through the environment contract."""
 
@@ -334,6 +406,48 @@ class CoderSessionEnvironmentProvider(
 
     async def stop_for_session(self, session_key: str) -> str | None:
         return await self.manager.stop_for_session(session_key)
+
+    async def health_for_session(self, session_key: str) -> SessionEnvironmentHealth:
+        from kiro_crew.coder.client import CoderClientError
+
+        binding = self.binding_for_session(session_key)
+        resource_name = binding.resource_name if binding is not None else ""
+        try:
+            workspace, memory = await self.manager.inspect_session_health(session_key)
+        except CoderClientError:
+            return SessionEnvironmentHealth(
+                provider=self.provider_id,
+                resource_name=resource_name,
+                state="unavailable",
+            )
+        if workspace is None:
+            return SessionEnvironmentHealth(
+                provider=self.provider_id,
+                resource_name=resource_name,
+                state="unavailable",
+            )
+        state = {
+            "pending": "starting",
+            "starting": "starting",
+            "running": "running",
+            "stopped": "stopped",
+        }.get(workspace.status, "unavailable")
+        projected_memory = (
+            SessionEnvironmentMemoryHealth(
+                available_gb=memory.available_gb,
+                total_gb=memory.total_gb,
+                used_percent=memory.used_percent,
+                pressure=memory.pressure,
+            )
+            if memory is not None
+            else None
+        )
+        return SessionEnvironmentHealth(
+            provider=self.provider_id,
+            resource_name=workspace.name,
+            state=state,
+            memory=projected_memory,
+        )
 
     @property
     def lifecycle_interval_seconds(self) -> int | None:

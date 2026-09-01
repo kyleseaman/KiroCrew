@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { screen } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { act, fireEvent, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { renderWithProviders } from '../test/helpers'
@@ -8,6 +8,7 @@ import type { ChatSlot } from '../types'
 vi.mock('../api/client', () => ({
   api: {
     getSessionEnvironments: vi.fn(),
+    getSessionEnvironmentHealth: vi.fn(),
     chatSlotEnvironment: vi.fn(),
   },
 }))
@@ -24,6 +25,10 @@ const slot: ChatSlot = {
 }
 
 describe('SessionEnvironmentControl', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
   beforeEach(() => {
     vi.clearAllMocks()
     vi.mocked(api.getSessionEnvironments).mockResolvedValue({
@@ -40,6 +45,17 @@ describe('SessionEnvironmentControl', () => {
     vi.mocked(api.chatSlotEnvironment).mockResolvedValue({
       ok: true,
       environment: { provider: 'coder', configuration: 'gpu', resource_name: '' },
+    })
+    vi.mocked(api.getSessionEnvironmentHealth).mockResolvedValue({
+      provider: 'coder',
+      resource_name: 'crew-opaque',
+      state: 'running',
+      memory: {
+        available_gb: 0.4,
+        total_gb: 4,
+        used_percent: 90,
+        pressure: 'critical',
+      },
     })
   })
 
@@ -90,12 +106,80 @@ describe('SessionEnvironmentControl', () => {
     expect(control).toHaveTextContent('Coder')
     expect(control).not.toHaveTextContent('crew-opaque')
     expect(screen.queryByText('Environment configuration · gpu')).not.toBeInTheDocument()
+    expect(api.getSessionEnvironmentHealth).not.toHaveBeenCalled()
+    expect(screen.queryByText('Critical pressure')).not.toBeInTheDocument()
 
     await user.click(control)
     expect(screen.getByText('crew-opaque')).toBeInTheDocument()
     expect(screen.getByText('gpu')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Copy workspace ID' })).toBeInTheDocument()
     expect(screen.queryByRole('combobox')).not.toBeInTheDocument()
+    await waitFor(() => expect(api.getSessionEnvironmentHealth).toHaveBeenCalledWith('chat-1'))
+    expect(screen.getByText('Critical pressure')).toBeInTheDocument()
+    expect(screen.getByText('90% used · 0.4GB available of 4GB')).toBeInTheDocument()
+    expect(screen.getByRole('progressbar', { name: 'Memory' })).toHaveAttribute(
+      'aria-valuenow',
+      '90',
+    )
+  })
+
+  it('omits memory when the provider has no live sample', async () => {
+    vi.mocked(api.getSessionEnvironmentHealth).mockResolvedValue({
+      provider: 'coder',
+      resource_name: 'crew-opaque',
+      state: 'stopped',
+    })
+    const user = userEvent.setup()
+    renderWithProviders(
+      <SessionEnvironmentControl
+        placement="composer"
+        slot={{
+          ...slot,
+          messages: 1,
+          environment: { provider: 'coder', configuration: 'gpu', resource_name: 'crew-opaque' },
+          execution_location: {
+            kind: 'coder',
+            workspace: 'crew-opaque',
+            remote_cwd: '/home/coder/workspace',
+            state: 'running',
+          },
+        }}
+      />,
+    )
+
+    await user.click(screen.getByRole('button', { name: 'Session Environments' }))
+    expect(await screen.findByText('Stopped')).toBeInTheDocument()
+    expect(screen.queryByText('Memory')).not.toBeInTheDocument()
+  })
+
+  it('stops health refreshes when the environment details close', async () => {
+    vi.useFakeTimers()
+    renderWithProviders(
+      <SessionEnvironmentControl
+        placement="composer"
+        slot={{
+          ...slot,
+          messages: 1,
+          environment: { provider: 'coder', configuration: 'gpu', resource_name: 'crew-opaque' },
+          execution_location: {
+            kind: 'coder',
+            workspace: 'crew-opaque',
+            remote_cwd: '/home/coder/workspace',
+            state: 'running',
+          },
+        }}
+      />,
+    )
+
+    const control = screen.getByRole('button', { name: 'Session Environments' })
+    fireEvent.click(control)
+    await act(async () => Promise.resolve())
+    expect(api.getSessionEnvironmentHealth).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(control)
+    act(() => vi.advanceTimersByTime(20_000))
+    await act(async () => Promise.resolve())
+    expect(api.getSessionEnvironmentHealth).toHaveBeenCalledTimes(1)
   })
 
   it('keeps the durable workspace ID visible after the live runtime idles', async () => {

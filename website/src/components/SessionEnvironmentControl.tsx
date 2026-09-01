@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { Server } from 'lucide-react'
 
@@ -46,6 +47,7 @@ export function SessionEnvironmentControl({
   slot?: ChatSlot
   placement?: 'header' | 'composer'
 }) {
+  const [detailsOpen, setDetailsOpen] = useState(false)
   const binding = sessionEnvironment(slot)
   const executionLocation = sessionExecutionLocation(slot)
   // Slot summaries arrive before full chat history on a reload. Two persisted
@@ -69,6 +71,14 @@ export function SessionEnvironmentControl({
       )
     },
   })
+  const health = useQuery({
+    queryKey: ['session-environment-health', slot?.key],
+    queryFn: () => api.getSessionEnvironmentHealth(slot?.key ?? ''),
+    enabled: detailsOpen && Boolean(slot?.key && executionLocation?.workspace),
+    refetchInterval: detailsOpen ? 10_000 : false,
+    refetchIntervalInBackground: false,
+    retry: false,
+  })
 
   if (executionLocation) {
     if (placement === 'header') return null
@@ -80,6 +90,9 @@ export function SessionEnvironmentControl({
           location={executionLocation}
           providerLabel={providerLabel || undefined}
           configurationLabel={configuration || undefined}
+          health={health.data}
+          healthLoading={health.isPending && health.fetchStatus === 'fetching'}
+          onOpenChange={setDetailsOpen}
         />
       </div>
     )

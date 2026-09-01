@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -261,3 +262,76 @@ async def test_coder_lifecycle_rejects_catalog_shaped_manager_authority() -> Non
 
     manager.reconcile_active_scopes.assert_not_awaited()
     manager.reconcile_retention.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_coder_adapter_projects_provider_neutral_memory_health() -> None:
+    from kiro_crew.coder.client import CoderWorkspace, CoderWorkspaceMemory
+    from kiro_crew.session_environment import CoderSessionEnvironmentProvider
+
+    manager = MagicMock()
+    manager.registry.get_by_session.return_value = SimpleNamespace(
+        workspace_name="crew-session-kyle-opaque",
+        workspace_uuid="workspace-uuid",
+        state="running",
+    )
+    manager.inspect_session_health = AsyncMock(
+        return_value=(
+            CoderWorkspace(
+                uuid="workspace-uuid",
+                name="crew-session-kyle-opaque",
+                owner="owner-uuid",
+                template="kirocrew-arm",
+                status="running",
+                last_used_at="2026-09-01T12:00:00Z",
+            ),
+            CoderWorkspaceMemory(0.4, 4.0, 90.0, "critical"),
+        )
+    )
+    provider = CoderSessionEnvironmentProvider(
+        manager=manager,
+        configurations={},
+        default_template="kirocrew-arm",
+        default_preset="",
+        remote_cwd="/home/coder/workspace",
+        coder_bin="/opt/coder",
+        coder_url="https://coder.example",
+        session_token="secret",
+        runtime_warm_minutes=5,
+    )
+
+    health = await provider.health_for_session("dashboard:chat-1")
+
+    assert health.to_dict() == {
+        "provider": "coder",
+        "resource_name": "crew-session-kyle-opaque",
+        "state": "running",
+        "memory": {
+            "available_gb": 0.4,
+            "total_gb": 4.0,
+            "used_percent": 90.0,
+            "pressure": "critical",
+        },
+    }
+    manager.inspect_session_health.assert_awaited_once_with("dashboard:chat-1")
+
+
+def test_health_capability_is_positive_opt_in() -> None:
+    from kiro_crew.session_environment import SessionEnvironmentHealthProvider
+
+    assert not isinstance(
+        SimpleNamespace(health_for_session=AsyncMock()), SessionEnvironmentHealthProvider
+    )
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_memory_health_rejects_non_finite_metrics(value: float) -> None:
+    from kiro_crew.session_environment import SessionEnvironmentMemoryHealth
+
+    with pytest.raises(ValueError, match="invalid"):
+        SessionEnvironmentMemoryHealth(
+            available_gb=value,
+            total_gb=4.0,
+            used_percent=50.0,
+            pressure="normal",
+        )

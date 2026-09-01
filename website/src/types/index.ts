@@ -702,6 +702,21 @@ export interface SessionEnvironmentProviderSummary {
   configurations: SessionEnvironmentConfiguration[]
 }
 
+export interface SessionEnvironmentMemoryHealth {
+  available_gb: number
+  total_gb: number
+  used_percent: number
+  pressure: 'normal' | 'elevated' | 'critical'
+}
+
+/** Ephemeral health queried only while the environment details popover is open. */
+export interface SessionEnvironmentHealth {
+  provider: string
+  resource_name: string
+  state: 'starting' | 'running' | 'stopped' | 'unavailable'
+  memory?: SessionEnvironmentMemoryHealth
+}
+
 export interface ChatSlot {
   key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; coder_profile?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; clean_mode?: boolean; project?: string; forked_from?: string | null; source_links?: { provider: 'github' | 'gitlab' | 'jira'; number: number; url: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
   /** Provenance bucket from the backend `SlotOrigin` ("user" | "app" | "cron"

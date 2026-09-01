@@ -127,6 +127,14 @@ adapter keeps its concrete control-plane trust checks at its own boundary. Coder
 is the first implementation; another provider can join the registry without
 adding common dashboard state or changing ACP runtime dispatch.
 
+Environment health is a separate positive opt-in capability. It accepts only a
+trusted durable session key and returns provider id, generated resource name,
+the allowlisted state (`starting`, `running`, `stopped`, or `unavailable`), and
+optional bounded memory telemetry. The public catalog does not imply health
+authority. Unsupported adapters return no sample, and health snapshots never
+enter slot metadata, WebSocket frames, transcripts, memory, prompt context, or
+MCP results.
+
 #### Coder session environment
 
 `acp/session_host.py` makes the process location an explicit runtime boundary.
@@ -173,6 +181,18 @@ finishes; that handshake uses the ordinary turn loader rather than replaying the
 billable-compute startup card. A reconstructed host seeds its generated name and
 initial phase from the durable binding, so an existing session never flashes an
 anonymous allocation state before the Coder status check completes.
+
+Coder health inspection resolves the protected binding by session key, fetches
+the current workspace, and revalidates immutable UUID, owner, template, and
+generated name before any remote probe. It samples memory only when the control
+plane reports that exact workspace running. The fixed stdlib probe runs through
+`coder ssh --disable-autostart`, explicitly unsets `CODER_AGENT_TOKEN` and
+`CODER_AGENT_TOKEN_FILE`, reads `/proc/meminfo`, and clamps availability to a
+finite cgroup v2 or v1 memory limit. Execution time and output are bounded;
+numeric output is validated before pressure is classified as elevated at 80%
+used or critical at 90%. Failures become `unavailable` without returning raw
+command output or diagnostics. Workload-scope inspection also uses
+`--disable-autostart`, so a status race cannot wake stopped compute.
 
 The runtime invokes `coder ssh <workspace> --remote-forward
 <workspace-port>:127.0.0.1:<gateway-loopback-port> -- kiro-cli acp --agent

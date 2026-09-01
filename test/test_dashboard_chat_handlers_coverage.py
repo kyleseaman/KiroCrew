@@ -368,7 +368,9 @@ class TestTryLiveModelSwitch:
     @pytest.mark.asyncio
     async def test_success_sends_the_wire_id(self):
         provider = _acp()
-        assert await ch._try_live_model_switch("s1", _ChatSlot("s1"), provider, "sonnet-4.5") is True
+        assert (
+            await ch._try_live_model_switch("s1", _ChatSlot("s1"), provider, "sonnet-4.5") is True
+        )
         provider.client.set_model.assert_awaited_once_with("claude-sonnet-4.5")
 
 
@@ -650,7 +652,9 @@ class TestSlotColor:
     @pytest.mark.asyncio
     async def test_out_of_range_index_is_rejected(self):
         slot = _ChatSlot("s1")
-        status, body = await self._patch(_state(slot), "s1", {"color_index": ch.MAX_COLOR_INDEX + 1})
+        status, body = await self._patch(
+            _state(slot), "s1", {"color_index": ch.MAX_COLOR_INDEX + 1}
+        )
         assert status == 400
         assert str(ch.MAX_COLOR_INDEX) in body["error"]
         assert slot.color_index is None
@@ -1269,6 +1273,22 @@ class TestSlotEnvironment:
             response = await client.post(f"/api/chat/slots/{name}/environment", json=payload)
             return response.status, await response.json()
 
+    async def _get_health(self, state, name, *, app_claim: str | None = None):
+        async def route(request: web.Request) -> web.Response:
+            if app_claim is not None:
+                request["app"] = app_claim
+            return await ch.api_chat_slot_environment_health(request)
+
+        app = _app(
+            state,
+            "GET",
+            "/api/chat/slots/{slot}/environment/health",
+            route,
+        )
+        async with TestClient(TestServer(app)) as client:
+            response = await client.get(f"/api/chat/slots/{name}/environment/health")
+            return response.status, await response.json()
+
     @pytest.mark.asyncio
     async def test_selects_generic_environment_before_allocation(self):
         from kiro_crew.session_environment import (
@@ -1370,6 +1390,168 @@ class TestSlotEnvironment:
                 }
             ]
         }
+
+    @pytest.mark.asyncio
+    async def test_health_reads_only_the_slots_bound_provider(self):
+        from kiro_crew.session_environment import (
+            SessionEnvironmentBinding,
+            SessionEnvironmentHealth,
+            SessionEnvironmentHealthProvider,
+            SessionEnvironmentRegistry,
+        )
+
+        class HealthProvider(SessionEnvironmentHealthProvider):
+            provider_id = "coder"
+
+            async def health_for_session(self, session_key: str) -> SessionEnvironmentHealth:
+                assert session_key == "dashboard:s1"
+                return SessionEnvironmentHealth(
+                    provider="coder",
+                    resource_name="crew-session-user-opaque",
+                    state="running",
+                )
+
+        slot = _ChatSlot("s1")
+        slot.environment = SessionEnvironmentBinding(
+            "coder", "standard", "crew-session-user-opaque"
+        )
+        state = _state(slot)
+        state.get_slot = MagicMock(return_value=slot)
+        state.sessions.environment_registry = MagicMock(
+            return_value=SessionEnvironmentRegistry([HealthProvider()])  # type: ignore[list-item]
+        )
+
+        status, body = await self._get_health(state, "s1")
+
+        assert status == 200
+        assert body == {
+            "provider": "coder",
+            "resource_name": "crew-session-user-opaque",
+            "state": "running",
+        }
+
+    @pytest.mark.asyncio
+    async def test_health_is_owner_only(self):
+        slot = _ChatSlot("s1")
+        state = _state(slot)
+        state.get_slot = MagicMock(return_value=slot)
+
+        status, body = await self._get_health(state, "s1", app_claim="external-app")
+
+        assert status == 403
+        assert body["code"] == "owner_only"
+
+    @pytest.mark.asyncio
+    async def test_health_requires_an_allocated_environment(self):
+        slot = _ChatSlot("s1")
+        state = _state(slot)
+        state.get_slot = MagicMock(return_value=slot)
+
+        status, body = await self._get_health(state, "s1")
+
+        assert status == 404
+        assert body["code"] == "session_environment_not_allocated"
+
+    @pytest.mark.asyncio
+    async def test_health_degrades_for_provider_without_health_capability(self):
+        from kiro_crew.session_environment import (
+            SessionEnvironmentBinding,
+            SessionEnvironmentRegistry,
+        )
+
+        provider = MagicMock()
+        provider.provider_id = "generic"
+        slot = _ChatSlot("s1")
+        slot.environment = SessionEnvironmentBinding(
+            "generic", "standard", "crew-session-user-opaque"
+        )
+        state = _state(slot)
+        state.get_slot = MagicMock(return_value=slot)
+        state.sessions.environment_registry = MagicMock(
+            return_value=SessionEnvironmentRegistry([provider])
+        )
+
+        status, body = await self._get_health(state, "s1")
+
+        assert status == 200
+        assert body == {
+            "provider": "generic",
+            "resource_name": "crew-session-user-opaque",
+            "state": "unavailable",
+        }
+
+    @pytest.mark.asyncio
+    async def test_health_hides_provider_failure_details(self):
+        from kiro_crew.session_environment import (
+            SessionEnvironmentBinding,
+            SessionEnvironmentHealth,
+            SessionEnvironmentHealthProvider,
+            SessionEnvironmentRegistry,
+        )
+
+        class FailingHealthProvider(SessionEnvironmentHealthProvider):
+            provider_id = "coder"
+
+            async def health_for_session(self, session_key: str) -> SessionEnvironmentHealth:
+                raise RuntimeError("secret diagnostic canary")
+
+        slot = _ChatSlot("s1")
+        slot.environment = SessionEnvironmentBinding(
+            "coder", "standard", "crew-session-user-opaque"
+        )
+        state = _state(slot)
+        state.get_slot = MagicMock(return_value=slot)
+        state.sessions.environment_registry = MagicMock(
+            return_value=SessionEnvironmentRegistry(
+                [FailingHealthProvider()]  # type: ignore[list-item]
+            )
+        )
+
+        status, body = await self._get_health(state, "s1")
+
+        assert status == 200
+        assert body == {
+            "provider": "coder",
+            "resource_name": "crew-session-user-opaque",
+            "state": "unavailable",
+        }
+        assert "canary" not in str(body)
+
+    @pytest.mark.asyncio
+    async def test_health_rejects_provider_identity_drift(self):
+        from kiro_crew.session_environment import (
+            SessionEnvironmentBinding,
+            SessionEnvironmentHealth,
+            SessionEnvironmentHealthProvider,
+            SessionEnvironmentRegistry,
+        )
+
+        class DriftingHealthProvider(SessionEnvironmentHealthProvider):
+            provider_id = "coder"
+
+            async def health_for_session(self, session_key: str) -> SessionEnvironmentHealth:
+                return SessionEnvironmentHealth(
+                    provider="coder",
+                    resource_name="different-workspace",
+                    state="running",
+                )
+
+        slot = _ChatSlot("s1")
+        slot.environment = SessionEnvironmentBinding(
+            "coder", "standard", "crew-session-user-opaque"
+        )
+        state = _state(slot)
+        state.get_slot = MagicMock(return_value=slot)
+        state.sessions.environment_registry = MagicMock(
+            return_value=SessionEnvironmentRegistry(
+                [DriftingHealthProvider()]  # type: ignore[list-item]
+            )
+        )
+
+        status, body = await self._get_health(state, "s1")
+
+        assert status == 409
+        assert body["code"] == "session_environment_identity_mismatch"
 
 
 # ── POST /api/chat/slots/{slot}/followup ─────────────────────────────────────

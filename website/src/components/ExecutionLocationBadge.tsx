@@ -1,19 +1,49 @@
 import { useEffect, useRef, useState } from 'react'
-import { Box, Check, ChevronDown, Copy, Layers3, Loader2, Server } from 'lucide-react'
+import {
+  Activity,
+  Box,
+  Check,
+  ChevronDown,
+  Copy,
+  Layers3,
+  Loader2,
+  MemoryStick,
+  Server,
+} from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
-import type { ExecutionLocation } from '../types'
+import { fmtPercent, fmtUnit } from '../i18n/format'
+import type { ExecutionLocation, SessionEnvironmentHealth } from '../types'
 import { copyToClipboard } from '../utils/clipboard'
 import { Btn, IconButton } from './ui'
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover'
 
+const STATE_LABEL_KEYS = {
+  running: 'execution_environment.state_running',
+  starting: 'execution_environment.state_starting',
+  stopped: 'execution_environment.state_stopped',
+  unavailable: 'execution_environment.state_unavailable',
+} as const
+
+const PRESSURE_LABEL_KEYS = {
+  normal: 'execution_environment.memory_pressure_normal',
+  elevated: 'execution_environment.memory_pressure_elevated',
+  critical: 'execution_environment.memory_pressure_critical',
+} as const
+
 export function ExecutionLocationBadge({
   configurationLabel,
   location,
+  health,
+  healthLoading = false,
+  onOpenChange,
   providerLabel,
 }: {
   configurationLabel?: string
   location?: ExecutionLocation
+  health?: SessionEnvironmentHealth
+  healthLoading?: boolean
+  onOpenChange?: (open: boolean) => void
   providerLabel?: string
 }) {
   const { t } = useTranslation()
@@ -49,9 +79,23 @@ export function ExecutionLocationBadge({
     if (resetTimer.current) clearTimeout(resetTimer.current)
     resetTimer.current = setTimeout(() => setCopied(false), 1500)
   }
+  const stateLabel = health
+    ? t(STATE_LABEL_KEYS[health.state])
+    : healthLoading
+      ? t('execution_environment.health_checking')
+      : ''
+  const memory = health?.memory
+  const pressureLabel = memory
+    ? t(PRESSURE_LABEL_KEYS[memory.pressure])
+    : ''
+  const pressureClass = memory?.pressure === 'critical'
+    ? 'text-danger'
+    : memory?.pressure === 'elevated'
+      ? 'text-warn'
+      : 'text-ok'
 
   return (
-    <Popover>
+    <Popover onOpenChange={onOpenChange}>
       <PopoverTrigger asChild>
         <Btn
           className="pointer-events-auto inline-flex h-7 min-w-0 max-w-[11rem] items-center gap-1.5 rounded-md border-none bg-transparent px-2.5 py-0 text-[12px] font-medium text-muted shadow-none transition-colors hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] hover:text-text"
@@ -119,6 +163,56 @@ export function ExecutionLocationBadge({
               </IconButton>
             ) : <span />}
           </div>
+          {stateLabel ? (
+            <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-2">
+              <dt className="flex items-center gap-1.5 text-muted">
+                <Activity className="lucide-inline" />
+                {t('execution_environment.status_label')}
+              </dt>
+              <dd className="truncate text-right font-medium text-text">{stateLabel}</dd>
+            </div>
+          ) : null}
+          {memory ? (
+            <div className="grid min-w-0 gap-1.5 border-t border-border pt-2.5">
+              <div className="flex min-w-0 items-center justify-between gap-3">
+                <dt className="flex items-center gap-1.5 text-muted">
+                  <MemoryStick className="lucide-inline" />
+                  {t('execution_environment.memory_label')}
+                </dt>
+                <dd className={`font-medium ${pressureClass}`}>{pressureLabel}</dd>
+              </div>
+              <div
+                role="progressbar"
+                aria-label={t('execution_environment.memory_label')}
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={memory.used_percent}
+                className="h-1.5 overflow-hidden rounded-full bg-border"
+              >
+                <div
+                  className={`h-full rounded-full ${
+                    memory.pressure === 'critical'
+                      ? 'bg-danger'
+                      : memory.pressure === 'elevated'
+                        ? 'bg-warn'
+                        : 'bg-ok'
+                  }`}
+                  style={{ width: `${memory.used_percent}%` }}
+                />
+              </div>
+              <dd className="text-right text-[11px] text-muted">
+                {t('execution_environment.memory_summary', {
+                  used: fmtPercent(memory.used_percent / 100),
+                  available: fmtUnit(memory.available_gb, 'gigabyte', {
+                    maximumFractionDigits: 1,
+                  }),
+                  total: fmtUnit(memory.total_gb, 'gigabyte', {
+                    maximumFractionDigits: 1,
+                  }),
+                })}
+              </dd>
+            </div>
+          ) : null}
         </dl>
       </PopoverContent>
     </Popover>
