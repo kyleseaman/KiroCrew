@@ -1253,6 +1253,28 @@ describe('chatSlice thunks', () => {
     expect(chat(store).activeSlot).toBeNull()
   })
 
+  it('keeps an archived slot dismissed when a stale slots frame lands during the delete', async () => {
+    let finishDelete: (value: unknown) => void = () => {}
+    apiMock.deleteChatSlot.mockReturnValue(new Promise(resolve => { finishDelete = resolve }))
+    const store = makeStore()
+    const doomed = slotRow('doomed')
+    store.dispatch(sseSlots([doomed]))
+
+    const pending = store.dispatch(deleteSlot('doomed'))
+    await Promise.resolve()
+    expect(root(store).dashboard.slots.map(s => s.key)).not.toContain('doomed')
+
+    // The gateway can publish the pre-archive snapshot while it waits for a
+    // managed environment to stop. A successful response is newer and must win.
+    store.dispatch(sseSlots([doomed]))
+    expect(root(store).dashboard.slots.map(s => s.key)).toContain('doomed')
+
+    finishDelete({ ok: true })
+    const outcome = await pending
+    expect(outcome.type).toBe('chat/deleteSlot/fulfilled')
+    expect(root(store).dashboard.slots.map(s => s.key)).not.toContain('doomed')
+  })
+
   // The dismissed tab must not wait on an unrelated conversation's transcript.
   // The peer's history fetch is unbounded, so awaiting it before the removal
   // pins the close control for as long as that load takes; only the state

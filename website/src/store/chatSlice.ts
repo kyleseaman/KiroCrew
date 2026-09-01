@@ -1752,6 +1752,11 @@ export const deleteSlot = createAsyncThunk(
     dispatch(removeSlotOptimistic(key))
     try {
       await api.deleteChatSlot(key)
+      // A slots frame captured before the archive can arrive while the backend
+      // waits for a managed environment to stop and re-add this optimistic
+      // removal. The successful response is the newer authoritative boundary,
+      // so dismiss the row again. The failure path below still refetches it.
+      dispatch(removeSlotOptimistic(key))
       gcSessionStorage(key)
     } catch {
       dispatch(fetchSlots())
