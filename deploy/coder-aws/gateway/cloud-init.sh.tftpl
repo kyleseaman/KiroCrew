@@ -2,6 +2,20 @@
 set -euo pipefail
 umask 077
 
+BOOTSTRAP_STATUS="/var/lib/kirocrew/bootstrap-status"
+install -d -m 0755 /var/lib/kirocrew
+write_bootstrap_status() {
+  printf '%s\n' "$1" > "$BOOTSTRAP_STATUS"
+  chmod 0644 "$BOOTSTRAP_STATUS"
+}
+BOOTSTRAP_STAGE="packages"
+trap 'status=$?; write_bootstrap_status "failed:$BOOTSTRAP_STAGE"; exit "$status"' ERR
+write_bootstrap_status "running:$BOOTSTRAP_STAGE"
+
+curl_retry() {
+  /usr/bin/curl --retry 5 --retry-all-errors --connect-timeout 10 --max-time 120 "$@"
+}
+
 dnf install -y \
   ca-certificates \
   dnf-plugins-core \
@@ -14,7 +28,7 @@ dnf install -y \
   unzip
 
 CODER_RPM="coder_${coder_version}_linux_arm64.rpm"
-curl --proto '=https' --tlsv1.2 -fsSL \
+curl_retry --proto '=https' --tlsv1.2 -fsSL \
   "https://github.com/coder/coder/releases/download/v${coder_version}/$CODER_RPM" \
   -o "/var/tmp/$CODER_RPM"
 printf '%s  %s\n' "${coder_rpm_sha256}" "/var/tmp/$CODER_RPM" | sha256sum -c -
@@ -77,7 +91,9 @@ KIRO_BOOTSTRAP_DIR="/var/tmp/kirocrew-bootstrap"
 install -d -m 0700 "$KIRO_BOOTSTRAP_DIR"
 
 # Amazon Linux 2023 needs the static musl aarch64 Kiro CLI package.
-curl --proto '=https' --tlsv1.2 -fsSL \
+BOOTSTRAP_STAGE="kiro-cli"
+write_bootstrap_status "running:$BOOTSTRAP_STAGE"
+curl_retry --proto '=https' --tlsv1.2 -fsSL \
   https://desktop-release.q.us-east-1.amazonaws.com/latest/manifest.json \
   -o "$KIRO_BOOTSTRAP_DIR/manifest.json"
 readarray -t KIRO_PACKAGE < <(python3 - <<'PY'
@@ -96,7 +112,7 @@ print(package["download"])
 print(package["sha256"])
 PY
 )
-curl --proto '=https' --tlsv1.2 -fsSL \
+curl_retry --proto '=https' --tlsv1.2 -fsSL \
   "https://desktop-release.q.us-east-1.amazonaws.com/$${KIRO_PACKAGE[0]}" \
   -o "$KIRO_BOOTSTRAP_DIR/kirocli.zip"
 printf '%s  %s\n' "$${KIRO_PACKAGE[1]}" "$KIRO_BOOTSTRAP_DIR/kirocli.zip" \
@@ -133,3 +149,5 @@ EOF
 systemctl daemon-reload
 systemctl enable --now coder-agent.service
 tailscale serve --bg --https=8443 http://127.0.0.1:8443
+trap - ERR
+write_bootstrap_status "complete"

@@ -26,6 +26,11 @@ variable "tailscale_auth_parameter" {
   type        = string
 }
 
+variable "tailscale_session_auth_parameter" {
+  description = "SSM SecureString containing a tagged ephemeral Tailscale auth key for session workspaces."
+  type        = string
+}
+
 variable "kiro_api_key_parameter" {
   description = "SSM SecureString parameter containing KIRO_API_KEY for workspaces."
   type        = string
@@ -80,6 +85,13 @@ locals {
       var.region,
       data.aws_caller_identity.current.account_id,
       trimprefix(var.tailscale_auth_parameter, "/"),
+    )
+    session_tailscale = format(
+      "arn:%s:ssm:%s:%s:parameter/%s",
+      data.aws_partition.current.partition,
+      var.region,
+      data.aws_caller_identity.current.account_id,
+      trimprefix(var.tailscale_session_auth_parameter, "/"),
     )
     kiro = format(
       "arn:%s:ssm:%s:%s:parameter/%s",
@@ -200,7 +212,7 @@ resource "aws_iam_role_policy" "workspace_secrets" {
     Statement = [{
       Effect   = "Allow"
       Action   = ["ssm:GetParameter"]
-      Resource = [local.parameter_arns.tailscale, local.parameter_arns.kiro]
+      Resource = [local.parameter_arns.session_tailscale, local.parameter_arns.kiro]
     }]
   })
 }
@@ -273,7 +285,7 @@ resource "aws_iam_role_policy" "session_secrets" {
     Statement = [{
       Effect   = "Allow"
       Action   = ["ssm:GetParameter"]
-      Resource = [local.parameter_arns.tailscale, local.parameter_arns.kiro]
+      Resource = [local.parameter_arns.session_tailscale, local.parameter_arns.kiro]
     }]
   })
 }
@@ -315,9 +327,9 @@ resource "aws_iam_role_policy" "control" {
         ]
       },
       {
+        Sid    = "DescribeEc2"
         Effect = "Allow"
         Action = [
-          "ec2:CreateTags",
           "ec2:DescribeImages",
           "ec2:DescribeInstanceAttribute",
           "ec2:DescribeInstanceCreditSpecifications",
@@ -331,12 +343,103 @@ resource "aws_iam_role_policy" "control" {
           "ec2:DescribeTags",
           "ec2:DescribeVolumes",
           "ec2:DescribeVolumesModifications",
-          "ec2:RunInstances",
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "RunCoderInstanceDependencies"
+        Effect = "Allow"
+        Action = "ec2:RunInstances"
+        Resource = [
+          format(
+            "arn:%s:ec2:%s::image/*",
+            data.aws_partition.current.partition,
+            var.region,
+          ),
+          format(
+            "arn:%s:ec2:%s::snapshot/*",
+            data.aws_partition.current.partition,
+            var.region,
+          ),
+          aws_subnet.public.arn,
+          aws_security_group.workspace.arn,
+          aws_security_group.gateway.arn,
+          format(
+            "arn:%s:ec2:%s:%s:network-interface/*",
+            data.aws_partition.current.partition,
+            var.region,
+            data.aws_caller_identity.current.account_id,
+          ),
+          format(
+            "arn:%s:ec2:%s:%s:volume/*",
+            data.aws_partition.current.partition,
+            var.region,
+            data.aws_caller_identity.current.account_id,
+          ),
+        ]
+      },
+      {
+        Sid    = "RunCoderInstances"
+        Effect = "Allow"
+        Action = "ec2:RunInstances"
+        Resource = format(
+          "arn:%s:ec2:%s:%s:instance/*",
+          data.aws_partition.current.partition,
+          var.region,
+          data.aws_caller_identity.current.account_id,
+        )
+        Condition = {
+          StringEquals = {
+            "aws:RequestTag/KiroCrewManaged" = "true"
+          }
+        }
+      },
+      {
+        Sid    = "TagNewCoderResources"
+        Effect = "Allow"
+        Action = "ec2:CreateTags"
+        Resource = [
+          format(
+            "arn:%s:ec2:%s:%s:instance/*",
+            data.aws_partition.current.partition,
+            var.region,
+            data.aws_caller_identity.current.account_id,
+          ),
+          format(
+            "arn:%s:ec2:%s:%s:volume/*",
+            data.aws_partition.current.partition,
+            var.region,
+            data.aws_caller_identity.current.account_id,
+          ),
+        ]
+        Condition = {
+          StringEquals = {
+            "ec2:CreateAction"               = "RunInstances"
+            "aws:RequestTag/KiroCrewManaged" = "true"
+          }
+        }
+      },
+      {
+        Sid    = "MutateCoderInstances"
+        Effect = "Allow"
+        Action = [
+          "ec2:CreateTags",
+          "ec2:DeleteTags",
           "ec2:StartInstances",
           "ec2:StopInstances",
           "ec2:TerminateInstances",
         ]
-        Resource = "*"
+        Resource = format(
+          "arn:%s:ec2:%s:%s:instance/*",
+          data.aws_partition.current.partition,
+          var.region,
+          data.aws_caller_identity.current.account_id,
+        )
+        Condition = {
+          StringEquals = {
+            "ec2:ResourceTag/KiroCrewManaged" = "true"
+          }
+        }
       },
       {
         Effect = "Allow"
@@ -427,7 +530,7 @@ output "session_template_values" {
     subnet_id                = aws_subnet.public.id
     security_group_id        = aws_security_group.workspace.id
     instance_profile_name    = aws_iam_instance_profile.session.name
-    tailscale_auth_parameter = var.tailscale_auth_parameter
+    tailscale_auth_parameter = var.tailscale_session_auth_parameter
     kiro_api_key_parameter   = var.kiro_api_key_parameter
   }
 }
@@ -439,7 +542,7 @@ output "workspace_template_values" {
     subnet_id                = aws_subnet.public.id
     security_group_id        = aws_security_group.workspace.id
     instance_profile_name    = aws_iam_instance_profile.session.name
-    tailscale_auth_parameter = var.tailscale_auth_parameter
+    tailscale_auth_parameter = var.tailscale_session_auth_parameter
     kiro_api_key_parameter   = var.kiro_api_key_parameter
   }
 }

@@ -22,6 +22,8 @@ import {
 } from './ui/select'
 
 const SELECTION_SEPARATOR = ':'
+const HEALTH_REFETCH_INTERVAL_MS = 30_000
+const HEALTH_STALE_TIME_MS = 25_000
 
 function selectionValue(provider: string, configuration: string): string {
   return `${provider}${SELECTION_SEPARATOR}${configuration}`
@@ -75,7 +77,8 @@ export function SessionEnvironmentControl({
     queryKey: ['session-environment-health', slot?.key],
     queryFn: () => api.getSessionEnvironmentHealth(slot?.key ?? ''),
     enabled: detailsOpen && Boolean(slot?.key && executionLocation?.workspace),
-    refetchInterval: detailsOpen ? 10_000 : false,
+    refetchInterval: detailsOpen ? HEALTH_REFETCH_INTERVAL_MS : false,
+    staleTime: HEALTH_STALE_TIME_MS,
     refetchIntervalInBackground: false,
     retry: false,
   })
@@ -91,6 +94,7 @@ export function SessionEnvironmentControl({
           providerLabel={providerLabel || undefined}
           configurationLabel={configuration || undefined}
           health={health.data}
+          healthError={health.isError}
           healthLoading={health.isPending && health.fetchStatus === 'fetching'}
           onOpenChange={setDetailsOpen}
         />
@@ -144,7 +148,7 @@ export function SessionEnvironmentControl({
           </SelectContent>
         </Select>
         {selectEnvironment.isError && (
-          <span className="sr-only" role="status">
+          <span className="mt-1 block text-[12px] text-danger" role="status">
             {i18nT('execution_environment.configuration_change_failed')}
           </span>
         )}

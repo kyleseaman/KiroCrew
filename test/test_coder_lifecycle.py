@@ -30,15 +30,19 @@ class _FakeClient:
         self.extended: list[tuple[str, int]] = []
         self.current_user_calls = 0
         self.memory_probes: list[str] = []
+        self.get_calls = 0
+        self.list_calls = 0
 
     async def current_user(self) -> tuple[str, str]:
         self.current_user_calls += 1
         return "kyleseaman", "owner-kyleseaman"
 
     async def get_workspace(self, name: str) -> CoderWorkspace | None:
+        self.get_calls += 1
         return self.workspaces.get(name)
 
     async def list_workspaces(self) -> tuple[CoderWorkspace, ...]:
+        self.list_calls += 1
         return tuple(self.workspaces.values())
 
     async def create_workspace(
@@ -131,6 +135,34 @@ async def test_unrelated_parents_get_distinct_workspaces(tmp_path: Path) -> None
     assert first.name != second.name
     assert first.name.startswith("crew-session-kyleseaman-")
     assert second.name.startswith("crew-session-kyleseaman-")
+
+
+@pytest.mark.asyncio
+async def test_unrelated_workspace_starts_can_provision_in_parallel(tmp_path: Path) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    entered: set[str] = set()
+    both_entered = asyncio.Event()
+    release = asyncio.Event()
+    create = client.create_workspace
+
+    async def blocked_create(**kwargs: object) -> CoderWorkspace:
+        entered.add(str(kwargs["name"]))
+        if len(entered) == 2:
+            both_entered.set()
+        await release.wait()
+        return await create(**kwargs)  # type: ignore[arg-type]
+
+    client.create_workspace = blocked_create  # type: ignore[method-assign]
+    first = asyncio.create_task(manager.ensure_ready("dashboard:one"))
+    second = asyncio.create_task(manager.ensure_ready("dashboard:two"))
+    try:
+        await asyncio.wait_for(both_entered.wait(), timeout=0.5)
+    finally:
+        release.set()
+    await asyncio.gather(first, second)
+
+    assert len(entered) == 2
 
 
 @pytest.mark.asyncio
@@ -338,6 +370,88 @@ async def test_stop_for_session_stops_its_exact_bound_workspace(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_stop_request_is_durable_before_control_plane_stop(tmp_path: Path) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    workspace = await manager.ensure_ready("dashboard:one")
+    release = asyncio.Event()
+
+    async def blocked_stop(name: str) -> CoderWorkspace:
+        await release.wait()
+        return await _FakeClient.stop_workspace(client, name)
+
+    client.stop_workspace = blocked_stop  # type: ignore[method-assign]
+
+    requested = await manager.request_stop_for_session("dashboard:one")
+
+    assert requested == workspace.name
+    binding = manager.registry.get_by_session("dashboard:one")
+    assert binding is not None
+    assert binding.state == "stop_pending"
+    release.set()
+    await manager.wait_for_pending_stops()
+    assert manager.registry.get_by_session("dashboard:one").state == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_retries_a_durable_stop_request(tmp_path: Path) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    workspace = await manager.ensure_ready("dashboard:one")
+    binding = manager.registry.get_by_session("dashboard:one")
+    assert binding is not None
+    manager.registry.replace(replace(binding, state="stop_pending"))
+
+    stopped = await manager.reconcile_stop_requests()
+
+    assert stopped == (workspace.name,)
+    assert manager.registry.get_by_session("dashboard:one").state == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_continues_after_one_stop_request_fails(tmp_path: Path) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    first = await manager.ensure_ready("dashboard:one")
+    second = await manager.ensure_ready("dashboard:two")
+    for session_key in ("dashboard:one", "dashboard:two"):
+        binding = manager.registry.get_by_session(session_key)
+        assert binding is not None
+        manager.registry.replace(replace(binding, state="stop_pending"))
+    stop = client.stop_workspace
+
+    async def fail_first_stop(name: str) -> CoderWorkspace:
+        if name == first.name:
+            raise RuntimeError("unexpected provider failure")
+        return await stop(name)
+
+    client.stop_workspace = fail_first_stop  # type: ignore[method-assign]
+
+    stopped = await manager.reconcile_stop_requests()
+
+    assert stopped == (second.name,)
+    assert manager.registry.get_by_session("dashboard:one").state == "stop_pending"
+    assert manager.registry.get_by_session("dashboard:two").state == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_resume_settles_pending_stop_before_restarting_workspace(tmp_path: Path) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    workspace = await manager.ensure_ready("dashboard:one")
+    binding = manager.registry.get_by_session("dashboard:one")
+    assert binding is not None
+    manager.registry.replace(replace(binding, state="stop_pending"))
+
+    resumed = await manager.ensure_ready("dashboard:one")
+
+    assert resumed.uuid == workspace.uuid
+    assert client.stopped == [workspace.name]
+    assert client.started == [workspace.name]
+    assert manager.registry.get_by_session("dashboard:one").state == "running"
+
+
+@pytest.mark.asyncio
 async def test_running_capacity_refuses_an_unrelated_start(tmp_path: Path) -> None:
     client = _FakeClient()
     manager = _manager(tmp_path, client)
@@ -346,6 +460,73 @@ async def test_running_capacity_refuses_an_unrelated_start(tmp_path: Path) -> No
 
     with pytest.raises(CoderCapacityError):
         await manager.ensure_ready("dashboard:two")
+
+
+@pytest.mark.asyncio
+async def test_parallel_capacity_counts_inflight_workspace_start(tmp_path: Path) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    manager.policy = ManagedWorkspacePolicy(**{**manager.policy.__dict__, "max_running": 1})
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    create = client.create_workspace
+
+    async def blocked_create(**kwargs: object) -> CoderWorkspace:
+        entered.set()
+        await release.wait()
+        return await create(**kwargs)  # type: ignore[arg-type]
+
+    client.create_workspace = blocked_create  # type: ignore[method-assign]
+    first = asyncio.create_task(manager.ensure_ready("dashboard:one"))
+    await entered.wait()
+    try:
+        with pytest.raises(CoderCapacityError):
+            await asyncio.wait_for(manager.ensure_ready("dashboard:two"), timeout=0.5)
+    finally:
+        release.set()
+    await first
+
+
+@pytest.mark.asyncio
+async def test_parallel_capacity_does_not_double_count_visible_reservation(
+    tmp_path: Path,
+) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    manager.policy = ManagedWorkspacePolicy(**{**manager.policy.__dict__, "max_running": 2})
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    create = client.create_workspace
+    calls = 0
+
+    async def publish_first_start(**kwargs: object) -> CoderWorkspace:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            name = str(kwargs["name"])
+            client.workspaces[name] = CoderWorkspace(
+                uuid=f"uuid-{name}",
+                name=name,
+                owner="kyleseaman",
+                template=str(kwargs["template"]),
+                status="starting",
+                last_used_at="2026-08-25T12:00:00Z",
+            )
+            entered.set()
+            await release.wait()
+        return await create(**kwargs)  # type: ignore[arg-type]
+
+    client.create_workspace = publish_first_start  # type: ignore[method-assign]
+    first = asyncio.create_task(manager.ensure_ready("dashboard:one"))
+    await entered.wait()
+    try:
+        second = await manager.ensure_ready("dashboard:two")
+    finally:
+        release.set()
+    await first
+
+    assert second.name in client.created
+    assert len(client.created) == 2
 
 
 @pytest.mark.asyncio

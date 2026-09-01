@@ -2,6 +2,20 @@
 set -euo pipefail
 umask 077
 
+BOOTSTRAP_STATUS="/var/lib/kirocrew/bootstrap-status"
+install -d -m 0755 /var/lib/kirocrew
+write_bootstrap_status() {
+  printf '%s\n' "$1" > "$BOOTSTRAP_STATUS"
+  chmod 0644 "$BOOTSTRAP_STATUS"
+}
+BOOTSTRAP_STAGE="packages"
+trap 'status=$?; write_bootstrap_status "failed:$BOOTSTRAP_STAGE"; exit "$status"' ERR
+write_bootstrap_status "running:$BOOTSTRAP_STAGE"
+
+curl_retry() {
+  /usr/bin/curl --retry 5 --retry-all-errors --connect-timeout 10 --max-time 120 "$@"
+}
+
 dnf install -y ca-certificates dnf-plugins-core git jq unzip
 command -v aws >/dev/null
 dnf config-manager --add-repo \
@@ -52,6 +66,8 @@ systemctl daemon-reload
 systemctl enable --now tailscaled.service
 systemctl enable --now kirocrew-tailscale-up.service
 
+BOOTSTRAP_STAGE="workspace-user"
+write_bootstrap_status "running:$BOOTSTRAP_STAGE"
 id coder >/dev/null 2>&1 || useradd --create-home --shell /bin/bash coder
 install -d -m 0700 -o coder -g coder /home/coder/workspace
 coder_uid="$(id -u coder)"
@@ -76,7 +92,9 @@ chmod 0644 /etc/kirocrew-coder-contract.json
 # Amazon Linux 2023 does not meet the aarch64 GNU artifact's glibc floor, so
 # select the static musl package from Kiro's signed release manifest.
 KIRO_ARCH="aarch64"
-curl --proto '=https' --tlsv1.2 -fsSL \
+BOOTSTRAP_STAGE="kiro-cli"
+write_bootstrap_status "running:$BOOTSTRAP_STAGE"
+curl_retry --proto '=https' --tlsv1.2 -fsSL \
   https://desktop-release.q.us-east-1.amazonaws.com/latest/manifest.json \
   -o /tmp/kirocli-manifest.json
 readarray -t KIRO_PACKAGE < <(python3 - <<'PY'
@@ -95,7 +113,7 @@ print(package["download"])
 print(package["sha256"])
 PY
 )
-curl --proto '=https' --tlsv1.2 -fsSL \
+curl_retry --proto '=https' --tlsv1.2 -fsSL \
   "https://desktop-release.q.us-east-1.amazonaws.com/$${KIRO_PACKAGE[0]}" \
   -o /tmp/kirocli.zip
 printf '%s  %s\n' "$${KIRO_PACKAGE[1]}" /tmp/kirocli.zip | sha256sum -c -
@@ -150,3 +168,5 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now coder-agent.service
+trap - ERR
+write_bootstrap_status "complete"

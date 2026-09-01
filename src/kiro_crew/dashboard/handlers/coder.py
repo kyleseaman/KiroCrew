@@ -33,6 +33,7 @@ from kiro_crew.constants import (
     CODER_DEFAULT_STOP_AFTER_MINUTES,
     CODER_DEFAULT_WORKSPACE_PREFIX,
     CODER_MAX_PROFILES,
+    CODER_WORKSPACE_PREFIX_MAX_CHARS,
 )
 from kiro_crew.dashboard.handlers.agents import _get_config_lock
 from kiro_crew.dashboard.handlers.secrets import _owner_only
@@ -68,12 +69,17 @@ def _string_field(body: dict[str, Any], name: str) -> str:
 def _validate_coordinates(
     *, url: str, template: str, preset: str, remote_cwd: str, workspace_prefix: str
 ) -> tuple[str, str, str, str, str]:
+    safe_prefix = validate_coder_workspace(workspace_prefix)
+    if len(safe_prefix) > CODER_WORKSPACE_PREFIX_MAX_CHARS:
+        raise ValueError(
+            "workspace_prefix must be at most " f"{CODER_WORKSPACE_PREFIX_MAX_CHARS} characters"
+        )
     return (
         validate_coder_url(url),
         validate_coder_workspace(template),
         validate_coder_workspace(preset) if preset else "",
         validate_coder_remote_cwd(remote_cwd),
-        validate_coder_workspace(workspace_prefix),
+        safe_prefix,
     )
 
 
@@ -181,6 +187,10 @@ async def api_coder_config(request: web.Request) -> web.Response:
                 "remote_cwd": remote_cwd,
                 "token_configured": bool(token or os.environ.get("CODER_SESSION_TOKEN", "")),
                 "legacy_environment": legacy,
+                "limits": {
+                    "max_profiles": CODER_MAX_PROFILES,
+                    "workspace_prefix_max_chars": CODER_WORKSPACE_PREFIX_MAX_CHARS,
+                },
                 **managed,
             }
         )

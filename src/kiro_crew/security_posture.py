@@ -1068,6 +1068,11 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # hygiene so a response echoing a credential or exfiltration URL cannot
         # leak into the log ring / /api/logs stream; not an egress boundary.
         "task_planner.py",
+        # Same shape: redacts the bounded stderr diagnostic from a failed Coder
+        # lifecycle command before writing an operational WARNING. Callers receive
+        # only the generic exit-status exception, so this is log hygiene rather
+        # than a new human or third-party output boundary.
+        "coder/client.py",
         # The shared recursive redactor helper itself — a pure scrubber, not an
         # egress boundary; the modules that CALL it (mochi routes/hooks) are the
         # registered sinks.

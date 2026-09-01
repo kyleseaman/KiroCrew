@@ -35,6 +35,7 @@ export function ExecutionLocationBadge({
   configurationLabel,
   location,
   health,
+  healthError = false,
   healthLoading = false,
   onOpenChange,
   providerLabel,
@@ -42,6 +43,7 @@ export function ExecutionLocationBadge({
   configurationLabel?: string
   location?: ExecutionLocation
   health?: SessionEnvironmentHealth
+  healthError?: boolean
   healthLoading?: boolean
   onOpenChange?: (open: boolean) => void
   providerLabel?: string
@@ -79,7 +81,9 @@ export function ExecutionLocationBadge({
     if (resetTimer.current) clearTimeout(resetTimer.current)
     resetTimer.current = setTimeout(() => setCopied(false), 1500)
   }
-  const stateLabel = health
+  const stateLabel = healthError
+    ? t(STATE_LABEL_KEYS.unavailable)
+    : health
     ? t(STATE_LABEL_KEYS[health.state])
     : healthLoading
       ? t('execution_environment.health_checking')

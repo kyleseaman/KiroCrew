@@ -4873,6 +4873,7 @@ class DashboardState:
         self._channel_slot_reconciler: asyncio.Task | None = None  # type: ignore[type-arg]
         self._loop_heartbeat: asyncio.Task | None = None  # type: ignore[type-arg]
         self._coder_lifecycle_task: asyncio.Task[None] | None = None
+        self._session_environment_health_cache: dict[str, tuple[float, dict[str, object]]] = {}
         # Off-loop event-loop stall watchdog; armed under the real gateway
         # entrypoint (faulthandler enabled) and stopped on shutdown. Annotated
         # here so the assignment in start_dashboard type-checks under mypy strict.

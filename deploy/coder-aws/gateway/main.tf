@@ -115,7 +115,7 @@ resource "coder_agent" "main" {
   arch               = "arm64"
   os                 = "linux"
   auth               = "aws-instance-identity"
-  connection_timeout = 0
+  connection_timeout = 600
 
   metadata {
     key          = "cpu"
@@ -198,6 +198,7 @@ resource "aws_instance" "gateway" {
     Name              = "coder-gateway-${data.coder_workspace_owner.me.name}"
     Coder_Provisioned = "true"
     Coder_Workspace   = data.coder_workspace.me.id
+    KiroCrewManaged   = "true"
     Project           = "Kiro Crew Gateway"
   }
 

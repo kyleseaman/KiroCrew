@@ -63,6 +63,7 @@ CODER_SESSION_TOKEN_SECRET = "coder.session_token.v1"
 _REMOTE_AGENT_TEXT_KEYS = ("name", "description", "model", "prompt")
 _CODER_URL_MAX_BYTES = 4 * 1024
 _CODER_CONNECTION_TIMEOUT_SECS = 30.0
+_REMOTE_COMMAND_TIMEOUT_SECS = 120.0
 _REMOTE_RUNTIME_MARKER = "__KIROCREW_REMOTE_RUNTIME__"
 _REMOTE_FORWARD_PORT_MIN = 30000
 _REMOTE_FORWARD_PORT_SPAN = 20000
@@ -349,6 +350,8 @@ class CoderWorkspaceSessionHost(RemoteSessionHost):
         )
 
     def spawn_argv(self, *, agent: str, model: str) -> list[str]:
+        if not _WORKSPACE_RE.fullmatch(agent):
+            raise ValueError("agent must be one safe Kiro agent name")
         forward = f"{self._remote_port}:127.0.0.1:{self._proxy.local_port}"
         remote_argv = [
             "kiro-cli",
@@ -374,8 +377,11 @@ class CoderWorkspaceSessionHost(RemoteSessionHost):
             *(item for key in _CODER_REMOTE_AGENT_ENV_KEYS for item in ("-u", key)),
             *remote_argv,
         ]
-        if self._workload_scope_prefix:
-            remote_argv = [user_bus_command(remote_argv)]
+        remote_command = (
+            user_bus_command(remote_argv)
+            if self._workload_scope_prefix
+            else shlex.join(remote_argv)
+        )
         return [
             self._coder_bin,
             "ssh",
@@ -383,7 +389,7 @@ class CoderWorkspaceSessionHost(RemoteSessionHost):
             "--remote-forward",
             forward,
             "--",
-            *remote_argv,
+            remote_command,
         ]
 
     def transport_env(self, environ: Mapping[str, str]) -> dict[str, str]:
@@ -447,7 +453,19 @@ class CoderWorkspaceSessionHost(RemoteSessionHost):
             ),
             profile=RLIMIT_PROFILE_SESSION_HOST,
         )
-        stdout, _stderr = await process.communicate(input=payload)
+        try:
+            stdout, _stderr = await asyncio.wait_for(
+                process.communicate(input=payload),
+                timeout=_REMOTE_COMMAND_TIMEOUT_SECS,
+            )
+        except asyncio.TimeoutError as exc:
+            platform_compat.kill_process_tree(process.pid, platform_compat.SIGKILL)
+            await process.wait()
+            raise SessionHostError(f"Coder workspace {operation} timed out") from exc
+        except asyncio.CancelledError:
+            platform_compat.kill_process_tree(process.pid, platform_compat.SIGKILL)
+            await process.wait()
+            raise
         if process.returncode:
             raise SessionHostError(
                 f"Coder workspace {operation} failed (exit {process.returncode})"

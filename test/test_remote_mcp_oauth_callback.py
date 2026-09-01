@@ -39,8 +39,16 @@ async def test_remote_mcp_oauth_callback_completes_once_without_echoing_state() 
             params={"code": "replay", "state": "one-shot-state"},
         )
         body = await replay.json()
+        response_text = await response.text()
 
-    assert response.status == 204
+    assert response.status == 200
+    assert response.content_type == "text/html"
+    assert "Authorization complete" in response_text
+    assert (
+        response.headers["Content-Security-Policy"]
+        == "default-src 'none'; base-uri 'none'; form-action 'none'"
+    )
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert replay.status == 400
     assert body == {"code": "remote_mcp_oauth_failed"}
     assert "one-shot-state" not in str(body)

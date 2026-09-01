@@ -48,14 +48,21 @@ else
   wheel_sha=$(shasum -a 256 "$wheel" | awk '{print $1}')
 fi
 dashboard_url_b64=$(printf '%s' "$dashboard_url" | base64 | tr -d '\n')
-remote_installer=/tmp/kirocrew-install-wheel-$wheel_sha
-remote_admin=/tmp/kirocrew-admin-$wheel_sha
-remote_dir=/tmp/kirocrew-$wheel_sha
+remote_dir=$(ssh -- "$ssh_host" 'umask 077; mktemp -d /tmp/kirocrew-deploy.XXXXXXXX')
+if [[ ! $remote_dir =~ ^/tmp/kirocrew-deploy\.[A-Za-z0-9]{8}$ ]]; then
+  printf 'Remote host returned an invalid staging directory: %s\n' "$remote_dir" >&2
+  exit 1
+fi
+cleanup() {
+  ssh -- "$ssh_host" /usr/bin/rm -rf -- "$remote_dir" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+remote_installer=$remote_dir/kirocrew-install-wheel
+remote_admin=$remote_dir/kirocrew-admin
 remote_wheel=$remote_dir/$wheel_name
 
 scp -- "$installer" "$ssh_host:$remote_installer"
 scp -- "$admin_launcher" "$ssh_host:$remote_admin"
-ssh -- "$ssh_host" /usr/bin/install -d -m 0700 "$remote_dir"
 scp -- "$wheel" "$ssh_host:$remote_wheel"
 ssh -- "$ssh_host" sudo /usr/bin/install -m 0755 \
   "$remote_installer" /usr/local/sbin/kirocrew-install-wheel
@@ -66,4 +73,6 @@ ssh -- "$ssh_host" sudo /usr/local/sbin/kirocrew-install-wheel \
 
 ssh -- "$ssh_host" \
   'sudo systemctl is-active --quiet kirocrew.service && curl --fail --silent --show-error http://127.0.0.1:8443/api/health >/dev/null'
+cleanup
+trap - EXIT
 printf 'Kiro Crew gateway is healthy at %s\n' "$dashboard_url"

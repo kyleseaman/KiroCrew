@@ -76,6 +76,20 @@ describe('SessionEnvironmentControl', () => {
     expect(api.chatSlotEnvironment).toHaveBeenCalledWith('chat-1', 'coder', 'gpu')
   })
 
+  it('shows a configuration selection failure beside the selector', async () => {
+    vi.mocked(api.chatSlotEnvironment).mockRejectedValue(new Error('unavailable'))
+    const user = userEvent.setup()
+    renderWithProviders(<SessionEnvironmentControl slot={slot} placement="composer" />)
+
+    await user.click(await screen.findByRole('combobox', {
+      name: 'Environment configuration for this session',
+    }))
+    await user.click(await screen.findByRole('option', { name: 'Coder · gpu' }))
+
+    expect(await screen.findByText('Could not change the environment configuration'))
+      .toBeVisible()
+  })
+
   it('keeps a fresh-session selector out of the session header', async () => {
     renderWithProviders(<SessionEnvironmentControl slot={slot} placement="header" />)
 
@@ -150,6 +164,30 @@ describe('SessionEnvironmentControl', () => {
     await user.click(screen.getByRole('button', { name: 'Session Environments' }))
     expect(await screen.findByText('Stopped')).toBeInTheDocument()
     expect(screen.queryByText('Memory')).not.toBeInTheDocument()
+  })
+
+  it('shows unavailable when the live health request fails', async () => {
+    vi.mocked(api.getSessionEnvironmentHealth).mockRejectedValue(new Error('offline'))
+    const user = userEvent.setup()
+    renderWithProviders(
+      <SessionEnvironmentControl
+        placement="composer"
+        slot={{
+          ...slot,
+          messages: 1,
+          environment: { provider: 'coder', configuration: 'gpu', resource_name: 'crew-opaque' },
+          execution_location: {
+            kind: 'coder',
+            workspace: 'crew-opaque',
+            remote_cwd: '/home/coder/workspace',
+            state: 'running',
+          },
+        }}
+      />,
+    )
+
+    await user.click(screen.getByRole('button', { name: 'Session Environments' }))
+    expect(await screen.findByText('Unavailable')).toBeInTheDocument()
   })
 
   it('stops health refreshes when the environment details close', async () => {

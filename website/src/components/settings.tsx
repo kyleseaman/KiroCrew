@@ -191,6 +191,7 @@ interface SettingsInputProps {
   type?: 'text' | 'number' | 'password'
   min?: number
   max?: number
+  maxLength?: number
   step?: number
   disabled?: boolean
   autoComplete?: string
@@ -200,7 +201,7 @@ interface SettingsInputProps {
   configKey?: string
 }
 
-export function SettingsInput({ label, description, hint, value, onChange, onBlur, onKeyDown, onFocus, onCompositionStart, onCompositionEnd, placeholder, type = 'text', min, max, step, disabled, autoComplete, multiline, 'aria-label': ariaLabel, configKey }: SettingsInputProps) {
+export function SettingsInput({ label, description, hint, value, onChange, onBlur, onKeyDown, onFocus, onCompositionStart, onCompositionEnd, placeholder, type = 'text', min, max, maxLength, step, disabled, autoComplete, multiline, 'aria-label': ariaLabel, configKey }: SettingsInputProps) {
   // Per-instance id pairing the caption's htmlFor with the control. This is
   // what gives the single-line branch an accessible name by DEFAULT: it used
   // to render aria-label={ariaLabel} with ariaLabel undefined unless a caller
@@ -224,6 +225,7 @@ export function SettingsInput({ label, description, hint, value, onChange, onBlu
           disabled={disabled}
           autoComplete={autoComplete}
           rows={3}
+          maxLength={maxLength}
           aria-label={ariaLabel ?? label}
           className="w-full rounded border border-border bg-bg px-2 py-1 text-sm text-text focus-visible:border-accent focus:outline-none resize-y flex-none"
         />
@@ -241,6 +243,7 @@ export function SettingsInput({ label, description, hint, value, onChange, onBlu
           placeholder={placeholder}
           min={min}
           max={max}
+          maxLength={maxLength}
           step={step}
           disabled={disabled}
           autoComplete={autoComplete}

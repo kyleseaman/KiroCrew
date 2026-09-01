@@ -68,13 +68,15 @@ gateway-owned. The workspace receives no Kiro Crew state, Coder bearer,
 operator AWS credentials, or SSH credentials. It has only its narrow EC2
 instance role and the Kiro credential required by its local CLI.
 
-#### 1. Create the two SSM secrets
+#### 1. Create the three SSM secrets
 
 Prerequisites are Terraform 1.5+, an AWS CLI authenticated to your account, a
-Tailscale tailnet with MagicDNS and HTTPS enabled, and a reusable tagged
-Tailscale auth key. The POC defaults to `us-east-2`.
+Tailscale tailnet with MagicDNS and HTTPS enabled, a reusable tagged Tailscale
+auth key for the control and gateway nodes, and a separately tagged key created
+with Tailscale's **Ephemeral** option for session workspaces. The POC defaults to
+`us-east-2`.
 
-Store the two credentials as `SecureString` parameters without putting their
+Store the credentials as `SecureString` parameters without putting their
 values in shell history:
 
 ```bash
@@ -83,14 +85,21 @@ aws ssm put-parameter --region us-east-2 --type SecureString --overwrite \
   --name /kirocrew/poc/tailscale-auth-key --value "$CREW_TS_KEY"
 unset CREW_TS_KEY
 
+read -rsp "Ephemeral Tailscale session auth key: " CREW_TS_SESSION_KEY && printf '\n'
+aws ssm put-parameter --region us-east-2 --type SecureString --overwrite \
+  --name /kirocrew/poc/tailscale-session-auth-key --value "$CREW_TS_SESSION_KEY"
+unset CREW_TS_SESSION_KEY
+
 read -rsp "Kiro API key: " CREW_KIRO_KEY && printf '\n'
 aws ssm put-parameter --region us-east-2 --type SecureString --overwrite \
   --name /kirocrew/poc/kiro-api-key --value "$CREW_KIRO_KEY"
 unset CREW_KIRO_KEY
 ```
 
-Use a reusable, tagged Tailscale key because the control node, gateway, and
-session workspaces consume it. Apply a tailnet policy that permits your
+Use the reusable tagged key for the control node and gateway. Session workspaces
+receive only the separate ephemeral key; the control-plane template requires
+both parameter names so a shared permanent key cannot silently retain offline
+session devices. Apply a tailnet policy that permits your
 identity to use Tailscale SSH as `ec2-user` on the tagged control and gateway
 nodes. The AWS security groups still expose no port 22.
 
@@ -103,6 +112,7 @@ console:
 terraform -chdir=deploy/coder-aws/control-plane init
 terraform -chdir=deploy/coder-aws/control-plane apply \
   -var tailscale_auth_parameter=/kirocrew/poc/tailscale-auth-key \
+  -var tailscale_session_auth_parameter=/kirocrew/poc/tailscale-session-auth-key \
   -var kiro_api_key_parameter=/kirocrew/poc/kiro-api-key \
   -var tailnet_dns_name=example.ts.net
 
@@ -169,15 +179,20 @@ and the Kiro CLI. Its root EBS volume has `delete_on_termination = false`, so a
 replacement or workspace deletion leaves the gateway state available for
 recovery. Session workspaces are created lazily by Kiro Crew; stopping one
 preserves its full root disk. Their Tailscale identity is deliberately ephemeral:
-the daemon stores state in memory, logs out on a clean stop, and leaves an abrupt
-stop eligible for Tailscale's automatic inactive-node cleanup. It rejoins on the
-next boot with the reusable tagged auth key. This prevents permanent dead session
-nodes without coupling workspace identity to a Tailscale IP:
+the daemon stores state in memory and authenticates with a tagged key created
+with Tailscale's Ephemeral option. The tailnet removes the device after it goes
+offline, and the next boot joins with a fresh identity. This prevents permanent
+dead session nodes without coupling workspace identity to a Tailscale IP:
 
 ```bash
 coder stop crew-session-user-opaqueid --yes
 coder start crew-session-user-opaqueid --yes
 ```
+
+The EC2 templates intentionally ignore AMI and cloud-init drift on retained
+instances. Pushing a new template version therefore does not retrofit bootstrap
+changes into an existing session workspace. Delete a disposable test session
+workspace and create a new session to verify those changes on a fresh instance.
 
 #### 4. Install this Kiro Crew build on the gateway workspace
 

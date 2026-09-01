@@ -6,6 +6,23 @@ from aiohttp import web
 
 REMOTE_MCP_OAUTH_CALLBACK_PATH = "/api/mcp/oauth/callback"
 _OAUTH_FAILURE_CODE = "remote_mcp_oauth_failed"
+_CALLBACK_HTML = """<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Authorization complete</title>
+<body>
+<h1>Authorization complete</h1>
+<p>You can close this window and return to Kiro Crew.</p>
+</body>
+</html>
+"""
+_CALLBACK_HEADERS = {
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": "default-src 'none'; base-uri 'none'; form-action 'none'",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+}
 
 
 async def api_remote_mcp_oauth_callback(request: web.Request) -> web.Response:
@@ -19,4 +36,8 @@ async def api_remote_mcp_oauth_callback(request: web.Request) -> web.Response:
         query[key] = values[0] if len(values) == 1 else values
     if not broker.complete(query):
         return web.json_response({"code": _OAUTH_FAILURE_CODE}, status=400)
-    return web.Response(status=204)
+    return web.Response(
+        text=_CALLBACK_HTML,
+        content_type="text/html",
+        headers=_CALLBACK_HEADERS,
+    )

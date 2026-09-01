@@ -1431,6 +1431,45 @@ class TestSlotEnvironment:
         }
 
     @pytest.mark.asyncio
+    async def test_health_reuses_a_short_lived_server_snapshot(self):
+        from kiro_crew.session_environment import (
+            SessionEnvironmentBinding,
+            SessionEnvironmentHealth,
+            SessionEnvironmentHealthProvider,
+            SessionEnvironmentRegistry,
+        )
+
+        class HealthProvider(SessionEnvironmentHealthProvider):
+            provider_id = "coder"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def health_for_session(self, session_key: str) -> SessionEnvironmentHealth:
+                self.calls += 1
+                return SessionEnvironmentHealth(
+                    provider="coder",
+                    resource_name="crew-session-user-opaque",
+                    state="running",
+                )
+
+        provider = HealthProvider()
+        slot = _ChatSlot("s1")
+        slot.environment = SessionEnvironmentBinding(
+            "coder", "standard", "crew-session-user-opaque"
+        )
+        state = _state(slot)
+        state.get_slot = MagicMock(return_value=slot)
+        state.sessions.environment_registry = MagicMock(
+            return_value=SessionEnvironmentRegistry([provider])  # type: ignore[list-item]
+        )
+
+        assert (await self._get_health(state, "s1"))[0] == 200
+        assert (await self._get_health(state, "s1"))[0] == 200
+
+        assert provider.calls == 1
+
+    @pytest.mark.asyncio
     async def test_health_is_owner_only(self):
         slot = _ChatSlot("s1")
         state = _state(slot)

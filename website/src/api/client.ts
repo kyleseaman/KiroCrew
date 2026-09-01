@@ -334,6 +334,10 @@ export interface CoderConfigData {
   workspace_prefix: string
   token_configured: boolean
   legacy_environment: boolean
+  limits: {
+    max_profiles: number
+    workspace_prefix_max_chars: number
+  }
   static_workspace?: string
 }
 

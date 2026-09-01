@@ -42,6 +42,30 @@ def test_control_plane_is_arm_nat_free_and_has_no_ingress() -> None:
     assert "local.parameter_arns.kiro" not in control_policy
 
 
+def test_control_plane_limits_ec2_mutations_to_coder_managed_resources() -> None:
+    terraform = _read("control-plane/main.tf")
+    control_policy = terraform.split('resource "aws_iam_role_policy" "control"', 1)[1].split(
+        'resource "aws_iam_instance_profile" "control"', 1
+    )[0]
+
+    describe_statement = control_policy.split('Sid    = "DescribeEc2"', 1)[1].split("},", 1)[0]
+    mutate_statement = control_policy.split('Sid    = "MutateCoderInstances"', 1)[1].split("},", 1)[
+        0
+    ]
+    run_statement = control_policy.split('Sid    = "RunCoderInstances"', 1)[1].split("},", 1)[0]
+
+    assert 'Resource = "*"' in describe_statement
+    assert "ec2:StartInstances" in mutate_statement
+    assert "ec2:ResourceTag/KiroCrewManaged" in mutate_statement
+    assert '"ec2:ResourceTag/KiroCrewManaged" = "true"' in mutate_statement
+    assert "ec2:RunInstances" in run_statement
+    assert "aws:RequestTag/KiroCrewManaged" in run_statement
+    assert re.search(r'"ec2:CreateAction"\s*=\s*"RunInstances"', control_policy)
+    assert re.search(r'"aws:RequestTag/KiroCrewManaged"\s*=\s*"true"', control_policy)
+    assert re.search(r'KiroCrewManaged\s*=\s*"true"', _read("workspace/main.tf"))
+    assert re.search(r'KiroCrewManaged\s*=\s*"true"', _read("gateway/main.tf"))
+
+
 def test_workspace_is_persistent_arm_compute_with_bounded_choices() -> None:
     terraform = _read("workspace/main.tf")
 
@@ -84,10 +108,15 @@ def test_workspace_bootstrap_verifies_kiro_and_reads_secrets_from_ssm() -> None:
     assert "chown coder:coder /etc/kiro-api-key.b64" in bootstrap
     assert 'KIRO_API_KEY="$(base64 -d /etc/kiro-api-key.b64)"' in bootstrap
     assert "ExecStart=/usr/local/libexec/coder-agent-start" in bootstrap
+    assert "connection_timeout = 600" in terraform
+    assert "curl --retry 5 --retry-all-errors" in bootstrap
+    assert "/var/lib/kirocrew/bootstrap-status" in bootstrap
+    assert 'write_bootstrap_status "complete"' in bootstrap
 
 
 def test_session_workspace_uses_ephemeral_tailnet_identity_on_every_boot() -> None:
     bootstrap = _read("workspace/cloud-init.sh.tftpl")
+    control = _read("control-plane/main.tf")
 
     assert "--state=mem:" in bootstrap
     assert "--port=$${PORT} $FLAGS" in bootstrap
@@ -96,6 +125,12 @@ def test_session_workspace_uses_ephemeral_tailnet_identity_on_every_boot() -> No
     assert "kirocrew-tailscale-up.service" in bootstrap
     assert "systemctl enable --now kirocrew-tailscale-up.service" in bootstrap
     assert "After=network-online.target kirocrew-tailscale-up.service" in bootstrap
+    assert 'variable "tailscale_session_auth_parameter"' in control
+    session_variable = control.split('variable "tailscale_session_auth_parameter"', 1)[1].split(
+        "}", 1
+    )[0]
+    assert "default" not in session_variable
+    assert "var.tailscale_session_auth_parameter" in control
 
 
 def test_gateway_is_a_dedicated_persistent_coder_workspace() -> None:
@@ -127,6 +162,9 @@ def test_gateway_is_a_dedicated_persistent_coder_workspace() -> None:
     )
     assert 'KIRO_BOOTSTRAP_DIR="/var/tmp/kirocrew-bootstrap"' in bootstrap
     assert "/tmp/kirocli.zip" not in bootstrap
+    assert "connection_timeout = 600" in terraform
+    assert "curl --retry 5 --retry-all-errors" in bootstrap
+    assert "/var/lib/kirocrew/bootstrap-status" in bootstrap
 
 
 def test_gateway_runbook_disables_autostop_without_changing_session_ttl() -> None:
@@ -270,14 +308,16 @@ def test_gateway_deployer_preserves_valid_wheel_name_for_remote_pip(
     trace = tmp_path / "trace"
     for command in ("scp", "ssh"):
         executable = fake_bin / command
-        executable.write_text(
+        body = (
             "#!/bin/sh\n"
             "set -eu\n"
             f"printf '{command}' >> {trace!s}\n"
             f"printf ' <%s>' \"$@\" >> {trace!s}\n"
-            f"printf '\\n' >> {trace!s}\n",
-            encoding="utf-8",
+            f"printf '\\n' >> {trace!s}\n"
         )
+        if command == "ssh":
+            body += "case \"$*\" in *mktemp*) printf '%s\\n' /tmp/kirocrew-deploy.A1b2C3d4;; esac\n"
+        executable.write_text(body, encoding="utf-8")
         executable.chmod(0o755)
 
     result = subprocess.run(
@@ -297,17 +337,18 @@ def test_gateway_deployer_preserves_valid_wheel_name_for_remote_pip(
 
     assert result.returncode == 0, result.stderr
     lines = trace.read_text(encoding="utf-8").splitlines()
-    remote_dir = "/tmp/kirocrew-2557613cf564ea9331cf47c9bca13e48a2fedd0e6d49ab33872b5de70227af16"
+    remote_dir = "/tmp/kirocrew-deploy.A1b2C3d4"
     remote_wheel = f"{remote_dir}/{wheel.name}"
 
-    assert len(lines) == 8
-    assert lines[0].startswith("scp <-->")
-    assert "gateway/kirocrew-install-wheel" in lines[0]
+    assert len(lines) == 9
+    assert lines[0].startswith("ssh <--> <ec2-user@kirocrew-coder>")
+    assert "mktemp -d /tmp/kirocrew-deploy.XXXXXXXX" in lines[0]
     assert lines[1].startswith("scp <-->")
-    assert "gateway/kirocrew-admin" in lines[1]
-    assert lines[2] == (
-        "ssh <--> <ec2-user@kirocrew-coder> </usr/bin/install> <-d> <-m> <0700> " f"<{remote_dir}>"
-    )
+    assert "gateway/kirocrew-install-wheel" in lines[1]
+    assert f"ec2-user@kirocrew-coder:{remote_dir}/kirocrew-install-wheel" in lines[1]
+    assert lines[2].startswith("scp <-->")
+    assert "gateway/kirocrew-admin" in lines[2]
+    assert f"ec2-user@kirocrew-coder:{remote_dir}/kirocrew-admin" in lines[2]
     assert lines[3] == f"scp <--> <{str(wheel)}> <ec2-user@kirocrew-coder:{remote_wheel}>"
     assert lines[4].startswith("ssh <--> <ec2-user@kirocrew-coder>")
     assert "/usr/local/sbin/kirocrew-install-wheel" in lines[4]
@@ -317,6 +358,9 @@ def test_gateway_deployer_preserves_valid_wheel_name_for_remote_pip(
     assert lines[7].startswith("ssh <--> <ec2-user@kirocrew-coder>")
     assert "systemctl is-active --quiet kirocrew.service" in lines[7]
     assert "curl --fail --silent --show-error http://127.0.0.1:8443/api/health" in lines[7]
+    assert lines[8] == (
+        "ssh <--> <ec2-user@kirocrew-coder> </usr/bin/rm> <-rf> <--> " f"<{remote_dir}>"
+    )
 
 
 def test_gateway_deployer_rejects_shell_metacharacters_before_remote_calls(
@@ -375,6 +419,9 @@ def test_gateway_remote_installer_is_identity_scoped_and_health_checked() -> Non
     assert "mkswap" in installer
     assert "swapon" in installer
     assert 'pip install --force-reinstall --no-deps "$verified_wheel"' in installer
+    assert "/var/lib/kirocrew/staging" in installer
+    assert "mktemp -d /var/lib/kirocrew/staging/install.XXXXXXXXXX" in installer
+    assert "/tmp/kirocrew-verified-" not in installer
     assert "systemctl is-active --quiet kirocrew.service" in installer
     assert "http://127.0.0.1:8443/api/health" in installer
     assert "curl | sh" not in installer
@@ -421,8 +468,20 @@ def test_workspace_bootstrap_installs_only_available_base_packages(tmp_path: Pat
     fake_dnf.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\nexit 42\n', encoding="utf-8")
     fake_dnf.chmod(0o755)
 
+    bootstrap_status_dir = tmp_path / "bootstrap-status"
+    bootstrap = (POC / "workspace/cloud-init.sh.tftpl").read_text(encoding="utf-8")
+    bootstrap = bootstrap.replace(
+        'BOOTSTRAP_STATUS="/var/lib/kirocrew/bootstrap-status"',
+        f'BOOTSTRAP_STATUS="{bootstrap_status_dir / "status"}"',
+    ).replace(
+        "install -d -m 0755 /var/lib/kirocrew",
+        f'install -d -m 0755 "{bootstrap_status_dir}"',
+    )
+    script = tmp_path / "cloud-init.sh"
+    script.write_text(bootstrap, encoding="utf-8")
+
     result = subprocess.run(
-        [bash, str(POC / "workspace/cloud-init.sh.tftpl")],
+        [bash, str(script)],
         check=False,
         capture_output=True,
         text=True,

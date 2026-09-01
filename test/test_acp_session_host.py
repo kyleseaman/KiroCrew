@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shlex
@@ -63,8 +64,9 @@ class TestCoderWorkspaceSessionHost:
                 "--remote-forward",
                 f"{host.remote_port}:127.0.0.1:{host._proxy.local_port}",
             ]
-            assert argv[5:] == [
-                "--",
+            assert argv[5] == "--"
+            assert len(argv) == 7
+            assert shlex.split(argv[6]) == [
                 "env",
                 "-u",
                 "CODER_AGENT_TOKEN",
@@ -77,6 +79,34 @@ class TestCoderWorkspaceSessionHost:
                 "--model",
                 "auto",
             ]
+        finally:
+            await host.close()
+
+    @pytest.mark.parametrize("agent", ["crew;touch /tmp/bad", "crew name", "-agent"])
+    def test_spawn_rejects_unsafe_agent_name(self, agent: str) -> None:
+        host = CoderWorkspaceSessionHost(
+            workspace="crew-dogfood",
+            remote_cwd="/home/coder/workspace",
+            coder_bin="/opt/coder",
+        )
+
+        with pytest.raises(ValueError, match="agent"):
+            host.spawn_argv(agent=agent, model="auto")
+
+    @pytest.mark.asyncio
+    async def test_spawn_quotes_model_as_remote_command_data(self) -> None:
+        host = CoderWorkspaceSessionHost(
+            workspace="crew-dogfood",
+            remote_cwd="/home/coder/workspace",
+            coder_bin="/opt/coder",
+        )
+
+        await host.start_bridge()
+        try:
+            argv = host.spawn_argv(agent="kirocrew", model="model; touch /tmp/bad")
+
+            assert len(argv) == 7
+            assert shlex.split(argv[6])[-2:] == ["--model", "model; touch /tmp/bad"]
         finally:
             await host.close()
 
@@ -318,6 +348,53 @@ class TestCoderWorkspaceSessionHost:
 
         assert "secret-value" not in str(caught.value)
         assert "workspace preparation failed" in str(caught.value)
+
+    @pytest.mark.asyncio
+    async def test_prepare_times_out_and_kills_the_remote_command(
+        self,
+        tmp_path,
+        monkeypatch,
+    ) -> None:
+        host = CoderWorkspaceSessionHost(
+            workspace="crew-dogfood",
+            remote_cwd="/home/coder/workspace",
+            coder_bin="/opt/coder",
+        )
+        process = MagicMock()
+        process.pid = 4242
+        process.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
+        process.wait = AsyncMock(return_value=-9)
+        killed = MagicMock()
+        monkeypatch.setattr(
+            host_mod,
+            "create_subprocess_limited",
+            AsyncMock(return_value=process),
+        )
+        monkeypatch.setattr(host_mod.platform_compat, "kill_process_tree", killed)
+        monkeypatch.setattr(host_mod, "_REMOTE_COMMAND_TIMEOUT_SECS", 0.001)
+
+        try:
+            with pytest.raises(host_mod.SessionHostError, match="preparation timed out"):
+                await host.prepare(
+                    agent="kirocrew",
+                    projected_spec={
+                        "name": "kirocrew",
+                        "prompt": "Dogfood Crew.",
+                        "tools": [],
+                        "allowedTools": [],
+                        "mcpServers": {},
+                    },
+                    environ={
+                        "CODER_URL": "https://coder.tail.example",
+                        "CODER_SESSION_TOKEN": "coder-token",
+                    },
+                    local_cwd=tmp_path,
+                )
+        finally:
+            await host.close()
+
+        killed.assert_called_once_with(4242, host_mod.platform_compat.SIGKILL)
+        process.wait.assert_awaited()
 
     @pytest.mark.asyncio
     async def test_session_capability_upload_exposes_only_relay_metadata(
@@ -751,17 +828,8 @@ async def test_runtime_remote_spawn_skips_local_confinement_and_gateway_env(
         assert argv[:4] == ("/opt/coder", "ssh", "crew-dogfood", "--remote-forward")
         assert argv[5:] == (
             "--",
-            "env",
-            "-u",
-            "CODER_AGENT_TOKEN",
-            "-u",
-            "CODER_AGENT_TOKEN_FILE",
-            "kiro-cli",
-            "acp",
-            "--agent",
-            "kirocrew",
-            "--model",
-            "auto",
+            "env -u CODER_AGENT_TOKEN -u CODER_AGENT_TOKEN_FILE "
+            "kiro-cli acp --agent kirocrew --model auto",
         )
         remote_port, loopback, local_port = str(argv[4]).split(":")
         assert int(remote_port) == host.remote_port

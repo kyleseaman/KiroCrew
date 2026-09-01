@@ -18,13 +18,15 @@ the next save strips the legacy keys. The public binding is allocation intent
 and display identity only: provider-owned protected records remain authoritative
 for destructive lifecycle operations and cannot be redirected by slot metadata.
 
-Archiving a slot with that binding dispatches shutdown to its owning provider before
-the slot is removed from the active dashboard. The transcript, memory,
-environment binding, protected provider record, and persistent resources remain
-restorable; restoring the conversation starts the same environment. A stop failure
-leaves the slot active instead of recording an archive whose compute may still be
-running. Bulk cleanup reports such a slot as failed and continues with the other
-independently bound sessions.
+Archiving a slot with that binding first persists a provider-owned stop intent,
+then removes the slot from the active dashboard without waiting for a remote
+control-plane round trip. The provider drains that intent asynchronously and the
+lifecycle reconciler retries it after a failure or gateway restart. The
+transcript, memory, environment binding, protected provider record, and
+persistent resources remain restorable; restoring the conversation starts the
+same environment after any pending stop settles. A failure to persist the intent
+leaves the slot active. Bulk cleanup applies the same durable handoff to each
+independently bound session, so one archive action is sufficient.
 
 - Append-only for LLM cache efficiency
 - Rotation at 2MB (keeps metadata + last 200 messages, atomic write)

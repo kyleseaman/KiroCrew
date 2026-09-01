@@ -133,6 +133,7 @@ _SESSION_RELOAD_NOTICE = (
 # a request-supplied value, and tuple `in` compares by equality rather than
 # hashing, so a non-string body value answers False instead of raising.
 _SLOT_SCOPED_TRUST_MODES = ("trust", "trust_reads")
+_SESSION_ENVIRONMENT_HEALTH_CACHE_SECONDS = 30.0
 
 
 def _sweep_stale_permissions(slot: "_ChatSlot") -> None:
@@ -2099,13 +2100,34 @@ async def api_chat_slot_environment_health(request: web.Request) -> web.Response
         resource_name=binding.resource_name,
         state="unavailable",
     )
+    cache_key = "\0".join((effective_session_key(slot), binding.provider, binding.resource_name))
+    health_cache: dict[str, tuple[float, dict[str, object]]] = state.__dict__.setdefault(
+        "_session_environment_health_cache", {}
+    )
+    now = time.monotonic()
+    expired_keys = tuple(
+        key
+        for key, (cached_at, _payload) in health_cache.items()
+        if now - cached_at >= _SESSION_ENVIRONMENT_HEALTH_CACHE_SECONDS
+    )
+    for expired_key in expired_keys:
+        health_cache.pop(expired_key, None)
+    cached = health_cache.get(cache_key)
+    if cached is not None and now - cached[0] < _SESSION_ENVIRONMENT_HEALTH_CACHE_SECONDS:
+        return web.json_response(cached[1])
+
+    def cache(health: SessionEnvironmentHealth) -> web.Response:
+        payload = health.to_dict()
+        health_cache[cache_key] = (time.monotonic(), payload)
+        return web.json_response(payload)
+
     if not isinstance(provider, SessionEnvironmentHealthProvider):
-        return web.json_response(unavailable.to_dict())
+        return cache(unavailable)
     try:
         health = await provider.health_for_session(effective_session_key(slot))
     except Exception:
         logger.warning("Session environment health inspection failed provider=%s", binding.provider)
-        return web.json_response(unavailable.to_dict())
+        return cache(unavailable)
     if health.provider != binding.provider or health.resource_name != binding.resource_name:
         return web.json_response(
             {
@@ -2114,7 +2136,7 @@ async def api_chat_slot_environment_health(request: web.Request) -> web.Response
             },
             status=409,
         )
-    return web.json_response(health.to_dict())
+    return cache(health)
 
 
 async def api_session_environments(request: web.Request) -> web.Response:
@@ -3376,15 +3398,15 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
             if registry is None:
                 raise SessionEnvironmentUnavailable("session environment registry is unavailable")
             provider = registry.require(environment.provider)
-            stopped = await provider.stop_for_session(_history_key_for(name))
-            if environment.resource_name and stopped != environment.resource_name:
-                raise RuntimeError("session environment stop could not be verified")
+            requested = await provider.request_stop_for_session(_history_key_for(name))
+            if environment.resource_name and requested != environment.resource_name:
+                raise RuntimeError("session environment stop request could not be verified")
         except Exception:
             logger.warning("Failed to stop managed session environment for %s", name, exc_info=True)
             return web.json_response(
                 {
-                    "error": "failed to stop managed session environment",
-                    "code": "session_environment_stop_failed",
+                    "error": "failed to request managed session environment stop",
+                    "code": "session_environment_stop_request_failed",
                 },
                 status=502,
             )
@@ -3395,13 +3417,13 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
         manager = state.sessions.coder_workspace_manager()
         if manager is not None:
             try:
-                await manager.stop_for_session(_history_key_for(name))
+                await manager.request_stop_for_session(_history_key_for(name))
             except Exception:
                 logger.warning("Failed to stop managed Coder workspace for %s", name, exc_info=True)
                 return web.json_response(
                     {
-                        "error": "failed to stop managed Coder workspace",
-                        "code": "coder_workspace_stop_failed",
+                        "error": "failed to request managed Coder workspace stop",
+                        "code": "coder_workspace_stop_request_failed",
                     },
                     status=502,
                 )
@@ -3677,9 +3699,9 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
                         "session environment registry is unavailable"
                     )
                 provider = registry.require(environment.provider)
-                stopped = await provider.stop_for_session(_history_key_for(name))
-                if environment.resource_name and stopped != environment.resource_name:
-                    raise RuntimeError("session environment stop could not be verified")
+                requested = await provider.request_stop_for_session(_history_key_for(name))
+                if environment.resource_name and requested != environment.resource_name:
+                    raise RuntimeError("session environment stop request could not be verified")
             except Exception:
                 logger.warning(
                     "Cleanup: failed to stop managed session environment for %s",
@@ -3692,7 +3714,7 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
             manager = state.sessions.coder_workspace_manager()
             if manager is not None:
                 try:
-                    await manager.stop_for_session(_history_key_for(name))
+                    await manager.request_stop_for_session(_history_key_for(name))
                 except Exception:
                     logger.warning(
                         "Cleanup: failed to stop managed Coder workspace for %s",

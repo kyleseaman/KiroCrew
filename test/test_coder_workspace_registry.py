@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import kiro_crew.coder.registry as registry_mod
 from kiro_crew.coder.registry import (
     WorkspaceBindingRegistry,
     WorkspaceRegistryCorrupt,
@@ -104,6 +105,38 @@ def test_corrupt_registry_fails_closed_without_overwrite(tmp_path: Path) -> None
         )
 
     assert path.read_text(encoding="utf-8") == original
+
+
+def test_identity_allocation_fails_closed_after_bounded_collisions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = WorkspaceBindingRegistry(tmp_path / "coder_workspaces.json")
+    registry.allocate(
+        "dashboard:one",
+        template="kirocrew-arm",
+        preset="",
+        prefix="crew-session",
+        owner_name="kyleseaman",
+    )
+    monkeypatch.setattr(registry_mod.secrets, "token_bytes", lambda _size: b"\0" * 5)
+    first_collision = registry.allocate(
+        "dashboard:collision-seed",
+        template="kirocrew-arm",
+        preset="",
+        prefix="crew-session",
+        owner_name="kyleseaman",
+    )
+    assert first_collision.binding_id == "aaaaaaaa"
+
+    with pytest.raises(WorkspaceRegistryCorrupt, match="unique Coder workspace identity"):
+        registry.allocate(
+            "dashboard:two",
+            template="kirocrew-arm",
+            preset="",
+            prefix="crew-session",
+            owner_name="kyleseaman",
+        )
 
 
 @pytest.mark.parametrize("prefix", (".kiro/crew", ".kirocrew"))

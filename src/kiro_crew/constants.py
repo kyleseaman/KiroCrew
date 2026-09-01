@@ -33,6 +33,7 @@ CODER_DEFAULT_DELETE_AFTER_DAYS = 30
 CODER_DEFAULT_MAX_RUNNING = 3
 CODER_DEFAULT_WORKSPACE_PREFIX = "crew-session"
 CODER_MAX_PROFILES = 16
+CODER_WORKSPACE_PREFIX_MAX_CHARS = 21
 
 # Provider lifecycle adapters may request a shorter cadence, while this value
 # bounds how long the gateway waits before discovering a newly enabled adapter.

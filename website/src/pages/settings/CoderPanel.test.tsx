@@ -33,6 +33,10 @@ function snapshot(overrides: Partial<CoderConfigData> = {}): CoderConfigData {
     workspace_prefix: 'crew',
     token_configured: true,
     legacy_environment: false,
+    limits: {
+      max_profiles: 16,
+      workspace_prefix_max_chars: 21,
+    },
     ...overrides,
   }
 }

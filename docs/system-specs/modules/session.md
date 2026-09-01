@@ -318,7 +318,9 @@ the runtime user, remote directory, or declared capabilities do not match.
 Generated workspace names use lowercase ASCII letters, digits, and hyphens so
 they satisfy Coder's CLI contract. A legacy unprovisioned binding with broader
 safe characters is renamed before its first create attempt; provisioned
-workspace identities remain immutable.
+workspace identities remain immutable. The settings API publishes the same
+profile-count and prefix-length limits enforced by the registry, and identity
+allocation has a bounded collision budget that fails closed instead of looping.
 
 Settings exposes placement under the provider-neutral **Session Environments**
 destination (`?tab=session-environments`), with a generic server glyph and a
@@ -370,8 +372,10 @@ long generated resource name; an expandable detail panel contains
 the provider, immutable configuration, full workspace name, and copy action. A later
 `starting` descriptor changes that same compact control into a reconnecting state.
 Opening the detail panel also enables an owner-only provider-health query. The
-browser polls it every ten seconds only while the panel is visible and stops
-polling when the panel closes or the tab is hidden. Providers that opt in may add
+browser polls it every thirty seconds only while the panel is visible and stops
+polling when the panel closes or the tab is hidden. The gateway caches an exact
+session/provider/resource snapshot for thirty seconds, so concurrent dashboard
+reads do not each spawn a control-plane command. Providers that opt in may add
 live state and memory pressure to the expanded panel; the compact control remains
 unchanged. The first detail row is labelled **Session Environment** and names the
 selected implementation (for example, Coder) rather than exposing the internal
@@ -392,12 +396,15 @@ Closing or archiving a dashboard slot with a managed environment binding is an e
 compute-stop action, not an idle-expiry decision. The dashboard always confirms
 it and identifies the provider, selected configuration, and generated resource.
 The handler resolves the owning adapter by the durable provider id and asks it to
-stop by the trusted session key before it tombstones the slot. The Coder adapter
-revalidates the binding's UUID, owner, and generated name before stopping that
-exact workspace. Any adapter failure leaves the slot visible with a
-retryable error if the stop cannot be verified. Bulk cleanup applies the same
-ordering independently to every stale slot, so one failed stop does not archive
-that slot or prevent safe siblings from being archived. A successful close keeps
+persist a stop intent by trusted session key before it tombstones the slot. That
+handoff is local and bounded; the adapter drains the control-plane operation in a
+tracked task, and the lifecycle reconciler retries a durable `stop_pending`
+binding after failure or gateway restart. The Coder adapter revalidates the
+binding's UUID, owner, and generated name before stopping that exact workspace.
+A persistence failure leaves the slot visible with a retryable error; a remote
+stop failure does not require a second archive action. Pending stops are excluded
+from activity-deadline renewal and retention deletion until they settle. Bulk
+cleanup applies the same handoff independently to every stale slot. A successful close keeps
 the session map, transcript, memory, durable generated workspace label, binding,
 and template-persistent storage;
 restoring the session starts the same workspace. Active turns, terminals, builds,

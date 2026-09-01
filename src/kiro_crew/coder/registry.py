@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.constants import CODER_WORKSPACE_PREFIX_MAX_CHARS
 from kiro_crew.platform_compat import file_lock
 
 _SCHEMA_VERSION = 1
@@ -23,7 +24,7 @@ _BINDING_BYTES = 5
 _OWNER_SLUG_MAX_CHARS = 20
 _WORKSPACE_NAME_MAX_CHARS = 32
 _BINDING_ID_CHARS = 8
-_MAX_PREFIX_CHARS = _WORKSPACE_NAME_MAX_CHARS - _BINDING_ID_CHARS - 3
+_IDENTITY_ALLOCATION_ATTEMPTS = 128
 
 
 class WorkspaceRegistryCorrupt(RuntimeError):
@@ -136,7 +137,7 @@ class WorkspaceBindingRegistry:
             digest = hashlib.sha256(owner_name.encode("utf-8")).hexdigest()[:8]
             owner_slug = f"user-{digest}"
         existing_names = {binding.workspace_name for binding in bindings.values()}
-        while True:
+        for _attempt in range(_IDENTITY_ALLOCATION_ATTEMPTS):
             binding_id = (
                 base64.b32encode(secrets.token_bytes(_BINDING_BYTES)).decode("ascii").lower()
             )
@@ -149,6 +150,7 @@ class WorkspaceBindingRegistry:
                 and _CODER_WORKSPACE_NAME_RE.fullmatch(workspace_name)
             ):
                 return binding_id, workspace_name
+        raise WorkspaceRegistryCorrupt("Could not allocate a unique Coder workspace identity")
 
     def allocate(
         self,
@@ -165,9 +167,13 @@ class WorkspaceBindingRegistry:
             raise ValueError("template must be one safe Coder name")
         if preset and not _SAFE_NAME_RE.fullmatch(preset):
             raise ValueError("preset must be one safe Coder name")
-        if not _CODER_WORKSPACE_NAME_RE.fullmatch(prefix) or len(prefix) > _MAX_PREFIX_CHARS:
+        if (
+            not _CODER_WORKSPACE_NAME_RE.fullmatch(prefix)
+            or len(prefix) > CODER_WORKSPACE_PREFIX_MAX_CHARS
+        ):
             raise ValueError(
-                f"prefix must be one safe Coder name of at most {_MAX_PREFIX_CHARS} characters"
+                "prefix must be one safe Coder name of at most "
+                f"{CODER_WORKSPACE_PREFIX_MAX_CHARS} characters"
             )
         if not owner_name:
             raise ValueError("owner_name is required")

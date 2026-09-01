@@ -175,6 +175,8 @@ class SessionEnvironmentProvider(Protocol):
 
     def create_session_host(self, session_key: str, configuration: str) -> Any: ...
 
+    async def request_stop_for_session(self, session_key: str) -> str | None: ...
+
     async def stop_for_session(self, session_key: str) -> str | None: ...
 
 
@@ -407,6 +409,9 @@ class CoderSessionEnvironmentProvider(
     async def stop_for_session(self, session_key: str) -> str | None:
         return await self.manager.stop_for_session(session_key)
 
+    async def request_stop_for_session(self, session_key: str) -> str | None:
+        return await self.manager.request_stop_for_session(session_key)
+
     async def health_for_session(self, session_key: str) -> SessionEnvironmentHealth:
         from kiro_crew.coder.client import CoderClientError
 
@@ -469,6 +474,7 @@ class CoderSessionEnvironmentProvider(
         # bindings, scopes, retention intents, and exact workspace identities.
         if not isinstance(self.manager, CoderWorkspaceManager):
             return
+        await self.manager.reconcile_stop_requests()
         await self.manager.reconcile_active_scopes()
         await self.manager.reconcile_retention()
 

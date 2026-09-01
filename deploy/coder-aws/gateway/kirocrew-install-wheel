@@ -18,16 +18,20 @@ esac
   exit 2
 }
 wheel_name=${wheel##*/}
-remote_dir=/tmp/kirocrew-$expected_sha
+remote_dir=${wheel%/*}
 case "$wheel_name" in
   kirocrew-*-py3-none-any.whl) ;;
   *) printf 'Refusing unexpected wheel name: %s\n' "$wheel_name" >&2; exit 2 ;;
 esac
-[ "$wheel" = "$remote_dir/$wheel_name" ] || {
+printf '%s\n' "$remote_dir" \
+  | /usr/bin/grep -Eq '^/tmp/kirocrew-deploy\.[A-Za-z0-9]{8}$' || {
+    printf 'Refusing unexpected staging directory: %s\n' "$remote_dir" >&2
+    exit 2
+  }
+[ "$wheel" = "$remote_dir/$wheel_name" ] && [ -f "$wheel" ] && [ ! -L "$wheel" ] || {
   printf 'Refusing unexpected wheel path: %s\n' "$wheel" >&2
   exit 2
 }
-printf '%s  %s\n' "$expected_sha" "$wheel" | /usr/bin/sha256sum --check --status
 
 dashboard_url=$(printf '%s' "$dashboard_url_b64" | /usr/bin/base64 --decode)
 printf '%s\n' "$dashboard_url" \
@@ -36,10 +40,14 @@ printf '%s\n' "$dashboard_url" \
     exit 2
   }
 
-verified_dir=/tmp/kirocrew-verified-$expected_sha
+staging_root=/var/lib/kirocrew/staging
+/usr/bin/install -d -m 0755 -o root -g root "$staging_root"
+verified_dir=$(/usr/bin/mktemp -d /var/lib/kirocrew/staging/install.XXXXXXXXXX)
+/usr/bin/chmod 0755 "$verified_dir"
 verified_wheel=$verified_dir/$wheel_name
-/usr/bin/install -d -m 0700 -o coder -g coder "$verified_dir"
-/usr/bin/install -m 0644 -o coder -g coder "$wheel" "$verified_wheel"
+/usr/bin/install -m 0644 -o root -g root "$wheel" "$verified_wheel"
+printf '%s  %s\n' "$expected_sha" "$verified_wheel" \
+  | /usr/bin/sha256sum --check --status
 
 /usr/sbin/runuser -u coder -- env \
   HOME=/home/coder USER=coder LOGNAME=coder \
@@ -101,5 +109,5 @@ until /usr/bin/systemctl is-active --quiet kirocrew.service \
 done
 
 /usr/bin/rm -f -- "$wheel" "$verified_wheel"
-/usr/bin/rmdir -- "$remote_dir" "$verified_dir"
+/usr/bin/rmdir -- "$verified_dir"
 printf 'Installed verified Kiro Crew wheel and restarted the gateway.\n'

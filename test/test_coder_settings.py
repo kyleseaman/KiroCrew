@@ -12,7 +12,11 @@ from aiohttp.test_utils import TestClient, TestServer
 
 import kiro_crew.config.loader as loader_mod
 from kiro_crew.acp.session_host import CODER_SESSION_TOKEN_SECRET
-from kiro_crew.constants import CODER_DEFAULT_RUNTIME_WARM_MINUTES
+from kiro_crew.constants import (
+    CODER_DEFAULT_RUNTIME_WARM_MINUTES,
+    CODER_MAX_PROFILES,
+    CODER_WORKSPACE_PREFIX_MAX_CHARS,
+)
 from kiro_crew.dashboard.handlers import coder as coder_handlers
 from kiro_crew.secrets import SecretVault
 
@@ -112,6 +116,10 @@ async def test_get_returns_only_masked_token_status(coder_paths: Path, tmp_path:
         "workspace_prefix": "crew",
         "token_configured": True,
         "legacy_environment": False,
+        "limits": {
+            "max_profiles": CODER_MAX_PROFILES,
+            "workspace_prefix_max_chars": CODER_WORKSPACE_PREFIX_MAX_CHARS,
+        },
     }
     assert "coder-secret-must-not-return" not in json.dumps(payload)
     assert "token" not in payload
@@ -201,6 +209,38 @@ async def test_put_rejects_enabled_config_without_a_token(
     assert response.status == 400
     assert payload["code"] == "coder_token_required"
     assert not coder_paths.exists()
+
+
+@pytest.mark.asyncio
+async def test_put_rejects_prefix_too_long_for_generated_workspace_names(
+    coder_paths: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODER_SESSION_TOKEN", "existing-token")
+    app = _app()
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.put(
+            "/api/coder/config",
+            json={
+                "enabled": True,
+                "url": "https://coder.example",
+                "template": "kirocrew-arm",
+                "preset": "",
+                "profiles": {},
+                "remote_cwd": "/home/coder/workspace",
+                "runtime_warm_minutes": 5,
+                "stop_after_minutes": 30,
+                "delete_after_days": 30,
+                "max_running": 3,
+                "workspace_prefix": "x" * (CODER_WORKSPACE_PREFIX_MAX_CHARS + 1),
+                "token": "",
+            },
+        )
+        payload = await response.json()
+
+    assert response.status == 400
+    assert payload["code"] == "coder_config_invalid"
 
 
 @pytest.mark.asyncio

@@ -51,11 +51,17 @@ and every subagent inherits it.
 
 The template expects an outbound-only public subnet to avoid a NAT Gateway's
 fixed hourly charge, an instance profile scoped to the two named SSM parameters,
-and a reusable tagged Tailscale auth key. Session nodes run Tailscale with
-in-memory state, so each clean stop removes the ephemeral node and an abrupt
-stop leaves it eligible for Tailscale's automatic inactive-node cleanup. Each
-later start rejoins with a fresh node identity instead of accumulating permanent
-offline devices. Do not bind automation to a session node's Tailscale IP.
+and a tagged Tailscale auth key created with Tailscale's **Ephemeral** option.
+Session nodes also run Tailscale with in-memory state. Together those settings
+make the control plane remove an offline session node instead of retaining a
+permanent dead device. Each later start rejoins with a fresh node identity. Do
+not reuse the non-ephemeral control/gateway key here, and do not bind automation
+to a session node's Tailscale IP.
+
+Coder does not rerun cloud-init on an existing EC2 instance when a newer
+template version changes `user_data`. To test bootstrap changes, stop and delete
+the disposable session workspace, then create a new session so Coder provisions
+a fresh instance. Retained project data should be copied out before deletion.
 Coder's workspace agent authenticates with AWS instance identity, so the template
 stores no static Coder agent token. Configure the separate gateway-only Coder API
 bearer in **Settings → Session Environments** after the workspace is reachable.

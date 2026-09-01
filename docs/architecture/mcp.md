@@ -170,15 +170,19 @@ digest. Authorization attempts are one-shot, bounded, and completed through the
 fixed `/api/mcp/oauth/callback` route. Its origin comes only from the configured
 HTTPS dashboard URL, the startup-validated Tailscale host, or exact loopback --
 never from request `Host`. The callback's high-entropy state authenticates its
-GET, while normal Host validation remains active.
+GET, while normal Host validation remains active. A successful callback returns
+a cache-forbidden completion page and never renders the code, state, token, or
+provider response.
 
 OAuth prompts and terminal outcomes reuse the dashboard's existing MCP OAuth
 banner and route to the visible parent slot for dashboard, linked channel, cron,
 and subagent sessions. Ending a session revokes its transport capability but
 retains the encrypted integration grant. Removing the stored integration
 deletes tokens and client registration locally and, when discovered metadata
-advertises a revocation endpoint, attempts RFC 7009 revocation without restoring
-local material after a remote failure. The workspace never receives a URL,
+advertises an HTTP(S) revocation endpoint on the issuer or token-endpoint origin,
+attempts RFC 7009 revocation without restoring local material after a remote
+failure. Cross-origin, credential-bearing, fragmented, or non-loopback cleartext
+revocation endpoints are ignored. The workspace never receives a URL,
 configured header, OAuth metadata, authorization code, PKCE verifier, token, or
 client secret.
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shlex
@@ -18,6 +19,8 @@ from kiro_crew.sandbox import RLIMIT_PROFILE_SESSION_HOST, create_subprocess_lim
 
 _COMMAND_TIMEOUT_SECS = 600.0
 _OUTPUT_MAX_BYTES = 4 * 1024 * 1024
+_DIAGNOSTIC_MAX_BYTES = 2 * 1024
+_PIPE_READ_BYTES = 64 * 1024
 _HEALTH_OUTPUT_MAX_BYTES = 4 * 1024
 _HEALTH_TIMEOUT_SECS = 30.0
 _MEMORY_ELEVATED_PERCENT = 80.0
@@ -26,6 +29,7 @@ _BYTES_PER_GIB = 1024**3
 _MEMORY_BYTES_MAX = 1 << 60
 _WORKSPACE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _CODER_DEADLINE_EXTENSION_MINUTES_MIN = 30
+logger = logging.getLogger(__name__)
 _WORKSPACE_MEMORY_SCRIPT = r"""
 import json
 from pathlib import Path
@@ -136,9 +140,20 @@ class CoderClient:
             ),
             profile=RLIMIT_PROFILE_SESSION_HOST,
         )
+        if process.stdout is None or process.stderr is None:
+            raise CoderClientError("Coder lifecycle command pipes are unavailable")
+        stdout_task = asyncio.create_task(self._drain_bounded(process.stdout, _OUTPUT_MAX_BYTES))
+        stderr_task = asyncio.create_task(
+            self._drain_bounded(process.stderr, _DIAGNOSTIC_MAX_BYTES)
+        )
+        wait_task = asyncio.create_task(process.wait())
+        tasks = (stdout_task, stderr_task, wait_task)
         try:
-            stdout, _stderr = await asyncio.wait_for(
-                process.communicate(), timeout=_COMMAND_TIMEOUT_SECS
+            (stdout, stdout_exceeded), (stderr, _stderr_exceeded), returncode = (
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks),
+                    timeout=_COMMAND_TIMEOUT_SECS,
+                )
             )
         except asyncio.TimeoutError as exc:
             platform_compat.kill_process_tree(process.pid, platform_compat.SIGKILL)
@@ -148,11 +163,45 @@ class CoderClient:
             platform_compat.kill_process_tree(process.pid, platform_compat.SIGKILL)
             await process.wait()
             raise
-        if process.returncode:
-            raise CoderClientError(f"Coder lifecycle command failed (exit {process.returncode})")
-        if len(stdout) > _OUTPUT_MAX_BYTES:
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if returncode:
+            diagnostic = self._redacted_diagnostic(stderr)
+            if diagnostic:
+                logger.warning("Coder lifecycle command failed: %s", diagnostic)
+            raise CoderClientError(f"Coder lifecycle command failed (exit {returncode})")
+        if stdout_exceeded:
             raise CoderClientError("Coder lifecycle command returned too much data")
         return stdout
+
+    @staticmethod
+    async def _drain_bounded(
+        stream: asyncio.StreamReader,
+        limit: int,
+    ) -> tuple[bytes, bool]:
+        retained = bytearray()
+        exceeded = False
+        while chunk := await stream.read(_PIPE_READ_BYTES):
+            remaining = limit - len(retained)
+            if remaining > 0:
+                retained.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                exceeded = True
+        return bytes(retained), exceeded
+
+    @staticmethod
+    def _redacted_diagnostic(stderr: bytes) -> str:
+        if not stderr:
+            return ""
+        from kiro_crew.security import redact_and_truncate
+
+        return redact_and_truncate(
+            stderr.decode("utf-8", errors="replace"),
+            max_chars=_DIAGNOSTIC_MAX_BYTES,
+        ).strip()
 
     async def _call(self, *args: str) -> bytes:
         return await self._runner([self.coder_bin, *args], self._env(), self.cwd)
@@ -259,7 +308,8 @@ class CoderClient:
         preset: str,
         stop_after_minutes: int,
     ) -> CoderWorkspace:
-        args = ["create", name, "--template", template]
+        workspace_name = self._validated_workspace_name(name)
+        args = ["create", workspace_name, "--template", template]
         if preset:
             args.extend(("--preset", preset))
         args.extend(
@@ -271,14 +321,15 @@ class CoderClient:
             )
         )
         await self._call(*args)
-        workspace = await self.get_workspace(name)
+        workspace = await self.get_workspace(workspace_name)
         if workspace is None:
             raise CoderClientError("Coder did not return the created workspace")
         return workspace
 
     async def start_workspace(self, name: str) -> CoderWorkspace:
-        await self._call("start", name, "--yes")
-        workspace = await self.get_workspace(name)
+        workspace_name = self._validated_workspace_name(name)
+        await self._call("start", workspace_name, "--yes")
+        workspace = await self.get_workspace(workspace_name)
         if workspace is None:
             raise CoderClientError("Coder did not return the started workspace")
         return workspace
@@ -291,7 +342,7 @@ class CoderClient:
         return workspace
 
     async def delete_workspace(self, name: str) -> None:
-        await self._call("delete", name, "--yes")
+        await self._call("delete", self._validated_workspace_name(name), "--yes")
 
     @staticmethod
     def _validated_workspace_name(name: str) -> str:

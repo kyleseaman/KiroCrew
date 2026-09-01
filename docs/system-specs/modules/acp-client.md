@@ -18,8 +18,9 @@ existing resolution, environment, sandbox, cgroup, cwd, and spawn behavior
 unchanged. `ManagedCoderWorkspaceSessionHost` is an explicitly configured
 Kiro-only path. It resolves a durable parent session to a dedicated Coder
 workspace lazily, then delegates transport to `CoderWorkspaceSessionHost`.
-Settings → Coder persists the URL, template/preset, remote directory, and
-lifecycle policy under `session.coder`; the Coder bearer is stored separately as
+Settings → Session Environments persists the Coder configuration's URL,
+template/preset, remote directory, and lifecycle policy under `session.coder`;
+the Coder bearer is stored separately as
 `coder.session_token.v1` in the gateway vault and is returned to the dashboard
 only as a presence boolean. An enabled but incomplete configuration fails
 closed before spawn. The legacy `KIROCREW_CODER_*`, `CODER_URL`, and
@@ -32,6 +33,12 @@ authenticate and verify that the configured template is visible. It neither
 creates nor starts a workspace, persists candidate values, nor echoes the
 bearer. Saving settings rebuilds only the provider defaults and drains the warm
 pool; it does not migrate or terminate active sessions.
+
+The remote argv crosses Coder's shell boundary as one shell-quoted command after
+identifier validation. Preparation and cleanup calls have a fixed timeout and
+kill their process tree when cancelled or expired; lifecycle command pipes are
+drained concurrently into bounded buffers and only redacted, truncated
+diagnostics may enter gateway logs.
 
 The host projects a credential-free agent spec, prepares a normalized remote
 cwd, and launches `kiro-cli acp` behind `coder ssh` while retaining JSON-RPC

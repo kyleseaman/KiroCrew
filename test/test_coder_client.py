@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
+import kiro_crew.coder.client as client_mod
 from kiro_crew.coder.client import (
     CoderClient,
     CoderClientError,
@@ -117,6 +121,31 @@ async def test_stop_workspace_uses_noninteractive_coder_command(tmp_path: Path) 
 
     assert workspace.status == "stopped"
     assert calls[0] == ["/opt/coder", "stop", "crew-abc123", "--yes"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["create", "start", "delete"])
+async def test_mutating_workspace_commands_reject_unsafe_names(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    async def run(argv: list[str], env: dict[str, str], cwd: Path) -> bytes:
+        raise AssertionError(f"unsafe command reached runner: {argv}")
+
+    client = CoderClient("/opt/coder", "https://coder.example", "token", tmp_path, run)
+
+    with pytest.raises(CoderClientError, match="workspace name"):
+        if operation == "create":
+            await client.create_workspace(
+                name="crew;bad",
+                template="kirocrew-arm",
+                preset="",
+                stop_after_minutes=30,
+            )
+        elif operation == "start":
+            await client.start_workspace("crew;bad")
+        else:
+            await client.delete_workspace("crew;bad")
 
 
 @pytest.mark.asyncio
@@ -264,3 +293,38 @@ async def test_workspace_memory_classifies_pressure(
     client = CoderClient("/opt/coder", "https://coder.example", "token", tmp_path, run)
 
     assert (await client.workspace_memory("crew-abc123")).pressure == pressure
+
+
+@pytest.mark.asyncio
+async def test_subprocess_failure_logs_only_bounded_redacted_diagnostics(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    stdout = asyncio.StreamReader()
+    stdout.feed_eof()
+    stderr = asyncio.StreamReader()
+    stderr.feed_data(b"KIRO_API_KEY=secret-value\n" + b"x" * 8192)
+    stderr.feed_eof()
+    process = AsyncMock()
+    process.pid = 4242
+    process.returncode = 7
+    process.stdout = stdout
+    process.stderr = stderr
+    process.wait = AsyncMock(return_value=7)
+    monkeypatch.setattr(
+        client_mod,
+        "create_subprocess_limited",
+        AsyncMock(return_value=process),
+    )
+    client = CoderClient("/opt/coder", "https://coder.example", "token", tmp_path)
+
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(CoderClientError, match=r"failed \(exit 7\)"),
+    ):
+        await client._run(["/opt/coder", "list"], client._env(), tmp_path)
+
+    assert "secret-value" not in caplog.text
+    assert "[REDACTED" in caplog.text
+    assert len(caplog.text) < 4096

@@ -195,6 +195,7 @@ export function CoderPanel() {
 
   const busy = save.isPending || testConnection.isPending
   const tokenConfigured = configQuery.data?.token_configured ?? false
+  const limits = configQuery.data!.limits
 
   return (
     <>
@@ -245,7 +246,7 @@ export function CoderPanel() {
               </div>
               <Btn
                 type="button"
-                disabled={busy || Object.keys(form.profiles).length >= 16}
+                disabled={busy || Object.keys(form.profiles).length >= limits.max_profiles}
                 onClick={() => setForm(current => {
                   let suffix = Object.keys(current.profiles).length + 1
                   while (current.profiles[`profile-${suffix}`]) suffix += 1
@@ -371,6 +372,7 @@ export function CoderPanel() {
             value={form.workspace_prefix}
             onChange={workspace_prefix => setForm(current => ({ ...current, workspace_prefix }))}
             placeholder="crew"
+            maxLength={limits.workspace_prefix_max_chars}
             disabled={busy}
             configKey="session.coder.workspace_prefix"
           />

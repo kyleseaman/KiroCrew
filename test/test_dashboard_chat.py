@@ -9869,13 +9869,13 @@ class TestSlotTaskNoneGuard:
             assert slot.task.cancelled()
 
     @pytest.mark.asyncio
-    async def test_delete_stops_bound_coder_workspace_before_archiving(
+    async def test_delete_queues_bound_coder_workspace_stop_before_archiving(
         self, tmp_path: Path
     ) -> None:
         state = _make_state(tmp_path)
         state.get_or_create_slot("s1")
         manager = MagicMock()
-        manager.stop_for_session = AsyncMock(return_value="crew-session-user-opaque")
+        manager.request_stop_for_session = AsyncMock(return_value="crew-session-user-opaque")
         state.sessions.coder_workspace_manager = MagicMock(return_value=manager)
 
         async with TestClient(TestServer(_make_app(state))) as client:
@@ -9883,26 +9883,28 @@ class TestSlotTaskNoneGuard:
                 resp = await client.delete("/api/chat/slots/s1")
 
         assert resp.status == 200
-        manager.stop_for_session.assert_awaited_once_with("dashboard:s1")
+        manager.request_stop_for_session.assert_awaited_once_with("dashboard:s1")
         assert "s1" not in state._slots
 
     @pytest.mark.asyncio
-    async def test_delete_keeps_slot_when_bound_coder_workspace_cannot_stop(
+    async def test_delete_does_not_wait_for_bound_coder_workspace_stop(
         self, tmp_path: Path
     ) -> None:
         state = _make_state(tmp_path)
         state.get_or_create_slot("s1")
         manager = MagicMock()
         manager.stop_for_session = AsyncMock(side_effect=RuntimeError("coder unavailable"))
+        manager.request_stop_for_session = AsyncMock(return_value="crew-session-user-opaque")
         state.sessions.coder_workspace_manager = MagicMock(return_value=manager)
 
         async with TestClient(TestServer(_make_app(state))) as client:
-            resp = await client.delete("/api/chat/slots/s1")
-            body = await resp.json()
+            with patch("kiro_crew.dashboard.chat_handlers.save_slot_off_loop"):
+                resp = await client.delete("/api/chat/slots/s1")
 
-        assert resp.status == 502
-        assert body["code"] == "coder_workspace_stop_failed"
-        assert "s1" in state._slots
+        assert resp.status == 200
+        manager.request_stop_for_session.assert_awaited_once_with("dashboard:s1")
+        manager.stop_for_session.assert_not_awaited()
+        assert "s1" not in state._slots
 
     @pytest.mark.asyncio
     async def test_delete_stops_environment_through_its_owning_provider(
@@ -9918,7 +9920,7 @@ class TestSlotTaskNoneGuard:
         slot.environment = SessionEnvironmentBinding("test-provider", "small", "env-opaque")
         provider = MagicMock()
         provider.provider_id = "test-provider"
-        provider.stop_for_session = AsyncMock(return_value="env-opaque")
+        provider.request_stop_for_session = AsyncMock(return_value="env-opaque")
         state.sessions.environment_registry = MagicMock(
             return_value=SessionEnvironmentRegistry([provider])
         )
@@ -9928,7 +9930,7 @@ class TestSlotTaskNoneGuard:
                 resp = await client.delete("/api/chat/slots/s1")
 
         assert resp.status == 200
-        provider.stop_for_session.assert_awaited_once_with("dashboard:s1")
+        provider.request_stop_for_session.assert_awaited_once_with("dashboard:s1")
         assert "s1" not in state._slots
 
 
@@ -9986,7 +9988,7 @@ class TestBulkCleanup:
         stale.append("user", "old msg", ts=old_ts)
         stale.drain()
         manager = MagicMock()
-        manager.stop_for_session = AsyncMock(return_value="crew-session-user-opaque")
+        manager.request_stop_for_session = AsyncMock(return_value="crew-session-user-opaque")
         state.sessions.coder_workspace_manager = MagicMock(return_value=manager)
 
         async with TestClient(TestServer(_make_app(state))) as client:
@@ -9996,7 +9998,7 @@ class TestBulkCleanup:
             )
 
         assert resp.status == 200
-        manager.stop_for_session.assert_awaited_once_with("dashboard:stale1")
+        manager.request_stop_for_session.assert_awaited_once_with("dashboard:stale1")
         assert "stale1" not in state._slots
 
     @pytest.mark.asyncio
@@ -10019,7 +10021,7 @@ class TestBulkCleanup:
         stale.environment = SessionEnvironmentBinding("test-provider", "small", "env-opaque")
         provider = MagicMock()
         provider.provider_id = "test-provider"
-        provider.stop_for_session = AsyncMock(return_value="env-opaque")
+        provider.request_stop_for_session = AsyncMock(return_value="env-opaque")
         state.sessions.environment_registry = MagicMock(
             return_value=SessionEnvironmentRegistry([provider])
         )
@@ -10031,7 +10033,7 @@ class TestBulkCleanup:
             )
 
         assert resp.status == 200
-        provider.stop_for_session.assert_awaited_once_with("dashboard:stale1")
+        provider.request_stop_for_session.assert_awaited_once_with("dashboard:stale1")
         assert "stale1" not in state._slots
 
     @pytest.mark.asyncio

@@ -34,12 +34,52 @@ _MAX_LIVE_ATTEMPTS = 64
 _CALLBACK_KEYS = frozenset(("code", "state", "iss", "error", "error_description"))
 _OAUTH_FAILURE_CODE = "remote_mcp_oauth_failed"
 _REVOCATION_TIMEOUT_SECONDS = 10.0
+_LOOPBACK_HOSTS = frozenset(("localhost", "127.0.0.1", "::1"))
 
 logger = logging.getLogger(__name__)
 
 
 def _contains_control(value: str) -> bool:
     return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+
+def _url_origin(value: str) -> tuple[str, str, int] | None:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    if (
+        scheme not in {"http", "https"}
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or _contains_control(value)
+    ):
+        return None
+    if scheme == "http" and host not in _LOOPBACK_HOSTS:
+        return None
+    return scheme, host, port or (443 if scheme == "https" else 80)
+
+
+def _validated_revocation_endpoint(
+    endpoint: str,
+    issuer: str,
+    token_endpoint: str,
+) -> str:
+    """Accept revocation only on an already-authorized OAuth server origin."""
+    endpoint_origin = _url_origin(endpoint)
+    if endpoint_origin is None:
+        return ""
+    allowed_origins = {
+        origin
+        for candidate in (issuer, token_endpoint)
+        if candidate and (origin := _url_origin(candidate)) is not None
+    }
+    return endpoint if endpoint_origin in allowed_origins else ""
 
 
 @dataclass(frozen=True, repr=False)
@@ -444,11 +484,17 @@ class RemoteMcpOAuthManager:
                 client_info = provider.context.client_info or await storage.get_client_info()
                 provider.context.client_info = client_info
                 metadata = provider.context.oauth_metadata
-                endpoint = (
-                    str(metadata.revocation_endpoint)
-                    if metadata is not None and (metadata.revocation_endpoint is not None)
-                    else ""
-                )
+                endpoint = ""
+                if metadata is not None and metadata.revocation_endpoint is not None:
+                    endpoint = _validated_revocation_endpoint(
+                        str(metadata.revocation_endpoint),
+                        str(metadata.issuer) if metadata.issuer is not None else "",
+                        (
+                            str(metadata.token_endpoint)
+                            if metadata.token_endpoint is not None
+                            else ""
+                        ),
+                    )
                 try:
                     if endpoint and tokens is not None:
                         for token_type, token_value in (

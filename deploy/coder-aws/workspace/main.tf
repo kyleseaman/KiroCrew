@@ -39,7 +39,7 @@ variable "instance_profile_name" {
 }
 
 variable "tailscale_auth_parameter" {
-  description = "SSM SecureString name for the workspace Tailscale auth key."
+  description = "SSM SecureString name for a tagged ephemeral Tailscale auth key."
   type        = string
 }
 
@@ -103,7 +103,7 @@ resource "coder_agent" "main" {
   arch               = "arm64"
   os                 = "linux"
   auth               = "aws-instance-identity"
-  connection_timeout = 0
+  connection_timeout = 600
 
   metadata {
     key          = "cpu"
@@ -165,6 +165,7 @@ resource "aws_instance" "workspace" {
     Name              = "coder-${data.coder_workspace_owner.me.name}-${lower(data.coder_workspace.me.name)}"
     Coder_Provisioned = "true"
     Coder_Workspace   = data.coder_workspace.me.id
+    KiroCrewManaged   = "true"
     Project           = "Kiro Crew Coder POC"
   }
 

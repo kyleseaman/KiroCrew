@@ -18,6 +18,7 @@ from kiro_crew.mcp_gateway.oauth import (
     RemoteMcpOAuthBroker,
     RemoteMcpOAuthManager,
     VaultOAuthTokenStorage,
+    _validated_revocation_endpoint,
 )
 from kiro_crew.mcp_gateway.remote_http import GatewayMcpHttpAdapter
 from kiro_crew.mcp_gateway.remote_proxy import RemoteHttpMcpTarget, RemoteMcpProxy
@@ -84,6 +85,50 @@ def test_oauth_identity_separates_resource_and_client_without_leaky_repr() -> No
     assert len({default.digest, other_resource.digest, explicit_client.digest}) == 3
     assert "mcp.example.test" not in repr(default)
     assert "client-two" not in repr(explicit_client)
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "issuer", "token_endpoint", "expected"),
+    [
+        (
+            "https://auth.example/revoke",
+            "https://auth.example",
+            "https://auth.example/token",
+            "https://auth.example/revoke",
+        ),
+        (
+            "http://127.0.0.1:8123/revoke",
+            "http://127.0.0.1:8123",
+            "http://127.0.0.1:8123/token",
+            "http://127.0.0.1:8123/revoke",
+        ),
+        (
+            "https://attacker.example/collect",
+            "https://auth.example",
+            "https://auth.example/token",
+            "",
+        ),
+        (
+            "http://169.254.169.254/latest",
+            "http://169.254.169.254",
+            "http://169.254.169.254/token",
+            "",
+        ),
+        (
+            "https://user:password@auth.example/revoke",
+            "https://auth.example",
+            "https://auth.example/token",
+            "",
+        ),
+    ],
+)
+def test_revocation_endpoint_must_match_the_oauth_server_origin(
+    endpoint: str,
+    issuer: str,
+    token_endpoint: str,
+    expected: str,
+) -> None:
+    assert _validated_revocation_endpoint(endpoint, issuer, token_endpoint) == expected
 
 
 @pytest.mark.asyncio

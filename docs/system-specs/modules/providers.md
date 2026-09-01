@@ -120,8 +120,10 @@ dashboard/history wire object and carries three non-secret strings: provider id,
 provider-owned configuration id, and generated resource name. Protected UUIDs,
 owners, credentials, templates, presets, and deletion intents never enter it.
 
-Adapters create a `RemoteSessionHost`, project safe binding metadata, stop by
-trusted session key, and may positively opt into the gateway lifecycle loop.
+Adapters create a `RemoteSessionHost`, project safe binding metadata, persist
+stop intent by trusted session key, and may positively opt into the gateway
+lifecycle loop. A provider-owned pending stop is retried before ordinary
+activity and retention reconciliation after a failure or gateway restart.
 Catalog-shaped objects alone cannot gain periodic mutation authority. Each
 adapter keeps its concrete control-plane trust checks at its own boundary. Coder
 is the first implementation; another provider can join the registry without
@@ -168,7 +170,12 @@ candidate coordinates and bearer without saving or returning them.
 The Coder environment adapter binds each durable parent session key to one generated Coder
 workspace in an owner-only registry. It creates the workspace from the selected
 template/preset on first use, starts a stopped binding on resume, and refuses a
-new parent when the configured running-workspace cap is reached. Descendant
+new parent when the configured running-workspace cap is reached. Allocation
+reserves capacity under a short lock, performs the remote create outside it, and
+uses one workspace inventory snapshot for that decision, so unrelated creates
+can proceed concurrently without exceeding the cap. Lifecycle passes likewise
+fetch one inventory and reconcile locally rather than issuing one list command
+per binding. Descendant
 subagents inherit the concrete parent host and stay in that same workspace.
 The static environment path remains a migration fallback only; a manually
 created bootstrap workspace such as `crew-dogfood` is never enrolled in managed
@@ -201,6 +208,9 @@ Workload-scope inspection also uses
 The runtime invokes `coder ssh <workspace> --remote-forward
 <workspace-port>:127.0.0.1:<gateway-loopback-port> -- kiro-cli acp --agent
 <name>` (plus the selected model) and preserves ACP JSON-RPC stdio end to end.
+Everything after Coder's `--` boundary is serialized as one shell-quoted remote
+command after validating every identifier, so model or agent text cannot become
+remote shell syntax.
 Preparation probes a bounded random set of high workspace-loopback ports; a
 forwarding failure aborts startup rather than falling back to local ACP.
 Only Coder URL/token, PATH, certificate, and proxy variables reach the transport
@@ -236,8 +246,12 @@ hook relay.
 Remote hosting is positively limited to `ACP_BACKEND_KIRO`; another harness
 fails before spawn. The SSH client itself is not wrapped in Kiro Crew's local
 agent sandbox or cgroup because the Coder workspace is the execution boundary.
-Preparation errors expose only the operation and exit code, not remote stderr,
-which may contain credential-bearing diagnostics.
+Preparation and cleanup commands have a bounded lifetime and terminate their
+process tree on timeout or cancellation. Coder lifecycle stdout and stderr are
+drained concurrently into bounded buffers to prevent pipe deadlocks or
+unbounded memory use. Logs retain only a redacted, truncated diagnostic;
+user-facing preparation errors expose only the operation and exit code, not raw
+remote stderr, which may contain credential-bearing diagnostics.
 
 Managed ACP transports have their own short warm timeout. Once the session is
 idle and its semaphore is unlocked, the gateway closes the SSH/ACP runtime but
