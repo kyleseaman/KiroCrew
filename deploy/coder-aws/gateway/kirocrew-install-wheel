@@ -40,11 +40,16 @@ printf '%s\n' "$dashboard_url" \
     exit 2
   }
 
-staging_root=/var/lib/kirocrew/staging
+staging_root=/var/lib/kirocrew-staging
 /usr/bin/install -d -m 0755 -o root -g root "$staging_root"
-verified_dir=$(/usr/bin/mktemp -d /var/lib/kirocrew/staging/install.XXXXXXXXXX)
+verified_dir=$(/usr/bin/mktemp -d /var/lib/kirocrew-staging/install.XXXXXXXXXX)
 /usr/bin/chmod 0755 "$verified_dir"
 verified_wheel=$verified_dir/$wheel_name
+cleanup_verified() {
+  /usr/bin/rm -f -- "$verified_wheel"
+  /usr/bin/rmdir -- "$verified_dir" 2>/dev/null || true
+}
+trap cleanup_verified 0
 /usr/bin/install -m 0644 -o root -g root "$wheel" "$verified_wheel"
 printf '%s  %s\n' "$expected_sha" "$verified_wheel" \
   | /usr/bin/sha256sum --check --status
@@ -108,6 +113,7 @@ until /usr/bin/systemctl is-active --quiet kirocrew.service \
   sleep 1
 done
 
-/usr/bin/rm -f -- "$wheel" "$verified_wheel"
-/usr/bin/rmdir -- "$verified_dir"
+/usr/bin/rm -f -- "$wheel"
+cleanup_verified
+trap - 0
 printf 'Installed verified Kiro Crew wheel and restarted the gateway.\n'

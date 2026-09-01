@@ -419,8 +419,9 @@ def test_gateway_remote_installer_is_identity_scoped_and_health_checked() -> Non
     assert "mkswap" in installer
     assert "swapon" in installer
     assert 'pip install --force-reinstall --no-deps "$verified_wheel"' in installer
-    assert "/var/lib/kirocrew/staging" in installer
-    assert "mktemp -d /var/lib/kirocrew/staging/install.XXXXXXXXXX" in installer
+    assert "/var/lib/kirocrew-staging" in installer
+    assert "mktemp -d /var/lib/kirocrew-staging/install.XXXXXXXXXX" in installer
+    assert "/var/lib/kirocrew/staging" not in installer
     assert "/tmp/kirocrew-verified-" not in installer
     assert "systemctl is-active --quiet kirocrew.service" in installer
     assert "http://127.0.0.1:8443/api/health" in installer
