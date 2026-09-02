@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import cast
 
 import anyio
 import httpx2
@@ -23,7 +23,14 @@ from mcp.shared.inbound import (
     x_mcp_header_map,
 )
 from mcp.shared.message import ClientMessageMetadata, SessionMessage
-from mcp.types import JSONRPCError, JSONRPCMessage, JSONRPCRequest, jsonrpc_message_adapter
+from mcp.types import (
+    JSONRPCError,
+    JSONRPCMessage,
+    JSONRPCNotification,
+    JSONRPCRequest,
+    JSONRPCResponse,
+    jsonrpc_message_adapter,
+)
 
 from kiro_crew.mcp_gateway.remote_proxy import RemoteHttpMcpTarget
 
@@ -35,6 +42,7 @@ _HTTP_POOL_TIMEOUT_SECONDS = 10.0
 _HTTP_READ_TIMEOUT_SECONDS = 300.0
 _HTTP_MAX_REDIRECTS = 3
 _HTTP_CLIENT_MAX_HISTORY = 32
+_PENDING_METHODS_MAX = 256
 _REDIRECT_COUNT_EXTENSION = "kiro_crew.remote_mcp_redirect_count"
 _REDIRECT_STATUSES = frozenset((301, 302, 303, 307, 308))
 _CREDENTIAL_HEADER_NAMES = frozenset(("authorization", "cookie"))
@@ -70,26 +78,24 @@ class _MessageState:
     pending_methods: dict[str | int, str] = field(default_factory=dict)
     tool_headers: dict[str, Mapping[tuple[str, ...], str]] = field(default_factory=dict)
 
-    @staticmethod
-    def _data(message: JSONRPCMessage) -> dict[str, Any]:
-        return message.model_dump(by_alias=True, mode="json", exclude_none=True)
-
     def outbound_metadata(self, message: JSONRPCMessage) -> ClientMessageMetadata | None:
-        data = self._data(message)
-        method = data.get("method")
-        request_id = data.get("id")
-        if isinstance(request_id, (str, int)) and isinstance(method, str):
-            self.pending_methods[request_id] = method
+        if not isinstance(message, (JSONRPCRequest, JSONRPCNotification)):
+            return None
+        method = message.method
+        if isinstance(message, JSONRPCRequest):
+            self.pending_methods[message.id] = method
+            while len(self.pending_methods) > _PENDING_METHODS_MAX:
+                self.pending_methods.pop(next(iter(self.pending_methods)))
         if method == "initialize":
             return None
-        if not isinstance(method, str) or not self.protocol_version:
+        if not self.protocol_version:
             return None
 
         headers = {
             MCP_PROTOCOL_VERSION_HEADER: self.protocol_version,
             MCP_METHOD_HEADER: method,
         }
-        params = data.get("params")
+        params = message.params
         typed_params = params if isinstance(params, Mapping) else {}
         name_key = NAME_BEARING_METHODS.get(method)
         name = typed_params.get(name_key) if name_key is not None else None
@@ -102,14 +108,15 @@ class _MessageState:
         return ClientMessageMetadata(headers=headers)
 
     def observe_inbound(self, message: JSONRPCMessage) -> None:
-        data = self._data(message)
-        response_id = data.get("id")
-        if not isinstance(response_id, (str, int)):
+        if not isinstance(message, (JSONRPCResponse, JSONRPCError)):
             return
-        method = self.pending_methods.pop(response_id, "")
-        result = data.get("result")
-        if not isinstance(result, Mapping):
+        message_id = message.id
+        if message_id is None:
             return
+        method = self.pending_methods.pop(message_id, "")
+        if not isinstance(message, JSONRPCResponse):
+            return
+        result = message.result
         if method == "initialize":
             version = result.get("protocolVersion")
             if isinstance(version, str):

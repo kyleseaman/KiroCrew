@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 from dataclasses import dataclass
@@ -197,6 +198,9 @@ class SessionEnvironmentLifecycleProvider:
         return None
 
     async def reconcile_lifecycle(self) -> None:
+        return None
+
+    async def shutdown_lifecycle(self) -> None:
         return None
 
 
@@ -415,7 +419,7 @@ class CoderSessionEnvironmentProvider(
     async def health_for_session(self, session_key: str) -> SessionEnvironmentHealth:
         from kiro_crew.coder.client import CoderClientError
 
-        binding = self.binding_for_session(session_key)
+        binding = await asyncio.to_thread(self.binding_for_session, session_key)
         resource_name = binding.resource_name if binding is not None else ""
         try:
             workspace, memory = await self.manager.inspect_session_health(session_key)
@@ -437,6 +441,10 @@ class CoderSessionEnvironmentProvider(
             "running": "running",
             "stopped": "stopped",
         }.get(workspace.status, "unavailable")
+        if memory is not None and memory.bootstrap_status.startswith("failed:"):
+            state = "unavailable"
+        elif memory is not None and memory.bootstrap_status.startswith("running:"):
+            state = "starting"
         projected_memory = (
             SessionEnvironmentMemoryHealth(
                 available_gb=memory.available_gb,
@@ -474,9 +482,14 @@ class CoderSessionEnvironmentProvider(
         # bindings, scopes, retention intents, and exact workspace identities.
         if not isinstance(self.manager, CoderWorkspaceManager):
             return
-        await self.manager.reconcile_stop_requests()
-        await self.manager.reconcile_active_scopes()
-        await self.manager.reconcile_retention()
+        await self.manager.reconcile_lifecycle()
+
+    async def shutdown_lifecycle(self) -> None:
+        from kiro_crew.coder.manager import CoderWorkspaceManager
+
+        if not isinstance(self.manager, CoderWorkspaceManager):
+            return
+        await self.manager.wait_for_pending_stops()
 
 
 def _validate_provider(value: str) -> None:

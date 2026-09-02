@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -265,6 +266,84 @@ async def test_coder_lifecycle_rejects_catalog_shaped_manager_authority() -> Non
 
 
 @pytest.mark.asyncio
+async def test_coder_adapter_delegates_one_atomic_lifecycle_pass(monkeypatch) -> None:
+    from kiro_crew.coder.manager import CoderWorkspaceManager
+    from kiro_crew.session_environment import CoderSessionEnvironmentProvider
+
+    manager = object.__new__(CoderWorkspaceManager)
+    reconcile = AsyncMock()
+    monkeypatch.setattr(manager, "reconcile_lifecycle", reconcile)
+    provider = CoderSessionEnvironmentProvider(
+        manager=manager,
+        configurations={},
+        default_template="kirocrew-arm",
+        default_preset="",
+        remote_cwd="/home/coder/workspace",
+        coder_bin="/opt/coder",
+        coder_url="https://coder.example",
+        session_token="secret",
+        runtime_warm_minutes=5,
+    )
+
+    await provider.reconcile_lifecycle()
+
+    reconcile.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_coder_adapter_drains_pending_stops_during_shutdown(monkeypatch) -> None:
+    from kiro_crew.coder.manager import CoderWorkspaceManager
+    from kiro_crew.session_environment import CoderSessionEnvironmentProvider
+
+    manager = object.__new__(CoderWorkspaceManager)
+    drain = AsyncMock()
+    monkeypatch.setattr(manager, "wait_for_pending_stops", drain)
+    provider = CoderSessionEnvironmentProvider(
+        manager=manager,
+        configurations={},
+        default_template="kirocrew-arm",
+        default_preset="",
+        remote_cwd="/home/coder/workspace",
+        coder_bin="/opt/coder",
+        coder_url="https://coder.example",
+        session_token="secret",
+        runtime_warm_minutes=5,
+    )
+
+    await provider.shutdown_lifecycle()
+
+    drain.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_gateway_cleanup_drains_provider_lifecycle_work() -> None:
+    from aiohttp import web
+
+    from kiro_crew.dashboard.server import _register_session_environment_lifecycle
+    from kiro_crew.session_environment import SessionEnvironmentLifecycleProvider
+
+    class ProbeProvider(SessionEnvironmentLifecycleProvider):
+        def __init__(self) -> None:
+            self.shutdown = AsyncMock()
+
+        async def shutdown_lifecycle(self) -> None:
+            await self.shutdown()
+
+    provider = ProbeProvider()
+    registry = SimpleNamespace(providers=lambda: (provider,))
+    state = SimpleNamespace(
+        sessions=SimpleNamespace(environment_registry=lambda: registry),
+        _coder_lifecycle_task=asyncio.create_task(asyncio.sleep(60)),
+    )
+    app = web.Application()
+    _register_session_environment_lifecycle(app, state)
+
+    await app.on_cleanup[-1](app)
+
+    provider.shutdown.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
 async def test_coder_adapter_projects_provider_neutral_memory_health() -> None:
     from kiro_crew.coder.client import CoderWorkspace, CoderWorkspaceMemory
     from kiro_crew.session_environment import CoderSessionEnvironmentProvider
@@ -314,6 +393,47 @@ async def test_coder_adapter_projects_provider_neutral_memory_health() -> None:
         },
     }
     manager.inspect_session_health.assert_awaited_once_with("dashboard:chat-1")
+
+
+@pytest.mark.asyncio
+async def test_coder_adapter_projects_failed_bootstrap_as_unavailable() -> None:
+    from kiro_crew.coder.client import CoderWorkspace, CoderWorkspaceMemory
+    from kiro_crew.session_environment import CoderSessionEnvironmentProvider
+
+    manager = MagicMock()
+    manager.registry.get_by_session.return_value = SimpleNamespace(
+        workspace_name="crew-session-kyle-opaque",
+        workspace_uuid="workspace-uuid",
+        state="running",
+    )
+    manager.inspect_session_health = AsyncMock(
+        return_value=(
+            CoderWorkspace(
+                uuid="workspace-uuid",
+                name="crew-session-kyle-opaque",
+                owner="owner-uuid",
+                template="kirocrew-arm",
+                status="running",
+                last_used_at="2026-09-01T12:00:00Z",
+            ),
+            CoderWorkspaceMemory(2.0, 8.0, 75.0, "normal", "failed:kiro-cli"),
+        )
+    )
+    provider = CoderSessionEnvironmentProvider(
+        manager=manager,
+        configurations={},
+        default_template="kirocrew-arm",
+        default_preset="",
+        remote_cwd="/home/coder/workspace",
+        coder_bin="/opt/coder",
+        coder_url="https://coder.example",
+        session_token="secret",
+        runtime_warm_minutes=5,
+    )
+
+    health = await provider.health_for_session("dashboard:chat-1")
+
+    assert health.state == "unavailable"
 
 
 def test_health_capability_is_positive_opt_in() -> None:

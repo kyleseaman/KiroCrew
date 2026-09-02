@@ -2896,7 +2896,7 @@ class _ChatSlot:
         # Debounced speculative session-creation task (session.eager_spawn).
         # At most one per slot: scheduling a new one cancels the previous, so
         # rapid signals (create + project set) collapse into a single spawn.
-        self._eager_spawn_task: asyncio.Task[None] | None = None
+        self._eager_spawn_task: asyncio.Task[bool] | asyncio.Task[None] | None = None
         # Unclaimed-prefetch teardown timer (resume prefetch). At most one per
         # slot: a newer resumed prefetch cancels the previous timer.
         self._prefetch_ttl_task: asyncio.Task[None] | None = None

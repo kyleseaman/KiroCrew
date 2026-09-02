@@ -3493,9 +3493,47 @@ async def _cap_armed_prefetches(sessions: Any, new_key: str) -> None:
             logger.warning("Resume prefetch: eviction failed for %s", oldest, exc_info=True)
 
 
+async def _schedule_eager_spawn_async(
+    state: "DashboardState",
+    slot: "_ChatSlot",
+    *,
+    allow_resume: bool,
+) -> bool:
+    environment_prefetch = False
+    try:
+        cfg = await asyncio.to_thread(KiroCrewConfig.load)
+        if not cfg.session.eager_spawn:
+            return False
+        registry_getter = getattr(state.sessions, "environment_registry", None)
+        registry = registry_getter() if callable(registry_getter) else None
+        if slot.environment is not None and not isinstance(registry, SessionEnvironmentRegistry):
+            return False
+        if isinstance(registry, SessionEnvironmentRegistry) and registry.providers():
+            selection = slot.environment.selection if slot.environment is not None else None
+            supported = await asyncio.to_thread(
+                registry.supports_prefetch,
+                effective_session_key(slot),
+                selection,
+            )
+            if not supported:
+                return False
+            environment_prefetch = True
+        await _eager_spawn(
+            state,
+            slot,
+            allow_resume=allow_resume,
+            environment_prefetch=environment_prefetch,
+        )
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
+
+
 def schedule_eager_spawn(
     state: "DashboardState", slot: "_ChatSlot", *, allow_resume: bool = False
-) -> "asyncio.Task | None":
+) -> "asyncio.Task[bool] | asyncio.Task[None] | None":
     """Speculatively create *slot*'s session ahead of its first message.
 
     Fire-and-forget: called from the slot-create and project-set handlers so
@@ -3513,6 +3551,30 @@ def schedule_eager_spawn(
     intent signals keep the refusal — slot create has no mapping, and the
     agent/project switch handlers reset the session themselves.
     """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # Synchronous callers exist in CLI-focused tests and utility code. The
+        # dashboard path always has a running loop and uses the off-thread gate.
+        pass
+    else:
+        prev = getattr(slot, "_eager_spawn_task", None)
+        if prev is not None and not prev.done():
+            prev.cancel()
+        task = asyncio.create_task(
+            _schedule_eager_spawn_async(state, slot, allow_resume=allow_resume)
+        )
+        slot._eager_spawn_task = task
+
+        def clear_noop(completed: asyncio.Task[bool]) -> None:
+            if completed.cancelled() or completed.exception() is not None:
+                return
+            if not completed.result() and slot._eager_spawn_task is completed:
+                slot._eager_spawn_task = None
+
+        task.add_done_callback(clear_noop)
+        return task
+
     environment_prefetch = False
     try:
         cfg = KiroCrewConfig.load()
@@ -3536,7 +3598,7 @@ def schedule_eager_spawn(
     prev = getattr(slot, "_eager_spawn_task", None)
     if prev is not None and not prev.done():
         prev.cancel()
-    task = asyncio.create_task(
+    spawn_task = asyncio.create_task(
         _eager_spawn(
             state,
             slot,
@@ -3544,8 +3606,8 @@ def schedule_eager_spawn(
             environment_prefetch=environment_prefetch,
         )
     )
-    slot._eager_spawn_task = task
-    return task
+    slot._eager_spawn_task = spawn_task
+    return spawn_task
 
 
 async def _recover_app_agent_binding(
@@ -3669,7 +3731,7 @@ async def _eager_spawn(
             agent_model = ""
             resolved_ok = False
             try:
-                cfg = KiroCrewConfig.load()
+                cfg = await asyncio.to_thread(KiroCrewConfig.load)
                 bindings = resolve_agent_bindings(cfg, slot.agent or None)
                 kiro_agent = bindings.kiro_agent
                 crew_alias = bindings.resolved_alias
@@ -4966,6 +5028,12 @@ async def _run_chat(
     # tool_call_id -> DISPLAY TITLE (LLM-authored prose for shell tools; used
     # only for PostToolUse hook name-matching — NOT trustworthy for security).
     _pending_tools: dict[str, str] = {}
+    # tool_call_id -> last raw cumulative PARTIAL output. Some ACP transports
+    # repeat the same partial frame while waiting for the terminal update. Drop
+    # only byte-identical non-terminal repeats before the expensive redaction
+    # pass and UI broadcast; every changed partial and every final frame still
+    # streams. Comparing raw text is safe because it never leaves this process.
+    _last_partial_tool_output: dict[str, str] = {}
     # tool_call_id -> canonical directive-tool name (forgery gate). Written
     # ONLY at EVENT_TOOL_CALL, ONLY from the out-of-band _meta.kiro identity
     # (event.tool_name + event.mcp_server_name), never from the title. This is
@@ -6480,6 +6548,13 @@ async def _run_chat(
                         exc_info=True,
                     )
             elif event.kind == EVENT_TOOL_RESULT:
+                if event.tool_call_id and not event.tool_final:
+                    _raw_partial = event.tool_output or ""
+                    if _last_partial_tool_output.get(event.tool_call_id) == _raw_partial:
+                        continue
+                    _last_partial_tool_output[event.tool_call_id] = _raw_partial
+                elif event.tool_call_id:
+                    _last_partial_tool_output.pop(event.tool_call_id, None)
                 _out = _redact_tool_field(event.tool_output)
                 # Redact the join key once for the WS broadcast and the
                 # message-meta comparison below. `_tool_meta` stores the

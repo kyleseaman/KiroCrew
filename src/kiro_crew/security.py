@@ -4830,7 +4830,8 @@ _SENSITIVE_HOME_DIRS: list[str] = [
 #                                 form (operator edits it out-of-band via the
 #                                 dashboard ``/api/security/…`` endpoints)
 #   coder_workspaces.json/.lock   destructive Coder ownership targets; a
-#                                 writable UUID could redirect stop/delete
+#   coder_workspaces.json.corrupt writable UUID could redirect stop/delete;
+#                                 quarantined originals carry the same records
 #   oauth_endpoints.json          operator OAuth consent-endpoint extension —
 #                                 each entry widens the banner-only OAuth
 #                                 entropy carve-out, so a writable file would
@@ -4941,6 +4942,7 @@ _CREW_SECRET_LEAVES: list[str] = [
     "denied_commands.json",
     "coder_workspaces.json",
     "coder_workspaces.lock",
+    "coder_workspaces.json.corrupt",
     # The cron store. It holds access-control state, not just scheduling data:
     # ``session_key`` decides which session may manage a job through the MCP cron
     # tools and where the job's output is delivered, ``approval_mode`` is a

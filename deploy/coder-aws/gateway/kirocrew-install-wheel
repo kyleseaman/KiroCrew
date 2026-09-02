@@ -57,12 +57,20 @@ printf '%s  %s\n' "$expected_sha" "$verified_wheel" \
 /usr/sbin/runuser -u coder -- env \
   HOME=/home/coder USER=coder LOGNAME=coder \
   /usr/bin/python3.11 -m venv /home/coder/kirocrew-venv
-/usr/sbin/runuser -u coder -- env \
+if /usr/sbin/runuser -u coder -- env \
   HOME=/home/coder USER=coder LOGNAME=coder \
-  /home/coder/kirocrew-venv/bin/pip install --upgrade "$verified_wheel"
-/usr/sbin/runuser -u coder -- env \
-  HOME=/home/coder USER=coder LOGNAME=coder \
-  /home/coder/kirocrew-venv/bin/pip install --force-reinstall --no-deps "$verified_wheel"
+  /home/coder/kirocrew-venv/bin/python -c 'import kiro_crew' >/dev/null 2>&1; then
+  # Routine wheel updates replace only Kiro Crew. Dependency resolution belongs
+  # to first install (or a deliberately rebuilt image), keeping deploy latency
+  # deterministic and avoiding an unnecessary package-index round trip.
+  /usr/sbin/runuser -u coder -- env \
+    HOME=/home/coder USER=coder LOGNAME=coder \
+    /home/coder/kirocrew-venv/bin/pip install --force-reinstall --no-deps "$verified_wheel"
+else
+  /usr/sbin/runuser -u coder -- env \
+    HOME=/home/coder USER=coder LOGNAME=coder \
+    /home/coder/kirocrew-venv/bin/pip install "$verified_wheel"
+fi
 /usr/sbin/runuser -u coder -- env \
   HOME=/home/coder USER=coder LOGNAME=coder \
   /bin/sh -c 'cd /home/coder && exec /home/coder/kirocrew-venv/bin/kirocrew setup --agent-only'

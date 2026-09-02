@@ -161,6 +161,16 @@ fallback. Configured headers are injected only at the exact modern resource URL
 redirects are refused, and actual redirect chains are capped at three. Relay
 JSON lines and non-streaming response bodies are capped at 8 MiB.
 
+One `httpx` client remains open for the lifetime of each relay connection, so
+Streamable HTTP calls reuse its keep-alive pool rather than paying a TLS
+handshake per MCP request. The relay derives request metadata directly from the
+SDK's typed JSON-RPC request/notification objects instead of serializing the
+whole message a second time. Its request-id-to-method correlation map is capped
+at 256 entries and evicts the oldest unresolved entry, bounding a malformed or
+silent server. Dashboard tool streaming still redacts every changed cumulative
+frame; byte-identical non-final transport repeats are dropped before redaction
+and broadcast, while every final frame remains observable.
+
 For URL entries without a configured `Authorization` header, the gateway also
 owns the SDK OAuth provider. One provider per canonical resource URL and client
 identity serializes discovery, dynamic registration, authorization, and refresh
@@ -169,10 +179,16 @@ encrypted in `SecretVault`; vault names contain only a versioned SHA-256 identit
 digest. Authorization attempts are one-shot, bounded, and completed through the
 fixed `/api/mcp/oauth/callback` route. Its origin comes only from the configured
 HTTPS dashboard URL, the startup-validated Tailscale host, or exact loopback --
-never from request `Host`. The callback's high-entropy state authenticates its
+never from request `Host`; an explicit non-default port in the configured
+dashboard origin is preserved. The callback's high-entropy state authenticates its
 GET, while normal Host validation remains active. A successful callback returns
 a cache-forbidden completion page and never renders the code, state, token, or
 provider response.
+
+The MCP SDK and HTTP transport packages are core runtime dependencies because
+URL-based MCP is a supported session capability, not an optional dashboard
+extra. Keeping them in the base installation avoids a configuration that saves
+successfully and then fails only when the first remote workspace connects.
 
 OAuth prompts and terminal outcomes reuse the dashboard's existing MCP OAuth
 banner and route to the visible parent slot for dashboard, linked channel, cron,

@@ -32,6 +32,7 @@ class _FakeClient:
         self.memory_probes: list[str] = []
         self.get_calls = 0
         self.list_calls = 0
+        self.lifecycle_events: list[str] = []
 
     async def current_user(self) -> tuple[str, str]:
         self.current_user_calls += 1
@@ -70,6 +71,7 @@ class _FakeClient:
         return running
 
     async def stop_workspace(self, name: str) -> CoderWorkspace:
+        self.lifecycle_events.append(f"stop:{name}")
         self.stopped.append(name)
         current = self.workspaces[name]
         stopped = CoderWorkspace(**{**current.__dict__, "status": "stopped"})
@@ -83,6 +85,7 @@ class _FakeClient:
         return name in self.active_scopes
 
     async def extend_workspace_deadline(self, name: str, minutes: int) -> None:
+        self.lifecycle_events.append(f"renew:{name}")
         self.extended.append((name, minutes))
 
     async def workspace_memory(self, name: str) -> CoderWorkspaceMemory:
@@ -432,6 +435,79 @@ async def test_lifecycle_continues_after_one_stop_request_fails(tmp_path: Path) 
     assert stopped == (second.name,)
     assert manager.registry.get_by_session("dashboard:one").state == "stop_pending"
     assert manager.registry.get_by_session("dashboard:two").state == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_pass_renews_before_stops_with_one_workspace_inventory(
+    tmp_path: Path,
+) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    active = await manager.ensure_ready("dashboard:active")
+    pending = await manager.ensure_ready("dashboard:pending")
+    client.active_scopes.add(active.name)
+    binding = manager.registry.get_by_session("dashboard:pending")
+    assert binding is not None
+    manager.registry.replace(replace(binding, state="stop_pending"))
+    client.list_calls = 0
+    client.get_calls = 0
+    client.lifecycle_events.clear()
+
+    await manager.reconcile_lifecycle(now="2026-08-25T13:00:00Z")
+
+    assert client.list_calls == 1
+    assert client.get_calls == 0
+    assert client.lifecycle_events == [f"renew:{active.name}", f"stop:{pending.name}"]
+
+
+@pytest.mark.asyncio
+async def test_stale_lifecycle_inventory_cannot_settle_a_new_stop_request(tmp_path: Path) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    workspace = await manager.ensure_ready("dashboard:one")
+    binding = manager.registry.get_by_session("dashboard:one")
+    assert binding is not None
+    manager.registry.replace(replace(binding, state="stop_pending"))
+    pending = manager.registry.get_by_session("dashboard:one")
+    assert pending is not None
+
+    stopped = await manager.reconcile_stop_requests(
+        workspace_inventory={},
+        bindings=(pending,),
+    )
+
+    assert stopped == ()
+    assert client.stopped == []
+    assert manager.registry.get_by_session("dashboard:one").state == "stop_pending"
+    assert workspace.name in client.workspaces
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_checks_independent_workspaces_concurrently(tmp_path: Path) -> None:
+    client = _FakeClient()
+    manager = _manager(tmp_path, client)
+    first = await manager.ensure_ready("dashboard:first")
+    second = await manager.ensure_ready("dashboard:second")
+    entered: set[str] = set()
+    both_entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_scope_check(name: str) -> bool:
+        entered.add(name)
+        if len(entered) == 2:
+            both_entered.set()
+        await release.wait()
+        return False
+
+    client.has_active_workload_scope = blocked_scope_check  # type: ignore[method-assign]
+    task = asyncio.create_task(manager.reconcile_lifecycle())
+    try:
+        await asyncio.wait_for(both_entered.wait(), timeout=0.5)
+    finally:
+        release.set()
+    await task
+
+    assert entered == {first.name, second.name}
 
 
 @pytest.mark.asyncio

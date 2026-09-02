@@ -10,8 +10,10 @@ from urllib.parse import urlsplit
 
 import pytest
 from aiohttp import web
+from mcp.shared.inbound import MCP_METHOD_HEADER
+from mcp.types import JSONRPCRequest
 
-from kiro_crew.mcp_gateway.remote_http import GatewayMcpHttpAdapter
+from kiro_crew.mcp_gateway.remote_http import GatewayMcpHttpAdapter, _MessageState
 from kiro_crew.mcp_gateway.remote_proxy import (
     RemoteHttpMcpTarget,
     RemoteMcpProxy,
@@ -152,6 +154,38 @@ async def test_http_adapter_rejects_oversized_or_malformed_relay_lines() -> None
 
 def test_http_adapter_has_bounded_public_failure_codes() -> None:
     assert GatewayMcpHttpAdapter.transport_error_code == "remote_mcp_transport_failed"
+
+
+def test_message_state_reads_typed_rpc_without_serializing(monkeypatch) -> None:
+    request = JSONRPCRequest(jsonrpc="2.0", id=1, method="tools/list", params={})
+
+    def refuse_dump(*_args, **_kwargs):
+        raise AssertionError("routing metadata must not serialize the whole message")
+
+    monkeypatch.setattr(JSONRPCRequest, "model_dump", refuse_dump)
+
+    metadata = _MessageState(protocol_version="2026-07-28").outbound_metadata(request)
+
+    assert metadata is not None
+    assert metadata.headers[MCP_METHOD_HEADER] == "tools/list"
+
+
+def test_message_state_bounds_unanswered_request_tracking() -> None:
+    state = _MessageState(protocol_version="2026-07-28")
+
+    for request_id in range(300):
+        state.outbound_metadata(
+            JSONRPCRequest(
+                jsonrpc="2.0",
+                id=request_id,
+                method="tools/list",
+                params={},
+            )
+        )
+
+    assert len(state.pending_methods) == 256
+    assert 0 not in state.pending_methods
+    assert 299 in state.pending_methods
 
 
 @pytest.mark.asyncio

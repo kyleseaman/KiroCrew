@@ -32,17 +32,20 @@ EOF
 cat > /usr/local/libexec/kirocrew-tailscale-up <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-TAILSCALE_KEY="$(aws ssm get-parameter \
+TAILSCALE_KEY_FILE="$(mktemp /run/tailscale-auth.XXXXXXXXXX)"
+trap 'rm -f "$TAILSCALE_KEY_FILE"' EXIT
+aws ssm get-parameter \
   --region "${region}" \
   --name "${tailscale_auth_parameter}" \
   --with-decryption \
   --query Parameter.Value \
-  --output text)"
+  --output text > "$TAILSCALE_KEY_FILE"
 tailscale up \
-  --auth-key="$TAILSCALE_KEY" \
+  --auth-key="file:$TAILSCALE_KEY_FILE" \
   --hostname="${tailscale_workspace_hostname}" \
   --accept-dns=true
-unset TAILSCALE_KEY
+rm -f "$TAILSCALE_KEY_FILE"
+trap - EXIT
 EOF
 chmod 700 /usr/local/libexec/kirocrew-tailscale-up
 

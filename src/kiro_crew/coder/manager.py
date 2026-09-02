@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
@@ -26,6 +26,8 @@ from kiro_crew.session_environment import SessionEnvironmentPrefetchUnavailable
 logger = logging.getLogger(__name__)
 
 WorkspaceProgressCallback = Callable[[str, str], None]
+_LIFECYCLE_MAX_CONCURRENCY = 4
+_LIFECYCLE_OPERATION_TIMEOUT_SECONDS = 30.0
 
 
 class CoderWorkspaceIdentityError(CoderClientError):
@@ -261,7 +263,12 @@ class CoderWorkspaceManager:
         async with self._capacity_lock:
             self._starting_names.discard(requested_name)
 
-    async def stop_for_session(self, session_key: str) -> str | None:
+    async def stop_for_session(
+        self,
+        session_key: str,
+        *,
+        workspace_inventory: Mapping[str, CoderWorkspace] | None = None,
+    ) -> str | None:
         """Stop the exact registry-owned workspace bound to a parent session."""
         snapshot = await asyncio.to_thread(self.registry.get_by_session, session_key)
         if snapshot is None or not snapshot.workspace_uuid or snapshot.state == "deleted":
@@ -270,8 +277,18 @@ class CoderWorkspaceManager:
             binding = await asyncio.to_thread(self.registry.get, snapshot.binding_id)
             if binding is None or not binding.workspace_uuid or binding.state == "deleted":
                 return None
-            workspace = await self.client.get_workspace(binding.workspace_name)
+            workspace = (
+                workspace_inventory.get(binding.workspace_name)
+                if workspace_inventory is not None
+                else await self.client.get_workspace(binding.workspace_name)
+            )
             if workspace is None:
+                # A shared inventory is a point-in-time view. A workspace and
+                # stop intent created after that list call may be absent even
+                # though the resource exists, so leave the durable intent for
+                # the next pass instead of falsely settling it as stopped.
+                if workspace_inventory is not None:
+                    return None
                 await asyncio.to_thread(
                     self.registry.replace,
                     replace(binding, state="stopped"),
@@ -340,20 +357,52 @@ class CoderWorkspaceManager:
         if tasks:
             await asyncio.gather(*tasks)
 
-    async def reconcile_stop_requests(self) -> tuple[str, ...]:
-        """Retry durable stop intents left by archive or an earlier outage."""
-        stopped: list[str] = []
-        for binding in await asyncio.to_thread(self.registry.list_bindings):
-            if binding.state != "stop_pending":
-                continue
+    async def _run_lifecycle_operations(
+        self,
+        bindings: Sequence[WorkspaceBinding],
+        operation: Callable[[WorkspaceBinding], Awaitable[str | None]],
+        *,
+        failure_message: str,
+    ) -> tuple[str, ...]:
+        semaphore = asyncio.Semaphore(_LIFECYCLE_MAX_CONCURRENCY)
+
+        async def run(binding: WorkspaceBinding) -> str | None:
             try:
-                workspace = await self.stop_for_session(binding.session_key)
+                async with semaphore:
+                    return await asyncio.wait_for(
+                        operation(binding),
+                        timeout=_LIFECYCLE_OPERATION_TIMEOUT_SECONDS,
+                    )
             except Exception:
-                logger.warning("Managed Coder workspace stop retry failed", exc_info=True)
-                continue
-            if workspace is not None:
-                stopped.append(workspace)
-        return tuple(stopped)
+                logger.warning(failure_message, exc_info=True)
+                return None
+
+        results = await asyncio.gather(*(run(binding) for binding in bindings))
+        return tuple(result for result in results if result is not None)
+
+    async def reconcile_stop_requests(
+        self,
+        *,
+        workspace_inventory: Mapping[str, CoderWorkspace] | None = None,
+        bindings: Sequence[WorkspaceBinding] | None = None,
+    ) -> tuple[str, ...]:
+        """Retry durable stop intents left by archive or an earlier outage."""
+        if bindings is None:
+            bindings = await asyncio.to_thread(self.registry.list_bindings)
+
+        async def stop(binding: WorkspaceBinding) -> str | None:
+            if binding.state != "stop_pending":
+                return None
+            return await self.stop_for_session(
+                binding.session_key,
+                workspace_inventory=workspace_inventory,
+            )
+
+        return await self._run_lifecycle_operations(
+            bindings,
+            stop,
+            failure_message="Managed Coder workspace stop retry failed",
+        )
 
     async def inspect_session_health(
         self, session_key: str
@@ -390,21 +439,31 @@ class CoderWorkspaceManager:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
 
-    async def reconcile_retention(self, *, now: str | None = None) -> tuple[str, ...]:
+    async def reconcile_retention(
+        self,
+        *,
+        now: str | None = None,
+        workspace_inventory: Mapping[str, CoderWorkspace] | None = None,
+        bindings: Sequence[WorkspaceBinding] | None = None,
+    ) -> tuple[str, ...]:
         """Delete only exact, stopped, registry-owned workspaces past retention."""
         now_dt = self._parse_time(now) if now else datetime.now(timezone.utc)
-        deleted: list[str] = []
-        workspaces = {
-            workspace.name: workspace for workspace in await self.client.list_workspaces()
-        }
-        for snapshot in await asyncio.to_thread(self.registry.list_bindings):
+        workspaces = (
+            dict(workspace_inventory)
+            if workspace_inventory is not None
+            else {workspace.name: workspace for workspace in await self.client.list_workspaces()}
+        )
+        if bindings is None:
+            bindings = await asyncio.to_thread(self.registry.list_bindings)
+
+        async def delete_if_due(snapshot: WorkspaceBinding) -> str | None:
             async with self._lock_for(snapshot.session_key):
                 binding = await asyncio.to_thread(self.registry.get, snapshot.binding_id)
                 if binding is None or not binding.workspace_uuid or binding.state == "deleted":
-                    continue
+                    return None
                 workspace = workspaces.get(binding.workspace_name)
                 if workspace is None or workspace.status != "stopped":
-                    continue
+                    return None
                 self._verify_destructive_identity(binding, workspace)
                 activity = max(
                     self._parse_time(binding.last_activity_at),
@@ -423,14 +482,14 @@ class CoderWorkspaceManager:
                                 deletion_due_at=due_text,
                             ),
                         )
-                    continue
+                    return None
                 pending = await asyncio.to_thread(
                     self.registry.replace,
                     replace(binding, state="delete_pending", deletion_due_at=due_text),
                 )
                 current = workspaces.get(pending.workspace_name)
                 if current is None or current.status != "stopped":
-                    continue
+                    return None
                 self._verify_destructive_identity(pending, current)
                 await self.client.delete_workspace(pending.workspace_name)
                 deleted_at = now_dt.isoformat().replace("+00:00", "Z")
@@ -438,31 +497,46 @@ class CoderWorkspaceManager:
                     self.registry.replace,
                     replace(pending, state="deleted", deleted_at=deleted_at),
                 )
-                deleted.append(pending.workspace_name)
-        return tuple(deleted)
+                return pending.workspace_name
+
+        return await self._run_lifecycle_operations(
+            bindings,
+            delete_if_due,
+            failure_message="Managed Coder workspace retention reconciliation failed",
+        )
 
     @property
     def scope_reconcile_interval_seconds(self) -> int:
         """Heartbeat often enough to retain two thirds of the autostop margin."""
         return max(60, self.policy.stop_after_minutes * 60 // 3)
 
-    async def reconcile_active_scopes(self, *, now: str | None = None) -> tuple[str, ...]:
+    async def reconcile_active_scopes(
+        self,
+        *,
+        now: str | None = None,
+        workspace_inventory: Mapping[str, CoderWorkspace] | None = None,
+        bindings: Sequence[WorkspaceBinding] | None = None,
+    ) -> tuple[str, ...]:
         """Renew Coder only while an exact managed systemd workload scope is active."""
         now_dt = self._parse_time(now) if now else datetime.now(timezone.utc)
         activity = now_dt.isoformat().replace("+00:00", "Z")
-        renewed: list[str] = []
-        workspaces = {
-            workspace.name: workspace for workspace in await self.client.list_workspaces()
-        }
-        for binding in await asyncio.to_thread(self.registry.list_bindings):
+        workspaces = (
+            dict(workspace_inventory)
+            if workspace_inventory is not None
+            else {workspace.name: workspace for workspace in await self.client.list_workspaces()}
+        )
+        if bindings is None:
+            bindings = await asyncio.to_thread(self.registry.list_bindings)
+
+        async def renew_if_active(binding: WorkspaceBinding) -> str | None:
             if not binding.workspace_uuid or binding.state != "running":
-                continue
+                return None
             workspace = workspaces.get(binding.workspace_name)
             if workspace is None or workspace.status != "running":
-                continue
+                return None
             self._verify_destructive_identity(binding, workspace)
             if not await self.client.has_active_workload_scope(workspace.name):
-                continue
+                return None
             await self.client.extend_workspace_deadline(
                 workspace.name,
                 self.policy.stop_after_minutes,
@@ -471,8 +545,32 @@ class CoderWorkspaceManager:
                 self.registry.replace,
                 replace(binding, state="running", last_activity_at=activity),
             )
-            renewed.append(workspace.name)
-        return tuple(renewed)
+            return workspace.name
+
+        return await self._run_lifecycle_operations(
+            bindings,
+            renew_if_active,
+            failure_message="Managed Coder workspace activity reconciliation failed",
+        )
+
+    async def reconcile_lifecycle(self, *, now: str | None = None) -> None:
+        """Reconcile one inventory snapshot, renewing active work before cleanup."""
+        inventory = {workspace.name: workspace for workspace in await self.client.list_workspaces()}
+        bindings = await asyncio.to_thread(self.registry.list_bindings)
+        await self.reconcile_active_scopes(
+            now=now,
+            workspace_inventory=inventory,
+            bindings=bindings,
+        )
+        await self.reconcile_stop_requests(
+            workspace_inventory=inventory,
+            bindings=bindings,
+        )
+        await self.reconcile_retention(
+            now=now,
+            workspace_inventory=inventory,
+            bindings=bindings,
+        )
 
     @staticmethod
     def _verify_destructive_identity(binding: WorkspaceBinding, workspace: CoderWorkspace) -> None:

@@ -58,6 +58,13 @@ permanent dead device. Each later start rejoins with a fresh node identity. Do
 not reuse the non-ephemeral control/gateway key here, and do not bind automation
 to a session node's Tailscale IP.
 
+Create that key with `tag:kirocrew-session`; the control and gateway key uses
+`tag:kirocrew-control`. The remote-host guide includes a policy that lets the
+session-tagged Coder agent reach control HTTPS without granting session nodes
+SSH or general tailnet access. Bootstrap stages the key in a root-only temporary
+file and deletes it after `tailscale up`, so it does not appear in process
+arguments.
+
 Coder does not rerun cloud-init on an existing EC2 instance when a newer
 template version changes `user_data`. To test bootstrap changes, stop and delete
 the disposable session workspace, then create a new session so Coder provisions

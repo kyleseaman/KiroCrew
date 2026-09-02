@@ -75,6 +75,16 @@ describe('CoderPanel', () => {
     expect(screen.getByTestId('coder-logo')).toHaveAttribute('aria-hidden', 'true')
   })
 
+  it('renders safely when an older gateway response omits client-side limits', async () => {
+    const data = snapshot()
+    delete (data as Partial<CoderConfigData>).limits
+
+    await renderPanel(data)
+
+    expect(screen.getByRole('button', { name: 'Add profile' })).toBeEnabled()
+    expect(screen.getByLabelText('Workspace name prefix')).not.toHaveAttribute('maxlength')
+  })
+
   it('keeps the Coder brand mark visible when configuration fails', async () => {
     vi.mocked(api.getCoderConfig).mockRejectedValue(new Error('unavailable'))
 

@@ -52,6 +52,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         (
             ("setup", "Install agent config and run the setup wizard"),
             ("config", "Get or set configuration values"),
+            ("environment", "Inspect or repair managed session environments"),
             ("sandbox", "Manage the AppArmor profile the agent sandbox needs (Linux)"),
             ("manifest", "Generate a Slack app manifest with your alias"),
         ),

@@ -66,6 +66,14 @@ def test_control_plane_limits_ec2_mutations_to_coder_managed_resources() -> None
     assert re.search(r'KiroCrewManaged\s*=\s*"true"', _read("gateway/main.tf"))
 
 
+def test_secret_readers_decrypt_only_parameter_store_ciphertexts() -> None:
+    terraform = _read("control-plane/main.tf")
+
+    assert terraform.count('Action   = ["kms:Decrypt"]') == 4
+    assert terraform.count('"kms:ViaService" = "ssm.${var.region}.amazonaws.com"') == 4
+    assert terraform.count('"kms:EncryptionContext:PARAMETER_ARN"') == 4
+
+
 def test_workspace_is_persistent_arm_compute_with_bounded_choices() -> None:
     terraform = _read("workspace/main.tf")
 
@@ -131,6 +139,18 @@ def test_session_workspace_uses_ephemeral_tailnet_identity_on_every_boot() -> No
     )[0]
     assert "default" not in session_variable
     assert "var.tailscale_session_auth_parameter" in control
+
+
+def test_bootstraps_keep_tailscale_auth_keys_out_of_process_arguments() -> None:
+    for relative in (
+        "control-plane/cloud-init.sh.tftpl",
+        "gateway/cloud-init.sh.tftpl",
+        "workspace/cloud-init.sh.tftpl",
+    ):
+        bootstrap = _read(relative)
+        assert "mktemp /run/tailscale-auth." in bootstrap
+        assert '--auth-key="file:$TAILSCALE_KEY_FILE"' in bootstrap
+        assert 'TAILSCALE_KEY="$(' not in bootstrap
 
 
 def test_gateway_is_a_dedicated_persistent_coder_workspace() -> None:
@@ -418,7 +438,9 @@ def test_gateway_remote_installer_is_identity_scoped_and_health_checked() -> Non
     assert "/var/lib/kirocrew/swapfile" in installer
     assert "mkswap" in installer
     assert "swapon" in installer
+    assert "-c 'import kiro_crew'" in installer
     assert 'pip install --force-reinstall --no-deps "$verified_wheel"' in installer
+    assert 'pip install --upgrade "$verified_wheel"' not in installer
     assert "/var/lib/kirocrew-staging" in installer
     assert "mktemp -d /var/lib/kirocrew-staging/install.XXXXXXXXXX" in installer
     assert "/var/lib/kirocrew/staging" not in installer

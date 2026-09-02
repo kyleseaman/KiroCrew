@@ -27,6 +27,7 @@ _MEMORY_ELEVATED_PERCENT = 80.0
 _MEMORY_CRITICAL_PERCENT = 90.0
 _BYTES_PER_GIB = 1024**3
 _MEMORY_BYTES_MAX = 1 << 60
+_BOOTSTRAP_STATUS_RE = re.compile(r"^(?:complete|(?:running|failed):[a-z0-9-]{1,64})$")
 _WORKSPACE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _CODER_DEADLINE_EXTENSION_MINUTES_MIN = 30
 logger = logging.getLogger(__name__)
@@ -65,7 +66,18 @@ for limit_path, current_path in (
     available = min(available, max(0, limit - current))
     break
 
-print(json.dumps({"available_bytes": min(available, total), "total_bytes": total}, separators=(",", ":")))
+try:
+    bootstrap_status = Path("/var/lib/kirocrew/bootstrap-status").read_text(
+        encoding="utf-8"
+    ).strip()
+except OSError:
+    bootstrap_status = ""
+
+print(json.dumps({
+    "available_bytes": min(available, total),
+    "total_bytes": total,
+    "bootstrap_status": bootstrap_status,
+}, separators=(",", ":")))
 """.strip()
 
 
@@ -89,6 +101,7 @@ class CoderWorkspaceMemory:
     total_gb: float
     used_percent: float
     pressure: str
+    bootstrap_status: str = ""
 
 
 Runner = Callable[[list[str], dict[str, str], Path], Awaitable[bytes]]
@@ -405,6 +418,7 @@ class CoderClient:
             raise CoderClientError("Coder workspace health probe returned an invalid shape")
         available = raw.get("available_bytes")
         total = raw.get("total_bytes")
+        bootstrap_status = raw.get("bootstrap_status", "")
         if (
             not isinstance(available, int)
             or isinstance(available, bool)
@@ -414,6 +428,8 @@ class CoderClient:
             or total > _MEMORY_BYTES_MAX
             or available < 0
             or available > total
+            or not isinstance(bootstrap_status, str)
+            or bool(bootstrap_status and not _BOOTSTRAP_STATUS_RE.fullmatch(bootstrap_status))
         ):
             raise CoderClientError("Coder workspace health probe returned invalid memory data")
         used_percent = (total - available) / total * 100
@@ -428,6 +444,7 @@ class CoderClient:
             total_gb=round(total / _BYTES_PER_GIB, 2),
             used_percent=round(used_percent, 1),
             pressure=pressure,
+            bootstrap_status=bootstrap_status,
         )
 
     async def extend_workspace_deadline(self, name: str, minutes: int) -> None:

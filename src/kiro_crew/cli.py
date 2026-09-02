@@ -144,6 +144,30 @@ def _refuse_unjailed(command: str, reason: str) -> NoReturn:
     sys.exit(2)
 
 
+def _environment_cmd(args: argparse.Namespace) -> int:
+    """Run explicit, fail-closed maintenance for managed environments."""
+    if getattr(args, "environment_action", "") != "repair":
+        print("Choose an environment action. See `kirocrew environment -h`.", file=sys.stderr)
+        return 2
+    if not getattr(args, "yes", False):
+        print(
+            "Refusing to replace the Coder ownership registry without --yes.",
+            file=sys.stderr,
+        )
+        return 2
+
+    from kiro_crew.coder.registry import WorkspaceBindingRegistry
+
+    registry = WorkspaceBindingRegistry(config_dir() / "coder_workspaces.json")
+    quarantined = registry.quarantine_corrupt()
+    if quarantined is None:
+        print("Coder workspace registry is healthy; no repair was needed.")
+    else:
+        print(f"Quarantined corrupt Coder workspace registry at {quarantined}")
+        print("Existing Coder workspaces were not adopted, stopped, or deleted.")
+    return 0
+
+
 def _jail_reexec_gate(command: str, no_jail_flag: bool) -> None:
     """Give the active edition a chance to re-exec into a process-isolation jail.
 
@@ -2192,6 +2216,18 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
     )
     cfg_sub.add_parser("edit", help="Open config in $EDITOR")
 
+    environment_parser = cli_help.add_command(sub, "environment")
+    environment_sub = environment_parser.add_subparsers(dest="environment_action")
+    environment_repair = environment_sub.add_parser(
+        "repair",
+        help="Quarantine a corrupt Coder ownership registry without adopting workspaces",
+    )
+    environment_repair.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm replacing a proven-corrupt registry with an empty one",
+    )
+
     # Last registration done: stop argparse from answering an unknown command
     # with the internal mcp-* server names. Must come after every add_parser,
     # and before parse_args.
@@ -2500,6 +2536,10 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         _consolidate_cmd(args)
     elif args.command == "config":
         _config_cmd(args)
+    elif args.command == "environment":
+        rc = _environment_cmd(args)
+        if rc:
+            raise SystemExit(rc)
     elif args.command == "perf":
         rc = perf_cmd(args)
         if rc:

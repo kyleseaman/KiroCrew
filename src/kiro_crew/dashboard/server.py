@@ -207,6 +207,10 @@ _DIST_DIR = _STATIC_DIR / "dist"
 # outlasts a sleep timer, so not catching it is harmless.
 _PREVENT_SLEEP_POLL_INTERVAL_SECS = 15.0
 
+# Shutdown must give provider-owned cleanup a chance to finish without letting a
+# control-plane outage hold the gateway process open indefinitely.
+_SESSION_ENVIRONMENT_SHUTDOWN_TIMEOUT_SECS = 10.0
+
 
 async def _prune_browser_snapshots_loop() -> None:
     """Keep the browser snapshot directory bounded for as long as we run.
@@ -2098,14 +2102,30 @@ def _register_session_environment_lifecycle(app: web.Application, state: Dashboa
 
     async def _shutdown(_app: web.Application) -> None:
         task = state._coder_lifecycle_task
-        if task is None:
-            return
-        state._coder_lifecycle_task = None
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        if task is not None:
+            state._coder_lifecycle_task = None
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        registry_getter = getattr(state.sessions, "environment_registry", None)
+        registry = registry_getter() if callable(registry_getter) else None
+        providers = registry.providers() if registry is not None else ()
+        for provider in providers:
+            if not isinstance(provider, SessionEnvironmentLifecycleProvider):
+                continue
+            try:
+                await asyncio.wait_for(
+                    provider.shutdown_lifecycle(),
+                    timeout=_SESSION_ENVIRONMENT_SHUTDOWN_TIMEOUT_SECS,
+                )
+            except Exception:  # noqa: BLE001 - shutdown remains best effort
+                logger.warning(
+                    "Managed session environment shutdown did not finish cleanly",
+                    exc_info=True,
+                )
 
     app.on_startup.append(_startup)
     app.on_cleanup.append(_shutdown)
@@ -2464,6 +2484,26 @@ def _pending_skill_notification(info: dict) -> tuple[str, str, str, list[dict[st
     return title, body, review_url, actions
 
 
+def _remote_mcp_callback_origin(port: int, tailnet_host: str, dashboard_url: str) -> str:
+    """Return the externally reachable OAuth origin selected at startup."""
+    configured_origin = dashboard_origin(dashboard_url) if dashboard_url else ""
+    parsed_origin = urlsplit(configured_origin)
+    if not (
+        parsed_origin.scheme == "https"
+        or (
+            parsed_origin.scheme == "http"
+            and parsed_origin.hostname in ("localhost", "127.0.0.1", "::1")
+        )
+    ):
+        configured_origin = ""
+    tailnet_origin = ""
+    if tailnet_host:
+        tailnet_origin = f"https://{tailnet_host}"
+        if port != 443:
+            tailnet_origin += f":{port}"
+    return configured_origin or tailnet_origin or f"http://127.0.0.1:{port}"
+
+
 def _install_remote_mcp_oauth(
     app: web.Application,
     state: DashboardState,
@@ -2480,21 +2520,7 @@ def _install_remote_mcp_oauth(
     )
     from kiro_crew.secrets.vault import SecretVault
 
-    configured_origin = dashboard_origin(dashboard_url) if dashboard_url else ""
-    parsed_origin = urlsplit(configured_origin)
-    if not (
-        parsed_origin.scheme == "https"
-        or (
-            parsed_origin.scheme == "http"
-            and parsed_origin.hostname in ("localhost", "127.0.0.1", "::1")
-        )
-    ):
-        configured_origin = ""
-    callback_origin = (
-        configured_origin
-        or (f"https://{tailnet_host}" if tailnet_host else "")
-        or f"http://127.0.0.1:{port}"
-    )
+    callback_origin = _remote_mcp_callback_origin(port, tailnet_host, dashboard_url)
     manager = RemoteMcpOAuthManager(
         SecretVault(data_home()),
         callback_origin,

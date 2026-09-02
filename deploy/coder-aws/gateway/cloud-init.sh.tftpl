@@ -40,18 +40,21 @@ dnf config-manager --add-repo \
 dnf install -y tailscale
 systemctl enable --now tailscaled
 
-TAILSCALE_KEY="$(aws ssm get-parameter \
+TAILSCALE_KEY_FILE="$(mktemp /run/tailscale-auth.XXXXXXXXXX)"
+trap 'rm -f "$TAILSCALE_KEY_FILE"' EXIT
+aws ssm get-parameter \
   --region "${region}" \
   --name "${tailscale_auth_parameter}" \
   --with-decryption \
   --query Parameter.Value \
-  --output text)"
+  --output text > "$TAILSCALE_KEY_FILE"
 tailscale up \
-  --auth-key="$TAILSCALE_KEY" \
+  --auth-key="file:$TAILSCALE_KEY_FILE" \
   --hostname="${tailscale_gateway_hostname}" \
   --ssh \
   --accept-dns=true
-unset TAILSCALE_KEY
+rm -f "$TAILSCALE_KEY_FILE"
+trap - EXIT
 
 id coder >/dev/null 2>&1 || useradd --create-home --shell /bin/bash coder
 # The Coder RPM creates a non-login service account before this template runs.

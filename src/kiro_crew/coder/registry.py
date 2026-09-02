@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import threading
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,7 +16,7 @@ from typing import BinaryIO
 
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.constants import CODER_WORKSPACE_PREFIX_MAX_CHARS
-from kiro_crew.platform_compat import file_lock
+from kiro_crew.platform_compat import file_lock, make_owner_only_dir, restrict_to_owner
 
 _SCHEMA_VERSION = 1
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -75,6 +76,10 @@ class WorkspaceBindingRegistry:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.lock_path = path.with_suffix(".lock")
+        self._cache_lock = threading.Lock()
+        self._cache_signature: tuple[int, int, int] | None = None
+        self._cache_bindings: dict[str, WorkspaceBinding] = {}
+        self._cache_valid = False
 
     @staticmethod
     def _now() -> str:
@@ -82,7 +87,16 @@ class WorkspaceBindingRegistry:
 
     def _read_unlocked(self) -> dict[str, WorkspaceBinding]:
         if not self.path.exists():
+            with self._cache_lock:
+                self._cache_signature = None
+                self._cache_bindings = {}
+                self._cache_valid = True
             return {}
+        stat_result = self.path.stat()
+        signature = (stat_result.st_ino, stat_result.st_size, stat_result.st_mtime_ns)
+        with self._cache_lock:
+            if self._cache_valid and signature == self._cache_signature:
+                return dict(self._cache_bindings)
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -100,6 +114,10 @@ class WorkspaceBindingRegistry:
                 raise WorkspaceRegistryCorrupt("Coder workspace registry identity is ambiguous")
             parsed[key] = binding
             sessions.add(binding.session_key)
+        with self._cache_lock:
+            self._cache_signature = signature
+            self._cache_bindings = dict(parsed)
+            self._cache_valid = True
         return parsed
 
     def _write_unlocked(self, bindings: dict[str, WorkspaceBinding]) -> None:
@@ -114,6 +132,15 @@ class WorkspaceBindingRegistry:
             fsync=True,
             restrict_to_owner=True,
         )
+        stat_result = self.path.stat()
+        with self._cache_lock:
+            self._cache_signature = (
+                stat_result.st_ino,
+                stat_result.st_size,
+                stat_result.st_mtime_ns,
+            )
+            self._cache_bindings = dict(bindings)
+            self._cache_valid = True
 
     def _open_lock(self) -> BinaryIO:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -249,6 +276,42 @@ class WorkspaceBindingRegistry:
         with self._open_lock() as lock_fd:
             with file_lock(lock_fd.fileno(), exclusive=False, required=True):
                 return tuple(self._read_unlocked().values())
+
+    def quarantine_corrupt(self) -> Path | None:
+        """Replace only a proven-corrupt registry, preserving its bytes for recovery.
+
+        The fresh registry is deliberately empty: repairing file syntax must not
+        silently adopt Coder workspaces whose immutable ownership cannot be
+        proven. Existing workspaces remain operator-managed until reconciled.
+        """
+        with self._open_lock() as lock_fd:
+            with file_lock(lock_fd.fileno(), exclusive=True, required=True):
+                if not self.path.exists():
+                    return None
+                try:
+                    self._read_unlocked()
+                except WorkspaceRegistryCorrupt:
+                    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                    quarantine_dir = self.path.with_name(f"{self.path.name}.corrupt")
+                    make_owner_only_dir(quarantine_dir)
+                    quarantined = quarantine_dir / f"{timestamp}.json"
+                    if quarantined.exists():
+                        raise WorkspaceRegistryCorrupt(
+                            "Coder workspace registry quarantine target already exists"
+                        )
+                    os.replace(self.path, quarantined)
+                    try:
+                        restrict_to_owner(quarantined)
+                        self._write_unlocked({})
+                    except Exception:
+                        if self.path.exists():
+                            self.path.unlink()
+                        os.replace(quarantined, self.path)
+                        with self._cache_lock:
+                            self._cache_valid = False
+                        raise
+                    return quarantined
+                return None
 
     def get(self, binding_id: str) -> WorkspaceBinding | None:
         return next((item for item in self.list_bindings() if item.binding_id == binding_id), None)

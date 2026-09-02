@@ -209,11 +209,29 @@ resource "aws_iam_role_policy" "workspace_secrets" {
   role = aws_iam_role.workspace.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["ssm:GetParameter"]
-      Resource = [local.parameter_arns.session_tailscale, local.parameter_arns.kiro]
-    }]
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = [local.parameter_arns.session_tailscale, local.parameter_arns.kiro]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = "ssm.${var.region}.amazonaws.com"
+          }
+          StringLike = {
+            "kms:EncryptionContext:PARAMETER_ARN" = [
+              local.parameter_arns.session_tailscale,
+              local.parameter_arns.kiro,
+            ]
+          }
+        }
+      },
+    ]
   })
 }
 
@@ -247,11 +265,29 @@ resource "aws_iam_role_policy" "gateway_secrets" {
   role = aws_iam_role.gateway.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["ssm:GetParameter"]
-      Resource = [local.parameter_arns.tailscale, local.parameter_arns.kiro]
-    }]
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = [local.parameter_arns.tailscale, local.parameter_arns.kiro]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = "ssm.${var.region}.amazonaws.com"
+          }
+          StringLike = {
+            "kms:EncryptionContext:PARAMETER_ARN" = [
+              local.parameter_arns.tailscale,
+              local.parameter_arns.kiro,
+            ]
+          }
+        }
+      },
+    ]
   })
 }
 
@@ -282,11 +318,29 @@ resource "aws_iam_role_policy" "session_secrets" {
   role = aws_iam_role.session.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["ssm:GetParameter"]
-      Resource = [local.parameter_arns.session_tailscale, local.parameter_arns.kiro]
-    }]
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = [local.parameter_arns.session_tailscale, local.parameter_arns.kiro]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = "ssm.${var.region}.amazonaws.com"
+          }
+          StringLike = {
+            "kms:EncryptionContext:PARAMETER_ARN" = [
+              local.parameter_arns.session_tailscale,
+              local.parameter_arns.kiro,
+            ]
+          }
+        }
+      },
+    ]
   })
 }
 
@@ -325,6 +379,19 @@ resource "aws_iam_role_policy" "control" {
           local.parameter_arns.tailscale,
           local.parameter_arns.al2023,
         ]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = "ssm.${var.region}.amazonaws.com"
+          }
+          StringLike = {
+            "kms:EncryptionContext:PARAMETER_ARN" = local.parameter_arns.tailscale
+          }
+        }
       },
       {
         Sid    = "DescribeEc2"

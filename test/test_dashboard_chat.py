@@ -5033,6 +5033,14 @@ class TestRunChatNativeSubagentAttribution:
                 tool_output="file body X",
                 tool_final=False,
             ),
+            # Identical cumulative partial frames are transport duplicates. They
+            # must not trigger another full redaction pass or UI repaint.
+            LLMEvent(
+                kind=EVENT_TOOL_RESULT,
+                tool_call_id="tc-1",
+                tool_output="file body X",
+                tool_final=False,
+            ),
             # 5) final tool_result (real output) → attributed + accumulated
             LLMEvent(
                 kind=EVENT_TOOL_RESULT,

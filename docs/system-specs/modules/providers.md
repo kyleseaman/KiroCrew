@@ -122,8 +122,14 @@ owners, credentials, templates, presets, and deletion intents never enter it.
 
 Adapters create a `RemoteSessionHost`, project safe binding metadata, persist
 stop intent by trusted session key, and may positively opt into the gateway
-lifecycle loop. A provider-owned pending stop is retried before ordinary
-activity and retention reconciliation after a failure or gateway restart.
+lifecycle loop. One reconciliation pass obtains one provider inventory and one
+protected binding snapshot, renews active workload scopes first, then drains
+pending stops and evaluates retention against those same views. Independent
+remote mutations run with bounded concurrency and per-operation timeouts; a
+renewal phase completes before any stop phase begins. Gateway shutdown cancels
+the periodic loop and gives providers a bounded final drain for already-persisted
+stop intent. A provider-owned pending stop is therefore retried after a failure
+or gateway restart without making shutdown depend on the next periodic tick.
 Catalog-shaped objects alone cannot gain periodic mutation authority. Each
 adapter keeps its concrete control-plane trust checks at its own boundary. Coder
 is the first implementation; another provider can join the registry without
@@ -175,7 +181,9 @@ reserves capacity under a short lock, performs the remote create outside it, and
 uses one workspace inventory snapshot for that decision, so unrelated creates
 can proceed concurrently without exceeding the cap. Lifecycle passes likewise
 fetch one inventory and reconcile locally rather than issuing one list command
-per binding. Descendant
+per binding. Coder runs at most four independent lifecycle mutations at once,
+bounds each at 30 seconds, and gives pending-stop drainage a 10-second gateway
+shutdown budget. Descendant
 subagents inherit the concrete parent host and stay in that same workspace.
 The static environment path remains a migration fallback only; a manually
 created bootstrap workspace such as `crew-dogfood` is never enrolled in managed
@@ -201,7 +209,10 @@ finite cgroup v2 or v1 memory limit. Execution time and output are bounded;
 numeric output is validated before pressure is classified as elevated at 80%
 used or critical at 90%. A control-plane or identity failure becomes
 `unavailable`; a memory-probe failure retains the verified workspace state and
-omits memory, without returning raw command output or diagnostics.
+omits memory, without returning raw command output or diagnostics. The same
+probe reads the root-owned bootstrap status breadcrumb: a validated
+`running:<stage>` keeps the environment in `starting`, `failed:<stage>` makes it
+`unavailable`, and `complete` leaves the verified control-plane state unchanged.
 Workload-scope inspection also uses
 `--disable-autostart`, so a status race cannot wake stopped compute.
 
@@ -266,6 +277,13 @@ it records a durable delete intent, re-fetches and re-validates exact identity,
 deletes the workspace, and records the tombstone. Active or starting
 workspaces, unbound workspaces, and a parent with an in-flight foreground turn
 are never retention targets.
+
+The owner-only binding registry fails closed on malformed bytes. Recovery is an
+explicit operator action, `kirocrew environment repair --yes`: it moves the
+original into the protected owner-only `coder_workspaces.json.corrupt/`
+directory and writes a fresh empty registry. Repair never adopts, stops, or
+deletes an existing Coder workspace; those rows remain manual operator work
+until a new trustworthy binding is allocated.
 
 ### Config (`config/loader.py`)
 

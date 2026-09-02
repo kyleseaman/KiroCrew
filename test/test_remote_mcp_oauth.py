@@ -13,6 +13,7 @@ from aiohttp import web
 from mcp.client.auth import OAuthFlowError
 from mcp.shared.auth import AuthorizationCodeResult, OAuthClientInformationFull, OAuthToken
 
+from kiro_crew.dashboard.server import _remote_mcp_callback_origin
 from kiro_crew.mcp_gateway.oauth import (
     OAuthCredentialIdentity,
     RemoteMcpOAuthBroker,
@@ -35,6 +36,16 @@ def _target(
         url=url,
         headers={},
         client_id=client_id,
+    )
+
+
+def test_tailnet_oauth_callback_keeps_nonstandard_dashboard_port() -> None:
+    assert (
+        _remote_mcp_callback_origin(8443, "crew.example.ts.net", "")
+        == "https://crew.example.ts.net:8443"
+    )
+    assert _remote_mcp_callback_origin(443, "crew.example.ts.net", "") == (
+        "https://crew.example.ts.net"
     )
 
 

@@ -10,6 +10,7 @@ and the handler wiring on project set.
 from __future__ import annotations
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -76,8 +77,35 @@ class TestScheduleEagerSpawn:
         slot = _ChatSlot("t1")
         state = _mock_state(slot)
         with patch.object(chat_runner.KiroCrewConfig, "load", _cfg(False)):
-            schedule_eager_spawn(state, slot)
+            task = schedule_eager_spawn(state, slot)
+            assert task is not None
+            await task
+            await asyncio.sleep(0)
         assert slot._eager_spawn_task is None
+
+    @pytest.mark.asyncio
+    async def test_scheduler_loads_config_off_the_event_loop(self):
+        slot = _ChatSlot("t1")
+        state = _mock_state(slot)
+        loop_thread = threading.get_ident()
+        load_threads: list[int] = []
+        cfg = MagicMock()
+        cfg.session.eager_spawn = True
+
+        def load_config():
+            load_threads.append(threading.get_ident())
+            return cfg
+
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load", load_config),
+            patch.object(chat_runner, "_eager_spawn", new=AsyncMock()),
+        ):
+            task = schedule_eager_spawn(state, slot)
+            assert task is not None
+            await task
+
+        assert load_threads
+        assert load_threads[0] != loop_thread
 
     @pytest.mark.asyncio
     async def test_noop_when_config_unreadable(self):
@@ -86,7 +114,10 @@ class TestScheduleEagerSpawn:
         with patch.object(
             chat_runner.KiroCrewConfig, "load", MagicMock(side_effect=OSError("boom"))
         ):
-            schedule_eager_spawn(state, slot)
+            task = schedule_eager_spawn(state, slot)
+            assert task is not None
+            await task
+            await asyncio.sleep(0)
         assert slot._eager_spawn_task is None
 
     @pytest.mark.asyncio
@@ -99,7 +130,10 @@ class TestScheduleEagerSpawn:
             [SimpleNamespace(provider_id="coder")]
         )
         with patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg):
-            schedule_eager_spawn(state, slot)
+            task = schedule_eager_spawn(state, slot)
+            assert task is not None
+            await task
+            await asyncio.sleep(0)
         assert slot._eager_spawn_task is None
 
     @pytest.mark.asyncio

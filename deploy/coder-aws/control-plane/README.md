@@ -8,14 +8,16 @@ co-located with the Coder server. Tailscale Serve publishes Coder and the
 gateway to your tailnet, while the AWS security groups expose no inbound ports.
 
 Prerequisites are Terraform 1.5+, authenticated AWS credentials, a Tailscale
-tailnet with MagicDNS/HTTPS, and two SSM `SecureString` parameters for the
-Tailscale auth key and Kiro credential. The defaults use `us-east-2`, a
+tailnet with MagicDNS/HTTPS, and three SSM `SecureString` parameters: a reusable
+`tag:kirocrew-control` Tailscale key, a separate ephemeral
+`tag:kirocrew-session` key, and the Kiro credential. The defaults use `us-east-2`, a
 `t4g.medium` control node, and a 30 GiB encrypted gp3 disk.
 
 ```bash
 terraform -chdir=deploy/coder-aws/control-plane init
 terraform -chdir=deploy/coder-aws/control-plane apply \
   -var tailscale_auth_parameter=/kirocrew/poc/tailscale-auth-key \
+  -var tailscale_session_auth_parameter=/kirocrew/poc/tailscale-session-auth-key \
   -var kiro_api_key_parameter=/kirocrew/poc/kiro-api-key \
   -var tailnet_dns_name=example.ts.net
 
@@ -42,6 +44,12 @@ only active sessions consume EC2 compute. The gateway deletes only workspaces
 recorded in its integrity-protected binding registry. This is a dogfood POC,
 not a multi-user or highly available Coder topology; Coder's built-in
 PostgreSQL database lives on the control node.
+
+The generated roles allow KMS decryption only through regional SSM and only for
+the exact configured Parameter Store ARN. A customer-managed KMS key must grant
+those roles in its own key policy as well. Use the least-privilege tailnet policy
+sample in the remote-host guide; session-tagged nodes need HTTPS to the
+control-tagged Coder server but do not receive Tailscale SSH access.
 
 The gateway template installs `/usr/local/bin/kirocrew` as an administration
 launcher. After the Kiro Crew wheel is installed in its stable

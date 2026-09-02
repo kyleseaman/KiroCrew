@@ -220,7 +220,10 @@ async def test_workspace_memory_uses_no_autostart_and_scrubs_agent_tokens(
 
     async def run(argv: list[str], env: dict[str, str], cwd: Path) -> bytes:
         calls.append(argv)
-        return b'{"available_bytes":4294967296,"total_bytes":8589934592}'
+        return (
+            b'{"available_bytes":4294967296,"total_bytes":8589934592,'
+            b'"bootstrap_status":"complete"}'
+        )
 
     client = CoderClient("/opt/coder", "https://coder.example", "token", tmp_path, run)
 
@@ -231,6 +234,7 @@ async def test_workspace_memory_uses_no_autostart_and_scrubs_agent_tokens(
         total_gb=8.0,
         used_percent=50.0,
         pressure="normal",
+        bootstrap_status="complete",
     )
     assert calls[0][:5] == [
         "/opt/coder",
@@ -244,6 +248,7 @@ async def test_workspace_memory_uses_no_autostart_and_scrubs_agent_tokens(
     assert remote_command.startswith(
         "env -u CODER_AGENT_TOKEN -u CODER_AGENT_TOKEN_FILE python3 -c "
     )
+    assert "/var/lib/kirocrew/bootstrap-status" in remote_command
     assert "'import json" in remote_command
 
 

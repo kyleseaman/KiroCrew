@@ -99,9 +99,46 @@ unset CREW_KIRO_KEY
 Use the reusable tagged key for the control node and gateway. Session workspaces
 receive only the separate ephemeral key; the control-plane template requires
 both parameter names so a shared permanent key cannot silently retain offline
-session devices. Apply a tailnet policy that permits your
-identity to use Tailscale SSH as `ec2-user` on the tagged control and gateway
-nodes. The AWS security groups still expose no port 22.
+session devices. Give the reusable key `tag:kirocrew-control` and the ephemeral
+key `tag:kirocrew-session`. Merge this least-privilege shape into the tailnet
+policy, replacing `you@example.com` with the owner identity. It lets the owner
+reach Coder, the dashboard, and administrative SSH; Coder agents may reach the
+control plane on HTTPS; session nodes cannot initiate SSH or reach arbitrary
+tailnet peers:
+
+```jsonc
+{
+  "tagOwners": {
+    "tag:kirocrew-control": ["you@example.com"],
+    "tag:kirocrew-session": ["you@example.com"]
+  },
+  "grants": [
+    {
+      "src": ["you@example.com"],
+      "dst": ["tag:kirocrew-control"],
+      "ip": ["22", "443", "8443"]
+    },
+    {
+      "src": ["tag:kirocrew-control", "tag:kirocrew-session"],
+      "dst": ["tag:kirocrew-control"],
+      "ip": ["443"]
+    }
+  ],
+  "ssh": [
+    {
+      "action": "accept",
+      "src": ["you@example.com"],
+      "dst": ["tag:kirocrew-control"],
+      "users": ["ec2-user"]
+    }
+  ]
+}
+```
+
+The AWS security groups still expose no port 22. Bootstrap obtains each auth
+key from SSM into a root-only temporary file, passes only its `file:` reference
+to `tailscale up`, and removes the file after registration; the reusable secret
+does not appear in a process argument or persisted shell environment.
 
 #### 2. Provision the control node
 
@@ -120,6 +157,12 @@ terraform -chdir=deploy/coder-aws/control-plane output coder_url
 terraform -chdir=deploy/coder-aws/control-plane output gateway_template_values
 terraform -chdir=deploy/coder-aws/control-plane output session_template_values
 ```
+
+The instance roles can decrypt only through SSM in the selected region and only
+when KMS receives the exact Parameter Store ARN as encryption context. When the
+parameters use a customer-managed KMS key, its key policy must also authorize
+the generated control, gateway, and session roles; the IAM condition alone
+cannot override a restrictive key policy.
 
 Open the Coder URL while connected to Tailscale and create the single owner
 account. The server is pinned to a checksummed ARM RPM and listens only on
@@ -189,6 +232,12 @@ coder stop crew-session-user-opaqueid --yes
 coder start crew-session-user-opaqueid --yes
 ```
 
+This single-user POC deliberately supplies the same Kiro API key to the gateway
+and every session workspace. That is the accepted dogfood shortcut here, not a
+multi-user isolation claim: compromise of one session requires rotating the
+shared key. A production design should mint per-workspace credentials or place
+model access behind a gateway capability.
+
 The EC2 templates intentionally ignore AMI and cloud-init drift on retained
 instances. Pushing a new template version therefore does not retrofit bootstrap
 changes into an existing session workspace. Delete a disposable test session
@@ -220,7 +269,12 @@ disconnect, and provisions a persistent 2 GiB swap file on the existing root
 volume. Agent cgroups retain `MemorySwapMax=0`; the swap is bounded headroom for
 the gateway and operating system on the deliberately small `t4g.small`, not an
 escape from the sandbox resource ceiling. Run the same command for later wheel
-updates.
+updates. The first install resolves dependencies; later deploys replace only the
+verified Kiro Crew wheel with `--no-deps`, avoiding package-index work in the
+restart path. Rebuild the virtual environment when dependency declarations
+change. For a production image, bake the pinned Python dependencies, Kiro CLI,
+Coder CLI, and Tailscale into the AMI, then keep routine application updates on
+the dependency-free wheel path.
 
 The gateway template provides `/usr/local/bin/kirocrew` for gateway
 administration. It delegates to the stable virtual environment above as the
@@ -279,6 +333,12 @@ Settings according to the lifetime configured on your Coder server. The legacy
 `KIROCREW_CODER_*`, `CODER_URL`, and `CODER_SESSION_TOKEN` environment variables
 remain a migration fallback for installs that have never saved the panel; once
 the panel is saved, its enabled/disabled value is authoritative.
+
+If the protected workspace registry is malformed, lifecycle mutations fail
+closed. After preserving the gateway data-home backup, an operator can run
+`kirocrew environment repair --yes`. The command quarantines the unreadable
+bytes and creates an empty owner-only registry; it does not adopt or delete the
+workspace rows still visible in Coder, so reconcile those manually.
 
 #### 5. Measure, resize, and tear down
 

@@ -1976,7 +1976,7 @@ async def api_chat_slot_coder_profile(request: web.Request) -> web.Response:
             {"error": "invalid Coder profile", "code": "coder_profile_invalid"}, status=400
         )
     try:
-        cfg = KiroCrewConfig.load()
+        cfg = await asyncio.to_thread(KiroCrewConfig.load)
         if cfg.session.coder.enabled is not True:
             raise RuntimeError("managed Coder is not enabled")
         cfg.session.coder.resolve_profile(profile)
