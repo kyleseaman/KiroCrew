@@ -1209,21 +1209,15 @@ class TestConsumePendingReset:
 
 
 class TestScheduleEagerSpawn:
-    def test_disabled_config_returns_no_task(self, tmp_path):
+    def test_no_running_loop_returns_without_loading_config(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
-        cfg = MagicMock()
-        cfg.session.eager_spawn = False
+        load_config = MagicMock()
 
-        with patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg):
+        with patch.object(chat_runner.KiroCrewConfig, "load", load_config):
             assert chat_runner.schedule_eager_spawn(state, slot) is None
 
-    def test_config_load_failure_returns_no_task(self, tmp_path):
-        state, slot = _state(tmp_path), _slot()
-
-        with patch.object(
-            chat_runner.KiroCrewConfig, "load", side_effect=RuntimeError("bad toml")
-        ):
-            assert chat_runner.schedule_eager_spawn(state, slot) is None
+        load_config.assert_not_called()
+        assert slot._eager_spawn_task is None
 
     @pytest.mark.asyncio
     async def test_a_newer_signal_cancels_the_pending_task(self, tmp_path):

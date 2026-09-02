@@ -3554,60 +3554,22 @@ def schedule_eager_spawn(
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        # Synchronous callers exist in CLI-focused tests and utility code. The
-        # dashboard path always has a running loop and uses the off-thread gate.
-        pass
-    else:
-        prev = getattr(slot, "_eager_spawn_task", None)
-        if prev is not None and not prev.done():
-            prev.cancel()
-        task = asyncio.create_task(
-            _schedule_eager_spawn_async(state, slot, allow_resume=allow_resume)
-        )
-        slot._eager_spawn_task = task
-
-        def clear_noop(completed: asyncio.Task[bool]) -> None:
-            if completed.cancelled() or completed.exception() is not None:
-                return
-            if not completed.result() and slot._eager_spawn_task is completed:
-                slot._eager_spawn_task = None
-
-        task.add_done_callback(clear_noop)
-        return task
-
-    environment_prefetch = False
-    try:
-        cfg = KiroCrewConfig.load()
-        if not cfg.session.eager_spawn:
-            return None
-        # A provider may prefetch only when it positively proves this exact
-        # session already owns running compute. The host created below carries
-        # the same no-start restriction, closing the state-change race between
-        # this synchronous check and the remote control-plane lookup.
-        registry_getter = getattr(state.sessions, "environment_registry", None)
-        registry = registry_getter() if callable(registry_getter) else None
-        if slot.environment is not None and not isinstance(registry, SessionEnvironmentRegistry):
-            return None
-        if isinstance(registry, SessionEnvironmentRegistry) and registry.providers():
-            selection = slot.environment.selection if slot.environment is not None else None
-            if not registry.supports_prefetch(effective_session_key(slot), selection):
-                return None
-            environment_prefetch = True
-    except Exception:
         return None
+
     prev = getattr(slot, "_eager_spawn_task", None)
     if prev is not None and not prev.done():
         prev.cancel()
-    spawn_task = asyncio.create_task(
-        _eager_spawn(
-            state,
-            slot,
-            allow_resume=allow_resume,
-            environment_prefetch=environment_prefetch,
-        )
-    )
-    slot._eager_spawn_task = spawn_task
-    return spawn_task
+    task = asyncio.create_task(_schedule_eager_spawn_async(state, slot, allow_resume=allow_resume))
+    slot._eager_spawn_task = task
+
+    def clear_noop(completed: asyncio.Task[bool]) -> None:
+        if completed.cancelled() or completed.exception() is not None:
+            return
+        if not completed.result() and slot._eager_spawn_task is completed:
+            slot._eager_spawn_task = None
+
+    task.add_done_callback(clear_noop)
+    return task
 
 
 async def _recover_app_agent_binding(

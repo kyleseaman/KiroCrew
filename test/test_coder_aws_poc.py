@@ -122,6 +122,15 @@ def test_workspace_bootstrap_verifies_kiro_and_reads_secrets_from_ssm() -> None:
     assert 'write_bootstrap_status "complete"' in bootstrap
 
 
+def test_workspace_readme_discloses_shared_model_credential_boundary() -> None:
+    readme = _read("workspace/README.md").lower()
+
+    assert "workspace user can read" in readme
+    assert "base64 is transport encoding, not encryption" in readme
+    assert "shared credential" in readme
+    assert "short-lived credential per workspace" in readme
+
+
 def test_session_workspace_uses_ephemeral_tailnet_identity_on_every_boot() -> None:
     bootstrap = _read("workspace/cloud-init.sh.tftpl")
     control = _read("control-plane/main.tf")
