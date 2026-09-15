@@ -532,6 +532,13 @@ def kiro_home() -> Path:
     return p
 
 
+# The path segments, relative to the kiro home, where kiro-cli stores its chat
+# transcripts. Shared so a remote session host (which cannot call
+# kiro_sessions_dir() because the store lives on another machine) reconstructs
+# the SAME tail as the local reader instead of hardcoding a copy that can drift.
+KIRO_SESSIONS_TAIL: tuple[str, ...] = ("sessions", "cli")
+
+
 def kiro_sessions_dir() -> Path:
     """Where kiro-cli stores its chat transcripts: ``<kiro home>/sessions/cli``.
 
@@ -542,7 +549,7 @@ def kiro_sessions_dir() -> Path:
     mappings pruned. Routing both through the resolver keeps writer and reader in
     agreement.
     """
-    return kiro_home() / "sessions" / "cli"
+    return kiro_home().joinpath(*KIRO_SESSIONS_TAIL)
 
 
 def isolated_agents_dir(data_home: Path) -> Path:

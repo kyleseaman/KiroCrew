@@ -22,6 +22,7 @@ from kiro_crew.coder.client import CoderClient
 from kiro_crew.coder.manager import CoderWorkspaceManager, ManagedWorkspacePolicy
 from kiro_crew.coder.registry import WorkspaceBindingRegistry
 from kiro_crew.coder.user_bus import user_bus_command
+from kiro_crew.config.paths import KIRO_SESSIONS_TAIL
 from kiro_crew.constants import (
     CODER_DEFAULT_REMOTE_CWD,
     CODER_DEFAULT_RUNTIME_WARM_MINUTES,
@@ -607,7 +608,7 @@ class CoderWorkspaceSessionHost(RemoteSessionHost):
         if self._remote_runtime_dir is None:
             raise SessionHostError("Coder workspace bridge is not prepared")
         kiro_home = PurePosixPath(self._remote_runtime_dir).parents[2]
-        return str(kiro_home / "sessions" / f"{session_id}.json")
+        return str(kiro_home.joinpath(*KIRO_SESSIONS_TAIL) / f"{session_id}.json")
 
     async def session_file_exists(
         self,

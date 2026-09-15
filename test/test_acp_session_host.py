@@ -1004,7 +1004,7 @@ async def test_runtime_remote_resume_uses_workspace_transcript_and_rotated_relay
     assert params["cwd"] == "/home/coder/workspace"
     assert params["mcpServers"] == relays
     assert params["_meta"] == {
-        "_kiro.dev/session_file": "/home/coder/.kiro/sessions/sid-remote.json"
+        "_kiro.dev/session_file": "/home/coder/.kiro/sessions/cli/sid-remote.json"
     }
     assert "/gateway" not in json.dumps(params)
     assert runtime._remote_session_keys == {"sid-remote": "dashboard:one"}
