@@ -14,7 +14,7 @@
  * session socket drives.
  */
 import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from 'vitest'
-import { waitFor, fireEvent } from '@testing-library/react'
+import { waitFor, fireEvent, act } from '@testing-library/react'
 
 import { PENDING_PATH, PRESENCE_PATH } from '../apps/crew-companion/constants'
 import type { SessionWatchOptions } from '../apps/crew-companion/sessionWatch'
@@ -47,8 +47,52 @@ const bridge = {
   updateHitbox: vi.fn(),
   setMenuHitbox: vi.fn(),
   contextMenuAction: vi.fn(),
+  // Single-active-overlay model: the pet renders only once main tells it it is the
+  // active display. Simulate the active overlay so these render assertions hold
+  // (a background overlay would receive false and draw nothing).
+  onSetActive: vi.fn((cb: (active: boolean, x?: number, y?: number, isDragging?: boolean) => void) => {
+    setActiveCb = cb
+    cb(true)
+    return () => {}
+  }),
+  // Single-owner model: the test overlay is BOTH the notification owner (runs the
+  // producer) and the active display (draws). The relay loop main performs in
+  // production is simulated here: reportBubbleState (owner → main) is looped straight
+  // into the onRenderBubble listener (main → active), and bubbleAction (active → main)
+  // into the onBubbleAction listener (main → owner).
+  onSetOwner: vi.fn((cb: (isOwner: boolean) => void) => {
+    cb(true)
+    return () => {}
+  }),
+  reportBubbleState: vi.fn((b: unknown) => { renderBubbleCb?.(b, true) }),
+  onRenderBubble: vi.fn((cb: (b: unknown, playReaction?: boolean) => void) => {
+    renderBubbleCb = cb
+    return () => {}
+  }),
+  // Main → replacement brain after a crash: rehydrate the live slot.
+  onRehydrateSlot: vi.fn((cb: (slot: unknown) => void) => {
+    rehydrateSlotCb = cb
+    return () => {}
+  }),
+  bubbleAction: vi.fn((a: unknown) => { bubbleActionCb?.(a) }),
+  onBubbleAction: vi.fn((cb: (a: unknown) => void) => {
+    bubbleActionCb = cb
+    return () => {}
+  }),
+  // Window command (owner → main → active), looped straight to the listener.
+  reportWindowCommand: vi.fn((cmd: unknown) => { windowCommandCb?.(cmd) }),
+  onWindowCommand: vi.fn((cb: (cmd: unknown) => void) => {
+    windowCommandCb = cb
+    return () => {}
+  }),
+  onDragListenMouseUp: vi.fn(() => () => {}),
+  onDragUpdate: vi.fn(() => () => {}),
+  onDragEnded: vi.fn(() => () => {}),
+  dragStart: vi.fn(),
+  dragEnd: vi.fn(),
+  dragMouseUp: vi.fn(),
 }
-vi.mock('../apps/crew-companion/petBridge', () => ({ petBridge: bridge }))
+vi.mock('../apps/crew-companion/petBridge', () => ({ petBridge: bridge, hasCompanionBridge: () => true }))
 // Both harnesses re-import the entry per test with `vi.resetModules()`, and the
 // entry boots through `../i18n/all` — so without this every test would re-fetch the
 // twelve non-English catalogs, 434 ms each. They pin `mc-lang` to `en` and assert
@@ -64,6 +108,13 @@ vi.mock('../i18n/all', async () => await import('../i18n/index'))
 
 /** The gateway socket is replaced by a handle on the callbacks the overlay passes. */
 let watch: SessionWatchOptions | null = null
+/** Relay callbacks the renderer registers, so a single-overlay test can stand in for
+ * the main-process relay loop (owner reports → active renders; action → owner). */
+let renderBubbleCb: ((b: unknown, playReaction?: boolean) => void) | null = null
+let setActiveCb: ((active: boolean, x?: number, y?: number, isDragging?: boolean) => void) | null = null
+let bubbleActionCb: ((a: unknown) => void) | null = null
+let windowCommandCb: ((cmd: unknown) => void) | null = null
+let rehydrateSlotCb: ((slot: unknown) => void) | null = null
 vi.mock('../apps/crew-companion/sessionWatch', () => ({
   watchSessions: (opts: SessionWatchOptions) => {
     watch = opts
@@ -125,6 +176,21 @@ let galleryOpenedCbs: Array<() => void> = []
 let galleryClosedCbs: Array<() => void> = []
 /** When true, the `since=0` re-read after a backend restart answers not-ok. */
 let sinceZeroFails = false
+/**
+ * What the main process answers when asked to surface the dashboard.
+ *
+ * False is the real refusal case — no dashboard window to raise — and it is the
+ * one the sticky bubble's survival depends on.
+ */
+let openSessionSucceeds = true
+/**
+ * When set, `openSession` waits on this before reporting.
+ *
+ * The replacement race needs a CTA that is still in flight while the next
+ * notification arrives, which is only observable if the handler can be held
+ * open deliberately rather than by timing.
+ */
+let openSessionGate: Promise<void> | null = null
 
 /** The window-level preload bridge the overlay toggles window input through. */
 function installCrewCompanion() {
@@ -138,6 +204,10 @@ function installCrewCompanion() {
       return () => {}
     }),
     galleryOpen: vi.fn(),
+    openSession: vi.fn(async () => {
+      if (openSessionGate) await openSessionGate
+      return openSessionSucceeds
+    }),
     onGalleryOpened: vi.fn((cb: () => void) => {
       galleryOpenedCbs.push(cb)
       return () => {}
@@ -192,10 +262,17 @@ function tapPet(at = { x: 340, y: 240 }): void {
 beforeEach(() => {
   calls = []
   watch = null
+  renderBubbleCb = null
+  setActiveCb = null
+  bubbleActionCb = null
+  windowCommandCb = null
+  rehydrateSlotCb = null
   panelClosedCbs = []
   galleryOpenedCbs = []
   galleryClosedCbs = []
   sinceZeroFails = false
+  openSessionSucceeds = true
+  openSessionGate = null
   packDetail = null
   savedPos = { x: 300, y: 200 }
   config = { activeAppearance: 'kiro-ghost', sessionNotificationsEnabled: true }
@@ -489,6 +566,154 @@ describe('session signals from the gateway socket', () => {
   })
 })
 
+/**
+ * The "Open session" CTA — the one button a sticky bubble has.
+ *
+ * `approval` and `session-input` bubbles render no ✕ and ignore body clicks, so
+ * this button is their only exit. Two properties therefore have to hold together,
+ * and they pull in opposite directions: the click must actually take the user to
+ * the blocked session, and it must NOT clear the notification when it could not.
+ */
+describe('the "Open session" call to action', () => {
+  /** The CTA, which is the only button inside the bubble for a sticky kind. */
+  function cta(): HTMLElement | null {
+    return document.querySelector('.cc-bubble-cta')
+  }
+
+  it('opens the session an approval is about, then clears the notification', async () => {
+    await mountPet()
+    await waitFor(() => expect(watch).not.toBeNull())
+    watch!.onApproval!({ slot: 'chat-7-1785905004', title: 'Run the migration' })
+    await waitFor(() => expect(cta()).not.toBeNull())
+
+    fireEvent.click(cta()!)
+
+    // The slot the gateway's approval frame named — not a title, not a guess.
+    await waitFor(() => expect(api.openSession).toHaveBeenCalledWith('chat-7-1785905004'))
+    // And only then does the bubble go: the block has somewhere to be resolved.
+    await waitFor(() => expect(document.querySelector('.cc-bubble-text')).toBeNull())
+  })
+
+  it('keeps a sticky approval on screen when the dashboard could not be surfaced', async () => {
+    openSessionSucceeds = false
+    await mountPet()
+    await waitFor(() => expect(watch).not.toBeNull())
+    watch!.onApproval!({ slot: 'chat-7-1785905004', title: 'Run the migration' })
+    await waitFor(() => expect(cta()).not.toBeNull())
+
+    fireEvent.click(cta()!)
+    // Longer than the 300ms exit animation, so a bubble still on screen after
+    // this was never asked to leave rather than being caught mid-animation.
+    await new Promise((r) => setTimeout(r, 500))
+
+    expect(document.querySelector('.cc-bubble-body')?.textContent).toBe('Run the migration')
+    expect(document.querySelector('.cc-bubble-wrap')?.className).not.toContain('cc-bubble-out')
+    // Still no ✕ — so had the CTA dismissed it, the only pointer to a session
+    // that is still blocked on the user would be gone for good.
+    expect(document.querySelector('.cc-bubble-x')).toBeNull()
+    expect(api.openSession).toHaveBeenCalledTimes(1)
+  })
+
+  it('a late CTA result must not dismiss the notification that replaced it', async () => {
+    // The overlay renders ONE bubble slot. Without a per-notification identity on
+    // the rendered element, React keeps a single <Bubble> instance across
+    // replacements -- so a CTA whose handler is still in flight holds that
+    // instance's dismissal, and when it finally reports it dismisses whatever
+    // bubble is on screen NOW. The user never acted on that one.
+    //
+    // Driven through `session-error` deliberately: `isSticky` excludes it, so it
+    // is a CTA-bearing bubble that a later notification can actually replace. An
+    // approval cannot reproduce this -- it is sticky, so it holds the slot and
+    // suppresses the replacement instead.
+    let release: () => void = () => {}
+    openSessionGate = new Promise<void>((res) => {
+      release = res
+    })
+
+    await mountPet()
+    await waitFor(() => expect(watch).not.toBeNull())
+
+    // A: a failed turn, clicked, with its handler held open.
+    watch!.onDone({ slot: 'a', title: 'Fix the parser', elapsedMs: 10, failed: true })
+    await waitFor(() => expect(cta()).not.toBeNull())
+    fireEvent.click(cta()!)
+    await waitFor(() => expect(api.openSession).toHaveBeenCalledTimes(1))
+
+    // B replaces A while A's handler is still pending. Asserted as "the text
+    // changed", not as B's title: two rapid completions coalesce into a count
+    // ("2 jobs finished"), which is still a different notification occupying the
+    // slot -- the replacement this test is about.
+    const aText = document.querySelector('.cc-bubble-text')?.textContent
+    watch!.onDone({ slot: 'b', title: 'Ship the release', elapsedMs: 10, failed: true })
+    await waitFor(() =>
+      expect(document.querySelector('.cc-bubble-text')?.textContent).not.toBe(aText),
+    )
+    const bText = document.querySelector('.cc-bubble-text')?.textContent
+    expect(bText).toBeTruthy()
+
+    // A now reports success -- for a notification that is no longer on screen.
+    release()
+    // Longer than the 300ms exit animation, so a bubble still up after this was
+    // never asked to leave rather than being caught mid-animation.
+    await new Promise((r) => setTimeout(r, 500))
+
+    expect(document.querySelector('.cc-bubble-text')?.textContent).toBe(bText)
+    expect(document.querySelector('.cc-bubble-wrap')?.className).not.toContain('cc-bubble-out')
+  })
+
+  it('raises the dashboard without routing when the approval owns no session', async () => {
+    await mountPet()
+    await waitFor(() => expect(watch).not.toBeNull())
+    // An approval with no owning conversation is broadcast with slot: "" and is
+    // surfaced on the dashboard's approvals feed instead.
+    watch!.onApproval!({ slot: '', title: 'Run the migration' })
+    await waitFor(() => expect(cta()).not.toBeNull())
+
+    fireEvent.click(cta()!)
+
+    await waitFor(() => expect(api.openSession).toHaveBeenCalledWith(''))
+    await waitFor(() => expect(document.querySelector('.cc-bubble-text')).toBeNull())
+  })
+
+  it('opens the session a failed turn belongs to', async () => {
+    await mountPet()
+    await waitFor(() => expect(watch).not.toBeNull())
+    watch!.onDone({ slot: 'chat-9-42', title: 'Fix the parser', elapsedMs: 10, failed: true })
+    await waitFor(() => expect(cta()).not.toBeNull())
+
+    fireEvent.click(cta()!)
+
+    await waitFor(() => expect(api.openSession).toHaveBeenCalledWith('chat-9-42'))
+  })
+
+  it('a queued approval names no session, so its CTA still leads to the dashboard', async () => {
+    // Fires drained from the companion's own backend carry a nudge key, never a
+    // slot. The CTA must not become a dead button on them — a sticky bubble whose
+    // only exit refuses is a notification that can never be cleared.
+    queue([fire({ seq: 1, kind: 'approval', text: 'needs your OK' })])
+    await mountPet()
+    await waitFor(() => expect(cta()).not.toBeNull())
+
+    fireEvent.click(cta()!)
+
+    await waitFor(() => expect(api.openSession).toHaveBeenCalledWith(''))
+    await waitFor(() => expect(document.querySelector('.cc-bubble-text')).toBeNull())
+  })
+
+  it('leaves the breathing nudge alone — its CTA opens the panel, not a session', async () => {
+    queue([fire({ seq: 1, kind: 'break-breathe', text: 'Try a breath' })])
+    await mountPet()
+    await waitFor(() => expect(cta()).not.toBeNull())
+
+    fireEvent.click(cta()!)
+
+    await waitFor(() => expect(api.panelOpen).toHaveBeenCalled())
+    expect(api.openSession).not.toHaveBeenCalled()
+    // A local action cannot fail, so it clears the bubble exactly as it always has.
+    await waitFor(() => expect(document.querySelector('.cc-bubble-text')).toBeNull())
+  })
+})
+
 describe('pointer and keyboard on the companion', () => {
   it('opens the panel on a tap and closes it on the next one', async () => {
     await mountPet()
@@ -621,6 +846,29 @@ describe('the active appearance pack', () => {
     galleryOpenedCbs[galleryOpenedCbs.length - 1]()
     galleryClosedCbs[galleryClosedCbs.length - 1]()
     expect(petEl()).not.toBeNull()
+  })
+})
+
+describe('the single notification owner drives the bubble', () => {
+  it('renders a produced reminder through the owner → main → active relay', async () => {
+    queue([fire({ seq: 4, kind: 'reminder', text: 'stretch' })])
+    await mountPet()
+    // No shared store and no per-overlay copy: the owner runs the poll, reports the
+    // resolved bubble to main, and main relays it to the active overlay's render push.
+    await waitFor(() => expect(bubbleText()).toBe('stretch'))
+    expect(bridge.reportBubbleState).toHaveBeenCalled()
+    expect(bridge.onRenderBubble).toHaveBeenCalled()
+  })
+
+  it('rehydrates the slot after a brain restart so a live count survives', async () => {
+    await mountPet()
+    await waitFor(() => expect(bridge.onRehydrateSlot).toHaveBeenCalled())
+    // Main hands the replacement brain the live slot (one completion already collapsed)
+    // on pet-ready. Without rehydration slotRef would be null and the next completion
+    // would start a fresh count instead of collapsing onto the one that survived.
+    rehydrateSlotCb!({ slot: { text: 'one', sticky: false, count: 1, at: Date.now(), kind: 'session-done' }, seq: -1 })
+    watch!.onDone({ slot: 'b', title: 'two', elapsedMs: 1, failed: false })
+    await waitFor(() => expect(bubbleText()).toBe('2 jobs finished'))
   })
 })
 
@@ -773,5 +1021,20 @@ describe('dragging the companion', () => {
     fireEvent.mouseMove(window, { clientX: 420, clientY: 300 })
     fireEvent.mouseUp(window)
     await waitFor(() => expect(bridge.savePosition).toHaveBeenCalled())
+  })
+
+  it('does not persist position after this display is handed off mid-drag', async () => {
+    await mountPet()
+    await waitFor(() => expect(petEl().style.opacity).toBe('1'))
+    const pet = petEl()
+    fireEvent.mouseDown(pet, { clientX: 340, clientY: 240, button: 0 })
+    fireEvent.mouseMove(window, { clientX: 420, clientY: 300 })
+    const before = bridge.savePosition.mock.calls.length
+    // Main elects another display: this overlay goes inactive while the gesture is
+    // still held. An inactive view no longer owns the avatar's position, so a later
+    // commit here must not overwrite the new owner's saved spot.
+    act(() => setActiveCb!(false))
+    fireEvent.mouseUp(window)
+    expect(bridge.savePosition.mock.calls.length).toBe(before)
   })
 })

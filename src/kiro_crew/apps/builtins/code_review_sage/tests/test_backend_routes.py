@@ -42,8 +42,8 @@ from sage_lib.review_driver import _all_delivered  # noqa: E402
 async def _noop_save() -> None:
     """Stand-in for ``routes._save_runs``, which is a coroutine.
 
-    The registry write is offloaded to a worker thread because its owner-only
-    lockdown spawns ``icacls`` on Windows, so a plain ``lambda: None`` stub is
+    The registry write is offloaded to a worker thread because it is blocking
+    file IO (see ``_write_runs``), so a plain ``lambda: None`` stub is
     not awaitable and the patched call site would raise instead of no-op.
     """
 
@@ -146,9 +146,10 @@ class TestRunsPersistence(unittest.TestCase):
         self.assertIn("e5", runs.read_text(encoding="utf-8"))
 
     def test_the_lockdown_never_runs_on_the_event_loop(self):
-        """The owner-only lockdown spawns ``icacls`` on Windows, so persisting the
-        registry must not block the single gateway loop -- a freeze there stalls
-        every chat turn and the liveness heartbeat, not just this write.
+        """Persisting the registry is blocking file IO (the owner-only lockdown
+        itself is now in-process — ``platform_compat``), and it must not run on
+        the single gateway loop -- a stall there delays every chat turn and the
+        liveness heartbeat, not just this write.
 
         Asserted structurally rather than by timing, so it holds regardless of how
         fast the syscall happens to be on this host. The thread is RECORDED and
@@ -171,12 +172,12 @@ class TestRunsPersistence(unittest.TestCase):
         self.assertIn("write", seen, "_write_runs was never reached")
         self.assertNotEqual(
             seen["write"], seen["loop"],
-            "_write_runs ran on the event-loop thread; the icacls spawn inside it "
-            "would freeze the gateway")
+            "_write_runs ran on the event-loop thread; the blocking file IO inside "
+            "it would stall the gateway")
 
 
 class TestRecordReviewedDelivery(unittest.TestCase):
-    """Regression for the reviewed-index write path:
+    """The reviewed-index write path:
       * a PR is indexed as reviewed ONLY when the poster
         actually delivered (posted_comments >= posting_expected), not merely when
         the poster turn completed (post_ok). A failed gh post must not strand it.
@@ -229,7 +230,7 @@ class TestRecordReviewedDelivery(unittest.TestCase):
 
 
 class TestUnderLockRededup(unittest.TestCase):
-    """Regression for the TOCTOU + double-review guards: a run re-checks the
+    """The TOCTOU + double-review guards: a run re-checks the
     reviewed index AND the in-flight claim registry before it owns a change, so a
     PR another run just recorded (or is reviewing right now) is not re-reviewed."""
 
@@ -639,8 +640,8 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
-# Round 11: worker-authored merge content reached learned-patterns.md unredacted,
-# and a half-failed auto-post still deleted the records the retry needs.
+# Worker-authored merge content must reach learned-patterns.md redacted, and a
+# half-failed auto-post must keep the records the retry needs.
 # ---------------------------------------------------------------------------
 
 
@@ -755,8 +756,8 @@ class TestAdoptionRefusesAPlantedLink:
     """The reviewer worker owns the shared dir and has file tools.
 
     ``is_file()`` follows symlinks, and ``os.replace`` moves the LINK, so a link
-    planted where a record belongs used to land in the run dir intact — and
-    ``read_result`` dereferences it with a plain read. Adoption must never carry a
+    planted where a record belongs lands in the run dir intact unless refused —
+    and ``read_result`` dereferences it with a plain read. Adoption must never carry a
     link across, and must not leave one behind to retry.
     """
 
@@ -882,10 +883,10 @@ class TestRetentionKeepsActiveRuns(unittest.IsolatedAsyncioTestCase):
 class TestAdoptionValidatesBeforeItWrites:
     """Adoption must be all-or-nothing.
 
-    Round 13 traded ``os.replace`` for an ``O_TRUNC`` write to close a symlink
-    hole, and that gave up atomicity: a malformed payload truncated whatever valid
-    record was already filed, and ``read_result`` then raised on the wreckage, so
-    no retry could recover it. Validate first, write via rename.
+    The ``O_TRUNC`` write that closes the symlink hole is not atomic: a malformed
+    payload truncates whatever valid record is already filed, and ``read_result``
+    then raises on the wreckage, so no retry can recover it. Validate first, write
+    via rename.
     """
 
     def _stage(self, tmp_path, change_id, body):
@@ -1068,7 +1069,7 @@ class TestRestartClearsAStrandedPostingFlag(unittest.TestCase):
         self.assertIn("restart", (run.get("post_error") or "").lower())
         # Delivery evidence survives, so re-posting sends only the remainder.
         self.assertEqual(run["posted_keys"], {"c1": ["k1"]})
-        # And the run is no longer considered live, so retention can reclaim it.
+        # And the run does not count as live, so retention can reclaim it.
         self.assertFalse(self.routes._is_live(run))
 
     def test_a_run_that_was_not_posting_is_untouched(self):
@@ -1092,11 +1093,11 @@ class TestGroupedPostAppliesKeysPerChange(unittest.TestCase):
     """A multi-change selection is one request, and each group keeps its own keys.
 
     `posting` is a per-run flag that only the poster clears, while the POST handler
-    returns as soon as it dispatches the poster -- so one request per change had
+    returns as soon as it dispatches the poster -- so one request per change gets
     every change after the first refused with `already_posting`. The grouped form
     is what makes the deliberate multi-select actually publish; the per-change key
-    scoping (round 8) has to survive inside it, or a selection made on one pull
-    request would be applied to another.
+    scoping has to survive inside it, or a selection made on one pull request would
+    be applied to another.
     """
 
     def setUp(self):
@@ -1454,10 +1455,10 @@ class TestCountValuesMustBeNumeric:
 
 
 class TestReportsDirReadsDoNotFollowAPlant:
-    """Round 21 made the reports-dir WRITES not follow a plant; the READS did.
+    """The reports-dir READS must not follow a plant, just as the WRITES do not.
 
-    The dir is reachable by the review worker, so a symlink at `index.json` or
-    `focus-report.html` was followed on read and its contents flowed onward —
+    The dir is reachable by the review worker, so an unguarded read of a symlink at
+    `index.json` or `focus-report.html` follows it and its contents flow onward —
     into a rendered report, or into a shareable dashboard artifact.
     """
 
@@ -1528,7 +1529,7 @@ class TestRedactionReachesNestedValues:
     # Assembled at runtime, never written as one literal: the redactor only fires
     # on credential-SHAPED input (a plain sentinel passes through untouched, so the
     # test would prove nothing), but a real key shape sitting in the source trips
-    # `scripts/scrub-lint.sh`'s credential scan. Splitting it satisfies both — the
+    # the internal-content-scan credential rules. Splitting it satisfies both — the
     # value is key-shaped when the redactor sees it, and no line here matches.
     SECRET = "AKIA" + "1234567890EXAMPLE"
 
@@ -1771,7 +1772,7 @@ class TestNoFindingFieldIsExemptFromRedaction:
 
 
 class TestFindingLineMustBeANumber:
-    """The boundary enforces what the redactor used to assume."""
+    """The boundary enforces `line` as a number, so no exemption rests on it."""
 
     def _record(self, line):
         return {
@@ -1911,11 +1912,11 @@ class TestNestedStringFieldsMustBeScalars:
 class TestRetryRepairsTheReviewedIndex(unittest.TestCase):
     """A retry that succeeds after a failed post must leave the PR indexed.
 
-    `_record_reviewed` reads ONLY `summary.per_change`. The explicit-retry path
-    used to write just the run-level counters, so a record still showing the
-    original failure kept the PR out of the dedup index -- and the next repo
-    review reviewed and posted it a second time. Both the first attempt and the
-    retry now write those fields through `review_driver.apply_post_outcome`.
+    `_record_reviewed` reads ONLY `summary.per_change`. A retry writing just the
+    run-level counters leaves a record still showing the original failure, which
+    keeps the PR out of the dedup index -- and the next repo review reviews and
+    posts it a second time. Both the first attempt and the retry write those fields
+    through `review_driver.apply_post_outcome`.
     """
 
     def setUp(self):
@@ -2241,11 +2242,11 @@ class TestPhase1ValuesMustBeStrings(unittest.TestCase):
         self.assertTrue(any("must be a string" in e for e in errs), errs)
 
     def test_numeric_gate_verdict_is_refused(self):
-        """This used to validate cleanly.
+        """A numeric gate_verdict must not validate cleanly.
 
-        The vocabulary check sat behind an isinstance() guard, so a numeric
-        gate_verdict was neither rejected as a shape nor checked against
-        VALID_VERDICTS — it reached `html.escape()` in the renderer, which raises.
+        Behind an isinstance() guard alone, a numeric gate_verdict is neither
+        rejected as a shape nor checked against VALID_VERDICTS — it reaches
+        `html.escape()` in the renderer, which raises.
         """
         from sage_lib import results
 
@@ -2269,7 +2270,7 @@ class TestPersistedReportIsRedactedOnRead(unittest.TestCase):
     Redacting on read is idempotent, so a report this module built is unchanged.
     """
 
-    # Assembled at runtime: scrub-lint scans source text, while the redactor only
+    # Assembled at runtime: the scan reads source text, while the redactor only
     # fires on credential-shaped input.
     _SENTINEL = "AKIA" + "IOSFODNN7EXAMPLE"
 
@@ -2344,19 +2345,19 @@ class TestPersistedReportIsRedactedOnRead(unittest.TestCase):
 class TestPlantedReportMetadataCannotBreakTheEndpoint(unittest.TestCase):
     """The remaining worker-writable fields in the read_report payload.
 
-    Round 40 redacted the rows and coerced the tallies but left two gaps in its
-    own hardening: `bands` was screened for truthiness rather than for being a
-    MAPPING, and `report_slug` was passed through untouched.
+    Redacting the rows and coercing the tallies is not enough on its own: `bands`
+    screened for truthiness rather than for being a MAPPING, and `report_slug`
+    passed through untouched, are two gaps.
 
-    `[] or {}` yields `{}`, so an empty list looked handled -- but a truthy
-    non-dict (a non-empty list, a string, a number) reached `.get` and raised
+    `[] or {}` yields `{}`, so an empty list looks handled -- but a truthy
+    non-dict (a non-empty list, a string, a number) reaches `.get` and raises
     AttributeError, turning a planted file into an HTTP 500 on the report
     endpoint. The slug names an artifact the dashboard turns into a share link, so
     it is screened against the artifact store's own grammar rather than redacted:
     a value that is not a slug cannot reference a real artifact.
     """
 
-    # Assembled at runtime so scrub-lint sees no credential-shaped literal.
+    # Assembled at runtime so the scan sees no credential-shaped literal.
     _SENTINEL = "AKIA" + "IOSFODNN7EXAMPLE"
 
     def setUp(self):
@@ -2456,7 +2457,7 @@ class TestNoRowFieldIsExemptFromRedaction(unittest.TestCase):
     row whose band is not one of the three cannot be grouped, so it is dropped.
     """
 
-    # Assembled at runtime: scrub-lint scans source text, the redactor only fires
+    # Assembled at runtime: the scan reads source text, the redactor only fires
     # on credential-shaped input.
     _SENTINEL = "AKIA" + "IOSFODNN7EXAMPLE"
 
@@ -2938,3 +2939,128 @@ class TestFollowupRunLiveAndReentry(unittest.IsolatedAsyncioTestCase):
         data = json.loads((await self.mod._handle_chat_get(
             _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"}))).body)
         self.assertTrue(data["resumable"])
+
+
+class TestFailureStringMapping(unittest.TestCase):
+    """Each skipped_reason renders a DISTINCT, cause-naming sentence.
+
+    "The reviewer found nothing" and "the reviewer never ran" collapsing into one
+    message is the ambiguity that made these failures untriageable — a reader
+    must be able to tell the causes apart from the run-level error alone.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._old_home = os.environ.get("KIROCREW_HOME")
+        self.addCleanup(self._restore_home)
+        os.environ["KIROCREW_HOME"] = self.tmp
+        self.mod = _load_routes_module()
+
+    def _restore_home(self):
+        if self._old_home is None:
+            os.environ.pop("KIROCREW_HOME", None)
+        else:
+            os.environ["KIROCREW_HOME"] = self._old_home
+
+    def _mapped(self, reason: str) -> str:
+        return self.mod._first_change_error(
+            {"per_change": [{"skipped_reason": reason}]})
+
+    def test_every_reason_maps_to_its_own_sentence(self):
+        reasons = ("no_review_recorded", "review_record_incomplete",
+                   "runtime_unavailable", "review_failed")
+        rendered = {reason: self._mapped(reason) for reason in reasons}
+        for reason, text in rendered.items():
+            self.assertNotEqual(text, reason,
+                                f"{reason} passed through unmapped")
+            self.assertTrue(text, f"{reason} rendered empty")
+        self.assertEqual(len(set(rendered.values())), len(reasons),
+                         f"reasons share a sentence: {rendered}")
+
+    def test_never_ran_and_found_nothing_read_apart(self):
+        never_ran = self._mapped("runtime_unavailable")
+        found_nothing = self._mapped("no_review_recorded")
+        self.assertIn("never ran", never_ran)
+        self.assertNotIn("never ran", found_nothing)
+
+    def test_specific_error_text_outranks_the_reason_mapping(self):
+        # A record carrying the preflight's own message (which names the missing
+        # runtime) surfaces that message verbatim rather than the generic map.
+        out = self.mod._first_change_error({"per_change": [{
+            "deep_error": "the reviewer cannot run: no kiro-cli executable was "
+                          "found on this host",
+            "skipped_reason": "runtime_unavailable",
+        }]})
+        self.assertIn("kiro-cli", out)
+
+
+class TestRuntimePreflightWiring(unittest.IsolatedAsyncioTestCase):
+    """The review path checks the runtime BEFORE spawning anything.
+
+    On a host that cannot spawn a reviewer, the run must fail fast with an error
+    naming the missing runtime — the batch is never opened, no session is
+    dispatched, and every change's progress carries the discriminated reason —
+    instead of "completing" and reporting an untriageable "no result record".
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self._old_home = os.environ.get("KIROCREW_HOME")
+        self.addCleanup(self._restore_home)
+        os.environ["KIROCREW_HOME"] = self.tmp
+        self.mod = _load_routes_module()
+        self.mod._RUNS = []
+
+    def _restore_home(self):
+        if self._old_home is None:
+            os.environ.pop("KIROCREW_HOME", None)
+        else:
+            os.environ["KIROCREW_HOME"] = self._old_home
+
+    async def test_failing_preflight_fails_the_run_without_spawning(self):
+        batch_calls: list[str] = []
+
+        class _FakePool:
+            async def begin_batch(self):
+                batch_calls.append("begin")
+
+            async def end_batch(self):
+                batch_calls.append("end")
+
+        def _refuse_dispatch(loop, pool, **kw):
+            def dispatch(task, timeout=0, **kwargs):
+                raise AssertionError("a session was dispatched despite a "
+                                     "failed runtime preflight")
+            return dispatch
+
+        async def _noop_async(*a, **k):
+            return None
+
+        url = "https://github.com/kirodotdev/KiroCrew/pull/33"
+        run: dict = {"run_id": "rp1", "status": "running", "changes": [url],
+                     "change_ids": [_rd.change_id_for(url)], "progress": {}}
+        self.mod._RUNS = [run]
+        with unittest.mock.patch.object(
+                self.mod.review_pool, "runtime_preflight",
+                lambda: "the reviewer cannot run: no kiro-cli executable was "
+                        "found on this host"), \
+                unittest.mock.patch.object(
+                    self.mod.review_pool, "get_pool", lambda: _FakePool()), \
+                unittest.mock.patch.object(
+                    self.mod.review_pool, "make_sync_dispatch",
+                    _refuse_dispatch), \
+                unittest.mock.patch.object(self.mod, "_save_runs", _noop_async), \
+                unittest.mock.patch.object(
+                    self.mod, "_notify_finished", _noop_async):
+            await self.mod._run_review_bg(run, [url])
+
+        self.assertEqual(batch_calls, [])            # runtime never spawned
+        self.assertEqual(run["status"], "error")
+        self.assertIn("kiro-cli", run["error"])
+        entry = run["progress"][_rd.change_id_for(url)]
+        self.assertEqual(entry["phase"], "failed")
+        self.assertIn("kiro-cli", entry["error"])
+        recs = run["summary"]["per_change"]
+        self.assertEqual(recs[0]["skipped_reason"], "runtime_unavailable")

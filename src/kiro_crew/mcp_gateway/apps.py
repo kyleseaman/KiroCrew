@@ -168,10 +168,10 @@ def write_spool(payload: dict) -> str:
     # Lockdown-before-content + atomic publish: ``restrict_to_owner=True``
     # applies the owner-only DACL (and 0o600 on POSIX) to the temp file BEFORE
     # any byte of the record — whose filename and callback_secret are live
-    # capability tokens — reaches it. The previous hand-rolled ``os.open`` at
-    # the final path published the content first and applied the Windows DACL
+    # capability tokens — reaches it. A hand-rolled ``os.open`` at the final
+    # path instead would publish the content first and apply the Windows DACL
     # only afterwards, leaving it readable under the inherited ACL for the
-    # write window (issue #5285). Fail closed is now structural: every failure
+    # write window. Fail closed is structural here: every failure
     # (lockdown, write, rename) happens before the final path is touched, so
     # an unprotected record never exists there and no unlink is needed; the
     # raised OSError propagates so the interception caller's failure-safe path
@@ -410,8 +410,16 @@ def extract_declared_ui_uris(result: dict) -> dict[str, str]:
 
 
 def append_marker(result: dict, spool_id: str) -> dict:
-    """Return a copy of a ``tools/call`` result with the spool marker appended
+    """Return a copy of a ``tools/call`` result with the spool marker PREPENDED
     to its FIRST text content item (or a new text item when none exists).
+
+    The marker sits at offset 0 of the first text block so it survives the
+    downstream ACP per-part 4000-char truncation in
+    ``acp/_dispatch.py::_build_tool_result_event`` before the dashboard marker
+    detector (``mcp_apps_render.find_marker``) runs; an end-appended marker on a
+    long first block (real cases run to tens of thousands of chars) is sliced
+    off and the app never mounts. Both consumers (``find_marker`` search,
+    ``strip_marker`` sub) are position-agnostic, so leading the block is safe.
 
     Copy discipline mirrors ``backend._strip_caller_meta``: the input ``result``
     and every nested container on the mutated path are copied, never mutated in
@@ -432,10 +440,14 @@ def append_marker(result: dict, spool_id: str) -> dict:
         None,
     )
     if text_idx is None:
-        content.append({"type": "text", "text": marker})
+        # No text item exists, so create one at offset 0 to match the prepend
+        # framing: a lone new item is already the earliest content, but leading
+        # it keeps the "marker at the front" invariant true regardless of what
+        # else lands in ``content`` later.
+        content.insert(0, {"type": "text", "text": marker})
     else:
         item = dict(content[text_idx])
-        item["text"] = f"{item['text']} {marker}"
+        item["text"] = f"{marker} {item['text']}"
         content[text_idx] = item
     out["content"] = content
     return out

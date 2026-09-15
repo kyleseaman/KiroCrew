@@ -18,6 +18,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { createTestStore } from './helpers'
 import { ThemeProvider } from '../hooks/useTheme'
 import type { ChatTag, TagColumn, ChatFolder } from '../types'
+import type { RootState } from '../store'
 
 // Render framer-motion elements as plain DOM (jsdom can't run projection).
 vi.mock('framer-motion', async () => {
@@ -28,21 +29,21 @@ vi.mock('framer-motion', async () => {
     'drag', 'dragConstraints', 'dragElastic', 'onAnimationComplete',
   ])
   const make = (tag: string) =>
-    React.forwardRef((props: any, ref: any) => {
-      const clean: any = {}
+    React.forwardRef((props: Record<string, unknown>, ref: React.Ref<unknown>) => {
+      const clean: Record<string, unknown> = {}
       for (const k of Object.keys(props)) {
         if (k === 'children') continue
         if (k === 'layoutId') { clean['data-layout-id'] = props[k]; continue }
         if (FRAMER_PROPS.has(k)) continue
         clean[k] = props[k]
       }
-      return React.createElement(tag, { ...clean, ref }, props.children)
+      return React.createElement(tag, { ...clean, ref }, props.children as React.ReactNode)
     })
   const motion = new Proxy({}, { get: (_t, tag: string) => make(tag) })
   return {
     motion,
-    AnimatePresence: ({ children }: any) => React.createElement(React.Fragment, null, children),
-    LayoutGroup: ({ children }: any) => React.createElement(React.Fragment, null, children),
+    AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
+    LayoutGroup: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
   }
 })
 
@@ -91,8 +92,8 @@ function renderSidebar(foldersOverride: ChatFolder[] = folders) {
       channelTrusted: false, refreshTrigger: 0, unreadSlots: [], updateProgress: null,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
-    } as any,
-    chat: { activeSlot: null } as any,
+    } as unknown as RootState['dashboard'],
+    chat: { activeSlot: null } as unknown as RootState['chat'],
   })
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   qc.setQueryData(['chat-tags'], tags)
@@ -183,5 +184,37 @@ describe('board view: folder reorder wiring', () => {
     const rendered = [...container.querySelectorAll('[data-col-folder-sortable]')]
       .map(el => el.getAttribute('data-col-folder-sortable'))
     expect(rendered).toEqual([FOLDER_A, FOLDER_B])
+  })
+})
+
+describe('board view: nested subfolders draw in stored order', () => {
+  // The surface the UX lane found unevidenced: `renderColumnFolder` sorts
+  // `childFolders` with `bySidebarOrder`, so a board column must show the same
+  // sequence the list sidebar does — and the same one `chat_folder_tree`
+  // reports, which is where an agent reads the gap it names in before/after.
+  const PARENT = 'folder-parent'
+  const CHILD_Z = 'folder-child-z'
+  const CHILD_A = 'folder-child-a'
+
+  // Stored order is the REVERSE of alphabetical, so a name-only sort fails here.
+  const nested: ChatFolder[] = [
+    { id: PARENT, name: 'Parent', order: 0 },
+    { id: CHILD_Z, name: 'Zulu', parent_id: PARENT, order: 0 },
+    { id: CHILD_A, name: 'Alpha', parent_id: PARENT, order: 1 },
+  ]
+
+  it('draws Zulu above Alpha because order says so, not the name', () => {
+    mocks.chatFolders.mockResolvedValue(nested)
+    const { container } = renderSidebar(nested)
+    const ids = [...container.querySelectorAll('[data-col-folder-sortable]')]
+      .map(el => el.getAttribute('data-col-folder-sortable'))
+    // The parent is the sortable root; children render inside it.
+    expect(ids).toContain(PARENT)
+    const html = container.innerHTML
+    const posZulu = html.indexOf('Zulu')
+    const posAlpha = html.indexOf('Alpha')
+    expect(posZulu).toBeGreaterThan(-1)
+    expect(posAlpha).toBeGreaterThan(-1)
+    expect(posZulu).toBeLessThan(posAlpha)
   })
 })

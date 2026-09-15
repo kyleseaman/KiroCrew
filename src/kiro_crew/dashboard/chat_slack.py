@@ -1,4 +1,4 @@
-"""Slack integration — link sessions, handoff, channel listing."""
+"""Slack integration — link sessions, channel listing."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.constants import strip_control_comments
 from kiro_crew.dashboard import state as dashboard_state
 from kiro_crew.dashboard.chat_backfill import (
     backfill_content,
@@ -16,14 +17,12 @@ from kiro_crew.dashboard.chat_backfill import (
     select_backfill_messages,
     session_deep_link,
 )
-from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
 from kiro_crew.dashboard.chat_utils import (
     effective_session_key,
     expire_slack_options,
     mint_options_token,
     remember_slack_options,
     slack_options_owner_keys_snapshot,
-    slot_history_key,
 )
 from kiro_crew.dashboard.state import DashboardState, _log_task_exception
 from kiro_crew.messaging.link import SLACK_NAMESPACE
@@ -39,7 +38,6 @@ from kiro_crew.slack.format import (
     render_for_slack,
 )
 from kiro_crew.slack.outbound import OPTIONS_FALLBACK_TEXT, PostedOptions
-from kiro_crew.sync_bridge import handoff_to_slack
 
 logger = logging.getLogger(__name__)
 
@@ -83,12 +81,13 @@ def _format_backfill_parts(content: str, icon: str) -> list[str]:
     """Render one transcript row into postable Slack parts, icon included.
 
     Thin delegate to :func:`kiro_crew.slack.format.render_for_slack`, which owns
-    the redact/convert/split ordering this path used to implement privately. The
-    icon is passed as the prefix rather than prepended afterwards: decorating a
-    maximally-sized part after the split pushed it past ``SLACK_MSG_LIMIT`` by
-    the width of the icon plus its space.
+    the redact/convert/split ordering. The icon is passed as the prefix rather
+    than prepended afterwards: decorating a maximally-sized part after the split
+    pushes it past ``SLACK_MSG_LIMIT`` by the width of the icon plus its space.
     """
-    return render_for_slack(content, prefix=f"{icon} ", redactor=redact_via_context)
+    return render_for_slack(
+        strip_control_comments(content), prefix=f"{icon} ", redactor=redact_via_context
+    )
 
 
 async def drain_slack_backfill(
@@ -258,7 +257,7 @@ async def drain_slack_backfill(
     # removes the routing before this drain finishes posting, so the control we
     # just rendered as live belongs to a thread nothing owns any more: a click on
     # it starts a FRESH Slack session and answers a question that session never
-    # asked. Round 32's unlink abort covers the other order (a control already
+    # asked. The unlink abort covers the other order (a control already
     # tracked when the unlink arrives); this covers a control recorded after the
     # unlink already succeeded, where there was nothing yet for it to abort on.
     _unlinked = slot._slack_channel != channel or slot._slack_thread_ts != thread_ts
@@ -287,7 +286,7 @@ def _split_backfill_options(row: dict[str, Any]) -> tuple[str, list[str]]:
     actually shows (ANSI, emphasis and backtick splits, link markup) before
     scanning — strictly stronger than redacting the raw bytes here, and the body
     is covered by ``_format_backfill_parts``. Duplicating the ordering in this
-    function is what previously let the two copies drift apart.
+    function would let the two copies drift apart.
     """
     content = backfill_content(row)
     if row.get("role") == "user":
@@ -502,16 +501,16 @@ async def api_chat_slot_slack_unlink(request: web.Request) -> web.Response:
         return done
 
     # Tear the link down with NO await in the middle, so nothing can interleave
-    # between reading the link and clearing it. That is what retires the
-    # compare-and-clear apparatus this handler used to carry: the strike-through no
-    # longer runs BEFORE the teardown, so there is no await for a relink to land
-    # inside and nothing to reconcile afterwards.
+    # between reading the link and clearing it. That is what makes any
+    # compare-and-clear reconciliation unnecessary: the strike-through does not
+    # run BEFORE the teardown, so there is no await for a relink to land inside
+    # and nothing to reconcile afterwards.
     #
-    # The ordering is free now. Striking first used to be mandatory -- while the
-    # reverse index was still intact -- because a click arriving after teardown
-    # resolved to nothing and started a brand-new session carrying a stale answer.
-    # A click now carries the identity of the conversation that asked it, so one
-    # arriving after the link is gone is refused on its own terms.
+    # The ordering is therefore free, and striking first is not mandatory: a
+    # click carries the identity of the conversation that asked it, so one
+    # arriving after the link is gone is refused on its own terms instead of
+    # resolving to nothing and starting a brand-new session carrying a stale
+    # answer.
     prev_channel = slot._slack_channel
     prev_thread_ts = slot._slack_thread_ts
     cleared = _clear_persisted_link_sync()
@@ -614,11 +613,11 @@ async def api_chat_slot_slack_pause(request: web.Request) -> web.Response:
     # Called ON the loop deliberately, NOT via ``to_thread``. ``SessionMap._save``
     # branches on whether its caller has a running loop: on the loop it marks the
     # map dirty and schedules ONE debounced flush that does the disk write in a
-    # worker (#2405), so the loop never pays the write inline; with no running
+    # worker, so the loop never pays the write inline; with no running
     # loop it writes inline on the calling thread. Offloading therefore selects
     # the inline-write branch and does that write while holding ``_MAP_LOCK``, so
     # any loop-side mutator then blocks the whole loop on the lock — strictly
-    # worse than calling it here. This is also why #2976 reverted the same idea.
+    # worse than calling it here.
     was_paused = bool(state.sessions.set_slack_paused(session_key, paused))
 
     # Posted INTO the Slack thread, not shown in the dashboard. Without it the
@@ -709,75 +708,3 @@ async def api_slack_channels(request: web.Request) -> web.Response:
     """GET /api/slack/channels — list channels the bot can reply in."""
     state: DashboardState = request.app["state"]
     return web.json_response(await list_slack_channels(state))
-
-
-async def api_chat_slot_handoff(request: web.Request) -> web.Response:
-    """POST /api/chat/slots/{slot}/handoff — hand off session to Slack DM thread."""
-
-    state: DashboardState = request.app["state"]
-    name = request.match_info.get("slot") or request.match_info.get("name", "")
-    slot = state.get_slot(name) or state._slots.get(name)
-    if not slot:
-        return web.json_response({"error": "not found"}, status=404)
-    if not state.slack_client:
-        return web.json_response({"error": "Slack not connected"}, status=503)
-    if not state.conversation_log:
-        return web.json_response({"error": "no conversation log"}, status=500)
-
-    try:
-        await save_slot_off_loop(state, slot)
-    except Exception:
-        pass
-
-    channel = None
-    try:
-        body = await request.json()
-        channel = body.get("channel")
-    except Exception:
-        pass
-
-    history_key = effective_session_key(slot)
-    transcript_key = slot_history_key(slot)
-    if transcript_key != history_key:
-        # The tab's conversation is stored somewhere other than the session it
-        # runs on -- an unbound channel tab. Handing off would seed the thread
-        # from the channel transcript while every later reply persisted under
-        # the session's own key, splitting one conversation across two files;
-        # a crash before the next slot flush would drop those replies entirely.
-        # Refuse rather than straddle.
-        return web.json_response(
-            {
-                "error": (
-                    "this tab's conversation lives in a channel transcript, so it "
-                    "cannot be handed off to a new Slack thread"
-                ),
-                "code": "transcript_not_own_session",
-            },
-            status=409,
-        )
-    thread_ts = await handoff_to_slack(
-        state.slack_client,
-        state.owner_id,
-        state.conversation_log,
-        history_key,
-        title=slot.title if slot._titled else "",
-        channel=channel,
-        sessions=state.sessions,
-        transcript_key=transcript_key,
-    )
-    if not thread_ts:
-        return web.json_response({"error": "handoff failed"}, status=500)
-
-    sel().log_api_access(
-        caller="dashboard",
-        operation="chat.slot_handoff",
-        outcome="allowed",
-        source="dashboard",
-        resources=slot.key,
-    )
-    return web.json_response({"ok": True, "thread_ts": thread_ts})
-
-
-async def api_handoff_channels(request: web.Request) -> web.Response:
-    """GET /api/handoff-channels — deprecated, use /api/slack/channels instead."""
-    return web.json_response({})

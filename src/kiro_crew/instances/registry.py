@@ -9,7 +9,7 @@ and is never stored here.
 Two persisted hints support lazy reconnect on gateway restart:
 
 * per-instance ``was_connected`` — whether the instance had an open tunnel when
-  it was last touched, used to render "disconnected — click to reconnect".
+  it was last touched; renders "disconnected — click to reconnect".
 * top-level ``last_active_id`` — the single instance to auto-revive on startup
   (startup opens *no* other tunnels, avoiding a stale-credential ssh herd).
 
@@ -41,6 +41,7 @@ from pathlib import Path
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import _DEFAULT_PORT, config_dir
 from kiro_crew.instances.constants import TTL_PATTERN
+from kiro_crew.instances.validation import _AWS_PROFILE_RE as _validation_aws_profile_re
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +66,11 @@ _REMOTE_BIN_RE = re.compile(r"^[A-Za-z0-9._/~\- ]{0,512}\Z")
 # authoritative validation lives with the tunnel manager (validation.py).
 _SSM_TARGET_RE = re.compile(r"^(i|mi)-[a-f0-9]{8,17}\Z")
 # aws_profile: named profile in ~/.aws/config; conservative charset, no shell
-# metacharacters. Empty string means "default credential chain".
-_AWS_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.\-]{0,128}\Z")
+# metacharacters ('+' is legal: IAM entity names permit it, and SSO-derived
+# profiles use "<account>+<permission-set>"). Single source of truth lives in
+# validation.py; the empty "default credential chain" value is handled by the
+# `if self.aws_profile` guard at the check site rather than by the pattern.
+_AWS_PROFILE_RE = _validation_aws_profile_re
 # aws_region: standard AWS region shape (e.g. us-east-1, eu-west-2). Empty
 # string means "use the profile's/environment's default region".
 _AWS_REGION_RE = re.compile(r"^[a-z]{2}(-gov)?-[a-z]+-\d{1,2}\Z|^\Z")
@@ -87,11 +91,9 @@ _DEFAULT_SSM_RUN_AS = "ec2-user"
 # re-export seam, giving the value a name that says what it means HERE (the
 # REMOTE's port, not ours).
 #
-# It was previously 7777 -- an earlier default dashboard port -- which left the
-# Add form pre-filling a port no stock remote listens on (#1972). Correcting it
-# was only safe once the local forward stopped mirroring this value: while it
-# mirrored, filling in the port a stock remote actually binds landed the user on
-# a guaranteed local-port collision.
+# The local forward does not mirror this value: mirroring would pre-fill the port
+# a stock remote actually binds and land the user on a guaranteed local-port
+# collision.
 DEFAULT_REMOTE_PORT = _DEFAULT_PORT
 _DEFAULT_TTL = "20h"
 
@@ -186,6 +188,9 @@ class Instance:
     # launcher-provisioned AL2023 user; set "ubuntu" (or whoever runs the remote
     # gateway) on other AMIs, otherwise the tunnel comes up but the mint fails.
     ssm_run_as: str = _DEFAULT_SSM_RUN_AS
+    # Provisioner that created this crew, when known. Empty means the machine
+    # was added directly or predates source tracking.
+    provisioner_id: str = ""
     # Sticky "connection intent" — the source of truth for whether a tab should
     # exist for this instance. Set True when a tunnel is opened and cleared ONLY
     # on an explicit user disconnect; deliberately LEFT TRUE across gateway
@@ -199,7 +204,7 @@ class Instance:
     # unknown). Persisted so a forwarder orphaned by a gateway hard-kill can be
     # reclaimed by its OWN identity — pid + start time + exact argv — never by
     # matching the process table, which cannot distinguish our child from an
-    # operator's own forward (#1972). Either half missing means the identity
+    # operator's own forward. Either half missing means the identity
     # cannot be confirmed and no reclaim happens (fail closed).
     forwarder_pid: int = _NO_FORWARDER_PID
     forwarder_start: str = ""
@@ -237,7 +242,10 @@ class Instance:
                     f"hex digits"
                 )
             if self.aws_profile and not _AWS_PROFILE_RE.match(self.aws_profile):
-                raise InvalidInstanceError(f"invalid aws_profile {self.aws_profile!r}")
+                raise InvalidInstanceError(
+                    f"invalid aws_profile {self.aws_profile!r} "
+                    f"(allowed: letters, digits, '.', '_', '+', '-')"
+                )
             if self.aws_region and not _AWS_REGION_RE.match(self.aws_region):
                 raise InvalidInstanceError(f"invalid aws_region {self.aws_region!r}")
             if not _SSM_RUN_AS_RE.match(self.ssm_run_as):
@@ -257,6 +265,10 @@ class Instance:
                     f"invalid {label} {port!r}: must be an int in "
                     f"[{lo}, 65535]" + (" (0 = unallocated)" if allow_zero else "")
                 )
+        if not isinstance(self.provisioner_id, str):
+            raise InvalidInstanceError(
+                f"invalid provisioner_id {self.provisioner_id!r}: must be a string"
+            )
         if not isinstance(self.forwarder_pid, int) or self.forwarder_pid < 0:
             raise InvalidInstanceError(
                 f"invalid forwarder_pid {self.forwarder_pid!r}: must be an int "
@@ -288,6 +300,7 @@ class Instance:
             "aws_profile": self.aws_profile,
             "aws_region": self.aws_region,
             "ssm_run_as": self.ssm_run_as,
+            "provisioner_id": self.provisioner_id,
             "was_connected": self.was_connected,
             "forwarder_pid": self.forwarder_pid,
             "forwarder_start": self.forwarder_start,
@@ -324,6 +337,7 @@ class Instance:
             # by an older build has no key, and one written with an explicit
             # empty string would fail validation — both mean "use the default".
             ssm_run_as=str(data.get("ssm_run_as", "") or _DEFAULT_SSM_RUN_AS),
+            provisioner_id=str(data.get("provisioner_id", "") or ""),
             was_connected=bool(data.get("was_connected", False)),
             # max(): a hand-edited negative pid normalizes to the sentinel
             # rather than poisoning every later update() with a validate error
@@ -446,6 +460,7 @@ class InstancesRegistry:
         aws_profile: str = "",
         aws_region: str = "",
         ssm_run_as: str = _DEFAULT_SSM_RUN_AS,
+        provisioner_id: str = "",
         instance_id: str | None = None,
     ) -> Instance:
         """Add a new instance and return it.
@@ -486,6 +501,7 @@ class InstancesRegistry:
                 aws_profile=aws_profile,
                 aws_region=aws_region,
                 ssm_run_as=ssm_run_as or _DEFAULT_SSM_RUN_AS,
+                provisioner_id=provisioner_id,
                 was_connected=False,
             )
             inst.validate()
@@ -507,7 +523,7 @@ class InstancesRegistry:
 
         Accepts any of: ``name``, ``ssh_host``, ``remote_port``, ``local_port``,
         ``ttl``, ``remote_bin``, ``connection_method``, ``ssm_target``,
-        ``ssm_run_as``,
+        ``ssm_run_as``, ``provisioner_id``,
         ``aws_profile``, ``aws_region``, ``was_connected``, ``forwarder_pid``,
         ``forwarder_start``, ``forwarder_sig``.
         The ``id`` is
@@ -527,6 +543,7 @@ class InstancesRegistry:
             "connection_method",
             "ssm_target",
             "ssm_run_as",
+            "provisioner_id",
             "aws_profile",
             "aws_region",
             "was_connected",
@@ -566,16 +583,3 @@ class InstancesRegistry:
             self._write(doc)
             logger.info("Removed instance %s", instance_id)
             return True
-
-    def set_last_active(self, instance_id: str) -> None:
-        """Mark *instance_id* as the one to auto-revive on next startup.
-
-        Raises :class:`InstanceNotFoundError` if the id is unknown so callers
-        can't silently point ``last_active_id`` at a non-existent instance.
-        """
-        with self._lock:
-            doc = self._read()
-            if _find(doc, instance_id) is None:
-                raise InstanceNotFoundError(f"no instance with id {instance_id!r}")
-            doc.last_active_id = instance_id
-            self._write(doc)

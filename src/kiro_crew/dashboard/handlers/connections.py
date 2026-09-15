@@ -3,19 +3,35 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from aiohttp import web
 
 from kiro_crew.connections import get_provider
+from kiro_crew.connections.ownership import remove_provider_entry
 from kiro_crew.connections.registry import Provider
-from kiro_crew.dashboard.handlers.mcp import _is_valid_mcp_name
+from kiro_crew.dashboard.handlers.mcp import (
+    _get_mcp_lock,
+    _is_valid_mcp_name,
+    _offload_config_write,
+    _scrub_preregistered_oauth_copies,
+)
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.sel import sel
+
+logger = logging.getLogger(__name__)
 
 _MAX_RETURN_ADDRESS_BYTES = 8192
 _MAX_REQUEST_TARGET_BYTES = 6144
+# RFC 3986 scheme followed by "://". Deliberately requires the "//": a bare
+# "host:port/..." (which urlsplit would misread as scheme + opaque path) must
+# NOT count as having a scheme, so it gets the http:// default.
+_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 _SERVER_SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _ALLOWED_CALLBACK_QUERY_KEYS = {
     "authuser",
@@ -44,12 +60,24 @@ def _validated_loopback_return_address(value: object) -> _LoopbackCallback | Non
     The user controls only an unprivileged loopback port and an ASCII HTTP
     request-target containing a single OAuth code.  The network host is selected
     later from fixed literals, so request data can never choose a remote host.
+
+    A paste with no scheme is normalized to ``http://`` first: mobile
+    browsers — iOS Safari in particular — copy address-bar URLs without the
+    scheme, so the documented paste-back flow otherwise fails on exactly the
+    text the browser gave the user. Prepending a scheme is safe here because
+    every containment constraint below (loopback host literals, port floor,
+    query allowlist) applies to the normalized value; a scheme cannot turn a
+    non-loopback host into a loopback one. The regex also catches the
+    ``urlsplit`` gotcha where ``localhost:8976/...`` parses ``localhost`` as
+    the scheme rather than the host.
     """
     if not isinstance(value, str):
         return None
     candidate = value.strip()
     if not candidate or len(candidate.encode("utf-8")) > _MAX_RETURN_ADDRESS_BYTES:
         return None
+    if not _URL_SCHEME_RE.match(candidate):
+        candidate = f"http://{candidate}"
     try:
         parsed = urlsplit(candidate)
         port = parsed.port
@@ -157,6 +185,11 @@ def _approval_superseded(error: str, code: str) -> web.Response:
 
 async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
     """POST /api/mcp/oauth/relay — deliver a failed browser redirect locally."""
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, "mcp_oauth_relay")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -168,7 +201,7 @@ async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
     # loopback listener that minted it; it never mints one. That listener and its
     # PKCE verifier belong to a specific pending kiro-cli OAuth flow regardless of
     # whether the server is a curated Connections provider or a user-added /
-    # self-hosted one (issue #4491, the #4008 population). So relay membership is
+    # self-hosted one. So relay membership is
     # NOT gated on the Connections registry — every safety property here is
     # provider-independent: the return address must target the gateway's own
     # loopback listener (_validated_loopback_return_address), and a port nothing is
@@ -179,8 +212,8 @@ async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
     # while staying a safe, bounded SEL audit label rather than
     # attacker-controlled log content. The registry-slug shape stays on the MINT
     # path only (_requested_provider). This is deliberately distinct from
-    # generalising the MINT to uncurated URLs, which is parked decision #4286 and
-    # untouched here.
+    # generalising the MINT to uncurated URLs, which is a separate parked
+    # decision and untouched here.
     server = body.get("server")
     if not isinstance(server, str) or not _is_valid_mcp_name(server):
         return _bad_request("invalid server", "invalid_server")
@@ -252,6 +285,16 @@ async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
 # Fire-and-forget mint tasks, held so the loop cannot collect one mid-flight.
 _mint_tasks: set[asyncio.Task] = set()
 
+# The same keepalive for the premint activation, kept separate so a page open cannot
+# be mistaken for a card-initiated mint when either set is inspected.
+_premint_tasks: set[asyncio.Task] = set()
+
+#: SEL read-id for the grant observation the premint endpoint acts on. Distinct from
+#: the mint engine's and the status module's ids so the trail says which surface
+#: looked; registered in ``hooks._AUDIT_ONLY_READ_IDS``, which fail-closes on an
+#: unregistered id and would record nothing.
+_GRANT_PRESENCE_READ_ID = "connections_premint.oauth_grant_presence"
+
 
 def _requested_provider(slug: str) -> Provider | None:
     """The registry provider ``slug`` names, or None."""
@@ -268,9 +311,11 @@ async def _mint_request(
 ) -> tuple[dict, Provider] | web.Response:
     """The JSON body and its registry provider, or the error response to return.
 
-    Registry membership is the bound on what a caller can make the gateway spawn: a
-    mint starts a kiro-cli process, so the slug has to resolve to a provider we ship
-    rather than to arbitrary caller-supplied text.
+    Registry membership is the bound on what a caller can make the gateway act on:
+    a mint starts a kiro-cli process and a disconnect deletes stored grant
+    artifacts, so the slug has to resolve to a provider we ship rather than to
+    arbitrary caller-supplied text. Shared by every provider-scoped endpoint so
+    that bound is enforced in one place.
     """
     try:
         body = await request.json()
@@ -291,19 +336,61 @@ async def api_connections_mint(request: web.Request) -> web.Response:
     Returns as soon as the mint is scheduled. The URL is not ready yet: the
     caller polls :func:`api_connections_mint_state` for it.
     """
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, "connections_mint")
+    if owner_denied is not None:
+        return owner_denied
     parsed = await _mint_request(request)
     if isinstance(parsed, web.Response):
         return parsed
     _body, provider = parsed
     slug = str(provider["slug"])
 
+    # A pre-registered provider (registry ``auth.mode``) has nothing to mint
+    # against until the operator has entered a usable client: kiro-cli would only
+    # come back with the vendor's "unknown client" error, which no user can act on,
+    # and the card is already rendering the instruction instead of Connect. Refuse
+    # here too so a stale tab or a hand-built request cannot start that process.
+    if not await asyncio.to_thread(_oauth_client_configured, provider):
+        return _conflict(
+            "this provider needs an OAuth app configured under Settings → OAuth Apps",
+            "client_not_configured",
+            slug=slug,
+        )
+
     # Function-local by DESIGN, not for a cycle: this handlers package is imported
     # on the gateway boot path, and the mint engine drags in the ACP client, the
-    # credential predicate and the PID registry. Keeping it here is what stops a
+    # credential predicate and the PID registry -- the warm engine adds the ACP
+    # runtime and the MCP inventory on top. Keeping both here is what stops a
     # gateway start paying for a subsystem most requests never touch, and
-    # test_the_handlers_package_does_not_import_the_mint_engine enforces it in a
-    # subprocess -- hoisting this to module scope turns that test red.
+    # test_the_handlers_package_does_not_import_the_mint_engine (and its warm twin)
+    # enforce it in a subprocess -- hoisting either to module scope turns them red.
     from kiro_crew.connections.mint import _dispose_mint, reserve_mint_row, start_oauth_mint
+    from kiro_crew.connections.warm import adopt_shared_mint
+
+    # ADOPTION FIRST, because the alternative is throwing the answer away. The premint
+    # sweep may already hold this provider's approval URL, and ``reserve_mint_row``
+    # below pops whatever row is at the slug -- so reserving first disposed the very
+    # URL this click existed to serve and then paid a ~7.5s cold spawn to re-mint it.
+    # A refusal (nothing warmed, a dead holder, another tab got there first) falls
+    # through to that cold path, which stays correct and stays the only path for a
+    # provider warming never covered.
+    adopted = await adopt_shared_mint(slug, str(provider["mcp_url"]))
+    if adopted is not None:
+        # ONE event, outcome ``ok``: unlike the cold path below, this request both
+        # starts and finishes here, so a ``started`` with no completion would leave the
+        # audit trail showing a mint that never ended. A bare enqueue — SEL is
+        # warmed at gateway startup (sel.warm_sel_singleton).
+        sel().log_api_access(
+            caller="dashboard",
+            operation="connections_mint",
+            outcome="ok",
+            resources=f"provider:{slug} reason=adopted_warm_mint",
+        )
+        # ``waiting`` rather than ``minting``: the URL exists already. The card polls
+        # the mint state either way, and that poll now finds it on the first read.
+        return web.json_response({"ok": True, "slug": slug, "state": "waiting", "token": adopted})
 
     # Reserved BEFORE responding: the response names a row this tab polls
     # immediately, so the row has to be visible first. Allocating only a token here
@@ -321,19 +408,14 @@ async def api_connections_mint(request: web.Request) -> web.Response:
     _mint_tasks.add(task)
     task.add_done_callback(_mint_tasks.discard)
 
-    # Off the loop: only the append is queued to SEL's writer thread. The FIRST
-    # sel() of a process CONSTRUCTS the log -- trust-dir creation, key validation,
-    # and on Windows an icacls subprocess -- and this handler runs BEFORE the audit
-    # middleware's own call (that one logs the response), so on a fresh gateway
-    # whose first state-changing request is a Connect click it would land here and
-    # stall every other request. Same reasoning as server._audit_denied.
-    await asyncio.to_thread(
-        lambda: sel().log_api_access(
-            caller="dashboard",
-            operation="connections_mint",
-            outcome="started",
-            resources=f"provider:{slug}",
-        )
+    # A bare enqueue (plus the writer thread's one-time start on the process's
+    # first log()): the construction cost of a process's FIRST sel() is paid once
+    # at gateway startup instead (sel.warm_sel_singleton).
+    sel().log_api_access(
+        caller="dashboard",
+        operation="connections_mint",
+        outcome="started",
+        resources=f"provider:{slug}",
     )
     return web.json_response({"ok": True, "slug": slug, "state": "minting", "token": token})
 
@@ -385,9 +467,93 @@ async def api_connections_status(request: web.Request) -> web.Response:
     # for grant presence -- test_the_handlers_package_does_not_import_the_mint_engine
     # keeps that engine off the boot path.
     from kiro_crew.connections.status import _STATUS_SCHEMA_VERSION, collect_connection_statuses
+    from kiro_crew.connections.warm import expire_dead_mints
 
+    # Withdraw shared rows whose minting process is gone BEFORE the statuses are
+    # read, so a card cannot be served an approval URL nothing can redeem. Keyed on
+    # the fact rather than a cause, which is what covers a process that went away by
+    # a route no expiry path anticipated; cheap enough to run per request because
+    # liveness is a returncode read, not I/O.
+    await expire_dead_mints()
     statuses = await collect_connection_statuses()
     return web.json_response({"schema_version": _STATUS_SCHEMA_VERSION, "connections": statuses})
+
+
+#: The slug currently running a Connections Test, or ``None`` when the endpoint
+#: is idle. Each click spawns its own promptless kiro-cli ACP session
+#: (``test_connection_tools``, ~10-100s), and two running together both contend
+#: for host resources and -- because the frontend tracked only one global busy
+#: slot -- made a second click's spinner silently replace the first card's,
+#: reading as a cancelled test that had actually completed (its SEL record
+#: still shows the earlier finish). This guard makes running two at once
+#: impossible on the server regardless of what any client renders.
+#:
+#: Guarded by :data:`_TEST_SLUG_GUARD`, a :class:`LoopBoundLock`, rather than a
+#: bare check-then-set: two POSTs handled back-to-back on the loop can each run
+#: up to the read of this variable before either writes it, so an unguarded
+#: "if None: set it" has a window where both readers see ``None`` and both
+#: proceed. The guard's own acquire never blocks a caller's request in a way
+#: that would turn a refusal into a queued wait -- read-and-write below is a
+#: synchronous critical section with no ``await`` inside it, so once acquired
+#: it commits its verdict (proceed or refuse) before yielding the loop at all.
+_testing_slug: str | None = None
+_TEST_SLUG_GUARD = LoopBoundLock()
+
+
+def _conflict(error: str, code: str, *, slug: str) -> web.Response:
+    return web.json_response({"error": error, "code": code, "slug": slug}, status=409)
+
+
+async def api_connections_test(request: web.Request) -> web.Response:
+    """POST /api/connections/test — enumerate this provider through kiro-cli.
+
+    The dedicated ACP session is promptless: kiro-cli authenticates the remote
+    server, performs its MCP ``tools/list``, and reports the final agent-exposed
+    tools through native structured commands. The endpoint never receives token
+    material and never invokes a provider tool.
+
+    Single-flight (:data:`_testing_slug`): a POST arriving while another test is
+    already running -- for the same provider or a different one -- is refused
+    immediately with 409 ``test_in_flight`` naming the slug currently running,
+    rather than starting a second concurrent kiro-cli session or queuing behind
+    the first.
+    """
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, "connections_test")
+    if owner_denied is not None:
+        return owner_denied
+    parsed = await _mint_request(request)
+    if isinstance(parsed, web.Response):
+        return parsed
+    _body, provider = parsed
+    slug = str(provider["slug"])
+
+    global _testing_slug
+    async with _TEST_SLUG_GUARD:
+        # No `await` between the read and the write: on one event loop this is
+        # the whole critical section, so no other coroutine can observe
+        # `_testing_slug` between them regardless of the lock -- the lock
+        # exists for the OTHER event loop a LoopBoundLock covers (a gateway
+        # restart-in-process, or two independent test loops in one process),
+        # never to make this caller wait for one already running.
+        if _testing_slug is not None:
+            return _conflict(
+                f"a connection test for {_testing_slug} is already running",
+                "test_in_flight",
+                slug=_testing_slug,
+            )
+        _testing_slug = slug
+
+    try:
+        # Function-local by design: the handlers package is imported at
+        # gateway boot, while this path imports the ACP client and should be
+        # paid only when the owner explicitly clicks Test.
+        from kiro_crew.connections.tool_test import test_connection_tools
+
+        return web.json_response(await test_connection_tools(provider))
+    finally:
+        _testing_slug = None
 
 
 async def api_connections_cancel(request: web.Request) -> web.Response:
@@ -401,6 +567,11 @@ async def api_connections_cancel(request: web.Request) -> web.Response:
     keeps the working connection. Idempotent -- cancelling a provider with no
     live mint answers ``dropped=false``.
     """
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, "connections_cancel")
+    if owner_denied is not None:
+        return owner_denied
     parsed = await _mint_request(request)
     if isinstance(parsed, web.Response):
         return parsed
@@ -420,16 +591,656 @@ async def api_connections_cancel(request: web.Request) -> web.Response:
 
     dropped = await cancel_mint(slug, token)
 
-    # Off the loop: the FIRST sel() of a process constructs the log (trust-dir
-    # creation, key validation, on Windows an icacls subprocess). Same reasoning
-    # as api_connections_mint above.
-    await asyncio.to_thread(
-        lambda: sel().log_api_access(
-            caller="dashboard",
-            operation="connections_cancel",
-            outcome="ok",
-            source="dashboard",
-            resources=f"provider:{slug} dropped={dropped}",
-        )
+    # A bare enqueue: SEL is warmed at gateway startup (sel.warm_sel_singleton),
+    # so no per-site thread hop is needed.
+    sel().log_api_access(
+        caller="dashboard",
+        operation="connections_cancel",
+        outcome="ok",
+        source="dashboard",
+        resources=f"provider:{slug} dropped={dropped}",
     )
     return web.json_response({"ok": True, "slug": slug, "dropped": dropped})
+
+
+def _open_project_dirs(state: Any) -> tuple[Path, ...]:
+    """Every project directory an open chat slot is bound to.
+
+    The UNION over the slot registry, deliberately WIDER than
+    :func:`_shared.active_project_dir`: that resolver fails closed to ``None``
+    when two slots name different projects, which is right for a settings page
+    that must write somewhere defensible and exactly wrong here, where ``None``
+    would read as "no project agent specs exist" -- the reading that deletes a
+    live grant. A census needs every directory that could hold a sharer, and its
+    own answer is already the resolver's superset.
+
+    Pure in-memory reads (``_ChatSlot.project``, with ``project_dir`` accepted for
+    slot-like objects that expose that name), so this is safe on the event loop;
+    the directory scans it feeds happen on a worker thread.
+
+    RESIDUAL: a project with no open chat slot is not enumerated, so its specs
+    stay invisible. Slot state is what the dashboard actually knows about the
+    checkouts kiro-cli runs in; widening to ``recent_projects.json`` would scan
+    directories the user may have moved on from.
+    """
+    from kiro_crew.dashboard.handlers._shared import _slot_project
+
+    found: dict[str, Path] = {}
+    for slot in list((getattr(state, "_slots", None) or {}).values()):
+        project = _slot_project(slot)
+        if project is not None:
+            found.setdefault(str(project), project)
+    return tuple(found.values())
+
+
+async def api_connections_disconnect(request: web.Request) -> web.Response:
+    """POST /api/connections/disconnect — undo a connection on this machine.
+
+    Body: ``{"slug": "<registry provider>"}``. Three local things: any in-flight
+    mint is torn down, then -- in ONE locked transaction -- the MCP entry is
+    removed from the scopes that configure this provider and the runtime's stored
+    grant artifacts are unlinked.
+
+    Deleting the artifacts is the whole point of this endpoint. Removing the config
+    entry alone leaves a usable refresh token on disk, so a later reconnect resumes
+    that grant silently instead of asking for consent -- while the card has already
+    told the user this machine's connection was gone.
+
+    What it deliberately does NOT do is revoke at the provider. Nothing here can;
+    only the provider can. So the response never claims the upstream grant is dead,
+    and the card keeps sending the user to the provider's revoke page as well.
+
+    ``grantRemoved`` and ``grantSurviving`` are separate answers on purpose: the
+    artifacts are a pair, and "the token went" is not the same fact as "the grant is
+    gone". The caller is told which one happened instead of inferring it from a
+    delete loop's own optimism, and the audit outcome is ``partial`` when anything
+    survived. ``grantCensusIncomplete`` says WHY a grant was kept when no sharer is
+    named: a source the ownership decision needed could not be read.
+    """
+    # Owner-only, BEFORE any parse or destructive act: this endpoint deletes
+    # machine-global config and OAuth artifacts, the same server-side boundary
+    # every mutating agents route enforces. Non-owner dashboard subjects are
+    # real (presigned links), and the token middleware only authenticates.
+    # Function-local import: same boot-path reason as the mint handlers below.
+    from kiro_crew.dashboard.handlers.agents import _require_owner
+
+    denied = await _require_owner(request, "connections.disconnect")
+    if denied is not None:
+        return denied
+
+    parsed = await _mint_request(request)
+    if isinstance(parsed, web.Response):
+        return parsed
+    _body, provider = parsed
+    slug = str(provider["slug"])
+    mcp_url = str(provider["mcp_url"])
+
+    # Function-local, same boot-path reason as the mint handlers.
+    from kiro_crew.connections.mint import cancel_mint
+    from kiro_crew.mcp_grant import surviving_grant_artifacts
+
+    # A pending mint for this provider is now moot, and leaving it live would let
+    # a grant arrive moments after the user asked for the connection to be gone.
+    await cancel_mint(slug, None)
+    # Read from slot state BEFORE the transaction and handed in, so the census and
+    # the purge judge one snapshot of which checkouts are open rather than two.
+    scope = await remove_provider_entry(slug, mcp_url, _open_project_dirs(request.app.get("state")))
+    removed = scope.grant_removed
+    # Asked rather than inferred from ``removed``: a survivor is what decides
+    # whether this Disconnect actually held. Read outside the lock on purpose --
+    # it changes nothing, and an entry appearing now does not make a pair that is
+    # already gone come back.
+    surviving = []
+    for grant_url in scope.attempted_urls:
+        for label in await asyncio.to_thread(surviving_grant_artifacts, grant_url):
+            if label not in surviving:
+                surviving.append(label)
+
+    # A bare enqueue: SEL is warmed at gateway startup (sel.warm_sel_singleton).
+    sel().log_api_access(
+        caller="dashboard",
+        operation="connections_disconnect",
+        # No `or grant_shared_with` escape: only ATTEMPTED pairs are re-stat'd,
+        # so a survivor is always a failed unlink rather than a deliberate keep
+        # that needs excusing.
+        outcome="partial" if surviving else "ok",
+        source="dashboard",
+        resources=(
+            f"provider:{slug} artifacts_removed={len(removed)} "
+            f"surviving={len(surviving)} entry_removed={scope.entry_removed} "
+            f"grant_shared={len(scope.grant_shared_with)} "
+            f"census_incomplete={scope.census_incomplete}"
+        ),
+    )
+    return web.json_response(
+        {
+            "ok": True,
+            "grantRemoved": bool(removed),
+            "grantSurviving": surviving,
+            "entryRemoved": scope.entry_removed,
+            "grantSharedWith": list(scope.grant_shared_with),
+            "grantCensusIncomplete": scope.census_incomplete,
+            "grantCensusUnreadable": list(scope.census_unreadable),
+        }
+    )
+
+
+async def api_connections_premint(request: web.Request) -> web.Response:
+    """POST /api/connections/premint — warm every mintable provider's URL in one activation.
+
+    The page fires this once on mount, ahead of any click, so that a Connect
+    serves a URL the warm table already holds instead of paying a cold spawn.
+    Takes no body: what is mintable is a fact about the user's registry and grant
+    state, never a caller's choice, and the bound on what may be spawned has to
+    stay on this side of the wire.
+
+    ``preminting`` names the providers warming was STARTED for, which is why the
+    response can precede any of them holding a URL. Warming one provider costs
+    seconds and the whole activation is a single shared process, so awaiting it
+    would stall the page's first paint for the sake of a report the card already
+    gets from its own mint feed. A slug reported here can still end up without a
+    URL -- the activation snapshot is the engine's to compute -- so the card's
+    verdict remains the mint state, not this list.
+    """
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    # Owner-gated for the same reason as the mint POST: warming spawns a kiro-cli
+    # process, so the caller has to be the owner rather than merely authenticated.
+    owner_denied = await require_owner_dashboard_request(request, "connections_premint")
+    if owner_denied is not None:
+        return owner_denied
+
+    # Function-local by DESIGN, not for a cycle: the handlers package is imported on
+    # the gateway boot path, and the warm engine imports the cold mint at module
+    # scope then adds the ACP runtime and the MCP inventory on top -- the heaviest
+    # half of Connections. test_the_handlers_package_does_not_import_the_warm_engine
+    # enforces it in a subprocess; hoisting this to module scope turns that red.
+    from kiro_crew.connections.warm import _audited_mintable_providers, warm_mint_all
+
+    # Off the loop: the scan reads the user's MCP config and stats kiro-cli's OAuth
+    # artifact directory, either of which can sit on a network mount where a stat is
+    # unbounded. warm.py routes the same call through a thread for this reason and
+    # pins it with a drift guard.
+    candidates, audit_recorded = await asyncio.to_thread(_audited_mintable_providers)
+    slugs = [str(provider["slug"]) for provider in candidates]
+    if not slugs:
+        # Nothing to warm: an activation with an empty claim set would spawn a
+        # process, pay the fixed activation cost and hold nothing. Nothing was acted
+        # on either, so the scan owes no audit -- see below.
+        return web.json_response({"ok": True, "preminting": []})
+
+    # The credential-store observation this endpoint ACTS on: the scan above stats
+    # kiro-cli's OAuth artifacts per provider, and reaching this line means the answer
+    # is about to spawn a warm activation. ONE event for the whole sweep, matching
+    # ``connections.status``: a single scan pass yields N answers but exactly one act
+    # decision, so per-candidate events would over-count one observation, and the
+    # per-URL ``mcp_grant.grant_observed`` wrapper would additionally have to break the
+    # scan's synchronous shape that warm.py pins with a drift guard.
+    #
+    # Off the loop because the entry point marks its events critical, which drains the
+    # SEL queue synchronously -- the same reason the log_api_access calls here are
+    # threaded. Best-effort, NOT fail-closed: the artifacts are stat-ed and never
+    # opened, so no credential material crosses this boundary, and refusing to warm on
+    # an SEL outage would make every Connect pay a cold spawn instead. An unaudited
+    # boolean is the lesser failure, and it leaves a warning behind.
+    if not audit_recorded:
+        logger.warning(
+            "grant-presence audit for the premint scan could not be recorded; "
+            "proceeding unaudited"
+        )
+
+    # The candidates are PASSED rather than re-derived inside the engine, so the
+    # claim set and this response come from one scan. Two independent scans can
+    # disagree -- a consent completing between them drops a provider -- and the
+    # response would then name a slug nothing ever claimed.
+    task = asyncio.create_task(warm_mint_all(candidates))
+    _premint_tasks.add(task)
+    task.add_done_callback(_premint_tasks.discard)
+
+    # A bare enqueue, same as api_connections_mint: the first-touch construction
+    # is paid once at gateway startup (sel.warm_sel_singleton).
+    sel().log_api_access(
+        caller="dashboard",
+        operation="connections_premint",
+        outcome="started",
+        resources=f"providers:{len(slugs)}",
+    )
+    return web.json_response({"ok": True, "preminting": slugs})
+
+
+# ── Operator-registered OAuth clients (Settings → OAuth Apps) ───────────────
+#
+# Three routes over one record per pre-registered provider. The record has two
+# halves with different custody: the PUBLIC client id lives in ``config.json``
+# and is echoed back; the client SECRET lives in the vault and is reported only
+# as ``client_secret_set`` -- no route returns it, by the same rule the Secrets
+# panel follows. Owner-only throughout: a client binds every future consent to
+# an app somebody registered, which is a write the same trust boundary as the
+# grant itself must own. Rationale and precedence: ``connections/oauth_clients``.
+
+#: Serializes every OAuth-client MUTATION (PUT and DELETE, all slugs) across both
+#: stores and the projection refresh. The record spans two stores with no shared
+#: transaction, so two overlapping requests can interleave between the writes --
+#: a DELETE deleting the secret a concurrent PUT just stored while the PUT still
+#: reports success. One lock for all slugs rather than one per slug: these
+#: mutations are rare operator actions, and a per-slug table is more machinery
+#: than the contention warrants. A ``LoopBoundLock`` for the same reason as the
+#: test guard below.
+_OAUTH_CLIENT_MUTATION = LoopBoundLock()
+
+
+def _oauth_client_views() -> list[dict]:
+    """The dashboard record for every pre-registered provider. Worker-thread only."""
+    from kiro_crew.config import config_dir
+    from kiro_crew.config.loader import read_config_for_update
+    from kiro_crew.connections.oauth_clients import oauth_client_view
+    from kiro_crew.connections.registry import get_preregistered_providers
+    from kiro_crew.secrets import SecretVault
+
+    try:
+        config = read_config_for_update()
+    except Exception:  # noqa: BLE001 -- unreadable config reads as "not configured"
+        config = {}
+    try:
+        names = set(SecretVault(config_dir()).list_names())
+    except Exception:  # noqa: BLE001 -- an unreadable vault must not take the tab down
+        names = set()
+    return [
+        dict(oauth_client_view(provider, config=config, vault_names=names))
+        for provider in get_preregistered_providers()
+    ]
+
+
+def _oauth_client_configured(provider: Provider) -> bool:
+    """Whether ``provider`` can attempt an authorization right now. Worker-thread only.
+
+    True for every DCR provider (nothing to configure). For a pre-registered one,
+    the same predicate the status feed and the Settings card use, so the three
+    surfaces cannot disagree about whether Connect is possible.
+    """
+    from kiro_crew.connections.registry import is_preregistered
+
+    if not is_preregistered(provider):
+        return True
+    from kiro_crew.config import config_dir
+    from kiro_crew.config.loader import read_config_for_update
+    from kiro_crew.connections.oauth_clients import oauth_client_view
+    from kiro_crew.secrets import SecretVault
+
+    try:
+        config = read_config_for_update()
+    except Exception:  # noqa: BLE001 -- unreadable config reads as "not configured"
+        config = {}
+    try:
+        names = set(SecretVault(config_dir()).list_names())
+    except Exception:  # noqa: BLE001 -- an unreadable vault reads as "not configured"
+        names = set()
+    return bool(oauth_client_view(provider, config=config, vault_names=names).get("configured"))
+
+
+async def _refresh_client_projections(slug: str) -> bool:
+    """Bring every runtime projection of ``slug``'s client in line with the record.
+
+    The vault and config.json are the source of truth; the emitted agent spec and
+    any in-flight mint are PROJECTIONS of them, and a projection left standing
+    after a rotate or a delete keeps authorizing with the credential the operator
+    just retired. So, after every mutation: (1) withdraw the slug's in-flight
+    mint, whose ephemeral spec was copied from the old record; (1b) strip the
+    projected client from any source-scope copy of the entry, which the rebuild
+    would otherwise merge straight back; (2) rebuild the agent spec so the next
+    session reads the new client (or none).
+
+    Returns False when the scope scrub or the spec rebuild failed. The caller reports that as an
+    error rather than success: the RECORD is committed (and stays committed --
+    reverting the source to match a stale projection would keep the retired
+    credential authoritative, the opposite of what the operator asked), but a
+    spec still carrying the old client is a fact the response must state so the
+    operator retries or restarts rather than assuming the rotation took. The
+    mint withdrawal is best-effort and logged; a mint that cannot be cancelled is
+    a process the TTL reaps, not a projection that persists.
+    """
+    from kiro_crew.connections.mint import cancel_mint
+
+    try:
+        await cancel_mint(slug)
+    except Exception:  # noqa: BLE001 -- see docstring
+        logger.warning(
+            "cancel_mint failed after an OAuth client change for %s", slug, exc_info=True
+        )
+    # (1b) Source scopes are inputs to the rebuild, so a copy of the rendered
+    # entry that a scope toggle once took (client included) would be merged
+    # straight back into the new spec, defeating step (2). Strip the projected
+    # keys from every scope first, under the MCP file lock the scope writers
+    # use. Failure here is reported like a rebuild failure: the record is
+    # committed, the projection is not known to be clean.
+    try:
+
+        async with _get_mcp_lock():
+            await _offload_config_write(_scrub_preregistered_oauth_copies, slug)
+    except Exception:  # noqa: BLE001 -- reported to the caller, see docstring
+        logger.warning(
+            "scrubbing scope copies failed after an OAuth client change for %s",
+            slug,
+            exc_info=True,
+        )
+        return False
+    try:
+        from kiro_crew.agent import rebuild_agent_config  # circular at module scope
+
+        await asyncio.to_thread(rebuild_agent_config)
+    except Exception:  # noqa: BLE001 -- reported to the caller, see docstring
+        logger.warning("rebuild_agent_config failed after an OAuth client change", exc_info=True)
+        return False
+    return True
+
+
+def _projection_stale_response(slug: str, current: dict | None) -> web.Response:
+    """The response for a committed record whose agent-spec projection did not refresh."""
+    return web.json_response(
+        {
+            "ok": False,
+            "error": (
+                "the client was saved but the agent spec could not be rebuilt; new sessions "
+                "may still load the previous client until a rebuild succeeds"
+            ),
+            "code": "projection_refresh_failed",
+            "slug": slug,
+            "client": current,
+        },
+        status=500,
+    )
+
+
+async def _rollback_secret(
+    vault: Any, name: str, *, slug: str, written: str | None, previous: Any
+) -> bool:
+    """Undo THIS request's vault write, and only this request's.
+
+    ``written`` is what the request stored (``None`` when it deleted), ``previous``
+    the :class:`SecretValue` (or ``None``) that was there before. The entry is put
+    back only if the vault still holds exactly ``written``: a Secrets-panel write
+    or a second mutation that landed in between owns the current value, and an
+    unconditional restore would replace that newer value with this request's
+    stale snapshot. Returns whether a rollback happened. The log names the SLUG,
+    never the vault entry or a value.
+    """
+    current = await asyncio.to_thread(vault.get, name)
+    current_value = current.reveal() if current is not None else None
+    if current_value != written:
+        logger.warning(
+            "vault entry for %s changed underneath a failed OAuth client mutation; leaving it",
+            slug,
+        )
+        return False
+    if previous is None:
+        await vault.delete(name)
+    else:
+        await vault.set(name, previous.reveal())
+    return True
+
+
+async def _write_oauth_client(
+    slug: str, *, client_id: str | None, secret: str | None, clear: bool
+) -> web.Response | None:
+    """Persist one client record across its two stores; ``None`` on success.
+
+    Two stores, one record. The secret goes FIRST and the id second, and a failed
+    id write restores the secret to what it was: the vault is the half without a
+    locked read-modify-write, so it is the one that can be put back exactly, and
+    the alternative -- an id that landed next to a secret that did not -- is a
+    pair the vendor will reject on every authorization until someone notices
+    which half is stale. Callers hold :data:`_OAUTH_CLIENT_MUTATION`.
+    """
+    from kiro_crew.config import config_dir
+    from kiro_crew.connections.oauth_clients import client_secret_name
+    from kiro_crew.secrets import SecretVault
+
+    vault = SecretVault(config_dir())
+    name = client_secret_name(slug)
+    previous_secret = None
+    if secret is not None or clear:
+        previous_secret = await asyncio.to_thread(vault.get, name)
+        if secret is not None:
+            await vault.set(name, secret)
+        else:
+            await vault.delete(name)
+
+    if client_id is not None:
+        from kiro_crew.config.loader import update_config_locked
+        from kiro_crew.connections.oauth_clients import CONFIG_CLIENTS_KEY, CONFIG_ROOT_KEY
+        from kiro_crew.dashboard.chat_utils import run_config_write
+
+        def _write_client_id(cfg: dict) -> dict:
+            root = cfg.get(CONFIG_ROOT_KEY)
+            if not isinstance(root, dict):
+                root = {}
+                cfg[CONFIG_ROOT_KEY] = root
+            clients = root.get(CONFIG_CLIENTS_KEY)
+            if not isinstance(clients, dict):
+                clients = {}
+                root[CONFIG_CLIENTS_KEY] = clients
+            record = clients.get(slug)
+            if not isinstance(record, dict):
+                record = {}
+                clients[slug] = record
+            record["client_id"] = client_id
+            return cfg
+
+        try:
+            await run_config_write(update_config_locked, mutate=_write_client_id)
+        except Exception:
+            if secret is not None or clear:
+                # Put the secret back exactly as it was before this request, so
+                # the stored pair is the pair that existed before, not a hybrid --
+                # unless something else wrote the entry in between, in which case
+                # that newer value is the one to keep.
+                await _rollback_secret(
+                    vault, name, slug=slug, written=secret, previous=previous_secret
+                )
+            logger.warning("client_id write failed for %s; secret change rolled back", slug)
+            return web.json_response(
+                {"error": "could not write config.json", "code": "config_write_failed"},
+                status=500,
+            )
+    return None
+
+
+def _preregistered_provider(request: web.Request) -> Provider | web.Response:
+    """The pre-registered provider named by ``{slug}``, or the error to return."""
+    from kiro_crew.connections.registry import is_preregistered
+
+    slug = str(request.match_info.get("slug") or "").strip().lower()
+    provider = _requested_provider(slug)
+    if provider is None or not is_preregistered(provider):
+        return _bad_request("unknown pre-registered provider", "unknown_provider")
+    return provider
+
+
+async def api_connections_oauth_clients(request: web.Request) -> web.Response:
+    """GET /api/connections/oauth-clients — every pre-registered provider's client record.
+
+    Readable by any dashboard user: the payload is what the gallery needs to
+    render a "needs configuration" card and what the Settings tab shows, and it
+    carries nothing a consent URL would not already expose (the client id) plus a
+    boolean for the secret.
+    """
+    views = await asyncio.to_thread(_oauth_client_views)
+    return web.json_response({"schema_version": 1, "clients": views})
+
+
+async def api_connections_oauth_client_put(request: web.Request) -> web.Response:
+    """PUT /api/connections/oauth-clients/{slug} — set the client id and/or secret.
+
+    Body: ``{"client_id"?: str, "client_secret"?: str, "client_secret_clear"?: bool}``.
+    Omitted fields are left as they are, so the Settings card can save the id
+    without re-entering a secret it never displays. ``client_secret`` and
+    ``client_secret_clear`` are mutually exclusive.
+    """
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, "connections_oauth_client_put")
+    if owner_denied is not None:
+        return owner_denied
+    provider = _preregistered_provider(request)
+    if isinstance(provider, web.Response):
+        return provider
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — malformed body is a client error, not a fault
+        return _bad_request("body must be JSON", "invalid_body")
+    if not isinstance(body, dict):
+        return _bad_request("body must be a JSON object", "invalid_body")
+
+    from kiro_crew.connections.oauth_clients import (
+        validate_client_id,
+        validate_client_secret,
+    )
+
+    client_id: str | None = None
+    if "client_id" in body:
+        client_id = validate_client_id(body["client_id"])
+        if client_id is None:
+            return _bad_request(
+                "client_id must be 1-512 printable ASCII characters without spaces",
+                "invalid_client_id",
+            )
+    secret: str | None = None
+    if "client_secret" in body:
+        secret = validate_client_secret(body["client_secret"])
+        if secret is None:
+            return _bad_request(
+                "client_secret must be a non-empty single-line string", "invalid_client_secret"
+            )
+    clear = body.get("client_secret_clear", False)
+    if not isinstance(clear, bool):
+        return _bad_request("client_secret_clear must be a boolean", "invalid_body")
+    if clear and secret is not None:
+        return _bad_request(
+            "client_secret and client_secret_clear are mutually exclusive", "invalid_body"
+        )
+    if client_id is None and secret is None and not clear:
+        return _bad_request("nothing to update", "invalid_body")
+
+    slug = str(provider["slug"])
+
+    async def _mutate() -> web.Response | None:
+        async with _OAUTH_CLIENT_MUTATION:
+            failure = await _write_oauth_client(
+                slug, client_id=client_id, secret=secret, clear=clear
+            )
+            if failure is not None:
+                return failure
+            if not await _refresh_client_projections(slug):
+                views_now = await asyncio.to_thread(_oauth_client_views)
+                return _projection_stale_response(
+                    slug, next((v for v in views_now if v.get("slug") == slug), None)
+                )
+            return None
+
+    # SHIELDED: a client disconnecting mid-request cancels this handler, and an
+    # unshielded await between the vault write and the config write would leave
+    # the record half-committed. The shield lets the mutation run to its own end
+    # (commit both halves, or roll the first back) before the cancellation
+    # propagates to the caller.
+    failure = await asyncio.shield(_mutate())
+    if failure is not None:
+        return failure
+
+    changed = [
+        label
+        for label, flag in (
+            ("client_id", client_id is not None),
+            ("client_secret", secret is not None),
+            ("client_secret_cleared", clear),
+        )
+        if flag
+    ]
+    sel().log_api_access(
+        caller=str(request.get("user") or "dashboard"),
+        operation="connections_oauth_client_put",
+        outcome="completed",
+        resources=f"{slug}:{','.join(changed)}",
+    )
+    views = await asyncio.to_thread(_oauth_client_views)
+    current = next((v for v in views if v.get("slug") == slug), None)
+    return web.json_response({"ok": True, "client": current})
+
+
+async def api_connections_oauth_client_delete(request: web.Request) -> web.Response:
+    """DELETE /api/connections/oauth-clients/{slug} — forget both halves of the record.
+
+    Removes the config record and the vault entry. Environment-supplied values
+    are not touched (they are not ours to delete) and the response says so
+    through the returned record's ``*_source`` fields.
+    """
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, "connections_oauth_client_delete")
+    if owner_denied is not None:
+        return owner_denied
+    provider = _preregistered_provider(request)
+    if isinstance(provider, web.Response):
+        return provider
+    slug = str(provider["slug"])
+
+    from kiro_crew.config import config_dir
+    from kiro_crew.config.loader import update_config_locked
+    from kiro_crew.connections.oauth_clients import (
+        CONFIG_CLIENTS_KEY,
+        CONFIG_ROOT_KEY,
+        client_secret_name,
+    )
+    from kiro_crew.dashboard.chat_utils import run_config_write
+    from kiro_crew.secrets import SecretVault
+
+    def _drop_client(cfg: dict) -> dict | None:
+        root = cfg.get(CONFIG_ROOT_KEY)
+        clients = root.get(CONFIG_CLIENTS_KEY) if isinstance(root, dict) else None
+        if not isinstance(clients, dict) or slug not in clients:
+            return None  # nothing to write
+        del clients[slug]
+        return cfg
+
+    async def _mutate() -> web.Response | None:
+        async with _OAUTH_CLIENT_MUTATION:
+            # Same order and the same rollback as the PUT: the vault half goes
+            # first because it is the half that can be put back exactly, and a
+            # failed config write restores it so the stored pair is the pair
+            # that existed before the request -- never an id-less secret or a
+            # secret-less id the vendor rejects on every authorization.
+            vault = SecretVault(config_dir())
+            name = client_secret_name(slug)
+            previous_secret = await asyncio.to_thread(vault.get, name)
+            await vault.delete(name)
+            try:
+                await run_config_write(update_config_locked, mutate=_drop_client)
+            except Exception:
+                await _rollback_secret(
+                    vault, name, slug=slug, written=None, previous=previous_secret
+                )
+                logger.warning("client record drop failed for %s; secret restored", slug)
+                return web.json_response(
+                    {"error": "could not write config.json", "code": "config_write_failed"},
+                    status=500,
+                )
+            if not await _refresh_client_projections(slug):
+                views_now = await asyncio.to_thread(_oauth_client_views)
+                return _projection_stale_response(
+                    slug, next((v for v in views_now if v.get("slug") == slug), None)
+                )
+            return None
+
+    # Shielded for the same reason as the PUT: both halves go, or the
+    # cancellation waits until they have.
+    failure = await asyncio.shield(_mutate())
+    if failure is not None:
+        return failure
+    sel().log_api_access(
+        caller=str(request.get("user") or "dashboard"),
+        operation="connections_oauth_client_delete",
+        outcome="completed",
+        resources=slug,
+    )
+    views = await asyncio.to_thread(_oauth_client_views)
+    current = next((v for v in views if v.get("slug") == slug), None)
+    return web.json_response({"ok": True, "client": current})

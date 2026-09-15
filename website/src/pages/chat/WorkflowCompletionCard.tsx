@@ -24,6 +24,7 @@ import type { ChatMessage } from '../../types'
 
 import { i18nT } from '../../i18n/t'
 import { useRowDisclosure } from './rowDisclosure'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 const WF_COMPLETION_PREFIX = '[Workflow completion event]'
 // Name is backtick-delimited; allow any char except a backtick (including
 // newlines) so an unusual name doesn't make the header fail to parse. If it
@@ -69,13 +70,26 @@ const WorkflowCompletionCard = memo(function WorkflowCompletionCard({
   message,
   onFileOpen,
   onFolderOpen,
+  onSessionOpen,
+  sessions,
+  activeSession,
+  messageTs,
   disclosureKey,
 }: {
   message: ChatMessage
   onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
   onFolderOpen?: (path: string) => void
+  /** Session switching for a `/chat?sid=` link in the result body, same triple
+   *  the assistant row passes. Omitted by hosts with no slot roster. */
+  onSessionOpen?: (key: string) => void
+  sessions?: ReadonlyMap<string, string>
+  /** When this row was written, ISO. Required by the session chip's SHORT-name
+   *  form, which refuses to resolve without a write time. */
+  messageTs?: string
+  activeSession?: string
   disclosureKey?: string
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const dispatch = useAppDispatch()
   const [expanded, setExpanded] = useRowDisclosure(disclosureKey, false)
   // Names the expanded body's scroll region after the headline. useId keeps it
@@ -161,9 +175,10 @@ const WorkflowCompletionCard = memo(function WorkflowCompletionCard({
           data-testid="workflow-completion-body"
           role="region"
           aria-labelledby={headlineId}
+          // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- WCAG 2.1.1: this max-h scroller's only descendant is rendered markdown with no guaranteed focusable node, so removing tabIndex makes an overflowing workflow result impossible to scroll by keyboard; role=region + aria-labelledby keep it announced as a named landmark, not a control
           tabIndex={0}
         >
-          <MarkdownRenderer content={body} onFileOpen={onFileOpen} onFolderOpen={onFolderOpen} />
+          <MarkdownRenderer content={body} onFileOpen={onFileOpen} onFolderOpen={onFolderOpen} onSessionOpen={onSessionOpen} sessions={sessions} activeSession={activeSession} messageTs={messageTs} />
         </div>
       )}
     </div>

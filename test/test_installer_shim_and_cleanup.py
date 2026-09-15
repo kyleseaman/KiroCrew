@@ -22,7 +22,7 @@ Property A — the packaged launcher must resolve
 Defect B — stale predecessor MCP entries
     ``clean_stale_managed_mcp()`` only removes ``kirocrew-*`` entries unless an
     edition registers a superseded agent through the import-source seam — those
-    entries point at a runtime that no longer exists and are purgeable by the
+    entries point at a runtime that does not exist and are purgeable by the
     edition that replaced them.
 
 Both tests FAIL against the pre-fix code, proving they catch the real bug.
@@ -170,7 +170,7 @@ def test_resolver_finds_the_bundled_launcher(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# Defect A — managed servers survive (no longer dropped)
+# Defect A — managed servers survive (not dropped)
 # --------------------------------------------------------------------------
 def test_managed_servers_survive_in_the_desktop_bundle(tmp_path, monkeypatch):
     """build_agent_config() must give kirocrew-core/kirocrew-cron an absolute,
@@ -323,6 +323,26 @@ def test_first_run_delivers_shim_and_purge(tmp_path, monkeypatch):
     assert marker.exists()
 
 
+def test_first_run_removes_a_generated_conductor_skill(tmp_path, monkeypatch):
+    exe = _fake_bundle_launcher(tmp_path)
+    _sandbox_first_run(tmp_path, monkeypatch, exe)
+    skills_root = tmp_path / "skills"
+    monkeypatch.setattr("kiro_crew.skills.skills_dir", lambda: skills_root)
+    skill = skills_root / "conductor" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    fixture = (
+        Path(__file__).parent
+        / "fixtures"
+        / "retired_conductor_skill"
+        / "select-crew-v2.md"
+    )
+    skill.write_bytes(fixture.read_bytes())
+
+    agent.run_first_run_setup()
+
+    assert not skill.parent.exists()
+
+
 def test_first_run_purge_is_one_time(tmp_path, monkeypatch):
     exe = _fake_bundle_launcher(tmp_path)
     marker, mcp = _sandbox_first_run(tmp_path, monkeypatch, exe)
@@ -364,6 +384,86 @@ def test_first_run_is_best_effort(tmp_path, monkeypatch):
 
     # Must not propagate — gateway startup cannot be broken by setup failures.
     agent.run_first_run_setup()
+
+
+# --------------------------------------------------------------------------
+# Default-on builtin backfill — runs ONCE, and must reach EXISTING installs
+# --------------------------------------------------------------------------
+def _spy_backfill(monkeypatch, calls, *, raises=None):
+    """Replace the backfill with a spy recording each invocation."""
+
+    def _fake() -> list[str]:
+        calls.append(True)
+        if raises is not None:
+            raise raises
+        return ["command-bar"]
+
+    monkeypatch.setattr("kiro_crew.apps.manager.backfill_default_on_builtins", _fake)
+
+
+def test_first_run_runs_the_default_on_backfill(tmp_path, monkeypatch):
+    """First-run invokes the backfill on every start.
+
+    The one-shot guarantee is NOT first-run's job: it lives on the app record
+    itself (``InstalledApp.defaultOnBackfilled``, written in the same atomic write
+    that flips ``enabled``), so calling unconditionally is correct and there is no
+    marker file for this layer to own. See test_builtin_app_optional_enable.py for
+    the once-only property.
+    """
+    exe = _fake_bundle_launcher(tmp_path)
+    _sandbox_first_run(tmp_path, monkeypatch, exe)
+    calls: list[bool] = []
+    _spy_backfill(monkeypatch, calls)
+
+    agent.run_first_run_setup()
+
+    assert calls == [True]
+
+
+def test_first_run_backfills_on_an_install_that_already_purged_mcp(tmp_path, monkeypatch):
+    """An install holding the stale-MCP marker still gets the backfill.
+
+    Existing installs are the ONLY ones this step has anything to do, and every
+    one of them already holds that marker. A backfill placed after the
+    stale-MCP early return would therefore run for nobody.
+    """
+    exe = _fake_bundle_launcher(tmp_path)
+    marker, mcp = _sandbox_first_run(tmp_path, monkeypatch, exe)
+    _seed_global_mcp(mcp)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("done\n")
+    calls: list[bool] = []
+    _spy_backfill(monkeypatch, calls)
+
+    agent.run_first_run_setup()
+
+    assert calls == [True]
+
+
+def test_first_run_survives_a_failing_backfill(tmp_path, monkeypatch):
+    """A raising backfill must not break gateway startup.
+
+    Continuation is asserted through the stale-MCP purge, a LATER step, rather
+    than through the `~/.local/bin` shim: that shim is POSIX-only (Windows uses
+    pip's `Scripts\\kirocrew.exe`), and skipping the whole case on Windows would
+    drop coverage of the one property here that is not platform-specific.
+    """
+    exe = _fake_bundle_launcher(tmp_path)
+    _, mcp = _sandbox_first_run(tmp_path, monkeypatch, exe)
+    _seed_global_mcp(mcp)
+    _install_superseded(
+        managed_mcp_names=("predecessor-core", "predecessor-cron"),
+        stale_mcp_binaries=("predecessor",),
+    )
+    calls: list[bool] = []
+    _spy_backfill(monkeypatch, calls, raises=RuntimeError("backfill boom"))
+
+    agent.run_first_run_setup()
+
+    assert calls == [True]
+    # A step AFTER the failing one still ran, so the failure did not abort setup.
+    remaining = set(json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"])
+    assert "predecessor-core" not in remaining
 
 
 # --------------------------------------------------------------------------
@@ -958,7 +1058,7 @@ def test_gateway_start_replaces_launcher_whose_interpreter_vanished(tmp_path, mo
     """The launcher file exists but its venv was reaped: dead, so replaceable.
 
     This is the shape that made the live host's `kirocrew` fail -- a readable,
-    executable console script whose interpreter no longer exists.
+    executable console script whose interpreter does not exist.
     """
     exe = _fake_bundle_launcher(tmp_path)
     _simulate_bundled_app_honest(monkeypatch, tmp_path, exe)

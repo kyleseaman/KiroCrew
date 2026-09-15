@@ -4,7 +4,7 @@ Manual (/compact, !compact, channel commands) and automatic
 (context-threshold) compaction perform the identical operation, so they share
 one wait budget: ``kiro_crew.constants.COMPACT_WAIT_TIMEOUT_SECS``. A shorter
 manual budget reports "Compaction timed out." on work that is still running
-and subsequently succeeds — the budget expires, not the work (issue #2183).
+and subsequently succeeds — the budget expires, not the work.
 
 These tests assert against the shared constant, never a literal value, so
 they keep holding if the budget is later tuned.
@@ -14,13 +14,16 @@ from __future__ import annotations
 
 import ast
 import inspect
-from pathlib import Path
 
 import pytest
+from source_corpus import parsed_candidates, src_root
 
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 
-_SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
+# One xdist worker for the whole module: `test_no_call_site_pins_a_shorter_wait` scans
+# src/ through the shared corpus, and under `--dist loadgroup` an unmarked module is
+# spread across workers, each of which re-pays the corpus read. One group PER FILE.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_compaction_wait_budget")
 
 
 def _wait_default(func) -> object:
@@ -118,7 +121,7 @@ def test_inner_status_wait_never_below_floor_or_non_positive():
 
 
 def test_no_call_site_pins_a_shorter_wait():
-    """Regression guard for issue #2183: no production call site may pass an
+    """Regression guard: no production call site may pass an
     explicit numeric-literal timeout below the shared budget — keyword or
     positional, int or float. Call sites inherit the
     shared default instead of restating the budget. Non-literal arguments
@@ -126,8 +129,14 @@ def test_no_call_site_pins_a_shorter_wait():
     they are derived from the shared budget and covered by the tests above.
     """
     offenders: list[str] = []
-    for path in sorted(_SRC_ROOT.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    # Only a file whose text names `wait_for_compaction` can hold a call to it, so
+    # the corpus parses those few files instead of the whole tree; the corpus
+    # NFKC-folds both sides, as CPython does for identifiers. A module that fails
+    # to parse propagates -- an unparseable file is a hole in this gate's coverage.
+    root = src_root()
+    for path, _text, tree in parsed_candidates(
+        require_all=("wait_for_compaction",), skip_syntax_errors=False
+    ):
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -143,10 +152,39 @@ def test_no_call_site_pins_a_shorter_wait():
                     continue  # non-literal (derived) timeouts are exempt
                 if isinstance(value, (int, float)) and value < COMPACT_WAIT_TIMEOUT_SECS:
                     offenders.append(
-                        f"{path.relative_to(_SRC_ROOT.parent.parent)}:{node.lineno}"
+                        f"src/kiro_crew/{path.relative_to(root).as_posix()}:{node.lineno}"
                         f" (timeout={value})"
                     )
     assert not offenders, (
         "Compaction wait shorter than the shared budget reintroduced (delete "
         f"the timeout argument so the shared default applies): {offenders}"
     )
+
+
+# ── Post-failure turn budget ──────────────────────────────────
+#
+# A DIFFERENT budget with a different job: the constant above bounds how long a
+# caller waits for compaction to finish, this one bounds how long a turn waits
+# for the backend after compaction reported `failed`. It exists because that
+# wait is otherwise unbounded in practice — the read loop drains to the
+# caller's full prompt ceiling and never released the slot.
+
+
+def test_post_failure_budget_is_one_constant_for_both_dispatch_paths():
+    """The dedicated-process client and the shared-runtime handle must reap an
+    abandoned post-compaction turn on the same schedule; a second literal would
+    let one path keep hanging after the other was tuned."""
+    from kiro_crew.acp import client, session_handle
+
+    assert session_handle._COMPACTION_FAILED_TURN_BUDGET is client._COMPACTION_FAILED_TURN_BUDGET
+
+
+def test_post_failure_budget_is_bounded_by_the_ordinary_silence_window():
+    """A turn the backend has already reported a failure for must not outlive an
+    ordinary silent turn — otherwise the hang it fixes just gets shorter."""
+    from kiro_crew.acp.client import (
+        _COMPACTION_FAILED_TURN_BUDGET,
+        _STALE_TURN_TIMEOUT,
+    )
+
+    assert 0 < _COMPACTION_FAILED_TURN_BUDGET <= _STALE_TURN_TIMEOUT

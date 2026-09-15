@@ -5,7 +5,7 @@
 user-facing (feed row, detail panel, action buttons), so the shape is pinned
 here: the review deep-link must target the exact candidate, and the
 auto-approve shortcut must land on the ``skills.approval_required`` setting —
-surfacing the opt-out at the moment of friction (issue #3927).
+surfacing the opt-out at the moment of friction.
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ def test_auto_approve_action_targets_the_approval_setting():
     # The URL uses the same highlight=key:<configKey> format <SettingRef> builds,
     # so useSettingHighlight can scroll to the toggle.
     assert _SKILL_APPROVAL_SETTING_URL == (
-        "/settings?tab=skills&highlight=key:skills.approval_required"
+        "/settings/skills?highlight=key:skills.approval_required"
     )
 
 

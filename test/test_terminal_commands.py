@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from conftest import host_abs
 from kiro_crew.dashboard import terminal_commands as tc
 
 
@@ -278,8 +279,14 @@ class TestSanitizedPath:
         # An empty or relative PATH entry means "the current directory", and this
         # process's cwd is not the user's — resolving a command name there would let
         # a planted executable run with gateway privileges.
-        monkeypatch.setenv("PATH", f"/usr/bin{os.pathsep}{os.pathsep}.{os.pathsep}rel/bin")
-        assert tc._sanitized_path() == "/usr/bin"
+        #
+        # The surviving entry is spelled for the host (conftest.host_abs): the
+        # filter is ``os.path.isabs``, which from Python 3.13 rejects a bare
+        # ``/usr/bin`` on Windows, so the POSIX literal would be DROPPED as
+        # relative and the test would fail on the wrong property.
+        usr_bin = host_abs("usr", "bin")
+        monkeypatch.setenv("PATH", f"{usr_bin}{os.pathsep}{os.pathsep}.{os.pathsep}rel/bin")
+        assert tc._sanitized_path() == usr_bin
 
     def test_returns_none_when_nothing_absolute_survives(self, monkeypatch):
         monkeypatch.setenv("PATH", f".{os.pathsep}rel")
@@ -299,14 +306,15 @@ class TestSanitizedPath:
         # ownership, and it broke on CI runners where `/usr/local/bin` is not
         # root-owned — a true fact about the runner, not about this filter.
         monkeypatch.setattr(tc, "_is_trusted_dir", lambda _d: True)
+        usr_bin, usr_local_bin = host_abs("usr", "bin"), host_abs("usr", "local", "bin")
         monkeypatch.setenv("PATH", os.pathsep.join([
-            "/usr/bin",
-            "/home/u/proj/.venv/bin",
-            "/home/u/proj/node_modules/.bin",
-            "/home/u/proj/.tox/py312/bin",
-            "/usr/local/bin",
+            usr_bin,
+            host_abs("home", "u", "proj", ".venv", "bin"),
+            host_abs("home", "u", "proj", "node_modules", ".bin"),
+            host_abs("home", "u", "proj", ".tox", "py312", "bin"),
+            usr_local_bin,
         ]))
-        assert tc._sanitized_path() == f"/usr/bin{os.pathsep}/usr/local/bin"
+        assert tc._sanitized_path() == f"{usr_bin}{os.pathsep}{usr_local_bin}"
 
     def test_matches_project_segments_wholesale_not_as_substrings(self):
         # `/opt/venv-tools/bin` is an installed prefix that merely CONTAINS the
@@ -439,8 +447,9 @@ class TestSanitizedPath:
         (proj / "bin").mkdir(parents=True)
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(proj))
         monkeypatch.setattr(tc, "_is_trusted_dir", lambda _d: True)
-        monkeypatch.setenv("PATH", os.pathsep.join([str(proj / "bin"), "/usr/bin"]))
-        assert tc._sanitized_path() == "/usr/bin"
+        usr_bin = host_abs("usr", "bin")
+        monkeypatch.setenv("PATH", os.pathsep.join([str(proj / "bin"), usr_bin]))
+        assert tc._sanitized_path() == usr_bin
 
     @pytest.mark.skipif(
         sys.platform == "win32",
@@ -1129,6 +1138,13 @@ class TestRunProbe:
         # environment is built from nothing instead of filtered down.
         for name in ("GH_TOKEN", "GITHUB_TOKEN", "KUBECONFIG", "NPM_TOKEN"):
             monkeypatch.setenv(name, f"leaked-{name}")
+        # `GRADLE_OPTS` is named in the allowlist below because the sandbox launcher
+        # writes it, so a marker in the parent is what keeps the check honest: naming
+        # the variable alone would let a future filtered-inherit hand the child the
+        # parent's value under an allowed name. The launcher APPENDS to whatever it
+        # finds, so an inherited value survives into the child and trips the
+        # `leaked-` assertion below.
+        monkeypatch.setenv("GRADLE_OPTS", "leaked-GRADLE_OPTS")
         # HOME keeps the `leaked-` marker but must be an ABSOLUTE path: on hosts
         # where the userns sandbox is unavailable the probe child runs unsandboxed
         # and inherits pytest's CWD (the repo root), and the workspace resolver
@@ -1141,12 +1157,20 @@ class TestRunProbe:
         assert out is not None
         assert "leaked-" not in out
         # And the allowlist really is minimal. The extras are not ours: the sandbox
-        # launcher injects its own markers (`KIROCREW_*`, `GIT_SSH_COMMAND`) and the
-        # shell adds `PWD`/`SHLVL`/`_`, so they are named rather than blanket-allowed
-        # — a NEW name appearing here should fail this and be looked at.
+        # launcher injects its own markers (`KIROCREW_*`, `GIT_SSH_COMMAND`,
+        # `GRADLE_OPTS`) and the shell adds `PWD`/`SHLVL`/`_`, so they are named
+        # rather than blanket-allowed — a NEW name appearing here should fail this
+        # and be looked at.
         ours = {"TERM", "NO_COLOR", "PAGER", "GIT_PAGER", "PATH", "LANG", "LC_ALL", "LC_CTYPE"}
+        # `GRADLE_OPTS` carries no inherited value: the launcher's guard appends
+        # `-Dorg.gradle.daemon=false` to whatever the ALLOWLISTED env holds, and the
+        # allowlist never carries it, so the child sees only the flag the launcher
+        # wrote. That the launcher always writes it is pinned from the shipped
+        # launcher source by
+        # test_sandbox_gradle_daemon.py::test_sets_the_flag_when_gradle_opts_is_absent.
         sandbox_injected = {"KIROCREW_HOST_PID", "KIROCREW_SANDBOX_ACTIVE",
-                            "KIROCREW_SANDBOX_LEVEL", "KIROCREW_SPAWNED", "GIT_SSH_COMMAND"}
+                            "KIROCREW_SANDBOX_LEVEL", "KIROCREW_SPAWNED",
+                            "GIT_SSH_COMMAND", "GRADLE_OPTS"}
         shell_added = {"PWD", "SHLVL", "_"}
         # macOS injects __CF_USER_TEXT_ENCODING into every spawned process
         # unconditionally (CoreFoundation per-user encoding preference). This is

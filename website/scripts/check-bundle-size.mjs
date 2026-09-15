@@ -17,7 +17,7 @@
 // byte-for-byte unaffected -- CI runs the analyze build and then this script.
 import path from 'path'
 import { pathToFileURL } from 'url'
-import { checkChunkBudgets, formatBytes, loadBundleSummary } from './lib/bundleReport.mjs'
+import { checkChunkBudgets, failGate, formatBytes, loadSummaryOrExit } from './lib/bundleReport.mjs'
 
 const KB = 1024
 
@@ -41,7 +41,37 @@ export const CHUNK_BUDGETS = {
   // `src/i18n/all.ts` — Rolldown names the chunk after that entry. Grows a
   // little with every translated string, which is expected and fine; what this
   // ceiling catches is a NEW library or surface landing in the catalog chunk.
-  all: 9100 * KB, // measured 8666 KB
+  // The built-in App Store guidance adds one use-case and one configuration
+  // string for each of 23 apps across all 12 shipped catalogs. The Dev Fleet
+  // closed-PR prune group and the expanded Disconnect guidance are the largest
+  // recent catalog increments included in this measurement; Dev Fleet's
+  // per-pod system readout then adds its own strings across the same 12
+  // catalogs on top of that baseline. The Drive gallery's keys across 13
+  // catalogs and this stack's structured-monitor, session-mode, and
+  // source-provider additions ride inside the headroom that measurement already
+  // left, so this stack does not move the ceiling.
+  // Re-measured 2026-09-06: main @ 3a6478967 alone builds the chunk at
+  // 10,700,930 B (10450 KB) against the 10490 KB ceiling -- 0.4% headroom, so
+  // any feature PR shipping a normal set of keys across the 13 catalogs fails
+  // the gate on its merge ref (first seen on the Create Folders From Project
+  // takeover, 13 catalogs x 52 lines, ~55 KB). Same recurrence as the `t` and
+  // `App` entries below: a ceiling that drifted to <1% headroom fails on
+  // routine string growth rather than on the new library it exists to catch.
+  // Re-measured 2026-09-10: main @ b165ba1be alone builds the chunk at
+  // 11,302,007 B (11037 KB) against the 10975 KB ceiling -- 62 KB OVER, so
+  // main's own gate is red and every PR rebased onto it inherits the failure.
+  // Attribution is measured, not assumed: the two feature PRs merged back to
+  // back at 17:53-17:54 (#9810 browser element annotations, +423 catalog lines
+  // across 13 languages; #9812 file-viewer type-first annotator, +107 lines)
+  // ship only translated product copy into this chunk -- it still holds the
+  // same 14 modules (13 catalogs plus the entry), no library reached it, and
+  // no lazy import() boundary can move a catalog string out of `all`. Same
+  // recurrence, same remedy: back to the 5% convention.
+  // Memory V2 adds the private-memory panels' strings (member memory, records
+  // editor, store picker/card, carve, backups, retired) across all 13 catalogs
+  // on top of that: with them the chunk builds at 11,332,186 B (11067 KB), so
+  // the 5% headroom is taken over that measurement rather than main's.
+  all: 11620 * KB, // measured 11067 KB on feat/memory-v2-ui 2026-09-10 (~5% headroom)
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because
@@ -49,7 +79,41 @@ export const CHUNK_BUDGETS = {
   // `t()` no longer pull the other twelve catalogs in behind them. Sized for the
   // English catalog plus headroom; a jump here means a non-English catalog, or a
   // library, reached the runtime module.
-  t: 700 * KB, // measured 641 KB
+  // Re-measured 2026-09-04 at 740 KB, and the 702 KB note above was ~38 KB
+  // stale, which is the same recurrence it describes: main drifted to EXACTLY
+  // 740.00 KB (757,764 B, 4 B over its own ceiling), so the gate began failing
+  // on the merge ref of every open PR rather than on the new library or surface
+  // it exists to catch. Attribution was measured, not assumed -- the branch that
+  // tripped it first builds a BYTE-IDENTICAL `t` chunk to its own base
+  // (`t-BLZeayKy.js`, 755,868 B on both), and main's tip alone, with none of that
+  // branch's code, reproduces the 4-byte failure with the same content hash. So
+  // the growth is main's accumulated English strings, and headroom is what was
+  // actually missing. 5% headroom, matching the `all` entry's convention above,
+  // so the next English string does not re-trip this for the third time.
+  // Re-measured 2026-09-08: main @ 9af9543b0 alone builds the chunk at
+  // 795,127 B (776.5 KB) against the 777 KB ceiling -- 0.07% headroom, the
+  // same drift again (~36 KB of English strings in four days). A feature PR
+  // adding ~40 keys (#8307) trips it on its merge ref while main's own gate
+  // stays green, so the ceiling moves back to the 5% convention.
+  // Two catalog surfaces stack on this chunk after the merge: the
+  // structured-monitor dashboard (57 English keys) and the managed-credentials
+  // surface (25 English keys plus setup / irreversibility guidance). Both are
+  // ordinary translated product copy, not a library reaching the runtime. The
+  // merged analyze build measures the chunk at 807,525 B (788.6 KB); keep
+  // roughly 5% headroom (matching the `all` entry's convention above) over that
+  // combined measurement so expected catalog growth does not block descendants.
+  // Re-measured 2026-09-13 on the reviewed member capability inheritance
+  // branch rebased onto main @ f382f0a70: the analyze build emits the chunk at
+  // 839,943 B (820.3 KB) against the 819 KB ceiling -- 1,287 B over. The
+  // growth is English catalog copy only: the feature's 96 keys
+  // (`crewCapabilities` / `crewCapabilityEditing`, ~4.7 KB) plus 15 upstream
+  // keys that landed on main after the branch's previous rebase. The chunk
+  // report counts 12 modules; this PR adds no dependency. This is the
+  // documented catalog-growth drift again: the previous ceiling
+  // was set at 3.7% over its own measurement, below the 5% convention, and
+  // ordinary catalog growth since then used that margin up. Back to the 5%
+  // convention over the measured size.
+  t: 861 * KB, // measured 820.3 KB on the capability-inheritance build rebased onto f382f0a70 (~5% headroom)
 
   // Pierre editor implementation (PR #4072 replaced Monaco, whose
   // 'editor.api2' chunk this entry set used to carry) -- the code-editor
@@ -69,10 +133,26 @@ export const CHUNK_BUDGETS = {
   // The app-core chunk: the dashboard shell plus everything eagerly imported
   // from it. The vendor split in vite.config.ts already extracts the heaviest
   // libraries; what remains is first-party code with no clean lazy boundary.
-  App: 3120 * KB, // measured 2969 KB
+  // Re-measured 2026-09-04: main drifted to 3201 KB (3,277,346 B, 546 B over
+  // the previous 3200 KB ceiling), so the gate began failing on the merge ref
+  // of every open PR rather than on a new library or surface — the same
+  // recurrence the `t` entry above documents. Attribution was measured, not
+  // assumed: main's tip alone, with no PR code, reproduces the failure.
+  // Re-measured 2026-09-08: four days of ordinary first-party growth took main
+  // @ 6ae74179d to 3,440,273 B (3360 KB) against the 3360 KB ceiling -- 367 B
+  // of headroom, so a PR adding ONE module to the app core (#9437, +1.7 KB)
+  // fails the gate on its merge ref while main itself still passes by a hair.
+  // Same recurrence, same remedy: 5% headroom, matching the `all` and `t`
+  // entries' convention, so ordinary first-party growth does not re-trip this
+  // within days.
+  // The managed-credentials UI and its setup / irreversible-delete states take
+  // the merge result to 3,445,107 B (3364.4 KB). Preserve the documented margin
+  // at that current measurement; a library-class regression still exceeds this
+  // ceiling by hundreds of kilobytes.
+  App: 3533 * KB, // measured 3364.4 KB on managed-credentials PR (~5% headroom)
 
   // Markdown/math/syntax rendering stack (katex, highlight.js, remark/rehype)
-  // -- one deliberate `manualChunks` bucket, see vite.config.ts.
+  // -- one deliberate `codeSplitting` group, see vite.config.ts.
   'vendor-markdown': 712 * KB, // measured 678 KB
 
   // Mermaid's own prebuilt internal chunk; the name comes from mermaid's build,
@@ -82,8 +162,36 @@ export const CHUNK_BUDGETS = {
   // gate reports as unused).
   'chunk-KEIR6QF5': 680 * KB, // measured 647 KB (mermaid 11.16.1)
 
+  // Excalidraw whiteboard (@excalidraw/excalidraw 0.18.1), reached ONLY through
+  // SketchDialog's lazy `import()` when the composer's sketch pad opens — none
+  // of these three chunks is statically imported or modulepreloaded (the entry
+  // graph is unchanged; verified by grepping the built App chunk and
+  // dist/index.html). Their sizes are the vendor's, not ours, and change only
+  // with an Excalidraw upgrade — re-measure and rename these entries then, the
+  // same maintenance contract as the mermaid entry above.
+  //
+  // `prod` is Excalidraw's main module (named after its dist/prod/index.js);
+  // the two hash-named chunks are its font-subsetting payload for PNG/SVG
+  // export (the large one is embedded font data) plus internals shared with
+  // the subsetting worker. Canvas DISPLAY fonts are separate emitted assets
+  // (dist/vendor/excalidraw/fonts/**, ~14MB, self-hosted by vite.config's
+  // excalidrawFontsPlugin with EXCALIDRAW_ASSET_PATH pointed at them) — they
+  // are not JS chunks, so this gate never sees them; without that plugin the
+  // library fetches them from a third-party CDN at text-tool time.
+  //
+  // UPGRADE RITUAL — an Excalidraw bump moves THREE things in lockstep, and a
+  // partial move fails at runtime, not build time: (1) the exact version in
+  // package.json dependencies, (2) the scoped Radix/nanoid overrides beside it
+  // (stale pins re-split the layer stack — the #6358 guard in
+  // AgentSelector.dialog.test.tsx goes red), and (3) these hash-named chunk
+  // entries (re-measure with an analyze build; stale names fail this gate's
+  // matched-no-chunk warning).
+  prod: 560 * KB, // measured 534 KB (@excalidraw/excalidraw 0.18.1)
+  'chunk-EIO257PC': 1830 * KB, // measured 1744 KB (excalidraw 0.18.1 embedded font data, worker-loaded)
+  'chunk-K2UTITRG': 550 * KB, // measured 522 KB (excalidraw 0.18.1 font-subsetting internals)
+
   // Graph/network visualization stack (vis-network, sigma, graphology,
-  // cytoscape) -- one deliberate `manualChunks` bucket, see vite.config.ts.
+  // cytoscape) -- one deliberate `codeSplitting` group, see vite.config.ts.
   'vendor-graph': 606 * KB, // measured 577 KB
 
   // The SPA entry chunk: router, providers, and the eager page skeleton.
@@ -92,29 +200,14 @@ export const CHUNK_BUDGETS = {
 
 const REPORT_PATH = path.resolve('dist', 'bundle-report.json')
 
-function fail(message, code = 1) {
-  process.stderr.write(`${message}\n`)
-  process.exit(code)
-}
-
-// Exit-code mapping for this gate: 2 = report missing, 3 = report malformed or
-// unsupported version, 4 = report valid but lists no chunks. The contract itself
-// (existence/shape/version) lives in the shared loadBundleSummary; 4 is checked
-// here rather than there because an empty report is legitimate for
+// This gate's own exit code, beyond the 2 (missing) / 3 (malformed) that
+// loadSummaryOrExit owns: 4 = report valid but lists no chunks. That one is
+// checked here rather than there because an empty report is legitimate for
 // bundle-report.mjs, which simply has nothing to render.
-function loadSummary(file) {
-  const { summary, error } = loadBundleSummary(file, {
-    hint:
-      'Run `vite build --mode analyze` first -- a plain `npm run build` deliberately ' +
-      'does not write one, so the normal build stays unaffected.',
-  })
-  if (error) fail(error.message, error.code === 'missing' ? 2 : 3)
-  return summary
-}
 
 export function main(argv = process.argv.slice(2)) {
   const reportPath = argv[0] ? path.resolve(argv[0]) : REPORT_PATH
-  const summary = loadSummary(reportPath)
+  const summary = loadSummaryOrExit(reportPath)
   const { breaches, unusedBudgets, checkedCount } = checkChunkBudgets(summary, {
     budgets: CHUNK_BUDGETS,
     defaultBudget: DEFAULT_BUDGET_BYTES,
@@ -128,7 +221,7 @@ export function main(argv = process.argv.slice(2)) {
   // unused-budget warnings, so the actionable line is not buried under one
   // warning per allowlist entry (11 of them today).
   if (checkedCount === 0) {
-    fail(
+    failGate(
       `no chunks in ${reportPath} -- the gate measured nothing, so it cannot ` +
         'certify anything. Re-run `vite build --mode analyze` and check it ' +
         'emitted a bundle.',
@@ -159,9 +252,9 @@ export function main(argv = process.argv.slice(2)) {
         `by ${formatBytes(b.overage)} (chunk '${b.logicalName}')\n`
     )
   }
-  fail(
+  failGate(
     `${breaches.length} chunk(s) over budget. Either shrink the chunk (prefer a lazy ` +
-      'import() boundary or a manualChunks split -- see website/vite.config.ts), or, if the ' +
+      'import() boundary or a codeSplitting group -- see website/vite.config.ts), or, if the ' +
       'growth is genuinely irreducible, add/adjust its entry in CHUNK_BUDGETS in ' +
       'scripts/check-bundle-size.mjs with a comment saying why, and justify it in the PR.'
   )

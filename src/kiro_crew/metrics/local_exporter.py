@@ -35,6 +35,7 @@ OSS-CLEAN: depends only on ``opentelemetry`` + the stdlib.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -45,19 +46,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, NamedTuple
 
-from opentelemetry.sdk.metrics import (
-    Counter,
-    Histogram,
-    UpDownCounter,
-)
 from opentelemetry.sdk.metrics.export import (
-    AggregationTemporality,
     MetricExporter,
     MetricExportResult,
     MetricsData,
 )
 
 from kiro_crew import platform_compat
+from kiro_crew.metrics.schema import RESOURCE_ATTR_PROCESS_START_TIME
+from kiro_crew.metrics.temporality import delta_preference
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +72,46 @@ _BYTES_PER_MB = 1024 * 1024
 _SHARD_NAME_RE = re.compile(
     r"metrics-(?P<day>\d{4}-\d{2}-\d{2})-(?P<pid>[1-9]\d*)" r"(?:-(?P<rotation>[1-9]\d*))?\.jsonl"
 )
+
+
+def _stamp_process_identity(line: str) -> str:
+    """Stamp the writing process's start-time identity at resource level.
+
+    One field per exported record: ``RESOURCE_ATTR_PROCESS_START_TIME`` is set
+    on each ``resource_metrics`` entry's resource attributes (in practice one
+    per line — one provider per exporter). The dashboard aggregator keys
+    cumulative-counter streams by (shard PID, this token, attrs), which makes a
+    PID-reuse process boundary deterministic instead of inferable only from a
+    value drop. Resource level deliberately — a per-metric attribute would
+    multiply every instrument's series cardinality (see ``schema.py``).
+
+    Stamped AFTER serialization, into the JSONL line only, never onto the SDK
+    ``Resource``: the provider's one ``Resource`` also feeds the opt-in OTLP
+    reader, so a resource attribute would egress this host-local token to
+    ``telemetry.otlp_endpoint``. The per-cycle re-serialize is the price of
+    keeping the token on-host.
+
+    Fail soft, twice over: when the platform read is unavailable the line is
+    returned untouched, so legacy consumers see exactly the shape they already
+    parse and the aggregator applies its value heuristic; and a line whose
+    payload cannot be parsed and mutated as the exporter's own JSON shape is
+    returned untouched rather than raised on — stamping is auxiliary, and it
+    must never cost the metric payload that was just serialized.
+    """
+    identity = platform_compat.own_process_start_time()
+    if identity is None:
+        return line
+    stamped = False
+    try:
+        payload = json.loads(line)
+        for rm in payload.get("resource_metrics") or []:
+            resource = rm.get("resource")
+            if isinstance(resource, dict):
+                resource.setdefault("attributes", {})[RESOURCE_ATTR_PROCESS_START_TIME] = identity
+                stamped = True
+    except (ValueError, AttributeError, TypeError):
+        return line
+    return json.dumps(payload) if stamped else line
 
 
 class _Shard(NamedTuple):
@@ -113,23 +150,11 @@ class JsonlMetricExporter(MetricExporter):
         # restarts and day boundaries (cumulative snapshots would double-count
         # and misattribute a PID's counts to the wrong day).
         #
-        # OBSERVABLE counters are deliberately ABSENT from this map and keep the
-        # SDK default (CUMULATIVE). DELTA was tried and reverted: the delta
-        # baseline lives in the provider, and the recorder is rebuilt in-process
-        # whenever telemetry consent changes (see provider._maybe_rebuild), so
-        # the first post-rebuild collection would re-emit the entire
-        # process-lifetime total as one giant delta and inflate daily sums. A
-        # cumulative snapshot is idempotent under the aggregator's
-        # keep-newest-per-PID rule (handlers/telemetry.py classifies temporality
-        # from the record itself), so provider rebuilds are harmless. Gauges
-        # carry no temporality and never belong here.
-        super().__init__(
-            preferred_temporality={
-                Counter: AggregationTemporality.DELTA,
-                UpDownCounter: AggregationTemporality.DELTA,
-                Histogram: AggregationTemporality.DELTA,
-            }
-        )
+        # The map itself lives in metrics.temporality, which owns the rule for
+        # BOTH sinks -- including why observable counters are deliberately absent
+        # from it. Declaring it inline here is what let the OTLP leg ship
+        # CUMULATIVE for the same instruments with nothing failing.
+        super().__init__(preferred_temporality=delta_preference())
         self._dir = Path(directory)
         # Negative values are meaningless; clamp to 0 (disabled) defensively so a
         # mis-wired caller can never request "prune everything".
@@ -183,7 +208,7 @@ class JsonlMetricExporter(MetricExporter):
         rotated = target.with_name(f"{target.stem}-{time.time_ns()}{target.suffix}")
         try:
             target.replace(rotated)
-            self._chmod(rotated, 0o600)
+            self._restrict_file(rotated)
         except OSError as exc:
             # Retention is best-effort and must never make a successful metric
             # serialization fail. A later export retries rotation/pruning.
@@ -201,7 +226,7 @@ class JsonlMetricExporter(MetricExporter):
             if lock_fd.tell() == 0:
                 lock_fd.write(b"\0")
                 lock_fd.flush()
-            self._chmod(lock_path, 0o600)
+            self._restrict_file(lock_path)
             acquired = platform_compat.try_acquire_lock(lock_fd.fileno(), exclusive=True)
             if not acquired:
                 yield False
@@ -212,12 +237,38 @@ class JsonlMetricExporter(MetricExporter):
                 platform_compat.release_lock(lock_fd.fileno())
 
     @staticmethod
-    def _chmod(path: Path, mode: int) -> None:
-        """Best-effort private-perm enforcement; never fail the export on it."""
+    def _restrict_file(path: Path) -> None:
+        """Best-effort owner-only lockdown of a telemetry FILE.
+
+        ``restrict_to_owner`` rather than ``os.chmod(0o600)``: on Windows chmod
+        only toggles the read-only attribute and leaves the inherited DACL
+        intact, so the "telemetry stays private" contract in this module's
+        docstring held on POSIX and silently did not on Windows.
+
+        Kept best-effort (the helper is fail-loud, so the except stays): an
+        exporter must never make a successful metric serialization fail, and a
+        readable telemetry shard is a smaller harm than a dropped metric.
+        Separate from :meth:`_restrict_dir` because ``restrict_to_owner`` is
+        file-shaped -- its grants carry no inheritance flags, so handing it a
+        directory leaves files created inside on the creating token's DACL.
+        """
         try:
-            os.chmod(path, mode)
+            platform_compat.restrict_to_owner(path)
         except OSError as exc:
-            logger.debug("chmod %s -> %o failed: %s", path, mode, exc)
+            logger.debug("owner-only lockdown of file %s failed: %s", path, exc)
+
+    @staticmethod
+    def _restrict_dir(path: Path) -> None:
+        """Best-effort owner-only lockdown of the telemetry DIRECTORY.
+
+        The directory counterpart of :meth:`_restrict_file`: it applies the
+        inheritable DACL, so shards created inside it later are owner-only from
+        birth rather than at the moment the export happens to chmod them.
+        """
+        try:
+            platform_compat.restrict_dir_to_owner(path)
+        except OSError as exc:
+            logger.debug("owner-only lockdown of dir %s failed: %s", path, exc)
 
     def export(
         self,
@@ -227,12 +278,13 @@ class JsonlMetricExporter(MetricExporter):
     ) -> MetricExportResult:
         """Serialize *metrics_data* to a single JSON line and append it."""
         try:
-            line = metrics_data.to_json(indent=None)
+            line = _stamp_process_identity(metrics_data.to_json(indent=None))
             encoded = (line + "\n").encode("utf-8")
             self._dir.mkdir(parents=True, exist_ok=True)
             # ~/.kiro/crew convention: telemetry stays private (dir 0o700, file
-            # 0o600). mkdir/open modes are masked by umask, so chmod explicitly.
-            self._chmod(self._dir, 0o700)
+            # 0o600). mkdir/open modes are masked by umask, and on Windows the
+            # mode bits do nothing at all, so lock both down explicitly.
+            self._restrict_dir(self._dir)
             # Per-PID shards have one writer, so append + rotation need no
             # directory-wide lock. Keeping this path lock-free prevents
             # phase-aligned exporters from permanently dropping DELTA cycles.
@@ -240,7 +292,7 @@ class JsonlMetricExporter(MetricExporter):
             self._rotate_target_if_needed(target, len(encoded))
             with target.open("ab") as fh:
                 fh.write(encoded)
-            self._chmod(target, 0o600)
+            self._restrict_file(target)
             # Retention is separately serialized and best-effort. A contended
             # prune is skipped without discarding the export that just landed.
             self._maybe_prune()

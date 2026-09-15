@@ -69,7 +69,11 @@ from kiro_crew.apps.builtins.mochi.petdex_import import (
     list_installed,
     read_installed,
 )
-from kiro_crew.apps.builtins.mochi.pinned_files_service import DATA_FILE_NAME, pins_mutation
+from kiro_crew.apps.builtins.mochi.pinned_files_service import (
+    DATA_FILE_NAME,
+    PinsCorruptError,
+    pins_mutation,
+)
 from kiro_crew.apps.builtins.mochi.queue_file import QUEUE_FILE as _QUEUE_FILE
 from kiro_crew.apps.builtins.mochi.queue_file import queue_mutation
 from kiro_crew.apps.builtins.mochi.redact import redact_tree
@@ -287,6 +291,27 @@ async def _handle_bg_usage(request: web.Request) -> web.Response:
 # ── Pinned files ────────────────────────────────────────────────────────────
 
 
+def _pins_corrupt() -> web.Response:
+    """Map the pin store's corruption refusal to a coded response.
+
+    The update reader refuses a corrupt pin list rather than replacing it, so
+    these handlers can see a ``PinsCorruptError``. Letting it escape
+    gives aiohttp's bare 500 with no ``code`` for the UI to branch on, and
+    reporting ``{"ok": false}`` instead would be read as "no such pin" -- for
+    mark-seen, as outright success. 500 rather than 503: corruption does not
+    clear on retry, a person has to repair the file, and the bytes it still
+    holds are exactly why the mutation refused.
+
+    The exception text is deliberately not echoed: pin labels and paths are
+    agent-authored (they are redacted on the way out of ``_handle_pinned_get``),
+    and the fixed message already says everything the caller can act on.
+    """
+    return web.json_response(
+        {"error": "the pin list is unreadable and must be repaired", "code": "pins_corrupt"},
+        status=500,
+    )
+
+
 async def _handle_pinned_get(request: web.Request) -> web.Response:
     # Pin labels are agent-authored (pin_file) — redact before the browser.
     return web.json_response({"pins": _redact_plan_tree(_rt().pinned.get_pins())})
@@ -305,7 +330,10 @@ async def _handle_pinned_unpin(request: web.Request) -> web.Response:
     # makes this a blocking wait — on the loop that would stall chat streaming and
     # the heartbeat for as long as the other side holds it. Same reason the pack
     # and queue writes are offloaded.
-    ok = await asyncio.to_thread(_rt().pinned.remove_pin, path)
+    try:
+        ok = await asyncio.to_thread(_rt().pinned.remove_pin, path)
+    except PinsCorruptError:
+        return _pins_corrupt()
     return web.json_response({"ok": ok})
 
 
@@ -318,7 +346,10 @@ async def _handle_pinned_mark_seen(request: web.Request) -> web.Response:
             {"error": "body must contain path", "code": "path_required"}, status=400
         )
     # Same cross-process lock as unpin above — see there.
-    await asyncio.to_thread(_rt().pinned.mark_seen, path)
+    try:
+        await asyncio.to_thread(_rt().pinned.mark_seen, path)
+    except PinsCorruptError:
+        return _pins_corrupt()
     return web.json_response({"ok": True})
 
 
@@ -890,7 +921,7 @@ async def _handle_pack_delete(request: web.Request) -> web.Response:
     except PackError as exc:
         return web.json_response({"error": str(exc), "code": "invalid_pack_delete"}, status=400)
     # Deleting the ACTIVE pack must also clear the pointer, or the pet keeps
-    # trying to render a pack that no longer exists.
+    # trying to render a pack that is gone.
     active = (await asyncio.to_thread(load_settings, _rt().data_dir)).get("activeAppearance")
     if removed and active == pack_id:
         updated = await asyncio.to_thread(save_settings, _rt().data_dir, {"activeAppearance": ""})
@@ -1121,8 +1152,8 @@ async def _handle_displays(request: web.Request) -> web.Response:
 
 def _write_displays_cache(data_dir: Any, displays: list[Any], active_id: Any) -> None:
 
-    # Keep the GEOMETRY, not just the size. This projection used to reduce each
-    # monitor to {id, width, height}, which left the pet unable to answer the one
+    # Keep the GEOMETRY, not just the size. Reducing each monitor to
+    # {id, width, height} leaves the pet unable to answer the one
     # question the cache exists for: which screen am I on, and where is it. With
     # no ordinal, no primary flag and no origin, an agent asked "which display?"
     # has nothing to reason from and guesses — usually "display 1". `index` is

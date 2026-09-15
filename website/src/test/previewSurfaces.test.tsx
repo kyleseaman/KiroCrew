@@ -5,17 +5,17 @@
  * which is a claim about EVERY consumer of the surface registry, not about one
  * component. So this file pins the gate at each door a user could walk through:
  * the storage primitive, the registry predicate, the Search Everywhere Pages
- * provider, and the Developer > Feature Previews toggle that opens them all. A
- * test that only covered the nav rail would have passed while the palette still
- * shipped a one-keystroke path to the same page.
+ * provider, and the Settings > Developer > Feature Previews toggle that opens
+ * them all. A test that only covered the nav rail would have passed while the
+ * palette still shipped a one-keystroke path to the same page.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import type { ReactElement } from 'react'
 import { render, screen, renderHook, act, cleanup } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, useLocation, useNavigationType } from 'react-router-dom'
 
-// DeveloperPage's sibling tabs are heavy and irrelevant here — the last describe
-// only needs the page's tab rail and the Feature Previews pane behind it.
+// DeveloperPage's tabs are heavy and irrelevant here — the last describe only
+// needs the page's tab rail and its legacy-link redirect.
 vi.mock('../pages/LogsPage', () => ({ LogViewer: () => <div /> }))
 vi.mock('../pages/SystemPage', () => ({ default: () => <div /> }))
 vi.mock('../pages/TelemetryPanel', () => ({ default: () => <div /> }))
@@ -31,20 +31,31 @@ vi.mock('../pages/overview/MemoryGraphTab', () => ({ default: () => <div /> }))
 import {
   registerBuiltinSurface,
   getBuiltinSurfaces,
+  getBuiltinSurface,
   getAdvertisedSurfaces,
+  selectAllSurfacesAttention,
   surfacePreviewEnabled,
   _resetBuiltinsForTest,
 } from '../surfaces/registry'
+import dashboardReducer from '../store/dashboardSlice'
+import notificationsReducer from '../store/notificationsSlice'
+// Side-effect import: registers the real surfaces, which the crew describe
+// asserts against. Every describe that needs a clean registry already calls
+// `_resetBuiltinsForTest()` in its own `beforeEach`.
+import '../surfaces/builtins'
 import {
+  PREVIEW_CREW,
   PREVIEW_FLAG_EVENT,
   PREVIEW_FLAG_PREFIX,
+  PREVIEW_INSTANCE_SESSIONS,
+  PREVIEW_REMOTE_CREW_CHAT,
   PREVIEW_WEBHOOKS,
   readPreviewFlag,
   setPreviewFlag,
 } from '../utils/previewFlags'
 import { usePreviewFlag, usePreviewFlagRevision } from '../hooks/usePreviewFlag'
 import { createPagesProvider } from '../components/commandPalette/providers/pagesProvider'
-import { FeaturePreviewsTab } from '../pages/developer/FeaturePreviewsTab'
+import { FeaturePreviewsSection, FEATURE_PREVIEWS_HIGHLIGHT_ANCHOR } from '../pages/settings/FeaturePreviewsSection'
 import DeveloperPage from '../pages/DeveloperPage'
 
 const TEST_ICON: ReactElement = <span />
@@ -113,7 +124,9 @@ describe('preview flag storage', () => {
   it('keeps every flag under the shared prefix', () => {
     // Cross-tab listeners match on the prefix rather than a list of known flags,
     // so a flag named outside it would silently stop updating other tabs.
-    expect(PREVIEW_WEBHOOKS.startsWith(PREVIEW_FLAG_PREFIX)).toBe(true)
+    for (const flag of [PREVIEW_WEBHOOKS, PREVIEW_CREW, PREVIEW_REMOTE_CREW_CHAT, PREVIEW_INSTANCE_SESSIONS]) {
+      expect(flag.startsWith(PREVIEW_FLAG_PREFIX)).toBe(true)
+    }
   })
 })
 
@@ -126,6 +139,84 @@ describe('surfacePreviewEnabled', () => {
     expect(surfacePreviewEnabled({ previewFlag: GATED_FLAG })).toBe(false)
     localStorage.setItem(GATED_FLAG, '1')
     expect(surfacePreviewEnabled({ previewFlag: GATED_FLAG })).toBe(true)
+  })
+})
+
+/**
+ * Crew, asserted against the REAL registry rather than a fixture.
+ *
+ * Declared before the `registry membership` block below, which resets the
+ * registry in its `beforeEach` and would take the imported builtins with it.
+ * Vitest runs describes in declaration order, so this position is the fixture.
+ */
+describe('crew is preview-gated end to end', () => {
+  it('gates the Crew Members surface on PREVIEW_CREW', () => {
+    // A literal `'mc-preview-crew'` here would keep passing if the constant were
+    // renamed, leaving the rail reading one key and the toggle writing another.
+    expect(getBuiltinSurface('members')?.previewFlag).toBe(PREVIEW_CREW)
+  })
+
+  it('drops Crew Members from the advertised list until the flag is on', () => {
+    const advertised = () => getAdvertisedSurfaces().some(s => s.navId === 'members')
+    expect(advertised()).toBe(false)
+    // Sessions is the ungated neighbour: it proves the real registry loaded, so
+    // the `false` above cannot be an empty-registry artefact.
+    expect(getAdvertisedSurfaces().some(s => s.navId === 'chat')).toBe(true)
+    localStorage.setItem(PREVIEW_CREW, '1')
+    expect(advertised()).toBe(true)
+  })
+
+  it('keeps the route registered either way', () => {
+    // The page has to be reachable the moment the flag flips, and a bookmark
+    // must still resolve — gating removes the ADVERTISEMENT, not the surface.
+    expect(getBuiltinSurfaces().find(s => s.navId === 'members')?.route).toBe('/members')
+  })
+})
+
+describe('browser-tab attention count', () => {
+  // The tab title is an ADVERTISEMENT: a gated surface has no rail row to trace
+  // a count to, so contributing one shows the user a `(1)` they cannot clear.
+  // Pinned here rather than in `surfaces.test.tsx` because it is part of the
+  // "not advertised ANYWHERE" contract, not of the sum's arithmetic.
+  beforeEach(() => _resetBuiltinsForTest())
+
+  const buildState = (slots: unknown[], unread: string[]) => {
+    const initialDashboard = dashboardReducer(undefined, { type: '@@INIT' })
+    return {
+      dashboard: { ...initialDashboard, slots, unreadSlots: unread },
+      notifications: notificationsReducer(undefined, { type: '@@INIT' }),
+    } as unknown as Parameters<typeof selectAllSurfacesAttention>[0]
+  }
+
+  const registerPair = () => {
+    registerBuiltinSurface({
+      navId: 'open', route: '/open', label: 'Open', labelKey: 'nav.sessions',
+      icon: TEST_ICON, group: 'Main', unreadSelector: () => 2,
+    })
+    registerBuiltinSurface({
+      navId: 'gated', route: '/gated', label: 'Gated', labelKey: 'nav.webhooks',
+      icon: TEST_ICON, group: 'Main', unreadSelector: () => 5, previewFlag: GATED_FLAG,
+    })
+  }
+
+  it('omits a gated surface while its flag is off, and counts it once on', () => {
+    registerPair()
+    const state = buildState([], [])
+    // 2, not 7: the ungated neighbour is what proves the sum ran at all.
+    expect(selectAllSurfacesAttention(state)).toBe(2)
+    localStorage.setItem(GATED_FLAG, '1')
+    expect(selectAllSurfacesAttention(state)).toBe(7)
+  })
+
+  it('still counts a hiddenFromNav surface, which IS advertised elsewhere', () => {
+    // The deliberate opposite of the gate above: `hiddenFromNav` means "rendered
+    // somewhere other than the rail" (the topbar bell), so its count has an
+    // owner the user can reach and must keep reaching the tab title.
+    registerBuiltinSurface({
+      navId: 'bell', route: '/bell', label: 'Bell', labelKey: 'nav.notifications',
+      icon: TEST_ICON, group: 'Main', unreadSelector: () => 4, hiddenFromNav: true,
+    })
+    expect(selectAllSurfacesAttention(buildState([], []))).toBe(4)
   })
 })
 
@@ -250,9 +341,9 @@ describe('usePreviewFlagRevision', () => {
   })
 })
 
-describe('Developer > Feature Previews', () => {
+describe('Settings > Developer > Feature Previews', () => {
   const renderTab = () =>
-    render(<MemoryRouter><FeaturePreviewsTab /></MemoryRouter>)
+    render(<MemoryRouter><FeaturePreviewsSection /></MemoryRouter>)
 
   /** `aria-checked` via the ATTRIBUTE: the Toggle is a `div role="switch"`, and
    *  the reflected `ariaChecked` DOM property is not populated for one. */
@@ -280,16 +371,162 @@ describe('Developer > Feature Previews', () => {
     expect(toggleState()).toBe('true')
   })
 
-  it('is its own tab on the Developer page, not part of Config', async () => {
-    // Pin both halves of the move: Config must not carry the switch, and the
-    // rail must offer the tab that does — otherwise the opt-ins become
-    // unreachable while every unit test above still passes.
+  it('carries a crew card that starts off', () => {
+    // One card per feature: crew's own toggle, not a row folded into the
+    // webhooks card. Anchored (`^…$`) because the label's words also appear in
+    // this card's description and in the "Chat on a crew" card next to it. The
+    // label names the page the flag holds so it stops sharing a bare "Crew"
+    // with that neighbour, which a newcomer could not tell apart.
+    renderTab()
+    expect(screen.getByRole('switch', { name: /^crew members$/i }).getAttribute('aria-checked')).toBe('false')
+  })
+
+  it('persists the crew opt-in under its own key, leaving webhooks alone', async () => {
+    renderTab()
+    await act(async () => {
+      screen.getByRole('switch', { name: /^crew members$/i }).click()
+    })
+    expect(localStorage.getItem(PREVIEW_CREW)).toBe('1')
+    // Two flags, two keys: a shared write would release both features at once.
+    expect(localStorage.getItem(PREVIEW_WEBHOOKS)).not.toBe('1')
+  })
+
+  it('gives the crew card NO ingress link, on either side of the toggle', async () => {
+    // Deliberate asymmetry with the webhooks card, and the reason is `webhooks`
+    // being `hiddenFromNav`: its card is that page's ONLY door, so it needs one.
+    // Crew's rail row returns in the same tick as the click, so a link here
+    // would be a second spelling of a door already on screen — and would cost a
+    // catalog key in twelve languages forever. Pinned so it cannot drift back in
+    // by symmetry with the card above it.
+    //
+    // Counted as `<button>` ELEMENTS rather than by accessible name: the name of
+    // a link that no longer exists is not in any catalog, so a name query could
+    // never fail. `SettingsToggle`'s own row is a `div role="button"`, so it is
+    // correctly not counted here. The "See what it looks like" button each card
+    // may carry (`FeaturePreviewIntroButton`) is excluded by its test id: it is
+    // not an ingress — it opens an explainer dialog, never the page — and it is
+    // present on either side of the toggle by design.
+    const { container } = renderTab()
+    const realButtons = () =>
+      Array.from(container.querySelectorAll('button:not([data-testid="feature-preview-intro-button"])'))
+    expect(realButtons()).toHaveLength(0)
+    await act(async () => {
+      screen.getByRole('switch', { name: /^crew members$/i }).click()
+    })
+    expect(realButtons()).toHaveLength(0)
+    // The webhooks card still HAS its link, so this is an asymmetry on purpose
+    // rather than the ingress mechanism having been broken for both.
+    await act(async () => {
+      screen.getByRole('switch', { name: /webhooks/i }).click()
+    })
+    expect(realButtons().map(b => b.textContent?.trim())).toEqual(['Open Webhooks'])
+  })
+
+  it('renders the section header and the per-device caveat once, above the cards', () => {
+    // The caveat used to be the Developer-page tab's description, rendered by
+    // SidePanelLayout as the page header. Inside Settings the section has to
+    // carry it itself — once, not per card — or the toggles read as released
+    // features that merely happen to be off.
+    renderTab()
+    expect(screen.getByRole('heading', { name: /feature previews/i })).toBeTruthy()
+    expect(screen.getAllByText(/unpolished on purpose/i)).toHaveLength(1)
+  })
+
+  it('carries the redirect anchor on ONE element that wraps the whole section', () => {
+    // `?highlight=key:<anchor>` rings the element carrying data-setting-key.
+    // The old-bookmark reader asked a section-sized question, so the ring must
+    // enclose the header and every card — an anchor on a single card would
+    // answer "is this row selected?" instead.
+    const { container } = renderTab()
+    const anchors = container.querySelectorAll(`[data-setting-key="${FEATURE_PREVIEWS_HIGHLIGHT_ANCHOR}"]`)
+    expect(anchors).toHaveLength(1)
+    const anchor = anchors[0]
+    expect(anchor.contains(screen.getByRole('heading', { name: /feature previews/i }))).toBe(true)
+    for (const s of screen.getAllByRole('switch')) expect(anchor.contains(s)).toBe(true)
+    // Four, not three: the count is here so a card added outside the anchor
+    // fails rather than silently escaping the ring.
+    expect(screen.getAllByRole('switch')).toHaveLength(4)
+  })
+
+  it('carries a remote-instance-sessions card that starts off and writes only its own key', async () => {
+    // The toggle IS this preview's whole affordance — it has no page of its own,
+    // so nothing else on the page would reveal a card that failed to render or
+    // an onChange wired to the wrong constant. Four flags now share one section,
+    // and a shared write would release every unfinished surface at once, so the
+    // sibling assertions are the point rather than padding.
+    //
+    // `/^remote instance sessions$/i` anchored: the card's description also says
+    // "Sessions list", and the accessible name is the label alone.
+    renderTab()
+    const toggle = () => screen.getByRole('switch', { name: /^remote instance sessions$/i })
+    expect(toggle().getAttribute('aria-checked')).toBe('false')
+    await act(async () => { toggle().click() })
+    expect(localStorage.getItem(PREVIEW_INSTANCE_SESSIONS)).toBe('1')
+    expect(toggle().getAttribute('aria-checked')).toBe('true')
+    for (const other of [PREVIEW_WEBHOOKS, PREVIEW_CREW, PREVIEW_REMOTE_CREW_CHAT]) {
+      expect(localStorage.getItem(other)).not.toBe('1')
+    }
+  })
+
+  it('is gone from the Developer page rail', () => {
+    // Pin the removal, not just the addition: a tab left behind would offer the
+    // same four switches from two places, and the two would drift.
     render(<MemoryRouter initialEntries={['/developer?tab=config']}><DeveloperPage /></MemoryRouter>)
     expect(screen.getByTestId('kirocrew-cfg')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /feature previews/i })).toBeNull()
     expect(screen.queryByRole('switch', { name: /webhooks/i })).toBeNull()
+  })
 
-    const tab = screen.getByRole('button', { name: /feature previews/i })
-    await act(async () => { tab.click() })
-    expect(screen.getByRole('switch', { name: /webhooks/i })).toBeTruthy()
+  it('redirects the old tab link to Settings > Developer with a replace', () => {
+    // `/developer?tab=feature-previews` survives in bookmarks, docs and palette
+    // history. Without the redirect SidePanelLayout would fall back to the
+    // first tab silently — the toggles would look deleted rather than moved.
+    // The probe reads the FINAL location AND the navigation type: a push would
+    // leave the pre-move URL one Back press away.
+    function LocationProbe() {
+      const loc = useLocation()
+      const navType = useNavigationType()
+      return <div data-testid="loc">{`${navType} ${loc.pathname}${loc.search}`}</div>
+    }
+    render(
+      <MemoryRouter initialEntries={['/developer?tab=feature-previews']}>
+        <DeveloperPage />
+        <LocationProbe />
+      </MemoryRouter>,
+    )
+    // The destination is the Settings tab that now hosts the cards, ringing
+    // the whole section (its `data-setting-key` anchor) so the reader lands ON
+    // the moved thing — the section, not one of its rows. Literal on purpose:
+    // this is the URL contract old bookmarks and docs depend on.
+    expect(screen.getByTestId('loc').textContent).toBe(
+      `REPLACE /settings/developer?highlight=key%3A${FEATURE_PREVIEWS_HIGHLIGHT_ANCHOR}`,
+    )
+  })
+
+  it('signposts the move from the rail footer, to the same ringed section', () => {
+    // The redirect only catches a URL that still names the old tab. Someone
+    // who navigates by memory (rail > Developer) finds the tab gone, so the
+    // footer every tab shares points onward — and to the SAME target as the
+    // redirect, so the two doors cannot drift apart.
+    render(<MemoryRouter initialEntries={['/developer?tab=config']}><DeveloperPage /></MemoryRouter>)
+    const link = screen.getByRole('link', { name: /feature previews moved to settings > developer/i })
+    expect(link.getAttribute('href')).toBe(`/settings/developer?highlight=key%3A${FEATURE_PREVIEWS_HIGHLIGHT_ANCHOR}`)
+  })
+
+  it('leaves every other Developer tab link alone', () => {
+    // The redirect keys on ONE legacy value. A broader match (any unknown tab)
+    // would hijack the page's own unknown-tab fallback, which SidePanelLayout
+    // owns and the queryParamConsumer tests pin.
+    function LocationProbe() {
+      const loc = useLocation()
+      return <div data-testid="loc">{loc.pathname + loc.search}</div>
+    }
+    render(
+      <MemoryRouter initialEntries={['/developer?tab=config']}>
+        <DeveloperPage />
+        <LocationProbe />
+      </MemoryRouter>,
+    )
+    expect(screen.getByTestId('loc').textContent).toBe('/developer?tab=config')
   })
 })

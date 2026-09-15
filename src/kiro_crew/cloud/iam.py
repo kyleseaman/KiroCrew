@@ -214,6 +214,20 @@ def policy_document() -> dict[str, Any]:
             "Resource": "*",
         },
         {
+            # DNS preflight: a private hosted zone bound to the target VPC can be
+            # authoritative for a host the bootstrap downloads from (e.g. Amazon
+            # Q's `q.<region>.amazonaws.com` endpoint zone shadows
+            # desktop-release.q.us-east-1.amazonaws.com), which makes the install
+            # fail on NXDOMAIN with no fallthrough to public DNS. The launch
+            # degrades gracefully without this action — it just loses the early
+            # warning — so it is safe to omit on an older policy.
+            # ListHostedZonesByVPC does not support resource-level permissions.
+            "Sid": "Route53DnsPreflight",
+            "Effect": "Allow",
+            "Action": ["route53:ListHostedZonesByVPC"],
+            "Resource": "*",
+        },
+        {
             # ec2:RunInstances — request-tag-gated on the NEW instance only.
             #
             # RunInstances authorizes PER-RESOURCE across every ARN the call
@@ -492,7 +506,7 @@ def policy_document() -> dict[str, Any]:
             # is a first-write race, but now for AVAILABILITY only — the launcher
             # verifies the existing boundary's content and FAILS CLOSED on a
             # mismatch, so a permissive boundary seeded at this name is refused
-            # (never used to under-cap a role), it can only block launches (a DoS).
+            # (it can never under-cap a role), it can only block launches (a DoS).
             # Operators who want to eliminate even that pre-create the boundary as an
             # admin (kirocrew cloud iam-boundary) and drop this statement — the
             # launcher then only *references* the boundary ARN.

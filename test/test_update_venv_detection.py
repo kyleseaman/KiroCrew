@@ -58,7 +58,7 @@ def _track_errors(state):
 class TestVenvPipInstall:
     """Tests for the _venv_pip_install helper.
 
-    The helper no longer spawns pip itself — it hands the install to
+    The helper does not spawn pip itself — it hands the install to
     ``dep_sync.sync_or_reinstall``, which picks an editable reinstall or a
     dependency-only sync depending on whether the console script can be
     rewritten. These stub that one seam, so they assert what this endpoint owns:
@@ -296,6 +296,35 @@ class TestRestartGateway:
         await _restart_gateway(state)
         assert execv_called, "os.execv should have been called even if close raises"
 
+    @pytest.mark.asyncio
+    async def test_concurrent_restart_is_coalesced_before_session_drain(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Only one caller may drain and exec a gateway process at a time."""
+        from kiro_crew.dashboard.handlers.updates import _restart_gateway
+
+        state = _make_state(monkeypatch, tmp_path)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        execv_called: list[tuple] = []
+
+        async def blocking_close() -> None:
+            entered.set()
+            await release.wait()
+
+        state.sessions = MagicMock()
+        state.sessions.close_all = blocking_close
+        monkeypatch.setattr("kiro_crew.dashboard.chat.save_all_slots_to_history", lambda s: None)
+        monkeypatch.setattr("os.execv", lambda *a, **k: execv_called.append(a))
+        monkeypatch.setattr("asyncio.sleep", AsyncMock(return_value=None))
+
+        first = asyncio.create_task(_restart_gateway(state))
+        await entered.wait()
+        assert await _restart_gateway(state) is False
+        release.set()
+        assert await first is True
+        assert len(execv_called) == 1
+
 
 class TestApiUpdateApplyVenvDispatch:
     """Tests for the install-path dispatch logic in api_update_apply."""
@@ -319,7 +348,10 @@ class TestApiUpdateApplyVenvDispatch:
             pip_called.append(True)
             return True
 
-        async def fake_restart(s):
+        async def fake_restart(s, *, resolver):
+            from kiro_crew.platform.wheel_engine import respawn_executable
+
+            assert resolver is respawn_executable
             restart_called.append(True)
 
         monkeypatch.setattr(
@@ -332,11 +364,16 @@ class TestApiUpdateApplyVenvDispatch:
         # Stub git pull so it succeeds.
         async def fake_exec(*args, **kwargs):
             proc = MagicMock()
-            # The apply guard fails CLOSED on an unparseable rev-list count, so
-            # the universal success stub must answer that one call with a real
-            # fast-forwardable distance for the dispatch under test to be
-            # reachable at all.
-            out = b"0\t1\n" if "rev-list" in args else b""
+            # The apply guard fails CLOSED on an unparseable rev-list count and
+            # on an empty upstream pin, so the universal success stub must
+            # answer those two calls with a real fast-forwardable distance and
+            # a real OID for the dispatch under test to be reachable at all.
+            if "rev-list" in args:
+                out = b"0\t1\n"
+            elif "rev-parse" in args:
+                out = b"0123456789abcdef0123456789abcdef01234567\n"
+            else:
+                out = b""
             proc.communicate = AsyncMock(return_value=(out, b""))
             proc.returncode = 0
             return proc
@@ -389,11 +426,16 @@ class TestApiUpdateApplyVenvDispatch:
 
         async def fake_exec(*args, **kwargs):
             proc = MagicMock()
-            # The apply guard fails CLOSED on an unparseable rev-list count, so
-            # the universal success stub must answer that one call with a real
-            # fast-forwardable distance for the dispatch under test to be
-            # reachable at all.
-            out = b"0\t1\n" if "rev-list" in args else b""
+            # The apply guard fails CLOSED on an unparseable rev-list count and
+            # on an empty upstream pin, so the universal success stub must
+            # answer those two calls with a real fast-forwardable distance and
+            # a real OID for the dispatch under test to be reachable at all.
+            if "rev-list" in args:
+                out = b"0\t1\n"
+            elif "rev-parse" in args:
+                out = b"0123456789abcdef0123456789abcdef01234567\n"
+            else:
+                out = b""
             proc.communicate = AsyncMock(return_value=(out, b""))
             proc.returncode = 0
             return proc

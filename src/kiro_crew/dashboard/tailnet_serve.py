@@ -1,11 +1,10 @@
 """Publish (and unpublish) the dashboard on this machine's tailnet.
 
-The write half of tailnet access. Until this module existed, Kiro Crew never ran
-``tailscale serve`` anywhere: the config switch made the gateway *trust* the
-tailnet origin, but actually putting the dashboard on the tailnet was a command
-the operator had to know and type. So the promised one-command experience was
-really two commands, one of them undocumented in the UI, and skipping it produced
-a working-looking switch that changed nothing observable.
+The write half of tailnet access. The config switch only makes the gateway
+*trust* the tailnet origin; putting the dashboard ON the tailnet is a separate
+``tailscale serve`` call, and this module is what runs it. Without it the switch
+is a working-looking control that changes nothing observable, and reaching the
+dashboard needs a second command the UI never mentions.
 
 Deliberately a **separate module from** :mod:`kiro_crew.dashboard.tailnet`, whose
 documented contract is the opposite of what a write path needs:
@@ -19,14 +18,19 @@ documented contract is the opposite of what a write path needs:
   those to a bare "failed" would reproduce the unexplained-refusal problem this
   feature exists to remove.
 
-Two consequences of never having seen this daemon's real output on a live tailnet
-(this repo's dev host has no Tailscale) shape the code, and both are deliberate
-rather than provisional:
+Two consequences of having seen almost none of this daemon's real output shape
+the code, and both are deliberate rather than provisional (one real status
+document — a Windows 1.x daemon holding a single port-80 mapping — is pinned in
+the test suite, and it is what justifies the one evidence-based narrowing here,
+:func:`_has_port_shaped_keys`; everything else stays schema-agnostic):
 
-**The daemon's own stderr is always passed through verbatim.** ``code`` is a
+**The daemon's own output is always passed through verbatim.** ``code`` is a
 best-effort classification for the UI to branch on; ``detail`` carries what
-Tailscale actually said. If the classification is wrong or the phrasing changes
-upstream, the operator still sees the real reason instead of our guess at it.
+Tailscale actually said — stderr first, but stdout too, because upstream prints
+some of its most actionable messages there (the Serve enablement URL among
+them), and a timeout hands over whatever was captured before the deadline. If
+the classification is wrong or the phrasing changes upstream, the operator
+still sees the real reason instead of our guess at it.
 
 **Published-state detection does not depend on the JSON schema.** Rather than
 reading key paths from ``tailscale serve status --json`` that are unverified here,
@@ -41,6 +45,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -97,9 +102,9 @@ class ServeResult:
     """Outcome of a publish/unpublish attempt.
 
     ``code`` is for branching, ``detail`` is for the human. ``detail`` includes
-    the daemon's own stderr whenever there was any, because this module's whole
-    reason to exist separately from the read path is that it must not invent a
-    reason or hide the real one.
+    the daemon's own output whenever there was any — stderr first, stdout when it
+    carries the reason — because this module's whole reason to exist separately
+    from the read path is that it must not invent a reason or hide the real one.
     """
 
     ok: bool
@@ -126,11 +131,67 @@ class ServeState:
     ``published=False, configured=True`` is the dangerous middle: something is
     served here and it is not ours, so a blind withdrawal could delete a mapping
     the operator set up by hand.
+
+    ``port_free`` narrows ``configured`` to the one port this module manages:
+    ``True`` means the status document provably holds no configuration for
+    ``SERVE_HTTPS_PORT`` — either no serve config exists at all, or every
+    configured mapping names some *other* port — so publishing replaces nothing.
+    ``False`` means the port carries some configuration (ours or a stranger's);
+    ``None`` means we could not determine it, which the write guards treat
+    exactly like ``False``. The field exists because ``configured`` alone made
+    a machine whose only serve mapping sits on port 80 indistinguishable from
+    one whose 443 is genuinely occupied, and both were refused.
     """
 
     published: bool | None
     configured: bool | None
     detail: str
+    port_free: bool | None = None
+
+
+def _stream_text(stream: str | bytes | None) -> str:
+    """Normalize a ``TimeoutExpired`` stream attribute to ``str``.
+
+    ``subprocess.run(text=True)`` decodes the streams on the success path, but a
+    ``TimeoutExpired`` carries whatever ``communicate`` had at the deadline:
+    ``None`` when nothing was captured, ``bytes`` on POSIX (the exception is
+    raised below the text layer), ``str`` on Windows (``run`` re-reads the pipes
+    after killing the child). Decoded with ``errors="replace"`` because the
+    deadline can split a multibyte sequence, and a mangled character beats a
+    dropped reason.
+    """
+    if stream is None:
+        return ""
+    if isinstance(stream, bytes):
+        return stream.decode("utf-8", errors="replace")
+    return stream
+
+
+#: Ceiling on how much recovered daemon output is spliced into a ``detail``
+#: string. The interesting part (a refusal, the Serve enablement URL) leads the
+#: stream, while the pathological case — a status read that timed out mid-way
+#: through a multi-KB JSON document — would otherwise turn a one-line refusal
+#: into a raw dump in the CLI and the mobile handler's JSON response.
+_DETAIL_MAX_CHARS = 1000
+
+
+def _daemon_output(*, out: str, err: str) -> str:
+    """Whatever the daemon said, wherever it said it.
+
+    stderr leads because that is where failure text belongs, but upstream prints
+    some of its most actionable messages to STDOUT — on a tailnet where Serve is
+    not enabled, ``tailscale serve`` prints the enablement URL there and then
+    blocks — so stdout is kept too: it follows stderr when both carry text and
+    stands alone when stderr is empty. Building ``detail`` from stderr alone
+    dropped exactly that URL. Keyword-only, because with two same-typed string
+    parameters a swapped call site would silently invert the precedence.
+    """
+    err = (err or "").strip()
+    out = (out or "").strip()
+    text = f"{err}\n{out}" if err and out else (err or out)
+    if len(text) > _DETAIL_MAX_CHARS:
+        return text[:_DETAIL_MAX_CHARS] + " …"
+    return text
 
 
 def _run(args: list[str], timeout: float) -> tuple[int, str, str]:
@@ -141,7 +202,10 @@ def _run(args: list[str], timeout: float) -> tuple[int, str, str]:
     different words to the operator:
 
     * ``-1`` — no binary at any vetted path. "Tailscale is not installed here."
-    * ``-2`` — timed out.
+    * ``-2`` — timed out, with whatever the child wrote before the deadline in
+      ``stdout``/``stderr``. On a Serve-disabled tailnet the command prints the
+      enablement URL and then blocks forever, so the timeout is the only
+      reachable outcome and the captured output IS the diagnosis.
     * ``-3`` — the binary exists but could not be launched (``OSError``), with the
       OS's own message in ``stderr``. Collapsing this into ``-1`` told the operator
       "tailscale was not found" about a binary that is right there — the misleading
@@ -167,25 +231,28 @@ def _run(args: list[str], timeout: float) -> tuple[int, str, str]:
             check=False,
             env=scrub_env(),
         )
-    except subprocess.TimeoutExpired:
-        return -2, "", ""
+    except subprocess.TimeoutExpired as exc:
+        return -2, _stream_text(exc.stdout), _stream_text(exc.stderr)
     except (OSError, subprocess.SubprocessError) as exc:
         logger.debug("tailscale %s failed to run: %s", " ".join(args), exc)
         return -3, "", str(exc)
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
-def _classify(stderr: str) -> ResultCode:
+def _classify(output: str) -> ResultCode:
     """Best-effort code for a non-zero exit. Never the only thing reported.
 
     Matching on message text is inherently fragile — upstream owns this wording
     and can change it — so this only ever *adds* a hint on top of the verbatim
-    stderr the caller also surfaces. The two codes worth separating are the ones
-    with different remedies: a permission problem needs ``sudo`` or an
-    ``--operator`` grant, while an unreachable daemon needs it started or logged
-    in.
+    output the caller also surfaces. Callers feed it the LEADING stream only
+    (stderr, or stdout when stderr is empty), never the concatenation: with both
+    streams in view, incidental stdout text containing "operator" would flip a
+    daemon-down failure to ``no_permission`` and attach a confidently wrong
+    remedy. The two codes worth separating are the ones with different remedies:
+    a permission problem needs ``sudo`` or an ``--operator`` grant, while an
+    unreachable daemon needs it started or logged in.
     """
-    low = stderr.lower()
+    low = output.lower()
     if any(
         s in low
         for s in ("access denied", "permission denied", "must be run as root", "operator")
@@ -193,7 +260,18 @@ def _classify(stderr: str) -> ResultCode:
         return "no_permission"
     if any(
         s in low
-        for s in ("not running", "cannot connect", "connection refused", "logged out", "not logged in")
+        for s in (
+            "not running",
+            "cannot connect",
+            "connection refused",
+            "logged out",
+            "not logged in",
+            # `tailscale serve` against a stopped daemon (`tailscale down`)
+            # fails with exactly "Tailscale is stopped." The needle keeps the
+            # product name so an unrelated message that merely
+            # ends "... is stopped" is not handed the start-Tailscale remedy.
+            "tailscale is stopped",
+        )
     ):
         return "daemon_unavailable"
     return "failed"
@@ -241,13 +319,79 @@ def _port_scoped_subtrees(node: Any, port: int) -> list[Any]:
     if isinstance(node, dict):
         for k, v in node.items():
             key = str(k)
-            if key == str(port) or key.endswith(f":{port}"):
+            # The single shared parse, so this detector and the port-evidence
+            # read (`_has_port_shaped_keys`) cannot disagree about a key — see
+            # `_key_port`. It is a strict superset of the bare-``"443"`` and
+            # ``endswith(":443")`` string forms (every shape they match parses
+            # here too, and it additionally catches e.g. ``"host:0443"``), so no
+            # separate string comparison is needed.
+            if _key_port(key) == port:
                 found.append(v)
             found.extend(_port_scoped_subtrees(v, port))
     elif isinstance(node, list):
         for v in node:
             found.extend(_port_scoped_subtrees(v, port))
     return found
+
+
+#: A dict key that names a port the way serve-status documents name them: a bare
+#: port number (the ``TCP`` map: ``"80"``) or a ``host:port`` suffix (the ``Web``
+#: and ``AllowFunnel`` maps: ``"desk.tail.ts.net:80"``). ASCII digits only and
+#: anchored with ``\Z``: ``\d`` admits Unicode decimal digits and ``$`` matches
+#: before a trailing newline, and either quirk would let a key parse as port
+#: evidence here while escaping the string comparisons in
+#: :func:`_port_scoped_subtrees`.
+_KEY_PORT_RE = re.compile(r"(?:^|:)([0-9]{1,5})\Z")
+
+
+def _key_port(key: str) -> int | None:
+    """The port a dict key names, or ``None`` when it names no port.
+
+    THE one key→port parse, shared by both predicates built on it. The free
+    determination in :func:`serve_state` is only sound while "this key is port
+    evidence" (:func:`_has_port_shaped_keys`) and "this key names OUR port"
+    (:func:`_port_scoped_subtrees`) agree about every key — a key that parses
+    as 443 for one predicate while escaping the other (a leading-zero
+    ``"host:0443"``, say) would count as evidence of a port-keyed schema while
+    hiding the very mapping the evidence is about. Parsing once and comparing
+    the integer removes the axis such a disagreement would turn on.
+    """
+    m = _KEY_PORT_RE.search(key)
+    if not m:
+        return None
+    port = int(m.group(1))
+    return port if 0 < port <= 65535 else None
+
+
+def _has_port_shaped_keys(node: Any) -> bool:
+    """Whether any dict key anywhere in *node* names a port.
+
+    The evidence read that lets :func:`serve_state` answer "our port is free"
+    instead of "unknown" when a document holds serve config only for OTHER
+    ports. The reasoning is schema self-evidence, not a hardcoded key path: one
+    document does not record one port in its keys and another port somewhere
+    else, so a document that demonstrably keys mappings by port (a real one from
+    a Windows Tailscale 1.102 daemon reads ``{"TCP": {"80": …}, "Web":
+    {"host:80": …}}``) and contains no key naming ours has nothing on ours.
+    A document with no port-shaped keys at all offers no such evidence, and the
+    caller keeps reporting ``unknown`` for it — the conservative floor is
+    narrowed, never removed. Values are never consulted: a proxy target like
+    ``http://127.0.0.1:9980`` names a port too, but only *keys* carry the
+    document's own indexing shape. The premise is deliberately loose in one
+    direction — a short numeric key that is not a port index (a counter, a
+    numeric session id) also reads as evidence — which is safe only because
+    every schema that records a mapping on a port also keys it, so the
+    443-detector fires before this evidence is consulted.
+    """
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if _key_port(str(k)) is not None:
+                return True
+            if _has_port_shaped_keys(v):
+                return True
+    elif isinstance(node, list):
+        return any(_has_port_shaped_keys(v) for v in node)
+    return False
 
 
 def _mount_subtrees(node: Any, mount: str) -> list[Any]:
@@ -283,14 +427,18 @@ def serve_state(port: int) -> ServeState:
             None, None, "The tailscale CLI was not found in a standard install location."
         )
     if rc == -2:
-        return ServeState(None, None, "The tailscale CLI did not respond in time.")
+        said = _daemon_output(out=out, err=err)
+        detail = "The tailscale CLI did not respond in time."
+        if said:
+            detail += f" Before the deadline it printed: {said}"
+        return ServeState(None, None, detail)
     if rc == -3:
         return ServeState(
             None, None, f"The tailscale CLI could not be launched: {(err or '').strip()}"
         )
     if rc != 0:
         return ServeState(
-            None, None, (err or "").strip() or f"tailscale serve status exited {rc}"
+            None, None, _daemon_output(out=out, err=err) or f"tailscale serve status exited {rc}"
         )
     try:
         doc = json.loads(out or "")
@@ -299,7 +447,7 @@ def serve_state(port: int) -> ServeState:
         # is a genuine "nothing configured" rather than an unknown. Anything else
         # unparseable is unknown.
         if not (out or "").strip():
-            return ServeState(False, False, "No serve configuration is active.")
+            return ServeState(False, False, "No serve configuration is active.", port_free=True)
         # ``configured=True``: the daemon DID answer, we just cannot read its shape.
         # That distinction is load-bearing for the publish/withdraw guards — it
         # separates "something is there that this build cannot attribute" (dangerous,
@@ -309,7 +457,7 @@ def serve_state(port: int) -> ServeState:
             None, True, "tailscale serve status returned output this build cannot read."
         )
     if doc in (None, {}, []):
-        return ServeState(False, False, "No serve configuration is active.")
+        return ServeState(False, False, "No serve configuration is active.", port_free=True)
     needles = (f"http://127.0.0.1:{port}", f"http://localhost:{port}")
     # Two narrowings, and each closes a way the previous predicate was wrong.
     #
@@ -323,6 +471,22 @@ def serve_state(port: int) -> ServeState:
     # touches: is the handler at SERVE_MOUNT, on SERVE_HTTPS_PORT, ours?
     scoped = _port_scoped_subtrees(doc, SERVE_HTTPS_PORT)
     if not scoped:
+        # No key names our port. When the document demonstrably keys mappings by
+        # port (see _has_port_shaped_keys), that absence is a determination, not
+        # an unknown: everything serve holds sits on other ports, and the write
+        # guards may treat our port as free without endangering any of it. This
+        # is the dev-machine case — another project published on port 80 must
+        # not read as "something is on 443". A document with no port-shaped keys
+        # anywhere stays unknown, because the assumption a determination needs
+        # (mappings record their port in a key) has no evidence in it.
+        if _has_port_shaped_keys(doc):
+            return ServeState(
+                False,
+                True,
+                f"Serve is configured for other ports only; nothing is on port "
+                f"{SERVE_HTTPS_PORT}.",
+                port_free=True,
+            )
         return ServeState(
             None,
             True,
@@ -336,6 +500,7 @@ def serve_state(port: int) -> ServeState:
             True,
             f"Serve is configured on port {SERVE_HTTPS_PORT}, but this build could "
             f"not identify the handler at {SERVE_MOUNT}.",
+            port_free=False,
         )
     if any(_find_proxy_target(m, needles) for m in mounts):
         return ServeState(
@@ -343,12 +508,14 @@ def serve_state(port: int) -> ServeState:
             True,
             f"Serve is proxying {SERVE_HTTPS_PORT}{SERVE_MOUNT} to the dashboard "
             f"on port {port}.",
+            port_free=False,
         )
     return ServeState(
         False,
         True,
         f"Serve is configured on {SERVE_HTTPS_PORT}{SERVE_MOUNT}, but not for "
         f"this dashboard.",
+        port_free=False,
     )
 
 
@@ -389,21 +556,21 @@ def publish(port: int, *, audit_tool: str = "tailnet_publish") -> ServeResult:
             "nothing was published. Install Tailscale, or publish the dashboard "
             "yourself and set dashboard.url instead.",
         )
-    # Proceed ONLY when the mount is explicitly free or already ours. Anything else
-    # — including a state we could not determine — refuses, because the costs are not
-    # symmetric: overwriting destroys configuration the operator rebuilds from
-    # memory, while refusing costs one copy-pasted command, which the refusal prints.
+    # Proceed ONLY when OUR PORT is explicitly free or the mount is already ours.
+    # Anything else — including a state we could not determine — refuses, because the
+    # costs are not symmetric: overwriting destroys configuration the operator
+    # rebuilds from memory, while refusing costs one copy-pasted command, which the
+    # refusal prints. ``port_free`` is the deciding read, not ``configured``: serve
+    # config that sits entirely on other ports (another project on this machine) is
+    # untouched by this write and must not block it.
     #
-    # An earlier revision keyed this on ``configured is True``, reasoning that when
-    # the daemon gives no usable answer the publish call would fail anyway and report
-    # the authoritative error. That reasoning does not hold for a **timeout**: the
-    # status read has a 5s ceiling and the write 15s, so a daemon slow enough to time
-    # out the read can still accept the write — and then replace an existing handler.
-    # "No answer" is not "no daemon", and the permissive branch existed largely
-    # because it made this module's own failure-mode tests simpler.
+    # Keying this on ``configured is True`` instead — betting that a daemon giving no
+    # usable answer would fail the publish call anyway and report the authoritative
+    # error — does not hold for a **timeout**: the status read has a 5s ceiling and the
+    # write 15s, so a daemon slow enough to time out the read can still accept the
+    # write, and then replace an existing handler. "No answer" is not "no daemon".
     state = serve_state(port)
-    _free = state.published is False and state.configured is False
-    if not (state.published is True or _free):
+    if not (state.published is True or state.port_free is True):
         return ServeResult(
             False,
             "not_ours",
@@ -413,7 +580,7 @@ def publish(port: int, *, audit_tool: str = "tailnet_publish") -> ServeResult:
             f"sure, run `tailscale serve --bg --https={SERVE_HTTPS_PORT} "
             f"http://127.0.0.1:{port}` yourself.",
         )
-    rc, _out, err = _run(
+    rc, out, err = _run(
         ["serve", "--bg", f"--https={SERVE_HTTPS_PORT}", f"http://127.0.0.1:{port}"],
         _WRITE_TIMEOUT_SECS,
     )
@@ -426,12 +593,18 @@ def publish(port: int, *, audit_tool: str = "tailnet_publish") -> ServeResult:
             "yourself and set dashboard.url instead.",
         )
     if rc == -2:
-        return ServeResult(
-            False,
-            "timeout",
+        # The most common way to land here is a Serve-disabled tailnet: the CLI
+        # prints the enablement URL to stdout and then blocks waiting for the
+        # capability, so the captured output carries the one thing the operator
+        # needs and the timeout heading alone would hide it.
+        said = _daemon_output(out=out, err=err)
+        detail = (
             "tailscale serve did not respond in time. It may still have applied — "
-            "check `kirocrew tailnet status` before retrying.",
+            "check `kirocrew tailnet status` before retrying."
         )
+        if said:
+            detail += f" Before the deadline it printed: {said}"
+        return ServeResult(False, "timeout", detail)
     if rc == -3:
         return ServeResult(
             False,
@@ -440,8 +613,8 @@ def publish(port: int, *, audit_tool: str = "tailnet_publish") -> ServeResult:
             + (err or "").strip(),
         )
     if rc != 0:
-        code = _classify(err)
-        said = (err or "").strip()
+        said = _daemon_output(out=out, err=err)
+        code = _classify(err.strip() or out.strip())
         hint = ""
         if code == "no_permission":
             # The single most likely refusal on Linux, and the one an operator
@@ -463,10 +636,59 @@ def publish(port: int, *, audit_tool: str = "tailnet_publish") -> ServeResult:
     )
 
 
+def revoke_if_governance_now_pins_off(port: int) -> None:
+    """Withdraw a published tailnet origin when the ceiling has come to forbid it.
+
+    Registered as a post-install hook on the central-distribution refresher, because the
+    ``capabilities.tailnet_origin`` gate fires when :func:`publish` is CALLED — it is a
+    chokepoint on the action, not a condition re-checked while serving. That was sound
+    while the ceiling could only change at boot. With a live refresh it is not: a fleet
+    that pins the capability off mid-flight would otherwise leave every already-published
+    host serving its dashboard on the tailnet until someone restarted it, with the policy
+    reporting the capability as denied the whole time.
+
+    Narrow on purpose. It does nothing unless governance denies the scope AND
+    :func:`serve_state` confirms the handler is OURS, so a mapping an operator added by
+    hand is never touched — the same ownership test :func:`unpublish` makes, for the same
+    reason. Best-effort and never raises: it runs on the refresher thread, and a
+    withdrawal that fails must not stop an installed ceiling being reported as installed.
+    """
+    # A PURE read first, with no ``audit_tool``: this runs on every confirming poll, and
+    # ``is_governance_pinned_off``'s own contract is that auditing a mere inspection appends
+    # HMAC-chained SEL rows at a multiple of the decisions that actually govern anything.
+    if not is_governance_pinned_off():
+        return
+    state = serve_state(port)
+    if state.published is not True:
+        # False (not ours) or None (could not tell). Neither is a mandate to remove
+        # something: the first is someone else's mapping, the second is the
+        # checked-but-never-ran case this module already refuses to render as a result.
+        return
+    # Now that there IS something to withdraw, ask again THROUGH the audited seam. This is
+    # the decision that does something, and it needs a forensic record more than a
+    # human-driven one does: nobody typed it, so the SEL row is the only place a reviewer
+    # can see that the fleet's policy — not an operator — took this host off the tailnet.
+    # ``unpublish`` cannot supply it: withdrawal is deliberately never gated there, so it
+    # discards its own ``audit_tool``. One extra evaluation, on the acting path only, so the
+    # per-poll cost the pure read above exists to avoid is unaffected.
+    is_governance_pinned_off(audit_tool="tailnet_governance_revoke")
+    logger.warning(
+        "the security policy now pins capabilities.tailnet_origin off; withdrawing this "
+        "host's published dashboard origin"
+    )
+    result = unpublish(port, audit_tool="tailnet_governance_revoke")
+    if not result.ok:
+        logger.error(
+            "could not withdraw the published tailnet origin after a policy tightening "
+            "(%s); it is still served until this host is restarted",
+            result.code,
+        )
+
+
 def unpublish(port: int, *, audit_tool: str = "tailnet_unpublish") -> ServeResult:
     """Stop serving the dashboard on the tailnet — **only if 443 is ours**.
 
-    Narrow in two ways that earlier revisions of this function only *claimed* to be.
+    Narrow in two ways, both enforced rather than merely documented.
 
     **The removal names its mount.** Upstream's ``unsetServe`` treats an absent
     ``--set-path`` as "every mount under this port" — it collects all handlers and
@@ -481,8 +703,9 @@ def unpublish(port: int, *, audit_tool: str = "tailnet_unpublish") -> ServeResul
     at the mount actually being removed.
 
     An **undetermined** state refuses too, and that is the deliberate half. This
-    code has never seen a real ``tailscale serve status --json``, so "I could not
-    tell" must not be treated as "go ahead": the two costs are not symmetric —
+    code has seen almost none of the real ``tailscale serve status --json``
+    shapes in the wild (one document is pinned in the test suite), so "I could
+    not tell" must not be treated as "go ahead": the two costs are not symmetric —
     wrongly proceeding destroys configuration the operator has to rebuild from
     memory, while wrongly refusing costs one copy-pasted command, which the
     refusal prints.
@@ -502,6 +725,17 @@ def unpublish(port: int, *, audit_tool: str = "tailnet_unpublish") -> ServeResul
         return ServeResult(
             True, "ok", "Nothing is published — no serve configuration is active."
         )
+    if state.published is False and state.port_free is True:
+        # The same idempotent no-op one level narrower: serve IS configured, but
+        # everything it holds sits on other ports. There is nothing on our port
+        # to withdraw, and running the removal anyway would be a write against
+        # config that belongs to something else on this machine.
+        return ServeResult(
+            True,
+            "ok",
+            f"Nothing is published on port {SERVE_HTTPS_PORT} — serve's "
+            f"configuration is for other ports only, and it is left alone.",
+        )
     if state.published is not True:
         return ServeResult(
             False,
@@ -511,7 +745,7 @@ def unpublish(port: int, *, audit_tool: str = "tailnet_unpublish") -> ServeResul
             f"you are sure, run `tailscale serve --https {SERVE_HTTPS_PORT} "
             f"--set-path={SERVE_MOUNT} off` yourself.",
         )
-    rc, _out, err = _run(
+    rc, out, err = _run(
         [
             "serve",
             "--https",
@@ -524,14 +758,37 @@ def unpublish(port: int, *, audit_tool: str = "tailnet_unpublish") -> ServeResul
     if rc == -1:
         return ServeResult(False, "no_cli", "The tailscale CLI was not found; nothing to do.")
     if rc == -2:
-        return ServeResult(False, "timeout", "tailscale serve did not respond in time.")
+        said = _daemon_output(out=out, err=err)
+        detail = "tailscale serve did not respond in time."
+        if said:
+            detail += f" Before the deadline it printed: {said}"
+        return ServeResult(False, "timeout", detail)
     if rc == -3:
         return ServeResult(
             False, "failed", "The tailscale CLI could not be launched: " + (err or "").strip()
         )
     if rc != 0:
-        code = _classify(err)
-        return ServeResult(False, code, (err or "").strip() or f"tailscale serve exited {rc}")
+        said = _daemon_output(out=out, err=err)
+        code = _classify(err.strip() or out.strip())
+        # Mirrors the publish path's hint branch. It matters more here: a failed
+        # withdrawal's verbatim output can read like a status line ("Tailscale
+        # is stopped.") rather than like a failure, so without the appended hint
+        # the operator has no way to tell that nothing was withdrawn. Hints are
+        # appended to — never replace — the daemon's words.
+        hint = ""
+        if code == "no_permission":
+            hint = (
+                " Nothing was withdrawn. Changing serve configuration needs root "
+                "or a standing grant: try `sudo tailscale serve …`, or grant this "
+                "user once with `sudo tailscale set --operator=$USER`."
+            )
+        elif code == "daemon_unavailable":
+            hint = (
+                " Nothing was withdrawn. Check `tailscale status`; the daemon may "
+                "be stopped or logged out — bring Tailscale back up, then turn "
+                "this off again."
+            )
+        return ServeResult(False, code, (said or f"tailscale serve exited {rc}") + hint)
     return ServeResult(
         True, "ok", "The dashboard is no longer published on this machine's tailnet."
     )

@@ -1,10 +1,9 @@
 """SessionMap's threading contract: the lock, the batch, and the ratchets.
 
-Issue #2989. Every mutation rewrites the WHOLE map from ``_data``, so a
+Every mutation rewrites the WHOLE map from ``_data``, so a
 read-modify-write is atomic only while nothing else touches the structure.
 Before ``_MAP_LOCK`` the event loop was the only thing providing that, which is
-why offloading a single write made the map racy instead of non-blocking (a
-``to_thread`` wrapper reverted on #2976 for exactly that reason).
+why offloading a single write made the map racy instead of non-blocking.
 
 Four properties are pinned here:
 
@@ -26,6 +25,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from source_corpus import parsed_candidates
 
 import kiro_crew.session_map as session_map_mod
 from kiro_crew.session_map import SESSION_MAP_FILENAME, SessionMap
@@ -505,14 +505,14 @@ class TestNoAwaitInsideBatch:
                     yield node
                     break
 
+    #: A block can only be one this gate cares about if the module spells
+    #: ``batched_save``, so nothing else is worth parsing.
+    _REQUIRE_ALL = ("batched_save",)
+
     def test_no_batch_block_awaits(self):
         offenders: list[str] = []
-        for path in SRC.rglob("*.py"):
+        for path, _text, tree in parsed_candidates(self._REQUIRE_ALL):
             if "_vendor" in path.parts:
-                continue
-            try:
-                tree = ast.parse(path.read_text(encoding="utf-8"))
-            except SyntaxError:  # pragma: no cover - the tree compiles in CI
                 continue
             for block in self._batch_blocks(tree):
                 for inner in ast.walk(block):

@@ -23,12 +23,14 @@ otherwise.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
 import platform
 import stat
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -129,12 +131,40 @@ def _sdk_path() -> str | None:
 #: Prefixes a compiler may live under. Anything outside these is refused even if
 #: ``xcrun`` names it, because the gateway executes what the compiler produces.
 _TRUSTED_TOOLCHAIN_PREFIXES = (
-    "/Applications/Xcode.app/",
-    "/Applications/Xcode-beta.app/",
     "/Library/Developer/",
     "/usr/bin/",
     "/usr/libexec/",
 )
+
+#: `/Applications` itself, for the Xcode bundle rule below.
+_APPLICATIONS_DIR = "/Applications/"
+
+
+def _xcode_bundle_prefix(real: str) -> str | None:
+    """The `/Applications/Xcode*.app` bundle *real* lives in, or None.
+
+    An Xcode bundle carries its VERSION in practice -- `Xcode_16.4.app`, with
+    `Xcode.app` a symlink to whichever is the default. That is the layout on every
+    GitHub macOS runner and on any machine holding more than one Xcode, so a
+    literal `/Applications/Xcode.app/` prefix matched nothing once `realpath`
+    resolved the link, and a genuine toolchain was refused.
+
+    Anchored to exactly ONE path component, so nothing deeper under
+    `/Applications` can widen it, and it grants no trust by itself: the caller
+    still walks from the compiler up to this bundle root requiring root ownership
+    with no group or other write at every level. `/Applications` is `775
+    root:admin`, so an admin-group user CAN create a bundle beside a real one --
+    and it is owned by that user, which is what the walk refuses.
+    """
+    if not real.startswith(_APPLICATIONS_DIR):
+        return None
+    head, _, rest = real[len(_APPLICATIONS_DIR) :].partition("/")
+    # `rest` must be non-empty for the same reason the literal prefixes carried a
+    # trailing slash: the bundle DIRECTORY is not itself a compiler or an SDK.
+    if not rest or not head.startswith("Xcode") or not head.endswith(".app"):
+        return None
+    return f"{_APPLICATIONS_DIR}{head}/"
+
 
 #: Wall-clock ceiling for one helper run. Generous relative to observed runtimes
 #: (sub-second per 10s of audio) because a first-ever run may block on asset install.
@@ -186,6 +216,8 @@ def _is_trusted_toolchain(path: str) -> bool:
     except OSError:
         return False
     prefix = next((p for p in _TRUSTED_TOOLCHAIN_PREFIXES if real.startswith(p)), None)
+    if prefix is None:
+        prefix = _xcode_bundle_prefix(real)
     if prefix is None:
         return False
     stop = prefix.rstrip("/")
@@ -349,6 +381,14 @@ def _sandboxed(argv: list[str]) -> tuple[list[str], dict[str, str], str | None]:
     protects; keeping the probe out of ``availability()`` was necessary but not
     sufficient, because these three call sites are themselves async.
 
+    Returns:
+        ``(wrapped_argv, scrubbed_env, cleanup_path_or_None)`` — the chokepoint's
+        own contract. The third element is a real temp launcher/profile whenever
+        the backend materializes one (``None`` for the nested-sandbox
+        passthrough), and the CALLER must unlink it after the child exits
+        (:func:`_drop_sandbox_launcher`); discarding it leaks one file per call,
+        forever.
+
     Raises:
         SandboxUnavailableError: propagated from the chokepoint when the host has no
             sandbox backend. Callers MUST catch this and surface the message, which
@@ -357,6 +397,45 @@ def _sandboxed(argv: list[str]) -> tuple[list[str], dict[str, str], str | None]:
             deliberate — see the callers.
     """
     return sandbox.sandboxed_spawn_argv(argv, mode="strict", env=_build_env())
+
+
+def _drop_sandbox_launcher(path: str | None) -> None:
+    """Remove the sandbox's temp launcher/profile once the child is done.
+
+    ``sandboxed_spawn_argv`` makes the caller responsible for unlinking the
+    cleanup path after the child exits (the Linux namespace launcher script or
+    the macOS ``sandbox-exec`` profile). Same shape as
+    ``mcp_gateway/resolve_once.py``: idempotent and silent, because a failed
+    unlink is a leaked temp file, never a reason to fail a transcription that
+    otherwise succeeded.
+    """
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+async def _sandboxed_off_loop(argv: list[str]) -> tuple[list[str], dict[str, str], str | None]:
+    """Offload :func:`_sandboxed` to a worker thread without a cancellation leak.
+
+    A plain ``asyncio.to_thread`` hop is the leak: cancelling the awaiting
+    coroutine abandons the hop while the worker thread is still inside
+    ``sandboxed_spawn_argv``, the thread goes on to materialize the
+    launcher/profile, and the returned tuple is never bound -- so no ``finally``
+    and no session field can ever reach the cleanup path.
+
+    Delegates to the shared :func:`sandbox.shielded_prepare_off_loop`, which
+    owns the shield-and-recover pattern (worker-thread hop + settle-then-unlink
+    under cancellation, repeat-cancellation safe) for every async
+    caller of the chokepoint.  Preparation stays behind :func:`_sandboxed` so
+    this module keeps owning its own ``mode="strict"`` + ``_build_env()``
+    policy.  ``SandboxUnavailableError`` still propagates to the caller
+    unchanged -- the shield only intercepts cancellation, and that raise carries
+    no tuple and hence no file to drop.
+    """
+    return await sandbox.shielded_prepare_off_loop(functools.partial(_sandboxed, argv))
 
 
 def _mkstemp_path(suffix: str) -> str:
@@ -483,20 +562,80 @@ def is_available() -> bool:
     return availability().ok
 
 
-async def _to_native_audio(audio_path: str) -> tuple[str, bool]:
+class TranscriptionRefusedError(RuntimeError):
+    """Base for pre-conversion refusals ``transcribe()`` surfaces as errors."""
+
+
+class RecordingTooLongError(TranscriptionRefusedError):
+    """The input exceeds the transcription ceiling; refusing beats truncating."""
+
+
+class DurationUnverifiedError(TranscriptionRefusedError):
+    """The duration probe could not answer; refusing beats risking truncation.
+
+    A ``None`` probe is not proof the input is under the ceiling: a TRANSIENT
+    cause — a load spike that times the probe out but clears before the
+    remux — would let the ``-t``-bounded conversion succeed on the truncated
+    prefix of an over-cap recording (GPT review r27). Only a persistent cause
+    is covered by the aligned-budget argument, so ``None`` must refuse loudly
+    and retryably, exactly as the meetings import gate does (r14).
+    """
+
+
+async def _to_native_audio(
+    audio_path: str, probe_timeout_secs: int = DEFAULT_TIMEOUT_SECS
+) -> tuple[str, bool]:
     """Return a path ``AVAudioFile`` can open, plus whether it is a temp file.
 
     Transcodes to 16 kHz mono WAV with ffmpeg when the input container is not one
     the framework reads. Falls back to the original path when ffmpeg is missing, so
     the caller still gets the framework's own error rather than a silent refusal.
+
+    Raises :class:`RecordingTooLongError` for an input the duration probe shows
+    is over the transcription ceiling, and :class:`DurationUnverifiedError`
+    when the probe cannot answer at all — both BEFORE the conversion, because
+    the remux below is ``-t``-bounded (a temp-disk guard) and converting only
+    the first hour of a longer-or-unknown recording would return a silently
+    truncated transcript, the exact data loss the meetings import gate refuses
+    (GPT reviews r26/r27). The no-ffmpeg degrade path is exempt: with no
+    decoder there is no remux and therefore no truncation to guard against.
     """
-    if Path(audio_path).suffix.lower() in _NATIVE_AUDIO_SUFFIXES:
+    from kiro_crew.transcribe import (
+        _MAX_AUDIO_SECS,
+        _close_ffmpeg_for_execution,
+        _create_ffmpeg_subprocess,
+        _describe_ffmpeg_exit,
+        _dev_fd_number,
+        _forced_demuxer_args,
+        _input_suffix,
+        _resolve_ffmpeg_for_execution,
+        audio_exceeds_secs,
+        ensure_ffmpeg_in_path,
+    )
+
+    # The native fast path hands *audio_path* to the Swift helper BY VALUE, and
+    # a descriptor path (``/dev/fd/N``) names a descriptor of THIS process —
+    # useless to the helper, whose own fd table does not hold N (GPT review
+    # r23: a native-suffix import would fail with a 502). The remux below is
+    # the materializing path: its FFmpeg child inherits the descriptor via the
+    # spawn seam and writes a NAMED temp file the helper can open.
+    if _dev_fd_number(audio_path) is None and _input_suffix(audio_path) in _NATIVE_AUDIO_SUFFIXES:
         return audio_path, False
 
-    from kiro_crew.transcribe import _find_ffmpeg, ensure_ffmpeg_in_path
+    try:
+        # Same demuxer pin as every other FFmpeg input (transcribe r20/r21):
+        # resolved BEFORE the decoder handle so a refusal cannot leak it. The
+        # loud-failure convention below applies: the helper then reports the
+        # undecodable input rather than this remux sniffing its content.
+        demux_args = _forced_demuxer_args(audio_path)
+    except OSError:
+        logger.warning("apple_speech: cannot resolve a demuxer for %s", audio_path)
+        return audio_path, False
 
     await asyncio.to_thread(ensure_ffmpeg_in_path)
-    ffmpeg = _find_ffmpeg()
+    # A bundled decoder is 49-88 MB and is SHA-256 authenticated on every
+    # execution. Keep that blocking read off the gateway event loop.
+    ffmpeg = await _resolve_ffmpeg_for_execution()
     if not ffmpeg:
         logger.warning(
             "apple_speech: %s needs transcoding but ffmpeg was not found",
@@ -504,27 +643,128 @@ async def _to_native_audio(audio_path: str) -> tuple[str, bool]:
         )
         return audio_path, False
 
+    # Duration gate, AFTER the decoder resolve on purpose: with no ffmpeg there
+    # is no remux and therefore no truncation to guard against (the degrade
+    # return above hands the original file over and the framework fails
+    # loudly), while WITH a decoder the ``-t``-bounded conversion below must
+    # never run on an input whose duration is over — or UNKNOWN. ``None``
+    # refuses too (GPT review r27): a transient probe cause (a load spike that
+    # clears before the remux) is not covered by the aligned-budget argument,
+    # and proceeding would transcribe a silently truncated prefix.
+    try:
+        exceeds = await audio_exceeds_secs(
+            audio_path, _MAX_AUDIO_SECS, timeout_secs=probe_timeout_secs
+        )
+    except BaseException:
+        await _close_ffmpeg_for_execution(ffmpeg, preserve_active_exception=True)
+        raise
+    if exceeds:
+        await _close_ffmpeg_for_execution(ffmpeg)
+        raise RecordingTooLongError(
+            f"recording exceeds the {_MAX_AUDIO_SECS // 60}-minute transcription "
+            "ceiling; trim it rather than transcribing a truncated prefix"
+        )
+    if exceeds is None:
+        await _close_ffmpeg_for_execution(ffmpeg)
+        raise DurationUnverifiedError(
+            "could not verify the recording's duration just now; retry, or trim "
+            f"it to under {_MAX_AUDIO_SECS // 60} minutes"
+        )
+
     # Both syscalls in ONE thread hop. `os.close` alone is trivial, but
     # `tempfile.mkstemp` is the heavier half — it creates a file — and leaving it
     # on the loop while offloading only the close would be the worse split.
-    out = await asyncio.to_thread(_mkstemp_path, ".wav")
-    proc = await asyncio.create_subprocess_exec(
-        ffmpeg,
-        "-y",
-        "-i",
-        audio_path,
-        "-ar",
-        "16000",
-        "-ac",
-        "1",
-        out,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, err = await proc.communicate()
+    try:
+        out = await asyncio.to_thread(_mkstemp_path, ".wav")
+    except BaseException:
+        await _close_ffmpeg_for_execution(ffmpeg, preserve_active_exception=True)
+        raise
+    # The `.wav` stays invocation-owned until the success return below hands it
+    # to the caller. A spawn failure or a cancellation (`CancelledError` is a
+    # `BaseException`, so `except Exception` would miss it) never transfers
+    # ownership, so remove the temp before propagating. Stop AND reap a live
+    # ffmpeg first: Windows keeps the output file locked until the child fully
+    # exits (the unlink would fail and the temp would survive), and on POSIX a
+    # still-running child can race the removal. Every cleanup step is
+    # best-effort — the exception in flight is the one that must surface.
+    try:
+        try:
+            proc = await _create_ffmpeg_subprocess(
+                ffmpeg,
+                "-y",
+                *demux_args,
+                "-i",
+                audio_path,
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                # Bounds the temp file as well as the conversion itself: a large
+                # low-bitrate input could otherwise expand into a multi-gigabyte
+                # WAV and exhaust the temp volume (GPT review r23). This is the
+                # ceiling ``batch_duration_cap_secs`` reports for the Apple lane,
+                # so the meetings import refuses over-cap recordings loudly
+                # BEFORE this truncation could ever bite.
+                "-t",
+                str(_MAX_AUDIO_SECS),
+                out,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, err = await proc.communicate()
+            except BaseException:
+                try:
+                    proc.kill()
+                except (OSError, ProcessLookupError):
+                    pass
+                else:
+                    try:
+                        await proc.communicate()
+                    except BaseException:
+                        # A repeat cancellation can land on this await; swallow it
+                        # so the unlink below still runs and the ORIGINAL exception
+                        # is the one that propagates.
+                        pass
+                raise
+        except BaseException:
+            try:
+                os.unlink(out)
+            except OSError:
+                pass
+            raise
+    finally:
+        # The authenticated handle must outlive the spawn: every branch
+        # above has already reaped the child (``communicate`` on success,
+        # kill-and-reap on failure) or never spawned one, so the staged image
+        # can be released now — off the loop, unconditionally, instead of by
+        # ``__del__`` running the close synchronously on the gateway event
+        # loop. ``preserve_active_exception`` is set only while an exception is
+        # genuinely in flight, so a cleanup failure never masks the original
+        # error and a cancellation landing on the close await of a success
+        # path still propagates.
+        try:
+            await _close_ffmpeg_for_execution(
+                ffmpeg,
+                preserve_active_exception=sys.exc_info()[1] is not None,
+            )
+        except BaseException:
+            # This await is the only suspension point between the child
+            # exiting and the success return transferring ``out`` to the
+            # caller. A cancellation landing exactly here (it can only raise
+            # on the no-exception-in-flight path) would otherwise propagate
+            # with the invocation-owned temp still on disk. The failure
+            # branches already unlinked, so this second unlink is a tolerated
+            # no-op there.
+            try:
+                os.unlink(out)
+            except OSError:
+                pass
+            raise
     if proc.returncode != 0:
+        tail = err.decode(errors="replace").strip()[-300:] if err else ""
         logger.warning(
-            "apple_speech: ffmpeg transcode failed: %s", err.decode(errors="replace")[-300:]
+            "apple_speech: ffmpeg transcode %s", _describe_ffmpeg_exit(proc.returncode, tail)
         )
         try:
             os.unlink(out)
@@ -555,35 +795,52 @@ async def transcribe(
     if not helper:
         return None, {"error": "speech helper could not be built"}
 
-    native_path, is_temp = await _to_native_audio(audio_path)
-    argv = [helper, "--locale", locale]
-    if install:
-        argv.append("--install")
-    argv.append(native_path)
+    try:
+        native_path, is_temp = await _to_native_audio(audio_path, probe_timeout_secs=timeout_secs)
+    except TranscriptionRefusedError as exc:
+        # Loud, user-actionable refusal — never a transcript that silently
+        # omits everything past the ceiling (GPT review r26/r27): over-cap
+        # AND duration-unverified inputs both stop here, before conversion.
+        return None, {"error": str(exc)}
+    # When `is_temp` is true this invocation owns the transcode temp from here
+    # on, so every exit — the sandbox rejection included — must route through
+    # the cleanup `finally` below. An original input (`is_temp` false) is the
+    # caller's file and is never removed on any path.
+    try:
+        argv = [helper, "--locale", locale]
+        if install:
+            argv.append("--install")
+        argv.append(native_path)
 
-    try:
-        argv, spawn_env, _sb_cleanup = await asyncio.to_thread(_sandboxed, argv)
-    except sandbox.SandboxUnavailableError as exc:
-        logger.warning("apple_speech: %s%s", _NO_SANDBOX_HINT, exc)
-        return None, {"error": f"{_NO_SANDBOX_HINT}{exc}"}
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            env=spawn_env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
-        except asyncio.TimeoutError:
+            argv, spawn_env, sb_cleanup = await _sandboxed_off_loop(argv)
+        except sandbox.SandboxUnavailableError as exc:
+            logger.warning("apple_speech: %s%s", _NO_SANDBOX_HINT, exc)
+            return None, {"error": f"{_NO_SANDBOX_HINT}{exc}"}
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                env=spawn_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
             try:
-                proc.kill()
-                await proc.communicate()
-            except (OSError, ProcessLookupError):
-                pass
-            return None, {"error": f"timed out after {timeout_secs}s"}
-    except OSError as exc:
-        return None, {"error": f"could not run speech helper: {exc}"}
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                    await proc.communicate()
+                except (OSError, ProcessLookupError):
+                    pass
+                return None, {"error": f"timed out after {timeout_secs}s"}
+        except OSError as exc:
+            return None, {"error": f"could not run speech helper: {exc}"}
+        finally:
+            # Covers the success, timeout and spawn-failure exits alike: the
+            # leak is per-call, so a launcher dropped only on success still
+            # accumulates. The sandbox-unavailable return above yields no
+            # tuple, hence no file to drop.
+            _drop_sandbox_launcher(sb_cleanup)
     finally:
         if is_temp:
             try:
@@ -612,9 +869,12 @@ async def inventory() -> dict:
     helper = await asyncio.to_thread(helper_path)
     if not helper:
         return {"error": "speech helper unavailable"}
+    # None until `_sandboxed` returns: its unavailable-raise yields no tuple and
+    # hence no file, so the `finally` below is a no-op on that branch.
+    inv_cleanup: str | None = None
     try:
         try:
-            inv_argv, inv_env, _ = await asyncio.to_thread(_sandboxed, [helper, "--inventory"])
+            inv_argv, inv_env, inv_cleanup = await _sandboxed_off_loop([helper, "--inventory"])
         except sandbox.SandboxUnavailableError as exc:
             return {"error": f"{_NO_SANDBOX_HINT}{exc}"}
         proc = await asyncio.create_subprocess_exec(
@@ -623,10 +883,25 @@ async def inventory() -> dict:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        except asyncio.TimeoutError:
+            # Reap before the finally unlinks, honouring the "after the child
+            # exits" contract — and a helper wedged past the ceiling must not
+            # be left running with nobody waiting on it. Same shape as
+            # transcribe(); the outer except turns the re-raise into the same
+            # error dict this path always returned.
+            try:
+                proc.kill()
+                await proc.communicate()
+            except (OSError, ProcessLookupError):
+                pass
+            raise
         return dict(json.loads(stdout.decode().strip().splitlines()[-1]))
     except (OSError, asyncio.TimeoutError, json.JSONDecodeError, IndexError) as exc:
         return {"error": str(exc)}
+    finally:
+        _drop_sandbox_launcher(inv_cleanup)
 
 
 # ─────────────────────────── live streaming ───────────────────────────────────
@@ -666,6 +941,11 @@ class StreamingSession:
         self._queue: asyncio.Queue[dict | None] = asyncio.Queue()
         self._pump: asyncio.Task | None = None
         self._final_text = ""
+        #: Sandbox temp launcher/profile for the live helper. The child OUTLIVES
+        #: :meth:`start`, so unlike the batch sites this cannot be dropped in a
+        #: ``finally`` there — it is held for the session and unlinked in
+        #: :meth:`close`, once the process is torn down.
+        self._sb_cleanup: str | None = None
 
     async def start(self) -> str:
         """Spawn the helper and wait for ``ready``. Returns "" on success, else why not."""
@@ -677,9 +957,25 @@ class StreamingSession:
             return "streaming speech helper could not be built"
         try:
             try:
-                stream_argv, stream_env, _ = await asyncio.to_thread(
-                    _sandboxed,
-                    [helper, "--locale", self.locale, "--sample-rate", str(self.sample_rate)],
+                # `--fast` inserts `.frequentFinalization` into the transcriber's
+                # reporting options so the helper emits mid-stream FINAL segments
+                # while the audio stream is still open. Without it the default
+                # DictationTranscriber produces only volatile partials until the
+                # stream closes, so the dashboard's semantic endpointer — which
+                # schedules its utterance-complete judgment exclusively from
+                # note_final() — never fires and auto-submit is impossible. The
+                # one-shot batch path deliberately omits it: its final arrives
+                # when the stream closes, and frequent finalization can trade
+                # accuracy for latency it has no use for.
+                stream_argv, stream_env, self._sb_cleanup = await _sandboxed_off_loop(
+                    [
+                        helper,
+                        "--locale",
+                        self.locale,
+                        "--sample-rate",
+                        str(self.sample_rate),
+                        "--fast",
+                    ]
                 )
             except sandbox.SandboxUnavailableError as exc:
                 return f"{_NO_SANDBOX_HINT}{exc}"
@@ -691,7 +987,20 @@ class StreamingSession:
                 stderr=asyncio.subprocess.DEVNULL,
             )
         except OSError as exc:
+            # The launcher exists but no child ever held it; the readiness
+            # failures below instead reach the same unlink through `close()`.
+            cleanup, self._sb_cleanup = self._sb_cleanup, None
+            _drop_sandbox_launcher(cleanup)
             return f"could not start streaming helper: {exc}"
+        except BaseException:
+            # Cancellation between the tuple binding and the spawn completing:
+            # `CancelledError` is a `BaseException`, so the `OSError` drop above
+            # never sees it, and the caller's teardown only exists after start()
+            # returns. close() is the right teardown even though `_proc` is
+            # still unbound here — it kills+reaps whatever was spawned before
+            # unlinking, and is a no-op for the parts that never came up.
+            await self.close()
+            raise
 
         self._pump = asyncio.create_task(self._read_events())
         try:
@@ -699,6 +1008,13 @@ class StreamingSession:
         except asyncio.TimeoutError:
             await self.close()
             return "streaming helper did not become ready"
+        except BaseException:
+            # Cancellation anywhere in the readiness wait leaves a live helper
+            # and a held launcher with no owner yet; run the session's own
+            # teardown — kill+reap, then unlink — before the cancellation
+            # surfaces.
+            await self.close()
+            raise
         if first is None:
             await self.close()
             return "streaming helper exited before becoming ready"
@@ -785,3 +1101,7 @@ class StreamingSession:
         if self._pump is not None:
             self._pump.cancel()
             self._pump = None
+        # After the kill/wait above, so the launcher is never unlinked out from
+        # under a live child. The swap keeps a double close from re-unlinking.
+        cleanup, self._sb_cleanup = self._sb_cleanup, None
+        _drop_sandbox_launcher(cleanup)

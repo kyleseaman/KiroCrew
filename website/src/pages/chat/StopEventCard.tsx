@@ -4,8 +4,10 @@ import { Square, XOctagon } from 'lucide-react'
 import type { ChatMessage } from '../../types'
 
 import { i18nT } from '../../i18n/t'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 /** Inline card for stop_event messages. Three visual states driven by meta.state. */
 export default memo(function StopEventCard({ message }: { message: ChatMessage }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const state = (message.meta?.state as string) ?? 'stopping'
 
   if (state === 'stopping') {
@@ -27,6 +29,14 @@ export default memo(function StopEventCard({ message }: { message: ChatMessage }
   }
 
   if (state === 'stop_failed_reset') {
+    // Transcript row, deliberately NOT routed through `ErrorNotice`, on the same
+    // grounds as `ErrorCard`'s exemption in the `errors-use-error-notice` rule:
+    // the agent is already in this conversation, so an "ask the agent" hand-off
+    // would be circular, and the text is a fixed localized status label rather
+    // than a backend error body — there is no journal entry for it to recover.
+    // The class recipe below IS the transcript's error-row treatment: it is
+    // pinned byte-for-byte to `ErrorCard`'s non-continuable card (#6229,
+    // `AppSdkStopEventCardParity.test.tsx`), so the two cannot drift apart.
     return (
       <div
         role="alert"

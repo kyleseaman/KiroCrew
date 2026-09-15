@@ -38,14 +38,47 @@ Framework **pushes** activities to a messaging endpoint you host. Kiro Crew:
 
   The gateway itself speaks HTTP, so something must terminate TLS in front of it;
   Teams will not deliver to a non-HTTPS endpoint.
-- The Teams extra installed (for inbound JWT validation):
+- The JWT dependency installed (for inbound token validation), in the
+  environment that runs the gateway:
 
   ```bash
-  pip install "kirocrew[teams]"
+  pip install "PyJWT[crypto]==2.13.0"
   ```
 
-  If the channel is enabled without this extra, Kiro Crew logs an actionable
-  error and skips Teams (the rest of the gateway still starts).
+  This is the whole of the `teams` extra. Installing the dependency directly is
+  the form that works on every layout: Kiro Crew is not published on PyPI, so
+  `pip install "kirocrew[teams]"` cannot resolve, and the direct-URL form below
+  reinstalls Kiro Crew itself rather than just adding the dependency.
+
+  If the channel is enabled without it, Kiro Crew logs an actionable error and
+  skips Teams (the rest of the gateway still starts).
+
+ > [!NOTE]
+ > The error `invalid-egg-fragment` occurs because modern `pip` (v22+) deprecated and removed support for using `#egg=package_name[extra]` in direct Git URLs.
+ >
+ > Use PIP's **Direct URL requirement syntax** (`package[extra] @ git+https://...`) to install the package along with extras:
+ >
+ > ```bash
+ > pip install "kirocrew[teams] @ git+https://github.com/kirodotdev/KiroCrew.git"
+ > ```
+ > ### Alternative Solutions
+ >
+ > #### Option 1: Install Subdirectory / Local Clone (Editable Mode)
+ >
+ > If you have cloned the [Kiro Crew GitHub repository](https://github.com/kirodotdev/KiroCrew) locally, navigate to the repo root and run:
+ >
+ > ```bash
+ > pip install -e ".[teams]"
+ > ```
+ >
+ > #### Option 2: Fallback to Two Steps
+ >
+ > If you run into issues with Git dependency syntax, you can install the repository root first and then install the required `teams` dependencies directly (such as `pyjwt` and `cryptography` required for Azure Bot Framework JWT validation):
+ >
+ > ```bash
+ > pip install "git+https://github.com/kirodotdev/KiroCrew.git"
+ > pip install pyjwt cryptography
+ > ```
 
 ## 1. Register an Azure Bot
 
@@ -95,8 +128,12 @@ Then enable the channel and add your allow-list in `~/.kiro/crew/config.json`:
 - **`app_password` is env-only.** It is read from `MICROSOFT_APP_PASSWORD`
   (env or `.env`) and is deliberately **not** loaded from `config.json`, which the
   agent can read — putting it there has no effect and the channel will not start.
-- `soft_threshold_pct` / `hard_threshold_pct` — context-window nudges
-  (defaults 80 / 95), same as the other channels.
+- `soft_threshold_pct` / `hard_threshold_pct` — context-window nudges (defaults `80` / `95`), same as the other channels.
+- `session_folder` — optional dashboard sidebar folder for Teams conversations (default `""`, which leaves them unfiled).
+
+Defaults: `enabled` is `false`; `app_id` and `tenant_id` are `""`; `allowed_emails` is `[]`; and `app_password` is `""` until `MICROSOFT_APP_PASSWORD` supplies it. `app_password` remains env-only even though the in-memory config field has that default.
+
+Transport capabilities: streaming and reactions are disabled; editing, inbound and outbound files, rich blocks, and proactive sends are enabled; threads are disabled. Text chunks are capped at 16,000 characters and interactive prompts at five buttons.
 
 ## 3. Package the Teams app and start a chat
 
@@ -134,7 +171,7 @@ Send `/help` in the chat for the current list. Today:
 | `/stop` (`/cancel`) | Stop the reply in progress and clear the queue |
 | `/yolo on\|off\|renew` | Auto-approve tools **everywhere** until it expires — see below |
 | `/link` / `/unlink` | Resume / stop mirroring dashboard replies into this chat |
-| `/sessions [search words]` | Continue a recent dashboard chat here (owner only) |
+| `/sessions [search words]` | Continue a recent dashboard or same-chat session here (owner only) |
 | `/dashboard [<N>h\|<N>m]` | Get a **dashboard login link** — see Security notes |
 | `/help` | Show the command list |
 
@@ -148,13 +185,16 @@ progress. A message sent mid-turn is never lost — if it cannot be folded in, i
 held and shown in a single "⏳ Queued (N)" receipt that is edited in place, then
 answered as one combined turn.
 
-### Continuing a dashboard conversation
+### Continuing an earlier conversation
 
-`/sessions` lists your recent dashboard chats as buttons; press one and it continues in
-this Teams chat, with the last few messages replayed so you can see where you left off.
-`/sessions <words>` searches them — over message content as well as titles, so a phrase
-you remember from the conversation finds it. `/unlink` (or `/new`) comes back to your own
-Teams conversation.
+`/sessions` lists your recent dashboard chats plus generations from this exact Teams
+identity bucket; native sessions for another identity, agent, conversation, or channel
+are excluded. Press one and it continues in this Teams chat, with the last few messages
+replayed so you can see where you left off. `/sessions <words>` searches them — over
+message content as well as titles, so a phrase you remember from the conversation finds
+it. `/unlink` comes back to your own Teams conversation. `/new` leaves the resumed
+session and durably records the fresh generation before replying; its first real turn
+adds it to `/sessions`.
 
 It is **owner-only**: a dashboard session is your whole working transcript, so the list
 is available only when `teams.allowed_emails` holds exactly one address. With more than
@@ -195,7 +235,7 @@ None of this disables the security gate: the sensitive-path keystone, the
 enterprise governance ceiling, and the destructive-command deny-list all run ahead
 of auto-approval, so anything denied by policy stays denied.
 
-## Security notes
+## Access control
 
 - The webhook is **exempt from the dashboard cookie gate and from the CSRF origin
   check, for `POST` only**, because it performs its own Bot Framework JWT
@@ -232,7 +272,7 @@ of auto-approval, so anything denied by policy stays denied.
   that resolves into a private, loopback or link-local range is refused — so an
   activity cannot turn the gateway into a proxy for your internal network.
 
-## Limitations (this release)
+## Limits
 
 - 1:1 personal chat only — no team channels, group chats, or @mention handling.
   A reply in a channel would expose tool output to people who are not on your
@@ -266,3 +306,9 @@ of auto-approval, so anything denied by policy stays denied.
   with a channel or user target — its addressing, allow-list and threading are Slack
   concepts — so a Teams-only install should rely on the mirror rather than on that
   tool's own delivery.
+
+## Related docs
+
+- [Channel capabilities](channel-capabilities.md): the ten-channel matrix — streaming, buttons, uploads, reply length, approval timeout
+- [Getting Started](getting-started.md): install, first run, connecting a channel
+- [Configuration](configuration.md): the config file and environment variables

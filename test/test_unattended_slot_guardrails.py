@@ -419,6 +419,10 @@ class _Loop:
         self.max_cycles = 24
         self.cycle_count = 3
         self.stop_sentinel_path = ""
+        # Read by the fire path to decide whether the transcript row shows a
+        # short banner instead of the full message. "" keeps the historical
+        # verbose row, which is what these tests assert on.
+        self.banner = ""
 
 
 def _bg_slot(key: str) -> MagicMock:
@@ -573,8 +577,8 @@ class TestIdleCleanupSparesArmedLoops:
     async def test_the_users_close_still_retires_the_loop(self, tmp_path, monkeypatch) -> None:
         """"Respect the close" survives adopt_closed=True.
 
-        The rule used to be an emergent property of the fire path's rehydrate
-        miss. Now that the fire path adopts a closed session, the ✕ handler has
+        The rule is not an emergent property of the fire path's rehydrate
+        miss: since the fire path adopts a closed session, the ✕ handler has
         to retire the loop itself — otherwise a dismissed tab would be
         resurrected by its own loop on the next cycle.
         """
@@ -583,20 +587,24 @@ class TestIdleCleanupSparesArmedLoops:
         state.get_or_create_slot("chat-1-1785")
 
         removed: list[str] = []
+        loop = _Loop("chat-1-1785", loop_id="loop-9")
         svc = MagicMock()
-        svc.get_by_slot = MagicMock(return_value=_Loop("chat-1-1785", loop_id="loop-9"))
+        svc.get_by_slot = MagicMock(return_value=loop)
 
-        async def _remove(loop_id: str) -> None:
-            removed.append(loop_id)
+        async def _remove_by_slot(slot_key: str) -> _Loop:
+            removed.append(slot_key)
+            return loop
 
-        svc.remove = _remove
+        svc.remove_by_slot = _remove_by_slot
         monkeypatch.setattr("kiro_crew.autonudge.get_instance", lambda: svc)
 
         async with TestClient(TestServer(_make_app(state))) as client:
             resp = await client.delete("/api/chat/slots/chat-1-1785")
             assert resp.status == 200
 
-        assert removed == ["loop-9"], "the user's ✕ must retire the slot's nudge loop"
+        assert removed == ["chat-1-1785"], (
+            "the user's ✕ must retire the slot's current nudge generation"
+        )
 
     @pytest.mark.asyncio
     async def test_the_users_close_tells_the_owning_app(self, tmp_path, monkeypatch) -> None:
@@ -659,9 +667,9 @@ class TestIdleCleanupSparesArmedLoops:
     ) -> None:
         """The app learns of the ✕ even when tearing the ACP session down throws.
 
-        REGRESSION: the notification used to run AFTER ``sessions.remove``. An ACP
-        teardown error therefore propagated out of the handler with the app never
-        told, leaving a live crew whose watchdog re-armed the very tab the user had
+        The notification must not run AFTER ``sessions.remove``: an ACP
+        teardown error would then propagate out of the handler with the app never
+        told, leaving a live crew whose watchdog re-arms the very tab the user had
         just closed — the resurrection this hook exists to prevent, reachable by an
         error in an unrelated subsystem.
         """
@@ -712,8 +720,8 @@ class TestIdleCleanupSparesArmedLoops:
 
         Asserted as an ORDER rather than by racing a real timer: the race is what the
         order exists to make unreachable, so reproducing it would be testing the
-        scheduler. What must hold is that no await sits between the pop and the
-        retire — and the retire is what removes the only thing that can fire.
+        scheduler. App-owned slots need one retirement before their close hook and a
+        final re-arbitration after it; both must finish before the synchronous pop.
         """
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
@@ -739,8 +747,8 @@ class TestIdleCleanupSparesArmedLoops:
             resp = await client.delete("/api/chat/slots/crew-c_1a2b3c4d")
             assert resp.status == 200
 
-        assert order[:2] == ["retire", "pop"], (
-            f"the slot left the registry before its loop was retired: {order}"
+        assert order == ["retire", "retire", "pop"], (
+            f"the slot left the registry before both retirement passes finished: {order}"
         )
 
 
@@ -862,9 +870,11 @@ class TestScopedGrantIsNeverPersisted:
         src = inspect.getsource(chat_runner._run_chat)
         assert "slot_trusted = _slot_is_trusted(slot)" in src
         # The trust/YOLO gate still branches on _slot_is_trusted's verdict; the
-        # low-fidelity qualifier only excludes backend-subagent events whose
-        # command bytes never reached the caches (see chat_runner).
-        assert "if (slot_trusted or yolo_active) and not _child_low_fidelity:" in src
+        # grant-eligibility qualifier only excludes backend-subagent events
+        # whose command bytes never reached the caches AND whose canonical MCP
+        # identity did not resolve either (see chat_runner — a verified
+        # identity keeps the unconditional grant honored).
+        assert "if (slot_trusted or yolo_active) and _child_grant_eligible:" in src
 
     def test_the_runner_writes_the_policy_through_the_helper(self) -> None:
         """Pins the call site, not just the helper.

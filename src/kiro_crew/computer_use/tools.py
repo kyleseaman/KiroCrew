@@ -274,11 +274,6 @@ _SECURE_TARGET_TOOLS: frozenset[str] = frozenset(
         TOOL_SCROLL,
     }
 )
-# Tools that synthesize KEYSTROKES. Both are element-targeted, and both are refused
-# outright without an index (see 3b in ``_dispatch``) — including
-# ``computer_press_key``, because ``press_key('tab')`` can MOVE focus onto a
-# password box and the next keystroke would land there.
-_KEYBOARD_TOOLS: frozenset[str] = frozenset({TOOL_TYPE_TEXT, TOOL_PRESS_KEY})
 
 
 def dispatch_tool(
@@ -301,8 +296,8 @@ def dispatch_tool(
     *session_key* is the identity the shim resolved with
     ``mcp_core._resolve_session_key_strict`` (env var, or ``KIROCREW_HOST_PID``
     plus the HMAC sidecar signed with the keystone-protected ``sel_hmac.key``). It
-    is used for the AUDIT RECORD, not for authorization: an empty value no longer
-    refuses, because the unattended-surface rule is gone and a cron job driving the
+    is used for the AUDIT RECORD, not for authorization: an empty value does not
+    refuse, because a cron job driving the
     desktop is a supported flow. It is still never inferred here — the lenient
     resolver walks a file mcp_core itself documents as "agent-writable and therefore
     forgeable", so a guess would put a forgeable identity in the audit trail.
@@ -471,7 +466,9 @@ def _dispatch(
             )
         request = built_drag
 
-    # (4) AUTHORIZATION — fail-closed, before any accessibility or capture call.
+    # (4) AUDIT — recorded before any accessibility or capture call, so the record
+    # exists even when the driver then fails. This step returns no decision: the
+    # fail-closed authorization is the keystone primary enable at step (1).
     denial = gate.require_computer_use(
         tool_name,
         session_key=session_key,
@@ -490,7 +487,7 @@ def _dispatch(
         return _static_refusal(denial, session_key=session_key, agent=agent, tool_name=tool_name)
 
     # (4b) THE REAL-POINTER PATH — reached only when the resolved method actually
-    #      warps the operator's physical cursor. It no longer needs a permit of its
+    #      warps the operator's physical cursor. It needs no permit of its
     #      own: one enable covers the feature. What still protects the cursor is
     #      upstream, in ``policy.resolve_click_method`` — ``auto`` NEVER resolves to
     #      ``global``, so the model has to NAME the pointer-moving method, and an
@@ -643,9 +640,9 @@ def _run(
         # TWO filters, and only the first is now a policy decision.
         # ``policy.check_app`` applies the built-in denylist plus the operator's own
         # allow/deny lists, so an app the agent may not touch is not enumerated
-        # either. ``gate.app_is_disclosable`` used to apply the per-app governance
-        # axes; with those gone it only asks "does this window have an identity at
-        # all", dropping rows there is nothing to show for. Both are kept in this
+        # either. ``gate.app_is_disclosable`` only asks "does this window have an
+        # identity at all", dropping rows there is nothing to show for. Both are kept
+        # in this
         # order so reintroducing a disclosure ceiling is a one-function change.
         visible = tuple(
             ref

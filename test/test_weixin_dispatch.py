@@ -14,6 +14,7 @@ import pytest
 
 from kiro_crew.messaging.driver import APPROVAL_AUTO
 from kiro_crew.messaging.transport import InboundMessage
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.weixin.client import ContextTokenStore, TypingTicketCache
 from kiro_crew.weixin.commands import parse_command
 from kiro_crew.weixin.transport import WEIXIN_CAPABILITIES
@@ -100,6 +101,10 @@ class FakeSessions:
     def __init__(self, provider=None, busy=False):
         self.provider = provider or FakeProvider()
         self._busy = busy
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
         self.released = 0
         self.successes = 0
         self.failures = 0
@@ -107,12 +112,19 @@ class FakeSessions:
         self.acquired = False
         self.mirror_links: dict[str, object] = {}
         self.opted_out = False
+        self.reserved_generations: list[str] = []
 
     def is_busy(self, key):
         return self._busy
 
     async def get_or_create(self, key, agent=None, channel_id=None):
         return self.provider, True, False
+
+    def begin_turn(self, key):
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key, channel_id):
         self.channels[key] = channel_id
@@ -138,6 +150,12 @@ class FakeSessions:
 
     def has_session(self, key):
         return True
+
+    def reserve_generation(self, session_key: str) -> None:
+        self.reserved_generations.append(session_key)
+
+    async def aflush(self) -> None:
+        return None
 
     def max_generation(self, *a, **kw):
         # seed_generation() probes for the highest existing generation; a fresh
@@ -376,7 +394,55 @@ def test_new_command_starts_a_fresh_session_without_a_turn(tmp_path):
 
     assert provider.prompts == []  # no LLM turn for a command
     assert before != after  # generation advanced
+    assert sessions.reserved_generations == [after]
     assert "新对话" in client.sent[0]["text"]
+
+
+def test_inline_callback_reservation_releases_before_poll_task_continues(tmp_path):
+    class Reservation:
+        def __init__(self):
+            self.releases = 0
+
+        def release(self):
+            self.releases += 1
+
+    d, _client, sessions = _make(tmp_path)
+    reservation = Reservation()
+    sessions.reserve_inbound_callback = lambda: reservation
+
+    async def run():
+        await d.handle_message(_msg("/help"))
+        # The caller is still the long-lived poll task here. A task-done lease
+        # would remain held until disconnect and defer every future update.
+        assert reservation.releases == 1
+
+    asyncio.run(run())
+
+
+def test_update_pause_spools_new_before_generation_side_effects(tmp_path, monkeypatch):
+    import kiro_crew.messaging.dispatch as dispatch
+
+    d, client, sessions = _make(tmp_path)
+    sessions.reserve_inbound_callback = lambda: None
+    spooled: list[tuple[str, Any]] = []
+
+    async def capture(*, channel_type, route):
+        spooled.append((channel_type, route))
+
+    monkeypatch.setattr(dispatch, "spool_refused_turn", capture)
+    before = d._session_key("userA")
+
+    asyncio.run(d.handle_message(_msg("/new")))
+
+    assert d._session_key("userA") == before
+    assert sessions.reserved_generations == []
+    assert client.sent == []
+    assert len(spooled) == 1
+    channel_type, refused = spooled[0]
+    assert channel_type == "weixin"
+    assert refused is not None
+    assert refused.conversation_id == "userA"
+    assert refused.text == "/new"
 
 
 def test_compact_command_compacts_without_a_turn(tmp_path):
@@ -386,6 +452,50 @@ def test_compact_command_compacts_without_a_turn(tmp_path):
     assert provider.compacted is True
     assert provider.prompts == []
     assert sessions.released == 1  # acquired for compaction, then released
+
+
+def test_compact_command_declined_on_auto_managed_backend(tmp_path):
+    # A backend that cannot serve /compact gets the informational reply and
+    # compact() is NEVER dispatched.
+    provider = FakeProvider()
+    provider.manual_compact_unsupported_backend = "kas"
+    d, client, sessions = _make(tmp_path, provider=provider)
+    asyncio.run(d.handle_message(_msg("/compact")))
+    assert provider.compacted is False
+    assert sessions.released == 1  # the acquired semaphore is handed back
+    assert any("自动压缩上下文" in s["text"] for s in client.sent)
+
+
+def test_compact_none_capability_preserves_dispatch(tmp_path):
+    # The ABC's None (supported) default keeps the existing dispatch.
+    provider = FakeProvider()
+    provider.manual_compact_unsupported_backend = None
+    d, client, sessions = _make(tmp_path, provider=provider)
+    asyncio.run(d.handle_message(_msg("/compact")))
+    assert provider.compacted is True
+
+
+def test_hard_threshold_declines_silently_on_auto_managed_backend(tmp_path):
+    # No /compact to dispatch and no notice: the backend compacts on its own
+    # as context fills.
+    provider = FakeProvider()
+    provider.manual_compact_unsupported_backend = "kas"
+    d, client, sessions = _make(tmp_path, provider=provider)
+    sessions.check_context_usage = lambda k, p: 99.0  # type: ignore[assignment]
+    asyncio.run(d.handle_message(_msg("long convo")))
+    assert provider.compacted is False
+    assert not any("已自动压缩" in s["text"] for s in client.sent)
+
+
+def test_soft_nudge_suppressed_on_auto_managed_backend(tmp_path):
+    # The nudge advises /compact, which this backend refuses — it compacts on
+    # its own, so there is nothing for the user to act on.
+    provider = FakeProvider()
+    provider.manual_compact_unsupported_backend = "kas"
+    d, client, sessions = _make(tmp_path, provider=provider)
+    sessions.check_context_usage = lambda k, p: 85.0  # type: ignore[assignment]
+    asyncio.run(d.handle_message(_msg("one")))
+    assert not any("上下文已较长" in s["text"] for s in client.sent)
 
 
 def test_busy_session_does_not_start_a_second_turn(tmp_path):
@@ -594,7 +704,7 @@ def test_turn_failure_records_failure_and_still_releases(tmp_path):
 def test_delivery_failure_is_not_recorded_as_success(tmp_path):
     """An undelivered reply must fail the turn, not persist as a success.
 
-    Regression: the renderer used to swallow send errors, so a send timeout left
+    The renderer must not swallow send errors, or a send timeout leaves
     the dispatcher recording + persisting a reply the user never received.
     """
     rows: list[tuple[str, str]] = []
@@ -604,7 +714,7 @@ def test_delivery_failure_is_not_recorded_as_success(tmp_path):
             raise RuntimeError("ilink send timeout")
 
     class Log:
-        def append(self, key, role, text, agent=None):
+        def append(self, key, role, text, agent=None, mid=None):
             rows.append((role, text))
 
         def set_title(self, key, title):
@@ -628,7 +738,7 @@ def test_persist_turn_writes_user_and_assistant_rows(tmp_path):
             self.rows: list[tuple[str, str]] = []
             self.title = ""
 
-        def append(self, key, role, text, agent=None):
+        def append(self, key, role, text, agent=None, mid=None):
             self.rows.append((role, text))
 
         def set_title(self, key, title):

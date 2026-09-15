@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import type { ComponentType } from 'react'
 import ArtifactsPage from '../pages/ArtifactsPage'
 import { renderWithProviders } from './helpers'
 import { api } from '../api/client'
@@ -11,9 +12,13 @@ vi.mock('../api/client')
 // VirtuosoMasonry virtualizes against real layout, which jsdom lacks — mock it
 // to a plain map so card content renders (same shim as ArtifactsPage.test.tsx).
 vi.mock('@virtuoso.dev/masonry', () => ({
-  VirtuosoMasonry: ({ data, context, ItemContent }: any) => (
+  VirtuosoMasonry: ({ data, context, ItemContent }: {
+    data: unknown[]
+    context: unknown
+    ItemContent: ComponentType<{ data: unknown; index: number; context: unknown }>
+  }) => (
     <div data-testid="masonry">
-      {data.map((d: any, i: number) => (
+      {data.map((d, i) => (
         <ItemContent key={i} data={d} index={i} context={context} />
       ))}
     </div>
@@ -102,6 +107,35 @@ describe('ArtifactsPage remote-browse gating', () => {
     expect(screen.getByText('Remote ext-1')).toBeInTheDocument()
     // The browse call was routed by provider name, not a hardcoded vendor.
     expect(vi.mocked(api).browseRemoteArtifacts).toHaveBeenCalledWith('companion', { scope: 'mine' })
+  })
+
+  it('renders NO section for a discovery-capable provider whose tooling is absent', async () => {
+    // available: false means the provider's tooling is not installed here, so
+    // every browse it could make fails. Its only possible rendering is an error
+    // card, and nothing inside the section installs anything.
+    vi.mocked(api).getArtifactPublishProviders = vi.fn().mockResolvedValue({
+      providers: [mkProvider('companion', { available: false })],
+      kind: 'widget',
+    })
+    const browse = vi.fn()
+    vi.mocked(api).browseRemoteArtifacts = browse
+    renderWithProviders(<ArtifactsPage />)
+    await waitFor(() => expect(screen.getByText('local a')).toBeInTheDocument())
+    expect(screen.queryByText('On Companion Provider')).not.toBeInTheDocument()
+    expect(browse).not.toHaveBeenCalled()
+  })
+
+  it('renders the section for an installed provider (available: true)', async () => {
+    // The filter must key on the explicit false, not on truthiness: an
+    // available provider is exactly the case the section exists for.
+    vi.mocked(api).getArtifactPublishProviders = vi.fn().mockResolvedValue({
+      providers: [mkProvider('companion', { available: true })],
+      kind: 'widget',
+    })
+    vi.mocked(api).browseRemoteArtifacts = vi.fn().mockResolvedValue({ artifacts: [mkRemote('ext-9')] })
+    renderWithProviders(<ArtifactsPage />)
+    await waitFor(() => expect(screen.getByText('On Companion Provider')).toBeInTheDocument())
+    expect(screen.getByText('Remote ext-9')).toBeInTheDocument()
   })
 
   it('dedups rows that already exist locally (local_slug set)', async () => {

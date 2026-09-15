@@ -20,6 +20,7 @@ from typing import Any
 
 from kiro_crew.eval.scenario import Assertion, AssertionType, Scenario, SeedProfile, Session, Turn
 from kiro_crew.memory import MemoryStore
+from kiro_crew.memory_stores import DEFAULT_MEMORY_STORE
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -230,10 +231,10 @@ class EvalRunner:
 
         config = KiroCrewConfig.load()
         memory = MemoryStore(workspace=ws)
-        memory.init()
+        await asyncio.to_thread(memory.init)
 
         if scenario.seed:
-            _seed_profile(ws, scenario.seed)
+            await asyncio.to_thread(_seed_profile, ws, scenario.seed)
 
         # Set env so providers share the same memory directory
         # NOTE: os.environ mutation is process-global — not safe for concurrent runs.
@@ -248,10 +249,11 @@ class EvalRunner:
             conv_log.init()
             lesson_store = LessonStore(base_dir=ws)
             vector_store = VectorMemoryStore(db_path=ws / "vector_memory.db")
-            # Off the loop: init() now tightens the DB and its sidecars to
-            # owner-only, which on Windows shells out to icacls up to 11 times.
-            # This runs once per scenario, so a synchronous call would freeze the
-            # loop for seconds on every one.
+            # Off the loop: init() tightens the DB and its sidecars to
+            # owner-only — blocking file IO alongside the sqlite connect and
+            # migrations (the Windows lockdown itself is now in-process).
+            # This runs once per scenario, so a synchronous call would stall
+            # the loop on every one.
             await asyncio.to_thread(vector_store.init)
 
             # Wrap provider factory so all sessions share the same workspace root
@@ -348,7 +350,7 @@ class EvalRunner:
             if session_mgr:
                 await session_mgr.close_all()
             if vector_store:
-                vector_store.close()
+                await asyncio.to_thread(vector_store.close)
             if old_ws is None:
                 os.environ.pop("KIROCREW_WORKSPACE", None)
             else:
@@ -390,7 +392,11 @@ class EvalRunner:
         # Build memory context once for the first turn of non-first sessions
         memory_context = ""
         if ctx_builder is not None:
-            memory_context = ctx_builder.build_session_context(session_key=session_key)
+            memory_context = await asyncio.to_thread(
+                ctx_builder.build_session_context,
+                session_key=session_key,
+                memory_store=DEFAULT_MEMORY_STORE,
+            )
 
         session_result = SessionResult(name=session_def.name)
         try:

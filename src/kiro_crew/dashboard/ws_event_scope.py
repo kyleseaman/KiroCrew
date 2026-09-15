@@ -78,7 +78,7 @@ manifest being trusted is not the one being widened.
 Gating the broad scopes through the install-time consent path
 (``apps/admission.py``) is tracked separately.
 
-## Dashboard users (empty app claim) are unaffected — full event stream as before.
+## Dashboard users (empty app claim) are unaffected — they get the full stream.
 """
 
 from __future__ import annotations
@@ -212,6 +212,10 @@ _SLOT_SCOPED_EVENTS = frozenset({
     "steer_push",
     # Slot metadata / lifecycle
     "slot_title", "slot_clear", "slot_agent_switch", "todo_update",
+    # The slot's own MCP session report. Slot-scoped like todo_update and for the
+    # same reason: it carries ``slot`` and describes only that slot's session, so
+    # a token already scoped to the slot learns nothing wider from it.
+    "mcp_report_update",
     "activity_event", "session_summary",
     # Voice
     "voice_chunk", "voice_complete", "voice_error",
@@ -611,7 +615,7 @@ def _decide_ws_event(
     # System-sourced notifications (source == "system" or source == "") are
     # gateway-internal sends (send_message MCP tool, heartbeat, cron fallback).
     # They carry no ``source_app`` because they flow through state.notify(),
-    # which pre-dates per-app channels. They need their OWN declaration
+    # which has no per-app channel. They need their OWN declaration
     # (``notification:system``): that stream is user content, not the app's
     # own, so folding it into ``notification`` would make a single declaration
     # a broad grant -- the shape this module exists to remove.
@@ -674,8 +678,8 @@ def _slot_visible(
 
     # slots:user — user-initiated slots
     # slots:user — user-initiated slots only.  ``getattr`` defaults to ``""``
-    # (a sentinel that matches NO scope declaration) so a pre-migration slot
-    # or a race condition that leaves ``_origin`` unset remains INVISIBLE
+    # (a sentinel that matches NO scope declaration) so a slot with no recorded
+    # origin, or a race that leaves ``_origin`` unset, remains INVISIBLE
     # rather than being silently classified as USER.  Deny-by-default (CWE-269).
     if getattr(slot, "_origin", "") == SlotOrigin.USER and "slots:user" in allowed_events:
         return True
@@ -1008,9 +1012,9 @@ def app_events_revoked(app: str) -> bool:
     A COLD miss reports NOT revoked (and schedules the refresh) for the same
     reason the declaration cache falls back to the connect snapshot: reporting
     "revoked" for an unknown app would blank every app's own slots on the first
-    broadcast after a gateway restart. One refresh interval of the pre-existing
-    behaviour is the conservative side here; the socket was authenticated against
-    the same file at connect.
+    broadcast after a gateway restart. One refresh interval of unrevoked
+    visibility is the conservative side here; the socket was authenticated
+    against the same file at connect.
     """
     cached = _declared_cache.get(app)
     if cached is None:
@@ -1105,8 +1109,35 @@ def filter_slots_for_app(
         if slot is None:
             continue
         if _slot_visible(slot, app, allowed_events, state):
-            result.append(slot_dict)
+            result.append(_strip_source_link_status(slot_dict))
             _audit_allow(app, "slots_item")
         else:
             _audit_deny(app, "slots_item", "slot_scope_denied")
     return result
+
+
+# Credential-backed chip fields attached by ``state._project_source_links``.
+# The general broadcast carries them for a dashboard user (public repos), but
+# an app token must never receive provider status — its scope is slot metadata,
+# not the operator's credential-backed view of a repository. Stripped here so
+# widening the general list for dashboard users cannot leak into an app frame.
+_SOURCE_LINK_STATUS_KEYS = ("ci", "state", "mergeable", "mergeStateStatus")
+
+
+def _strip_source_link_status(slot_dict: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of *slot_dict* with chip status removed from source links.
+
+    Only touches slots that carry source links with status; otherwise returns
+    the input unchanged (no needless copy on the hot path).
+    """
+    links = slot_dict.get("source_links")
+    if not links or not any(
+        any(k in link for k in _SOURCE_LINK_STATUS_KEYS) for link in links
+    ):
+        return slot_dict
+    cleaned = dict(slot_dict)
+    cleaned["source_links"] = [
+        {k: v for k, v in link.items() if k not in _SOURCE_LINK_STATUS_KEYS}
+        for link in links
+    ]
+    return cleaned

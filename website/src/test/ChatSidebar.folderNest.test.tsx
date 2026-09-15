@@ -27,6 +27,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { createTestStore } from './helpers'
 import { ThemeProvider } from '../hooks/useTheme'
 import type { ChatTag, TagColumn, ChatFolder } from '../types'
+import type { RootState } from '../store'
 
 // Render framer-motion elements as plain DOM (jsdom can't run projection).
 vi.mock('framer-motion', async () => {
@@ -37,21 +38,21 @@ vi.mock('framer-motion', async () => {
     'drag', 'dragConstraints', 'dragElastic', 'onAnimationComplete',
   ])
   const make = (tag: string) =>
-    React.forwardRef((props: any, ref: any) => {
-      const clean: any = {}
+    React.forwardRef((props: Record<string, unknown>, ref: React.Ref<unknown>) => {
+      const clean: Record<string, unknown> = {}
       for (const k of Object.keys(props)) {
         if (k === 'children') continue
         if (k === 'layoutId') { clean['data-layout-id'] = props[k]; continue }
         if (FRAMER_PROPS.has(k)) continue
         clean[k] = props[k]
       }
-      return React.createElement(tag, { ...clean, ref }, props.children)
+      return React.createElement(tag, { ...clean, ref }, props.children as React.ReactNode)
     })
   const motion = new Proxy({}, { get: (_t, tag: string) => make(tag) })
   return {
     motion,
-    AnimatePresence: ({ children }: any) => React.createElement(React.Fragment, null, children),
-    LayoutGroup: ({ children }: any) => React.createElement(React.Fragment, null, children),
+    AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
+    LayoutGroup: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
   }
 })
 
@@ -101,8 +102,8 @@ function renderSidebar(foldersOverride: ChatFolder[] = folders) {
       channelTrusted: false, refreshTrigger: 0, unreadSlots: [], updateProgress: null,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
-    } as any,
-    chat: { activeSlot: null } as any,
+    } as unknown as RootState['dashboard'],
+    chat: { activeSlot: null } as unknown as RootState['chat'],
   })
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   qc.setQueryData(['chat-tags'], tags)
@@ -156,5 +157,46 @@ describe('board view: folder-into-folder nest wiring', () => {
     const { container } = renderSidebar()
     expect(container.querySelector(`[data-col-folder-sortable="${FOLDER_A}"]`)).toBeTruthy()
     expect(container.querySelector(`[data-col-folder-sortable="${FOLDER_B}"]`)).toBeTruthy()
+  })
+})
+
+describe('nested subfolders are drawn in their stored order', () => {
+  /**
+   * The list-view nested render (`renderFolderBlock`) and the board-view one
+   * (`renderColumnFolder`) both drew `folders.filter(parent_id === folder.id)`
+   * in raw cache order, so a subfolder's stored `order` never reached the
+   * screen. That was invisible while nothing could set it deliberately (a drag
+   * only ever reordered ROOTS) and wrong the moment `chat_folder_move`'s
+   * `before`/`after` could — the store would say one sequence and the sidebar
+   * show another.
+   */
+  const PARENT = 'folder-pppp'
+  const EARLIER = 'folder-1111'
+  const LATER = 'folder-2222'
+
+  it('follows order, not the position the row holds in the cache', () => {
+    // Listed AGAINST order on purpose: the higher position comes first in the
+    // array, so array order and stored order disagree.
+    const { container } = renderSidebar([
+      { id: PARENT, name: 'Parent', order: 0 },
+      { id: LATER, name: 'Later', order: 9, parent_id: PARENT },
+      { id: EARLIER, name: 'Earlier', order: 1, parent_id: PARENT },
+    ])
+    const drawn = [...container.querySelectorAll('[data-folder-drop]')]
+      .map(el => el.getAttribute('data-folder-drop'))
+      .filter(id => id === EARLIER || id === LATER)
+    expect(drawn).toEqual([EARLIER, LATER])
+  })
+
+  it('breaks an order tie on name so the sequence cannot shuffle on refetch', () => {
+    const { container } = renderSidebar([
+      { id: PARENT, name: 'Parent', order: 0 },
+      { id: LATER, name: 'Zulu', order: 4, parent_id: PARENT },
+      { id: EARLIER, name: 'Alpha', order: 4, parent_id: PARENT },
+    ])
+    const drawn = [...container.querySelectorAll('[data-folder-drop]')]
+      .map(el => el.getAttribute('data-folder-drop'))
+      .filter(id => id === EARLIER || id === LATER)
+    expect(drawn).toEqual([EARLIER, LATER])
   })
 })

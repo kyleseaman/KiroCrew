@@ -58,7 +58,7 @@ class TestStatusSnapshot:
         # Tokens were present at boot (client wired) but the socket connect
         # failed, e.g. invalid_auth or a network error. The badge must NOT show
         # green: slack_client alone only proves tokens existed, not that Socket
-        # Mode came up. This is the reported bug (#1770): a green "Connected"
+        # Mode came up. The bug guarded: a green "Connected"
         # over a Slack that never received an event.
         state.slack_client = MagicMock()
         state.slack_socket_connected = False
@@ -71,9 +71,20 @@ class TestStatusSnapshot:
         """Any field added to status_snapshot is automatically in SSE/WS/API."""
         snap = state.status_snapshot()
         # These keys must exist — if one is missing, a caller will lose it
-        required = {"uptime", "start_time", "sessions", "messages",
-                    "cron_jobs", "lessons", "subagents", "update_available",
-                    "no_crons", "slack_connected", "branch", "commit"}
+        required = {
+            "uptime",
+            "start_time",
+            "sessions",
+            "messages",
+            "cron_jobs",
+            "lessons",
+            "subagents",
+            "update_available",
+            "no_crons",
+            "slack_connected",
+            "branch",
+            "commit",
+        }
         assert required.issubset(snap.keys())
 
     def test_includes_build_branch_and_commit(self, state: DashboardState) -> None:
@@ -157,10 +168,19 @@ class TestAllStatusSnapshotCallersPassTheUpdateFields:
             "update_can_apply",
             "update_check_status",
             "update_command",
+            "update_latest_version",
+            "update_latest_version_display",
             "update_channel",
+            "update_channel_move_pending",
             "update_managed_by",
             "update_commits_ahead",
             "update_commits_behind",
+            "update_can_arm",
+            "update_last_checked_at",
+            "update_check_interval_secs",
+            "update_required",
+            "update_min_version",
+            "version_display",
         }
 
     def test_the_shared_reader_never_flattens_a_missing_verdict(self) -> None:
@@ -176,10 +196,77 @@ class TestAllStatusSnapshotCallersPassTheUpdateFields:
             updates._update_info.clear()
             updates._update_info.update(original)
 
+    def test_version_display_folds_the_running_stamp_on_stable_only(self, monkeypatch) -> None:
+        """The About page's version chip reads ``version_display`` — the
+        RUNNING build's promoted-stamp fold. The raw ``version`` the WS frame
+        appends is NOT part of this reader and stays untouched: the SPA
+        compares it across pushes to force a reload over a gateway upgrade,
+        and folding it would collapse two RCs of the same release into one
+        string, masking the very upgrade that comparison exists to catch."""
+        from kiro_crew.dashboard.handlers import updates
+
+        original = dict(updates._update_info)
+        monkeypatch.setattr(updates, "_local_version", "0.4.0rc14")
+        try:
+            updates._update_info.clear()
+            updates._update_info.update({"channel": "stable", "latest_version": "0.5.0rc3"})
+            fields = status_fields_of(updates)
+            assert fields["version_display"] == "0.4.0"
+            # The candidate's fold rides the same rule; its raw sibling (the
+            # snooze/skip and arm key) is untouched.
+            assert fields["update_latest_version_display"] == "0.5.0"
+            assert fields["update_latest_version"] == "0.5.0rc3"
+            updates._update_info.update({"channel": "insider"})
+            fields = status_fields_of(updates)
+            assert fields["version_display"] == "0.4.0rc14"
+            assert fields["update_latest_version_display"] == "0.5.0rc3"
+            # Channel not yet resolved (no check has run): raw, never "".
+            updates._update_info.clear()
+            assert status_fields_of(updates)["version_display"] == "0.4.0rc14"
+        finally:
+            updates._update_info.clear()
+            updates._update_info.update(original)
+
+    def test_latest_version_rides_the_hot_path_as_a_plain_string(self) -> None:
+        """The popup keys its per-version snooze/skip on this field, so an
+        absent value must read as "" (no candidate), never as None or a stale
+        non-string the cache happened to hold."""
+        from kiro_crew.dashboard.handlers import updates
+
+        original = dict(updates._update_info)
+        try:
+            updates._update_info.clear()
+            assert status_fields_of(updates)["update_latest_version"] == ""
+            updates._update_info.update({"latest_version": "0.5.0"})
+            assert status_fields_of(updates)["update_latest_version"] == "0.5.0"
+        finally:
+            updates._update_info.clear()
+            updates._update_info.update(original)
+
+    def test_snapshot_accepts_every_shared_reader_field(self) -> None:
+        """Every emitter calls ``status_snapshot(**status_update_fields())``,
+        so a key the reader gains that the snapshot's keyword-only signature
+        lacks is not a missing feature — it is a TypeError that takes down
+        /api/status, the WS status frame, and the SSE stream at once."""
+        import inspect
+
+        from kiro_crew.dashboard.handlers.updates import status_update_fields
+        from kiro_crew.dashboard.state import DashboardState
+
+        params = inspect.signature(DashboardState.status_snapshot).parameters
+        missing = set(status_update_fields()) - set(params)
+        assert not missing, (
+            f"status_update_fields() emits {sorted(missing)} but "
+            "DashboardState.status_snapshot() does not accept them — every "
+            "status emitter spreads the reader into the snapshot, so this "
+            "crashes all three transports"
+        )
+
     def test_ws_uses_the_shared_reader(self) -> None:
         import inspect
 
         from kiro_crew.dashboard import ws
+
         source = inspect.getsource(ws)
         assert "status_update_fields()" in source, (
             "ws.py calls status_snapshot() without the shared update fields — "
@@ -190,6 +277,7 @@ class TestAllStatusSnapshotCallersPassTheUpdateFields:
         import inspect
 
         from kiro_crew.dashboard import handlers_system
+
         source = inspect.getsource(handlers_system)
         assert "status_update_fields()" in source
 
@@ -255,12 +343,12 @@ def status_fields_of(updates_module) -> dict:
 class TestBuildInfoResolution:
     """set_build_info() is the ONLY resolver — build info is never resolved at import.
 
-    Regression (dogfood 2026-07-06): an earlier revision resolved git_build_info()
-    at state.py *module import*. Under systemd the entrypoint imports this module
-    BEFORE main() detects KIROCREW_PROJECT_DIR, so it resolved with no project dir
-    and lru_cache then pinned ("", "") for the process lifetime — the dropdown was
-    always blank. The value is now recorded by the CLI gateway entrypoint (sync,
-    pre-loop, post-detection) via set_build_info() and only read here.
+    Resolving git_build_info() at state.py *module import* is wrong: under systemd
+    the entrypoint imports this module BEFORE main() detects KIROCREW_PROJECT_DIR,
+    so it resolves with no project dir and lru_cache then pins ("", "") for the
+    process lifetime, leaving the dropdown blank. The value is recorded by the CLI
+    gateway entrypoint (sync, pre-loop, post-detection) via set_build_info() and
+    only read here.
     """
 
     def test_setter_flows_into_new_state(self, monkeypatch, tmp_path) -> None:
@@ -291,3 +379,93 @@ class TestBuildInfoResolution:
             start_time=time.time(),
         )
         assert st._build_info == ("", "")
+
+
+class TestServedBundleId:
+    """The served-bundle hash the SPA compares across status pushes.
+
+    It is what lets a tab reload over a SAME-version rebuild (a git checkout's
+    in-app update), which moves neither ``version`` nor ``commit`` — see
+    ``DashboardState.served_bundle_id``.
+    """
+
+    def test_missing_bundle_reports_empty(self, tmp_path: pathlib.Path) -> None:
+        # No built frontend (source tree, unit tests): empty means UNKNOWN to
+        # the SPA — never a change, so no reload can fire off it.
+        assert DashboardState.served_bundle_id(tmp_path / "absent.html") == ""
+
+    def test_hashes_and_caches_by_stat(self, tmp_path: pathlib.Path) -> None:
+        index = tmp_path / "index.html"
+        index.write_text("<html>build-one</html>")
+        first = DashboardState.served_bundle_id(index)
+        assert first and len(first) == 16
+        # Same stat → same id, answered from cache (idempotent read).
+        assert DashboardState.served_bundle_id(index) == first
+
+    def test_rebuild_changes_id(self, tmp_path: pathlib.Path) -> None:
+        # A rebuild rewrites index.html with new hashed asset names — in
+        # practice a different length and a later mtime. The cache key is
+        # (mtime_ns, size), so model both moving: a same-length rewrite inside
+        # one mtime tick is not a case a real `npm run build` can produce.
+        import os
+
+        index = tmp_path / "index.html"
+        index.write_text("<html>build-one</html>")
+        first = DashboardState.served_bundle_id(index)
+        index.write_text("<html>build-two, with new hashed asset names</html>")
+        st = index.stat()
+        os.utime(index, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        assert DashboardState.served_bundle_id(index) != first
+
+    def test_snapshot_carries_bundle_id(self, state: DashboardState) -> None:
+        # The field rides the shared snapshot (WS push + /api/status alike);
+        # in this test env there is a real built bundle or there is not — both
+        # shapes are legal, but the KEY must be present so the SPA can compare.
+        snap = state.status_snapshot()
+        assert "bundle_id" in snap
+        assert isinstance(snap["bundle_id"], str)
+
+
+class TestGatewayMemoryFields:
+    """`/api/status` publishes the gateway's own RSS and the session ceiling so
+    `kirocrew status` can show what is bounding memory."""
+
+    def test_fields_read_rss_and_the_configured_ceiling(self, monkeypatch) -> None:
+        from kiro_crew.dashboard import handlers_system
+
+        monkeypatch.setattr(
+            handlers_system.platform_compat, "proc_rss_bytes", lambda: 321 * 1024 * 1024 + 7
+        )
+        cfg = MagicMock()
+        cfg.session.watchdog_rss_max_mb = 1536
+        monkeypatch.setattr(handlers_system.KiroCrewConfig, "load", lambda: cfg)
+        assert handlers_system._gateway_memory_fields() == (321, 1536)
+
+    def test_each_reading_degrades_alone(self, monkeypatch) -> None:
+        from kiro_crew.dashboard import handlers_system
+
+        def _boom():
+            raise OSError("no procfs")
+
+        monkeypatch.setattr(handlers_system.platform_compat, "proc_rss_bytes", _boom)
+        cfg = MagicMock()
+        cfg.session.watchdog_rss_max_mb = 1536
+        monkeypatch.setattr(handlers_system.KiroCrewConfig, "load", lambda: cfg)
+        assert handlers_system._gateway_memory_fields() == (0, 1536)
+
+        monkeypatch.setattr(handlers_system.platform_compat, "proc_rss_bytes", lambda: 2**30)
+        monkeypatch.setattr(
+            handlers_system.KiroCrewConfig, "load", MagicMock(side_effect=RuntimeError)
+        )
+        assert handlers_system._gateway_memory_fields() == (1024, 0)
+
+    def test_api_status_publishes_both_fields_off_loop(self) -> None:
+        import inspect
+
+        from kiro_crew.dashboard import handlers_system
+
+        source = inspect.getsource(handlers_system.api_status)
+        assert '"gateway_rss_mb": gateway_rss_mb' in source
+        assert '"watchdog_rss_max_mb": watchdog_rss_max_mb' in source
+        # procfs + config read: never inline on the event loop.
+        assert "to_thread(_gateway_memory_fields)" in source

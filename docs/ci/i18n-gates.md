@@ -25,12 +25,13 @@ build over loopback and answers every `/api/**` call from fixtures.
 
 ## `npm run i18n:check` is a RUNNER, not an `&&` chain
 
-`scripts/i18n-check.mjs` spawns eight scripts, keeps every byte of their output,
-then reports the twelve checks they contain in one table.
+`scripts/i18n-check.mjs` spawns the scripts named in
+`scripts/lib/i18n-gate-table.mjs`, keeps every byte of their output, then reports
+every check they contain in one table.
 
-An `&&` chain short-circuits. With twelve checks that means a PR only ever learns
+An `&&` chain short-circuits. With this many checks that means a PR only ever learns
 about its **first** failure, fixes it, pushes, waits for another full frontend-lint
-round, and discovers the next. Up to twelve rounds for one PR, over independent
+round, and discovers the next — one round per check, over independent
 measurements of the same tree. The runner reports all of them once, and folds each
 script's raw output into its own collapsed CI group so nothing is lost.
 
@@ -58,7 +59,10 @@ conversion path.
 
 ## The table
 
-Thirteen checks over eight scripts. The split is by the only question an author
+The rows are the checks declared in `scripts/lib/i18n-gate-table.mjs`, which is the
+one place that decides both the table and the exit code — a number written here
+instead would drift the moment a check is added. The split is by the only question an
+author
 has: **is this mine to fix?** A `diff`-scoped finding is on a line this branch
 wrote or in a file it touched. A `repo`-scoped finding is a whole-repo measurement
 the branch may simply have inherited.
@@ -67,19 +71,25 @@ the branch may simply have inherited.
 |---|---|---|---|
 | `[added-lines]` | diff | zero tolerance | a user-visible literal on a line THIS BRANCH WROTE |
 | `[vs-base]` | diff | zero tolerance | a file you touched holds more untranslated strings than at the base |
+| `[unit-added-lines]` | diff | zero tolerance | a number+unit literal on a line this branch wrote. Runs as a script, not a vitest test: it parses the whole in-scope tree with the TypeScript compiler, so its cost scales with the repo and it outgrew the suite's per-test budget under coverage instrumentation |
+| `[unit-vs-base]` | diff | zero tolerance | a file you touched gained number+unit literals relative to the base |
 | `[source-strings]` | diff | zero tolerance | badly shaped copy among only the English keys your branch adds |
 | `[changed-values]` | diff | zero tolerance | catalog QA over every value the branch added or changed, all languages |
+| `[changed-passthrough]` | diff | zero tolerance | a catalog value the branch added or changed that still reads as English. Separate from `changed-values` although one script hosts both: "you left this in English" and "your quotes do not pair" are different work, and one shared count would mean two things |
 | `[key-refs]` | repo | hard zero | a `t('key')` naming a key that does not exist |
-| `[plurals]` | repo | hard zero | a plural suffix concatenated outside the translation call |
+| `[plurals]` | repo | hard zero | an i18nT-adjacent plural suffix concatenated outside the translation call |
+| `[plurals-hardcoded]` | repo | ceiling — fails on growth | the same plural glue with NO `i18nT` in it — template-literal glue, JSX-text glue, string concatenation, or a whole-word ternary |
 | `[pseudolocale]` | repo | hard zero | `en-XA.json` stale relative to its generator |
 | `[dnt]` | repo | hard zero | a do-not-translate term respelt in a shipped catalog |
 | `[manifest-sync]` | repo | hard zero | a built-in `app.json` string and its `en.json` value stopped matching |
+| `[unit-ceiling]` | repo | report only | the un-migrated number+unit backlog against its stored baseline |
 | `[dynamic-keys]` | repo | report only | a call site whose key cannot be resolved statically |
 | `[extractable]` | repo | report only | a literal in markup the codemod could have extracted |
 | `[untranslated]` | repo | report only | per-file ceilings over the frozen untranslated debt |
 | `[allcaps]` | repo | report only | untranslated strings inside ALL-CAPS module constants |
+| `[untranslated-passthrough]` | repo | report only | the per-locale backfill worklist of catalog values still reading as English. Deliberately carries NO ceiling, unlike every other report-only row: `changed-passthrough` already refuses growth where it is introduced, so a stored total would buy nothing and add a file to update and a way for two branches to conflict over a count |
 
-### Only two kinds of check can fail the step
+### Only three kinds of check can fail the step
 
 1. **A diff-scoped one.** A finding on a line you wrote is yours and there is no
    number to raise.
@@ -89,6 +99,42 @@ the branch may simply have inherited.
    references in files the PR never opens. It also needs no base ref, so it cannot
    skip itself. The user-visible symptom it prevents is a raw dotted key rendered
    into the UI, because a missing key is returned as its own fallback.
+3. **A whole-repo CEILING that fails only on growth.** `[plurals-hardcoded]` is the
+   one check of this kind, and it exists because the class it counts cannot be a
+   hard zero (the frozen sites need manual conversion, so a hard zero would have
+   failed on arrival and been disabled) and was invisible to the gate entirely —
+   the hard-zero tier keys on an adjacent `i18nT` call, so a fully hardcoded
+   literal reported zero to it and the class regrew silently. The detector
+   (`website/scripts/lib/hardcoded-plural.mjs`) covers four spellings of the
+   defect, each in all three comparison forms (`> 1`, `!== 1`, inverted `=== 1`),
+   whitespace- and quote-tolerant:
+
+   - **template-literal glue** — `` `${n} noun${n > 1 ? 's' : ''}` ``
+   - **JSX-text glue** — `{n} noun{n > 1 ? 's' : ''}` with no `i18nT`
+   - **string concatenation** — `'noun' + (n > 1 ? 's' : '')`
+   - **whole-word ternary** — `n === 1 ? 'line' : 'lines'`, where the plural arm
+     must be the `s`-suffixed (or `y`→`ies`) form of the singular arm, so a
+     ternary choosing two unrelated words never counts as a plural pair
+
+   Spellings it does NOT cover, named so a miss is triaged as a known gap rather
+   than a malfunction: a JSX-text match never crosses a tag boundary
+   (`<b>{n}</b> noun{…}` is unseen), the concat and template spellings require
+   the noun to be literal text (glue onto a variable or a call result is
+   unseen), a whole-word pair with irregular morphology
+   (`'child' : 'children'`) or multi-word arms is unseen, and any expression
+   containing braces defeats the lexical patterns. The ceiling is
+   pinned at `HARDCODED_CEILING` in `website/scripts/i18n-plural-codemod.mjs` and
+   ratchets DOWN as sites are converted. What keeps it out of the stored-total
+   trap below: it is pinned at the frozen debt's worst point, so main crosses it
+   only when a PR adds a site — unlike the `[untranslated]`/`[allcaps]` totals,
+   which move whenever any counted file changes. Lowering the constant after a
+   conversion is suggested on every run but optional, for the same recorded
+   reason as `[extractable]`'s `--baseline`: forcing every improving branch to
+   edit one shared line makes it a merge conflict between all of them. The cost
+   of that choice is bounded and accepted — a site re-added inside unclaimed
+   slack rides free until the constant is tightened. A failure prints every site
+   with `file:line`, so a red always names lines an author can check against
+   their own diff.
 
 Everything else is **report only**. A stored whole-repo total is written by
 whichever branch measured it last, so another branch can push it past its number
@@ -211,7 +257,18 @@ on: every catalog value is wrapped in `[` … `]`, and every ASCII letter outsid
 preserved region is accented. So inside one inline run, a `]…[` seam **is** a
 surviving concatenation, and plain Latin **is** text that never reached a catalog.
 
-Five things to know before touching it:
+An explicit `group`, `tablist`, `radiogroup` or `toolbar` ends its parent's inline
+run. Its contents are still scanned independently, including hardcoded labels,
+attributes and multiple catalog units inside one control. Ungrouped inline-flex
+content does not receive this boundary. Use these roles for actual control groups;
+they do not exempt text from translation checks.
+
+Locale-formatted machine timestamps may use a semantic `<time dateTime="...">`
+with `data-i18n-opaque` around only the formatted value. Keep surrounding labels
+in the catalog and keep active-locale formatting. Memory record fixture keys,
+like other visible fixture values, use digit-shaped identifiers.
+
+Seven things to know before touching it:
 
 1. **It builds its own bundle with `NODE_ENV=development`.** `en-XA` is DEV-only in
    three independent places, all keyed on `import.meta.env.DEV`. `vite build --mode
@@ -244,6 +301,20 @@ Five things to know before touching it:
    placeholder would render the surface while hiding the defect it exists to show.
    Read those numbers as a fixed structural probe, not as the size of the debt,
    because the scanner counts per word.
+6. **Fetched content must be ready before it is measured.** The App Details
+   surface waits for its fixture description to mount before its existing settle
+   interval. The shell alone exceeds the generic text-volume check while the
+   manifest requests are pending; comparing that loading state with the populated
+   body would report different findings for identical code. A missing readiness
+   marker fails the run instead of silently measuring less content.
+7. **A new query-param panel has no old panel to measure.** A surface may declare
+   its required `sourceFile`, relative to `website/`. If both the source file and
+   the surface registration are absent from the exported base, the base sweep
+   omits that panel and its findings are compared against zero. HEAD still renders
+   it and must satisfy `readyText`; a missing declared HEAD source fails the run.
+   Newly registered panels whose implementation already existed remain measured
+   on the base. This prevents waiting for member-memory content on an older
+   overview page that keeps the query URL but cannot render that panel.
 
 Known limits of the render gate, named rather than papered over:
 
@@ -278,6 +349,13 @@ per-file dynamic-site diff, the same shape as `[vs-base]`.
 
 Runs in `frontend-test`, outside the `i18n:check` runner above, because it is a
 plain vitest assertion over the catalog files rather than a diff-scoped gate.
+
+The same job also runs `src/i18n/destructiveConfirm.test.ts`, which is the
+convention detector for quoted operands on destructive confirms (#4821): every
+`confirm` key that interpolates a placeholder must be on the quoted-operand pin,
+an explicit key exemption, or interpolate only names in
+`EXEMPT_CONFIRM_PLACEHOLDER_NAMES`. A brand-new confirm with a bare `{{name}}`
+fails that test even if nobody remembers to extend the pin.
 
 It fails on any key defined **twice inside one object** in any
 `src/i18n/locales/*.json`. Every catalog on disk is covered, so adding a language

@@ -11,7 +11,7 @@
  * caught before release, while the core (or first) registration is preserved.
  * In production the same collision degrades to warn-and-ignore.
  */
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import { lazy } from 'react'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -23,6 +23,11 @@ import {
   hasBuiltinComponent,
 } from '../apps/builtinRegistry'
 import { registerBuiltinIcons, getBuiltinIcon } from '../apps/builtinIcons'
+import {
+  registerAutolinkRules,
+  getAutolinkRules,
+  resetAutolinkRulesForTest,
+} from '../utils/autolinkRules'
 import { registerThemeBranding, getThemeBranding } from '../themeBranding'
 import { registerTopBarWidgets, getTopBarWidgets } from '../apps/topBarWidgets'
 import {
@@ -31,10 +36,32 @@ import {
   DEFAULT_SHORTCUTS,
   RESERVED_PANEL_CODES,
 } from '../hooks/useKeyboardShortcuts'
+import { eventKeyToken, registryAltNonShiftKeys } from '../lib/shortcutRegistry'
+
+/** Every `KeyboardEvent.code` a registry Alt chord could name — letters, digits, the punctuation the chords use. */
+const CANDIDATE_CODES = [
+  'Comma', 'Enter', 'Backquote', 'ArrowLeft', 'ArrowRight', 'Slash',
+  ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map(l => `Key${l}`),
+  ...'123456789'.split('').map(d => `Digit${d}`),
+]
 import { registerTheme, getRegisteredThemes } from '../hooks/useTheme'
 import { registerCapsuleSegment, getCapsuleSegments } from '../apps/capsuleSegments'
 import { registerOverviewStatCards, getOverviewStatCards } from '../pages/overviewStatCards'
 import { registerOverviewPanel, getOverviewPanel } from '../pages/overviewPanel'
+import {
+  suppressOverviewBuiltin,
+  isOverviewBuiltinSuppressed,
+} from '../pages/overviewBuiltins'
+import {
+  registerMobileConnectRenderer,
+  getMobileConnectRenderers,
+  canRenderMobileConnectKind,
+} from '../components/mobileConnectRenderers'
+import {
+  registerRemoteProvisionerRenderer,
+  getRemoteProvisionerRenderer,
+  canRenderRemoteProvisionerKind,
+} from '../components/remoteProvisionerRenderers'
 import { apiTransport } from '../api/apiTransport'
 // Importing the client installs the blessed transport (installApiTransport runs
 // at client module load), so `apiTransport` is populated for the test below.
@@ -187,6 +214,18 @@ describe('panel shortcut — nav seam', () => {
         for (let d = 1; d <= 9; d++) consumed.add(`Digit${d}`)
       }
     }
+    // The registry-dispatched action chords (⌥K help, ⌥, settings, ⌥↩ focus)
+    // are no longer `code ===` literals in the handler: `matchShortcutEvent`
+    // claims them before panel routing. Their non-shift Alt codes come from the
+    // registry itself, so a chord added or re-aliased there lands in this set
+    // without a handler edit.
+    for (const key of registryAltNonShiftKeys()) {
+      // Token → code is the inverse of `eventKeyToken`; resolved against a
+      // candidate list rather than spelled out so the two cannot disagree.
+      const code = CANDIDATE_CODES.find(c => eventKeyToken({ code: c, key: '' }) === key)
+      expect(code, `registry alt chord key ${key} maps to a code`).toBeDefined()
+      consumed.add(code!)
+    }
     // The core panel chords (KeyC/N/P/S) live in CORE_PANEL_MAP, dispatched at
     // the panelMap block itself — not "pre-panel" — so exclude them here.
     for (const code of Object.keys(CORE_PANEL_MAP)) consumed.delete(code)
@@ -333,6 +372,183 @@ describe('overviewPanel — lower-region single-owner slot', () => {
       registerOverviewPanel({ id: 'testpanel:b', component: () => null }),
     ).toThrow(/already owns the overview panel slot/)
     expect(getOverviewPanel()?.id).toBe('testpanel:a')
+  })
+})
+
+describe('overviewBuiltins — built-in suppression seam', () => {
+  it('suppresses nothing in the stock build', () => {
+    expect(isOverviewBuiltinSuppressed('tailnet-mobile')).toBe(false)
+  })
+
+  it('suppresses a built-in surface once asked', () => {
+    suppressOverviewBuiltin('tailnet-mobile')
+    expect(isOverviewBuiltinSuppressed('tailnet-mobile')).toBe(true)
+  })
+
+  it('is idempotent — a repeat is agreement, not a collision', () => {
+    // Deliberately unlike `overviewPanel` above, which throws on a second claim
+    // because two owners cannot share one slot. Two parties that both want a
+    // surface GONE do not conflict, so a repeat must not fail-loud the way a
+    // duplicate contribution does — HMR and a twice-imported module both hit
+    // this path.
+    expect(() => suppressOverviewBuiltin('tailnet-mobile')).not.toThrow()
+    expect(isOverviewBuiltinSuppressed('tailnet-mobile')).toBe(true)
+  })
+})
+
+describe('mobileConnectRenderers — phone-connection method renderer seam', () => {
+  // The registry is a module singleton, so every test here is self-contained on
+  // its OWN kind and none asserts an absolute registry size — an assertion like
+  // that passes or fails on test ORDER once a sibling has registered (it fails
+  // under --sequence.shuffle). The "core registers nothing" claim is the one
+  // that genuinely needs an untouched registry, so it takes a fresh module.
+  it('registers nothing of its own — a fresh registry is empty', async () => {
+    vi.resetModules()
+    const fresh = await import('../components/mobileConnectRenderers')
+    expect(fresh.getMobileConnectRenderers()).toEqual([])
+    for (const kind of fresh.BUILTIN_MOBILE_CONNECT_KINDS) {
+      expect(fresh.canRenderMobileConnectKind(kind)).toBe(true)
+    }
+    expect(fresh.canRenderMobileConnectKind('seam_test_unregistered')).toBe(false)
+  })
+
+  it('registering a kind is what makes it drawable', () => {
+    const Comp = () => null
+    expect(canRenderMobileConnectKind('seam_test_new')).toBe(false)
+    registerMobileConnectRenderer({ kind: 'seam_test_new', component: Comp })
+    // The single definition of the renderable set: this predicate is what gates
+    // the nav rail's row, so registering is what makes the row appear at all.
+    expect(canRenderMobileConnectKind('seam_test_new')).toBe(true)
+    expect(getMobileConnectRenderers()).toContainEqual({ kind: 'seam_test_new', component: Comp })
+  })
+
+  it('refuses a built-in kind — that would be an override, not a contribution', () => {
+    // `tailnet_qr` and `login_link` are drawn by core sections whose mint
+    // endpoints the core audits. Silently replacing one would let a composition
+    // step redirect a credential mint the core still believes it owns.
+    expect(() =>
+      registerMobileConnectRenderer({ kind: 'tailnet_qr', component: () => null }),
+    ).toThrow(/drawn by a built-in section/)
+    expect(getMobileConnectRenderers().some(r => r.kind === 'tailnet_qr')).toBe(false)
+  })
+
+  it('refuses a kind that could never match a descriptor verbatim', () => {
+    // Blank, whitespace-padded, and non-string all route to one rejection: the
+    // readers compare the server's `kind` verbatim, so normalizing here would
+    // register a key nothing can ever match, and reaching for `.trim()` on a
+    // non-string would throw a raw TypeError in production instead of degrading.
+    for (const kind of ['', '   ', ' padded_qr ', 123 as unknown as string]) {
+      expect(() => registerMobileConnectRenderer({ kind, component: () => null })).toThrow(
+        /non-empty method kind with no surrounding whitespace/,
+      )
+    }
+    expect(getMobileConnectRenderers().some(r => r.kind.includes('padded'))).toBe(false)
+  })
+
+  it('throws on a duplicate kind in dev/test; the first renderer keeps it', () => {
+    const first = () => null
+    const second = () => null
+    registerMobileConnectRenderer({ kind: 'seam_test_dup', component: first })
+    expect(() =>
+      registerMobileConnectRenderer({ kind: 'seam_test_dup', component: second }),
+    ).toThrow(/already has a renderer/)
+    expect(getMobileConnectRenderers().find(r => r.kind === 'seam_test_dup')?.component).toBe(first)
+  })
+})
+
+describe('remoteProvisionerRenderers — remote-instance provisioner form seam', () => {
+  // Same shape as the mobile-connect block above: the registry is a module
+  // singleton, so every test here is self-contained on its OWN kind and none
+  // asserts an absolute registry size — an assertion like that passes or fails on
+  // test ORDER once a sibling has registered (it fails under --sequence.shuffle).
+  // The "core registers nothing" claim is the one that genuinely needs an
+  // untouched registry, so it takes a fresh module.
+  it('registers nothing of its own — a fresh registry is empty', async () => {
+    vi.resetModules()
+    const fresh = await import('../components/remoteProvisionerRenderers')
+    expect(fresh.getRemoteProvisionerRenderer('seam_test_unlisted')).toBeUndefined()
+    for (const kind of fresh.BUILTIN_REMOTE_PROVISIONER_KINDS) {
+      // Drawable because the PANEL draws it, so there is no renderer to hand back.
+      expect(fresh.canRenderRemoteProvisionerKind(kind)).toBe(true)
+      expect(fresh.getRemoteProvisionerRenderer(kind)).toBeUndefined()
+    }
+    expect(fresh.canRenderRemoteProvisionerKind('seam_test_unlisted')).toBe(false)
+  })
+
+  it('registering a kind is what makes it drawable', () => {
+    const Comp = () => null
+    expect(canRenderRemoteProvisionerKind('seam_test_devspace')).toBe(false)
+    registerRemoteProvisionerRenderer({ kind: 'seam_test_devspace', component: Comp })
+    // The single definition of the renderable set: this predicate is what the
+    // setup tab filters the server's provisioner list on, so registering is what
+    // makes the row selectable at all.
+    expect(canRenderRemoteProvisionerKind('seam_test_devspace')).toBe(true)
+    expect(getRemoteProvisionerRenderer('seam_test_devspace')?.component).toBe(Comp)
+  })
+
+  it('refuses the built-in kind — that would be an override, not a contribution', () => {
+    // `aws_ec2` is drawn by RemoteCrewPanel's own prerequisites card and launch
+    // form. Silently replacing it would let a composition step redirect a launch
+    // into a different AWS account while the core still believes it owns the form.
+    expect(() =>
+      registerRemoteProvisionerRenderer({ kind: 'aws_ec2', component: () => null }),
+    ).toThrow(/drawn by a built-in form/)
+    expect(getRemoteProvisionerRenderer('aws_ec2')).toBeUndefined()
+  })
+
+  it('refuses a kind that could never match a server row verbatim', () => {
+    // Blank, whitespace-padded, and non-string all route to one rejection: the
+    // readers compare the server's `kind` verbatim, so normalizing here would
+    // register a key nothing can ever match, and reaching for `.trim()` on a
+    // non-string would throw a raw TypeError in production instead of degrading.
+    for (const kind of ['', '   ', ' padded_devspace ', 123 as unknown as string]) {
+      expect(() => registerRemoteProvisionerRenderer({ kind, component: () => null })).toThrow(
+        /non-empty provisioner kind with no surrounding whitespace/,
+      )
+    }
+    expect(getRemoteProvisionerRenderer(' padded_devspace ')).toBeUndefined()
+  })
+
+  it('throws on a duplicate kind in dev/test; the first renderer keeps it', () => {
+    const first = () => null
+    const second = () => null
+    registerRemoteProvisionerRenderer({ kind: 'seam_test_prov_dup', component: first })
+    expect(() =>
+      registerRemoteProvisionerRenderer({ kind: 'seam_test_prov_dup', component: second }),
+    ).toThrow(/already has a renderer/)
+    expect(getRemoteProvisionerRenderer('seam_test_prov_dup')?.component).toBe(first)
+  })
+})
+
+describe('autolinkRules — bare-token autolink seam', () => {
+  afterEach(() => resetAutolinkRulesForTest())
+
+  it('ships empty in the core, so stock rendering is unchanged', () => {
+    expect(getAutolinkRules()).toHaveLength(0)
+  })
+
+  it('a registered rule is retrievable and normalised to a global pattern', () => {
+    registerAutolinkRules([
+      { id: 'seam-token', pattern: /\bZZ-\d+\b/, href: 'https://example.invalid/{match}' },
+    ])
+    const rules = getAutolinkRules()
+    expect(rules).toHaveLength(1)
+    expect(rules[0].id).toBe('seam-token')
+    expect(rules[0].pattern.global).toBe(true)
+  })
+
+  it('a duplicate id is fail-loud in dev/test and preserves the first registration', () => {
+    const rule = {
+      id: 'seam-token-dup',
+      pattern: /\bZZ-\d+\b/g,
+      href: 'https://first.invalid/{match}',
+    }
+    registerAutolinkRules([rule])
+    expect(() =>
+      registerAutolinkRules([{ ...rule, href: 'https://second.invalid/{match}' }]),
+    ).toThrow(/already registered/)
+    expect(getAutolinkRules().filter(r => r.id === 'seam-token-dup')).toHaveLength(1)
+    expect(getAutolinkRules()[0].href).toBe('https://first.invalid/{match}')
   })
 })
 

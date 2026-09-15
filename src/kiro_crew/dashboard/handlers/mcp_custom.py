@@ -281,8 +281,8 @@ def _load_kirocrew_config_strict() -> dict | None:
     is malformed or unreadable.  The batch-add path must refuse to write
     in the None case: the lenient ``_load_json_or_empty`` coerces a broken
     file to ``{}``, and the subsequent atomic write would then silently
-    replace EVERY previously configured server with just the new batch
-    while reporting success.
+    replace EVERY configured server with just the new batch while reporting
+    success.
     """
     try:
         text = _mcp._kirocrew_mcp_json().read_text(encoding="utf-8")
@@ -353,7 +353,7 @@ async def api_mcp_custom_add(request: web.Request) -> web.Response:
     async with _get_mcp_lock():
         # Load once, strictly: a malformed existing file must fail the
         # request, never be coerced to {} and overwritten (that would
-        # destroy every previously configured server "successfully").
+        # destroy every configured server "successfully").
         data = _load_kirocrew_config_strict()
         if data is None:
             sel().log_api_access(
@@ -388,8 +388,8 @@ async def api_mcp_custom_add(request: web.Request) -> web.Response:
             if not enable:
                 entry["disabled"] = True
             entries[name] = entry
-        # The secure store write DACLs its temp file via icacls on Windows —
-        # a blocking subprocess that must not run on the event loop.
+        # The secure store write applies an owner-only DACL to its temp file on
+        # Windows — blocking filesystem work kept off the event loop.
         await _mcp._offload_config_write(_mcp._atomic_write, _mcp._kirocrew_mcp_json(), data)
 
     await _rebuild_agent_config()
@@ -542,8 +542,8 @@ async def api_mcp_custom_update(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": _oauth_err, "code": "oauth_field_not_editable"}, status=400
             )
-        # Same offload rationale as the add path: the store write applies an
-        # owner-only DACL via a subprocess on Windows.
+        # Same offload rationale as the add path: the store write is blocking
+        # file IO (owner-only lockdown included, in-process on Windows).
         replaced = await _mcp._offload_config_write(_replace_kirocrew_spec, name, spec)
     if not replaced:
         return web.json_response({"error": f"server '{name}' not found"}, status=404)

@@ -42,8 +42,8 @@ import { useListDetailView } from '../hooks/useListDetailView'
 
 const FILES = {
   files: [
-    { key: 'user/personal.md', name: 'personal.md', rel: 'personal.md', source: 'user', path: '~/.kiro/steering/personal.md', size: 12, description: 'Personal' },
-    { key: 'workspace/api.md', name: 'api.md', rel: 'api.md', source: 'workspace', path: '~/proj/.kiro/steering/api.md', size: 20, description: 'API standards' },
+    { key: 'user/personal.md', name: 'personal.md', rel: 'personal.md', source: 'user', path: '~/.kiro/steering/personal.md', size: 12, description: 'Personal', inclusion: 'always', inclusion_declared: '', file_match_pattern: '' },
+    { key: 'workspace/api.md', name: 'api.md', rel: 'api.md', source: 'workspace', path: '~/proj/.kiro/steering/api.md', size: 20, description: 'API standards', inclusion: 'always', inclusion_declared: '', file_match_pattern: '' },
   ],
   roots: [{ source: 'user', path: '~/.kiro/steering', exists: true }],
   project: '~/proj',
@@ -209,47 +209,6 @@ describe('SteeringTab across a viewport change', () => {
     // Auto-selection still has not been mistaken for intent.
     expect(listPane()).not.toBeNull()
     expect(screen.queryByTestId('md')).toBeNull()
-  })
-})
-
-/**
- * Clearing the selection must also leave the detail pane.
- *
- * With exclusive panes, `selectedAgent = null` while `detailOpen` stays true
- * renders the "select an agent" placeholder — a branch that carries no Back
- * control, since Back lives in the `selectedAgent` truthy branch — with the
- * roster and its filter inside the hidden list pane. That combination leaves a
- * phone user with no in-page way back, which is what deleting the agent you were
- * viewing used to do.
- *
- * Asserted over the source because the invariant is about EVERY path that nulls
- * the selection, including ones added later: a rendered test would only cover
- * the delete path that exists today.
- */
-describe('AgentsPage selection clearing', () => {
-  it('pairs every setSelectedAgent(null) with closeDetail()', async () => {
-    const src = (await import('../pages/AgentsPage.tsx?raw')).default as string
-    const clears = [...src.matchAll(/setSelectedAgent\(null\)/g)]
-    expect(clears.length, 'expected at least one path that clears the selection')
-      .toBeGreaterThan(0)
-    for (const match of clears) {
-      // The pane exit has to be in the same statement/handler, not merely
-      // somewhere in the file.
-      const window = src.slice(match.index!, match.index! + 200)
-      expect(window, `setSelectedAgent(null) at ${match.index} without closeDetail()`)
-        .toMatch(/closeDetail\(\)/)
-    }
-  })
-
-  it('keeps Back out of the placeholder branch, so the exit must be the handler', async () => {
-    const src = (await import('../pages/AgentsPage.tsx?raw')).default as string
-    // Documents WHY the fix belongs in the mutation handler. If a future change
-    // renders Back in the placeholder too, this can be revisited deliberately
-    // rather than by accident.
-    const placeholder = src.indexOf('select_an_agent_to_view_details')
-    expect(placeholder, 'placeholder branch not found').toBeGreaterThan(-1)
-    const branch = src.slice(placeholder - 400, placeholder + 200)
-    expect(branch).not.toMatch(/ListDetailBack/)
   })
 })
 

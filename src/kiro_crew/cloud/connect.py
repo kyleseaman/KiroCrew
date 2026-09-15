@@ -17,6 +17,7 @@ no hand-edited ``~/.ssh/config`` — only IAM + the SSM agent. Removing the box
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -27,6 +28,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from kiro_crew.cloud import ssm
+from kiro_crew.platform.interfaces import BUILTIN_PROVISIONER_ID
 
 logger = logging.getLogger(__name__)
 
@@ -183,7 +185,9 @@ def connect(
             # false positive (`exc` is an AWSError/permission message, never the
             # JWT — the token is never logged; see redact_token()), but the
             # neutral wording keeps the SAST gate green without a nosemgrep.
-            logger.warning("dashboard sign-in provisioning failed on local port %d: %s", local_port, exc)
+            logger.warning(
+                "dashboard sign-in provisioning failed on local port %d: %s", local_port, exc
+            )
             error = (
                 "connected the SSM tunnel but minting a dashboard token failed "
                 f"({exc}) — check `kirocrew cloud status` / your IAM permissions, "
@@ -285,6 +289,7 @@ def register_instance(
                     aws_profile=profile,
                     aws_region=region,
                     remote_port=remote_port,
+                    provisioner_id=BUILTIN_PROVISIONER_ID,
                 )
                 return existing.id
         inst = reg.add(
@@ -294,11 +299,63 @@ def register_instance(
             aws_profile=profile,
             aws_region=region,
             remote_port=remote_port,
+            provisioner_id=BUILTIN_PROVISIONER_ID,
         )
         return inst.id
     except Exception as exc:  # pragma: no cover - non-fatal
         logger.info("could not register instance in Instances registry: %s", exc)
         return None
+
+
+def is_launched_instance(ssm_target: str) -> bool:
+    """True if *ssm_target* (an EC2 instance id) was provisioned by a Kiro Crew
+    cloud launch, per the launch job store — i.e. it is a *correlated* instance,
+    not a hand-added SSM record that merely happens to use the same transport.
+
+    Protects a correlated instance's addressing fields
+    (``connection_method``/``ssm_target``/``aws_profile``/``aws_region``) from
+    being rewritten via the generic ``PATCH /api/instances/{id}`` endpoint:
+    doing so would leave Stop/Start/Delete unable to resolve the real EC2 stack,
+    which then keeps running and billing with no dashboard path to reach it.
+
+    Best-effort ONLY for the "cloud feature not installed" case: an
+    ``ImportError`` on the launch job module means nothing could ever have
+    been launched, so returning False (not correlated) is safe. Every OTHER
+    failure propagates, so the caller
+    (``handlers_instances._is_correlated_cloud_instance`` / the PATCH handler)
+    can fail the request CLOSED: silently treating an unreadable store as
+    "not correlated" would let an I/O blip unlock a launched instance's
+    addressing fields for PATCH to rewrite, which is exactly the stranding
+    this function exists to prevent.
+
+    That is why this reads the job files directly instead of calling
+    ``LaunchJobStore.list()``. ``list()`` is built for DISPLAY, where dropping
+    one damaged record beats showing nothing: it defers to ``get()``, which
+    logs and returns ``None`` for a file it cannot read or parse, and then
+    omits that job. Borrowing it here would invert the guarantee above — one
+    unreadable job file, including the one for the instance being edited,
+    would read as "no such launch job" and unlock the fields. A vanished file
+    is the single benign case (a concurrent ``cloud destroy`` removing a job
+    mid-scan) and is skipped: an instance whose launch record is gone is no
+    longer correlated to anything.
+    """
+    if not ssm_target:
+        return False
+    try:
+        from kiro_crew.cloud.launch_job import LaunchJobStore
+    except ImportError:  # pragma: no cover - cloud feature absent
+        return False
+    root = LaunchJobStore().root
+    if not root.exists():
+        return False
+    for path in sorted(root.glob("*.json")):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        if isinstance(raw, dict) and raw.get("instance_id") == ssm_target:
+            return True
+    return False
 
 
 def unregister_instance(instance_id_or_name: str) -> bool:

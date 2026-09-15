@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import type { MockedFunction } from 'vitest'
 import { screen, waitFor, fireEvent } from '@testing-library/react'
 import { Routes, Route, useNavigate } from 'react-router-dom'
 import ArtifactDetailPage from '../pages/ArtifactDetailPage'
@@ -241,11 +242,11 @@ describe('ArtifactDetailPage', () => {
     })
     vi.mocked(api).artifact = vi.fn((s: string) =>
       Promise.resolve(mkArtifact({ slug: s, name: s === 'art-a' ? 'Artifact A' : 'Artifact B' })),
-    ) as any
+    ) as MockedFunction<typeof api.artifact>
     vi.mocked(api).artifactVersions = vi.fn((s: string) =>
       Promise.resolve({ slug: s, versions: [1] }),
-    ) as any
-    vi.mocked(api).artifactComments = vi.fn((s: string) => Promise.resolve(mkComment(s))) as any
+    ) as MockedFunction<typeof api.artifactVersions>
+    vi.mocked(api).artifactComments = vi.fn((s: string) => Promise.resolve(mkComment(s))) as MockedFunction<typeof api.artifactComments>
 
     function Nav() {
       const navigate = useNavigate()
@@ -791,7 +792,7 @@ describe('ArtifactDetailPage', () => {
     fireEvent.click(screen.getByLabelText('Toggle agent chat'))
     await waitFor(() => expect(createSlotSpy).toHaveBeenCalledTimes(1))
     // The 8th positional argument is the artifact binding the backend persists.
-    expect(createSlotSpy.mock.calls[0][7]).toBe('cr-queue')
+    expect(createSlotSpy.mock.calls[0][6]).toBe('cr-queue')
   })
 
   it('description renders when artifact has one', async () => {

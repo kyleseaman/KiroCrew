@@ -1,7 +1,15 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { render, fireEvent, screen } from '@testing-library/react'
+import { render as rtlRender, fireEvent, screen } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { NotificationsPanel } from '../pages/settings/NotificationsPanel'
 import { __resetForTests, playPreset } from '../hooks/useNotificationSound'
+
+// The channels section reads through React Query, so every render needs a
+// client. Same call shape as RTL's render so the cases below stay unchanged.
+function render(ui: React.ReactElement) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  return rtlRender(<QueryClientProvider client={qc}>{ui}</QueryClientProvider>)
+}
 
 // Mock only playPreset: the panel's Test buttons and dropdown previews call it,
 // and the assertions below need to observe the (preset, volume) pair without
@@ -71,6 +79,39 @@ describe('NotificationsPanel', () => {
     render(<NotificationsPanel />)
     // The cron row should show "Ding" (the override), not "Use default"
     expect(screen.getAllByText(/Ding/).length).toBeGreaterThan(0)
+  })
+
+  it('renders the Agent messages row and loads its seeded override', () => {
+    // Seed the exact configuration the row exists for: silent default,
+    // audible agent messages.
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      enabled: true,
+      volume: 0.35,
+      perCategory: { all: 'none', agent: 'ding' },
+    }))
+    render(<NotificationsPanel />)
+    expect(screen.getAllByText('Proactive agent messages').length).toBeGreaterThan(0)
+    // The agent row shows "Ding" (the override), not "Use default"
+    expect(screen.getAllByText(/Ding/).length).toBeGreaterThan(0)
+  })
+
+  it('describes the turn sound as a conversation handoff, not an every-turn chime', () => {
+    const { container } = render(<NotificationsPanel />)
+    // The chime fires when a conversation hands control back (finished, or
+    // paused for input), so the row must not promise audio on every turn.
+    expect(screen.getByText('Conversation handoffs')).toBeTruthy()
+    expect(screen.getByText('When a conversation finishes or pauses for your input')).toBeTruthy()
+    expect(container.textContent).not.toContain('Agent replies')
+    expect(container.textContent).not.toContain('finishes a turn in any chat')
+  })
+
+  it('describes the approval sound as covering questions too', () => {
+    const { container } = render(<NotificationsPanel />)
+    // A question card plays the same attention sound as a tool approval, so
+    // the row names both instead of reading as tool-approval-only.
+    expect(screen.getByText('Approvals and questions')).toBeTruthy()
+    expect(screen.getByText('When the agent needs a tool approval or an answer')).toBeTruthy()
+    expect(container.textContent).not.toContain('Tool approval requests')
   })
 
   it('persists volume=0 when slider is at 0 (enforces quiet mode)', () => {

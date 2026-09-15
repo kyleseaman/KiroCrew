@@ -41,6 +41,34 @@ export function getTerminalCwd(sessionId: string): string | undefined {
   return cwds.get(sessionId)
 }
 
+/* ── Per-session launched shell (absolute path, reported by the backend in the
+ * `ready` frame). The client mints session ids and opens the socket without
+ * asking what will be spawned, so this is the only place it learns which shell
+ * will interpret the bytes it writes. Read imperatively at hand-off time, same
+ * as `cwds`. */
+const shells = new Map<string, string>()
+/* ── Per-session map of fence-nameable shell name -> ABSOLUTE path, as the
+ * backend resolved it on this host. A snippet handed to another shell must name
+ * an absolute path: a bare name would be resolved again in the terminal's
+ * project cwd, where a relative PATH entry could supply a planted binary. */
+const fenceShells = new Map<string, Record<string, string>>()
+
+/** Absolute path of the shell a session actually launched, if the backend has
+ *  reported one. Undefined until the `ready` frame arrives, and on a gateway
+ *  that does not report it -- callers must treat undefined as "unknown" and
+ *  not guess. */
+export function getTerminalShell(sessionId: string): string | undefined {
+  return shells.get(sessionId)
+}
+
+/** Fence-nameable shells the backend resolved on this host, name -> absolute
+ *  path. Empty until the `ready` frame arrives, and on a gateway that does not
+ *  report them -- a shell missing from this map is one the caller must not try
+ *  to invoke. */
+export function getTerminalFenceShells(sessionId: string): Record<string, string> {
+  return fenceShells.get(sessionId) ?? {}
+}
+
 function setSessionTitle(sessionId: string, title: string) {
   if (titles.get(sessionId) === title) return
   titles.set(sessionId, title)
@@ -138,6 +166,9 @@ const MAX_RETRIES = 10
 const BASE_DELAY_MS = 1000
 const MAX_DELAY_MS = 30_000
 
+/** Coarse connection state a session's terminal view can render. */
+export type TerminalConnStatus = 'connected' | 'reconnecting' | 'disconnected'
+
 interface Conn {
   term: Terminal
   fit: FitAddon
@@ -146,11 +177,194 @@ interface Conn {
   disposed: boolean
   retries: number
   reconnectTimer?: ReturnType<typeof setTimeout>
+  status: TerminalConnStatus
+  /**
+   * Set when the user clicked "Reconnect" and cleared the moment the socket
+   * next resolves (connected) or the redial chain gives up (disconnected). It
+   * scopes the "Reconnecting…" banner to a user-initiated attempt: ordinary
+   * automatic redials (transient tab-hide/visibility blips) leave it false and
+   * stay bannerless, preserving the deliberate anti-flicker behaviour.
+   */
+  manualRetry: boolean
+  /**
+   * Set when the server told this socket that a newer connection now owns the
+   * PTY (`error` frame with `code: 'displaced'`). The close that follows is
+   * deliberate, not a drop: automatic redial would take the terminal straight
+   * back and two open windows would displace each other forever. The session
+   * parks in 'disconnected' until the user clicks Reconnect (a manual retry
+   * clears the flag); the online/visibility revive listeners leave it alone.
+   */
+  displaced: boolean
 }
 const conns = new Map<string, Conn>()
 
+/* ── Per-session connection status, published to the terminal view ──
+ * The status lives on the Conn but is surfaced through its own listener set so
+ * a view can subscribe with useSyncExternalStore without reaching into the
+ * connection manager. 'disconnected' is the terminal state after the retry
+ * ceiling is hit; 'reconnecting' covers both the automatic backoff chain and a
+ * socket that has not opened yet. */
+const statusListeners = new Map<string, Set<() => void>>()
+
+function notifyStatus(sessionId: string) {
+  const ls = statusListeners.get(sessionId)
+  if (ls) for (const cb of ls) cb()
+}
+
+function setConnStatus(sessionId: string, c: Conn, status: TerminalConnStatus) {
+  // A resolved outcome ends any user-initiated attempt: 'connected' means the
+  // redial succeeded, 'disconnected' means the chain gave up — both return the
+  // banner to its non-manual presentation.
+  const clearManual = (status === 'connected' || status === 'disconnected') && c.manualRetry
+  if (clearManual) c.manualRetry = false
+  if (c.status === status) {
+    // Status unchanged but the manual flag flipped off: still publish so the
+    // "Reconnecting…" banner can retire.
+    if (clearManual) notifyStatus(sessionId)
+    return
+  }
+  c.status = status
+  notifyStatus(sessionId)
+}
+
+/**
+ * Mark a session as being under a user-initiated reconnect and publish it, so
+ * the view can distinguish a manual retry (banner stays, as "Reconnecting…")
+ * from an automatic redial (bannerless). Idempotent notify-wise.
+ */
+function setManualRetry(sessionId: string, c: Conn) {
+  if (c.manualRetry) return
+  c.manualRetry = true
+  notifyStatus(sessionId)
+}
+
+/** Imperative read of whether a session's reconnect was user-initiated. */
+function manualRetryActive(sessionId: string): boolean {
+  return conns.get(sessionId)?.manualRetry ?? false
+}
+
+/**
+ * React hook: whether this session's current reconnect attempt was started by
+ * the user clicking "Reconnect". Drives the "Reconnecting…" banner, which is
+ * deliberately NOT shown for ordinary automatic redials.
+ */
+export function useTerminalManualRetry(sessionId: string): boolean {
+  return useSyncExternalStore(
+    (cb) => {
+      let s = statusListeners.get(sessionId)
+      if (!s) { s = new Set(); statusListeners.set(sessionId, s) }
+      s.add(cb)
+      return () => { s?.delete(cb) }
+    },
+    () => manualRetryActive(sessionId),
+    () => false,
+  )
+}
+
+/**
+ * React hook: whether this session is parked because a newer window took the
+ * terminal (server `error` frame with `code: 'displaced'`). Lets the banner
+ * say so instead of rendering the generic network-failure copy. Publishes on
+ * the same listener set as the status, since it only ever changes alongside a
+ * status transition (the displaced close, or the manual Reconnect that clears it).
+ */
+export function useTerminalDisplaced(sessionId: string): boolean {
+  return useSyncExternalStore(
+    (cb) => {
+      let s = statusListeners.get(sessionId)
+      if (!s) { s = new Set(); statusListeners.set(sessionId, s) }
+      s.add(cb)
+      return () => { s?.delete(cb) }
+    },
+    () => conns.get(sessionId)?.displaced ?? false,
+    () => false,
+  )
+}
+
+/** React hook: a session's live connection status. Undefined until a
+ *  connection is managed for the session. */
+export function useTerminalConnStatus(sessionId: string): TerminalConnStatus | undefined {
+  return useSyncExternalStore(
+    (cb) => {
+      let s = statusListeners.get(sessionId)
+      if (!s) { s = new Set(); statusListeners.set(sessionId, s) }
+      s.add(cb)
+      return () => { s?.delete(cb) }
+    },
+    () => conns.get(sessionId)?.status,
+    () => undefined,
+  )
+}
+
+/**
+ * Re-arm and immediately redial a session's connection: clears the retry
+ * ceiling and any pending backoff timer, then dials at once. Used by the
+ * manual "Reconnect" button and by the network/visibility revive listeners.
+ * No-op for a disposed, unmanaged, or already-live (OPEN/CONNECTING) socket.
+ *
+ * `manual` marks a user-initiated retry so the view keeps the banner visible
+ * as "Reconnecting…"; the automatic revive listeners pass false so transient
+ * redials stay bannerless.
+ */
+export function retryTerminalConnection(sessionId: string, manual = true): void {
+  const c = conns.get(sessionId)
+  if (!c || c.disposed) return
+  // A displaced session was closed on purpose by the server; only the user
+  // takes it back. Automatic revives (online / tab foreground) must not, or a
+  // background tab regaining focus would silently displace the active window.
+  if (c.displaced) {
+    if (!manual) return
+    c.displaced = false
+    notifyStatus(sessionId)
+  }
+  if (manual) setManualRetry(sessionId, c)
+  const rs = c.ws?.readyState
+  if (rs === WebSocket.OPEN || rs === WebSocket.CONNECTING) return
+  if (rs === WebSocket.CLOSING) {
+    // The socket's own onclose is imminent and will schedule a redial. Dialing
+    // here too would race it into two competing PTY attachments (each reset()
+    // + scrollback replay corrupting the display). Reset the budget so that
+    // onclose redials promptly even if the chain was exhausted, and let it own
+    // the dial.
+    c.retries = 0
+    return
+  }
+  c.retries = 0
+  clearTimeout(c.reconnectTimer)
+  c.reconnectTimer = undefined
+  connect(sessionId, c)
+}
+
+/**
+ * Revive every managed session whose socket is not currently OPEN/CONNECTING.
+ * Registered once at module load against the events that signal a stalled
+ * backoff chain can make progress again: the tab regaining network ('online')
+ * and a backgrounded tab returning to the foreground ('visibilitychange' →
+ * visible), where mobile browsers freeze setTimeout so the backoff chain can
+ * silently stall or exhaust while hidden.
+ */
+function reviveAllConnections() {
+  for (const [sessionId] of conns) retryTerminalConnection(sessionId, false)
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('online', reviveAllConnections)
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') reviveAllConnections()
+  })
+}
+
 function connect(sessionId: string, c: Conn) {
-  if (c.disposed || c.retries >= MAX_RETRIES) return
+  if (c.disposed) return
+  if (c.retries >= MAX_RETRIES) {
+    // Backoff exhausted: no further dial will happen until a revive event
+    // (online / tab foreground) or a manual Reconnect re-arms it. This is the
+    // one place dialing truly stops, so it owns the terminal 'disconnected'
+    // state — an earlier onclose still has a redial pending.
+    setConnStatus(sessionId, c, 'disconnected')
+    return
+  }
+  setConnStatus(sessionId, c, 'reconnecting')
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const qs = c.cwd ? `?cwd=${encodeURIComponent(c.cwd)}` : ''
   const ws = new WebSocket(`${proto}//${location.host}/api/ws/terminal/${sessionId}${qs}`)
@@ -159,6 +373,7 @@ function connect(sessionId: string, c: Conn) {
 
   ws.onopen = () => {
     c.retries = 0
+    setConnStatus(sessionId, c, 'connected')
     // Server replays this session's scrollback on (re)connect; reset first so
     // the cached term's retained screen doesn't stack under the replay.
     c.term.reset()
@@ -180,9 +395,19 @@ function connect(sessionId: string, c: Conn) {
     if (typeof ev.data === 'string') {
       try {
         const m = JSON.parse(ev.data)
-        if (m && m.type === 'ready') registerTerminalWs(sessionId, ws)
+        if (m && m.type === 'ready') {
+          // Record the shell BEFORE registering: registerTerminalWs drains the
+          // ready listeners synchronously, and Run-in-terminal's listener reads
+          // the shell to decide how to hand over the snippet.
+          if (typeof m.shell === 'string' && m.shell) shells.set(sessionId, m.shell)
+          if (m.fence_shells && typeof m.fence_shells === 'object') {
+            fenceShells.set(sessionId, m.fence_shells as Record<string, string>)
+          }
+          registerTerminalWs(sessionId, ws)
+        }
         if (m && m.type === 'title' && typeof m.text === 'string') setSessionTitle(sessionId, m.text)
         if (m && m.type === 'cwd' && typeof m.path === 'string') cwds.set(sessionId, m.path)
+        if (m && m.type === 'error' && m.code === 'displaced') c.displaced = true
       } catch { /* ignore non-JSON control frames */ }
     }
   }
@@ -190,9 +415,26 @@ function connect(sessionId: string, c: Conn) {
   ws.onclose = () => {
     unregisterTerminalWs(sessionId)
     if (c.disposed) return
+    if (c.displaced) {
+      // The server handed this PTY to a newer window and closed us on purpose.
+      // Park instead of redialing: a redial would displace that window right
+      // back. The banner's Reconnect button is the way to take the terminal.
+      clearTimeout(c.reconnectTimer)
+      c.reconnectTimer = undefined
+      setConnStatus(sessionId, c, 'disconnected')
+      return
+    }
     const attempt = c.retries++
-    if (attempt >= MAX_RETRIES) return
+    if (attempt >= MAX_RETRIES) {
+      // Already past the ceiling (a straggler close after dialing stopped):
+      // reflect the terminal state without scheduling another dial.
+      setConnStatus(sessionId, c, 'disconnected')
+      return
+    }
+    setConnStatus(sessionId, c, 'reconnecting')
     const delay = Math.min(BASE_DELAY_MS * 2 ** attempt, MAX_DELAY_MS)
+    // The scheduled connect() flips to 'disconnected' itself once retries has
+    // reached the ceiling, so exhaustion is surfaced even on the last redial.
     c.reconnectTimer = setTimeout(() => connect(sessionId, c), delay + delay * 0.2 * Math.random())
   }
 
@@ -208,7 +450,7 @@ export function ensureTerminalConnection(
   sessionId: string, term: Terminal, fit: FitAddon, cwd?: string | null,
 ): void {
   if (conns.has(sessionId)) return
-  const c: Conn = { term, fit, cwd, ws: null, disposed: false, retries: 0 }
+  const c: Conn = { term, fit, cwd, ws: null, disposed: false, retries: 0, status: 'reconnecting', manualRetry: false, displaced: false }
   conns.set(sessionId, c)
   // Wire terminal I/O once (the term is cached for the session's lifetime;
   // its listeners are cleaned up by term.dispose() in destroyTerm).
@@ -233,6 +475,9 @@ export function disposeTerminalConnection(sessionId: string): void {
   titles.delete(sessionId)
   titleListeners.delete(sessionId)
   cwds.delete(sessionId)
+  shells.delete(sessionId)
+  fenceShells.delete(sessionId)
+  statusListeners.delete(sessionId)
   // Drop any pending onTerminalReady callbacks. They're normally drained by
   // registerTerminalWs when the socket opens; if the tab is closed before the
   // WS ever connects, they'd otherwise leak in readyListeners indefinitely.

@@ -3,6 +3,7 @@ import { Trans } from 'react-i18next'
 
 import { i18nT } from '../i18n/t'
 import { SettingRef } from '../components/settingRef/SettingRef'
+import ErrorNotice from '../components/ErrorNotice'
 interface ArchiveEntry {
   name: string
   key: string
@@ -74,11 +75,12 @@ export default function SessionArchive() {
     <div className="flex gap-4 h-full text-sm">
       <div className="w-1/3 flex flex-col border border-border rounded p-2 overflow-hidden">
         <div className="flex gap-2 mb-2">
-          <input aria-label={i18nT('pages.sessionArchive.fuzzy_filter_substring_match')} className="flex-1 min-w-0 bg-bg-2 border border-border rounded px-2 py-1 text-[13px]" placeholder={i18nT('pages.sessionArchive.fuzzy_filter_substring_match')} value={filterKey} onChange={e => setFilterKey(e.target.value)} />
+          <input aria-label={i18nT('pages.sessionArchive.fuzzy_filter_substring_match')} className="flex-1 min-w-0 bg-bg-elevated border border-border rounded px-2 py-1 text-[13px]" placeholder={i18nT('pages.sessionArchive.fuzzy_filter_substring_match')} value={filterKey} onChange={e => setFilterKey(e.target.value)} />
           <button className="px-2 py-1 bg-accent text-accent-fg rounded text-[13px]" onClick={loadList}>{i18nT('pages.sessionArchive.reload')}</button>
         </div>
         {loading && <div className="text-muted text-[13px]">{i18nT('pages.sessionArchive.loading')}</div>}
-        {error && <div className="text-red-500 text-[13px]">{error}</div>}
+        {/* askAgent on: a list read; the filter box above is a query, not a draft. */}
+        <ErrorNotice message={error} askAgent testId="session-archive-list-error" />
         <div className="overflow-auto flex-1">
           {archives.length === 0 && !loading && !error && <div className="text-muted text-[13px] p-2 break-words min-w-0"><Trans i18nKey="pages.sessionArchive.no_archives_with_compaction_hint" components={{ settingRef: <SettingRef configKey="session.autocompact_pct" /> }} /></div>}
           {archives.length > 0 && visible.length === 0 && !error && <div className="text-muted text-[13px] p-2">{i18nT('pages.sessionArchive.no_matches_for_query', { query: filterKey })}</div>}
@@ -89,7 +91,7 @@ export default function SessionArchive() {
               tabIndex={0}
               onClick={() => openArchive(a.name)}
               onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openArchive(a.name) } }}
-              className={`cursor-pointer px-2 py-1 rounded hover:bg-bg-2 ${selected === a.name ? 'bg-bg-2' : ''}`}
+              className={`cursor-pointer px-2 py-1 rounded hover:bg-bg-hover ${selected === a.name ? 'bg-bg-elevated' : ''}`}
             >
               <div className="text-[13px] font-mono truncate" title={a.key}>{a.key}</div>
               <div className="text-[13px] text-muted flex justify-between"><span>{fmtStamp(a.stamp)}</span><span>{fmtSize(a.size)}</span></div>
@@ -103,8 +105,9 @@ export default function SessionArchive() {
           <>
             <div className="text-[13px] text-muted mb-2 font-mono truncate">{selected}</div>
             {contentLoading && <div className="text-muted text-[13px] p-2">{i18nT('pages.sessionArchive.loading')}</div>}
-            {!contentLoading && contentError && <div className="text-red-500 text-[13px] p-2">{contentError}</div>}
-            {!contentLoading && !contentError && <pre className="flex-1 overflow-auto text-[13px] bg-bg-2 p-2 rounded whitespace-pre-wrap">{content}</pre>}
+            {/* askAgent on: a read-only archive body; nothing on this pane is editable. */}
+            {!contentLoading && <ErrorNotice message={contentError} askAgent testId="session-archive-content-error" />}
+            {!contentLoading && !contentError && <pre className="flex-1 overflow-auto text-[13px] bg-bg-elevated p-2 rounded whitespace-pre-wrap">{content}</pre>}
           </>
         )}
       </div>

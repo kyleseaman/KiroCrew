@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import hashlib
 import json
 import logging
 import os
 import time as _time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TypeVar
 from uuid import uuid4
 
+from kiro_crew.embeddings import PRIORITY_BULK, PRIORITY_NORMAL, bulk_pace_delay
 from kiro_crew.llm_helpers import _extract_json_of_type
 from kiro_crew.security import (
     is_sensitive_path,
@@ -22,19 +26,53 @@ from kiro_crew.security import (
 )
 from kiro_crew.sel import sel
 
-from .autosource import AUTO_ADDED_PROP
-from .chunker import CHUNK_OVERLAP, CHUNK_TOKEN_SIZE, HeadingAwareChunker
+from .chunker import CHUNK_OVERLAP, CHUNK_TOKEN_SIZE, MAX_CHUNKS_PER_FILE, HeadingAwareChunker
 from .dedup import PERSISTENT_SOURCE_TYPES, dedup_document
 from .embedder import embedder_signature, floats_to_bytes
 from .extractor import EntityExtractor
 from .readers import FileReader
-from .store import KnowledgeStore
+from .store import AUTO_ADDED_PROP, KnowledgeStore
+
+#: Per-task depth of :meth:`IngestionPipeline.ingestion_in_flight` holds, so a
+#: nested entry by a current holder is a no-op instead of a second acquisition.
+_INGESTION_GATE_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "kirocrew_ingestion_gate_depth", default=0
+)
+#: Set in a context handed to a task by a current gate holder: the task's first
+#: hold joins the holder's admission instead of waiting behind a maintenance
+#: window that began waiting in between (see IngestionGate.ingestion_in_flight).
+_INGESTION_GATE_ADMITTED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "kirocrew_ingestion_gate_admitted", default=False
+)
+
+
+def handoff_gate_context() -> contextvars.Context:
+    """The context for a background task started by a current gate holder.
+
+    ``asyncio.create_task`` copies the creating task's context, so a task
+    created inside an ``IngestionPipeline.ingestion_in_flight()`` hold would
+    inherit the depth and treat its own entry as nested -- running its ingest
+    without the gate once the creator releases. This copy resets the depth so
+    the task takes a real hold of its own, and marks it admitted so that first
+    hold cannot block behind a maintenance window the holder is keeping open:
+    the holder waits for the task's hold, the window waits for the holder, and
+    the task waiting for the window would close the cycle until the window's
+    timeout.
+    """
+    ctx = contextvars.copy_context()
+    ctx.run(_INGESTION_GATE_DEPTH.set, 0)
+    ctx.run(_INGESTION_GATE_ADMITTED.set, True)
+    return ctx
+
 
 logger = logging.getLogger(__name__)
 
+#: Extensions routed to the code-aware chunker. Must be a subset of
+#: ``FileReader.SUPPORTED`` -- that set is the folder-scan gate, so an extension
+#: listed here but absent there never reaches this dispatch at all.
 CODE_EXTS = {
     '.py', '.java', '.ts', '.js', '.rs', '.go', '.rb', '.c', '.cpp', '.h',
-    '.sh', '.ps1', '.psm1', '.cs', '.kt', '.swift', '.scala',
+    '.sh', '.ps1', '.psm1', '.cs', '.kt', '.kts', '.swift', '.scala',
 }
 
 MARKDOWN_EXTS = {'.md', '.docx'}
@@ -167,6 +205,193 @@ def _max_ingest_file_mb() -> float:
         return DEFAULT_MAX_INGEST_FILE_MB
 
 
+#: Rolling window (seconds) over which the explicit-import chunk budget is
+#: totalled. 60s is a short window because the explicit paths are interactive
+#: (a user adding files, an agent handing over a document), so the ceiling bounds
+#: a burst of successive adds within about a minute rather than pacing a
+#: long-running scan the way the watcher's per-sweep budget does. Inlined as the
+#: single window: only ``ImportChunkBudget()`` is constructed in production.
+_IMPORT_CHUNK_BUDGET_WINDOW_SECS = 60.0
+
+
+class ImportChunkBudgetError(RuntimeError):
+    """Raised when an explicit import would exceed ``knowledge.import_chunk_budget``.
+
+    Carries the budget, the window and the count already spent in the window so a
+    caller can surface WHY the import was deferred rather than failing opaquely --
+    the whole point of refusing rather than silently truncating a deliberate
+    import. The message is deterministic and ASCII so it is safe to surface to an
+    agent tool result or a dashboard error.
+    """
+
+    def __init__(self, budget: int, window_secs: float, spent: int):
+        self.budget = budget
+        self.window_secs = window_secs
+        self.spent = spent
+        super().__init__(
+            f"Knowledge import deferred: the explicit-import chunk budget "
+            f"(knowledge.import_chunk_budget={budget} chunks per {window_secs:g}s) "
+            f"is already spent ({spent} chunks reserved or ingested this window). "
+            f"Retry after the window rolls over, ingest fewer files at once, or "
+            f"raise knowledge.import_chunk_budget (0 removes the bound)."
+        )
+
+
+class ImportChunkBudget:
+    """Rolling-window ceiling on chunks ingested through the EXPLICIT import paths.
+
+    The watcher path (folder sweep) already has its own per-sweep and global
+    chunk budgets; those are bounded by a scan (one pass over one source). The
+    explicit routes -- single-file add, agent ``knowledge_add_document``, direct
+    text ingest, remote sync -- are many independent calls in succession with no
+    scan boundary, so there is nothing to total the cost across files. This is
+    the equivalent ceiling for that path: a rolling 60-second window over which
+    at most ``budget`` chunks may be ingested.
+
+    ``budget=0`` disables it (unbounded). Per-file cost stays bounded by the
+    chunker's 50-chunk cap independently; this bounds the CROSS-FILE total.
+
+    The gate is enforced at CALL granularity, not chunk granularity: a file whose
+    real cost pushes the window PAST ``budget`` still completes (its chunks are
+    already produced), and the NEXT call is the one refused. So the effective
+    bound is ``[budget, budget + MAX_CHUNKS_PER_FILE)`` -- a run of adds can end at
+    most one file's worst case (50 chunks) above ``budget``, never unbounded. This
+    is deliberate: the alternative -- rejecting a file mid-flight once its chunk
+    count is known -- would waste the extraction already spent and is the
+    silent-truncation failure this exists to avoid. Treat ``budget`` as a soft
+    ceiling with a bounded, single-file overshoot, not a hard cap.
+
+    Trip behaviour is REFUSE, not truncate: a single-file cap that silently
+    dropped part of a user's deliberate import would be a worse failure than the
+    cost it prevents. :meth:`reserve` raises :class:`ImportChunkBudgetError` at
+    entry, before any chunking/extraction cost is incurred; an accepted file
+    always runs to completion, its reservation settled to its real chunk count.
+
+    Concurrency: the caller does ``reserve()`` (synchronous), then awaits the
+    chunk/extract work, then ``settle()``. If N imports each only checked a
+    running total they would all pass before any recorded, overrunning by
+    concurrency x file. So ``reserve`` books a placeholder of the per-file
+    maximum (:data:`~kiro_crew.knowledge.chunker.MAX_CHUNKS_PER_FILE`) INTO the
+    window immediately, and that reservation is visible to every concurrent
+    ``reserve`` across the await -- ``settle`` later reconciles it down to the
+    real count. The reservation is an UPPER bound, so a burst is refused a little
+    early rather than allowed to overrun; the worst residual error is one file's
+    slack per in-flight import, never unbounded. Every caller is on the event
+    loop and reserve/settle/release are synchronous and non-awaiting, so no lock
+    is needed (unlike the embed limiter, whose refill straddles an await).
+    """
+
+    def __init__(self, budget: int = 0):
+        self._budget = max(0, int(budget))
+        self._window_secs = _IMPORT_CHUNK_BUDGET_WINDOW_SECS
+        # (monotonic_ts, chunk_count, token) entries; pruned to the window on each
+        # touch. token identifies a live reservation so settle/release can find it.
+        self._events: list[tuple[float, int, int]] = []
+        self._next_token = 0
+        # Tokens already settled: a later release() of one is a no-op, which is
+        # what makes a finally-release safe after a success-path settle.
+        self._settled: set[int] = set()
+        # Tokens reserved and not yet settled or released, i.e. imports still in
+        # flight. Window pruning skips their events: an import slower than the
+        # window would otherwise age out of its own reservation while still
+        # running, and a concurrent reserve() would stop seeing it and admit
+        # another import past the concurrency ceiling the placeholder enforces.
+        self._open: set[int] = set()
+
+    def set_budget(self, budget: int) -> None:
+        """Update the ceiling live (config is read per-ingest, no restart)."""
+        self._budget = max(0, int(budget))
+
+    def _spent(self, now: float) -> int:
+        """Chunks reserved-or-recorded within the trailing window.
+
+        Prunes entries older than the window, EXCEPT an open reservation: an
+        import still in flight holds its slot however long it runs, so a file
+        slower than the window cannot age out of the ceiling it occupies.
+        """
+        cutoff = now - self._window_secs
+        self._events = [
+            (ts, n, t) for (ts, n, t) in self._events if ts >= cutoff or t in self._open
+        ]
+        return sum(n for (_, n, _t) in self._events)
+
+    def reserve(self) -> int | None:
+        """Refuse a new import when the window is at/over budget; else book a
+        worst-case placeholder and return its token.
+
+        Returns ``None`` when the budget is disabled (0) -- the caller then does
+        not settle. Raises :class:`ImportChunkBudgetError` when the trailing
+        window (including live reservations from concurrent in-flight imports) is
+        already exhausted.
+
+        The placeholder is the per-file maximum because the true chunk count is
+        not known until the file is chunked, which happens after an await; booking
+        the maximum now is what makes a concurrent ``reserve`` see this import and
+        stops N simultaneous imports from each passing before any records.
+        """
+        if self._budget <= 0:
+            return None
+        now = _time.monotonic()
+        spent = self._spent(now)
+        if spent >= self._budget:
+            raise ImportChunkBudgetError(self._budget, self._window_secs, spent)
+        token = self._next_token
+        self._next_token += 1
+        self._events.append((now, MAX_CHUNKS_PER_FILE, token))
+        self._open.add(token)
+        return token
+
+    def settle(self, token: int | None, chunk_count: int) -> None:
+        """Reconcile a reservation to the real chunk count of an accepted import.
+
+        No-op when ``token`` is ``None`` (budget was disabled at reserve time).
+        The reservation timestamp is preserved so the window still expires the
+        cost at the moment the import began, not when it finished. After a settle
+        the token is CONSUMED, so a later :meth:`release` of it is a no-op -- that
+        is what lets every caller put ``release`` in a ``finally`` and settle on
+        the success path without double-counting.
+        """
+        if token is None:
+            return
+        self._settled.add(token)
+        self._open.discard(token)
+        n = max(0, int(chunk_count))
+        for i, (ts, _placeholder, t) in enumerate(self._events):
+            if t == token:
+                self._events[i] = (ts, n, t)
+                return
+
+    def release(self, token: int | None) -> None:
+        """Drop a still-open reservation, so a failed OR no-op import does not hold
+        budget. A no-op when the token is ``None`` or was already settled -- so it
+        is safe to call unconditionally in a ``finally`` after a possible settle.
+
+        This is the fix for the reservation LEAK on the no-op success paths
+        (content-hash-unchanged, dedup-refused): those branches return before any
+        chunk work, so they never settle; a finally-release reclaims their
+        placeholder. Without it, ten no-op re-ingests would each strand a 50-chunk
+        placeholder and falsely refuse genuine imports at the default budget.
+        """
+        if token is None:
+            return
+        if token in self._settled:
+            self._settled.discard(token)
+            return
+        self._open.discard(token)
+        self._events = [(ts, n, t) for (ts, n, t) in self._events if t != token]
+
+
+def _import_chunk_budget() -> int:
+    # Read live so a config change takes effect without a restart, matching
+    # _max_ingest_file_mb. Circular import guarded the same way.
+    from kiro_crew.config.loader import KiroCrewConfig  # circular import
+
+    try:
+        return max(0, int(KiroCrewConfig.load().knowledge.import_chunk_budget))
+    except Exception:
+        return 0
+
+
 def _run_chunker(chunker: HeadingAwareChunker, ext: str, text: str, uri: str) -> list[dict]:
     """Dispatch to the right chunker. CPU-bound -- run via asyncio.to_thread."""
     if ext == '.pptx':
@@ -261,6 +486,63 @@ class IngestionPipeline:
         self.reader = reader
         self.embedder = embedder
         self._dedup_enabled = dedup_enabled
+        # Cross-file cost ceiling for the EXPLICIT import paths (single-file add,
+        # agent add, direct text ingest, remote sync). The watcher path has its
+        # own per-sweep budgets; this bounds the windowless explicit path. One
+        # instance per pipeline (per gateway process), so a run of successive
+        # explicit adds shares one rolling window. Budget is refreshed from live
+        # config on each ingest, so it is 0/unbounded by default and a config
+        # change takes effect without a restart.
+        self._import_budget = ImportChunkBudget()
+
+    async def reserve_import_budget(self) -> int | None:
+        """Reserve explicit-import admission BEFORE the caller accepts the work.
+
+        For a route that answers the client and ingests afterwards, discovering a
+        refusal inside the background task is too late: the multipart upload route
+        replies 'processing', and the staged temp file is the only server-side copy
+        (its ``finally`` unlinks it), so a refusal found later discards a file the
+        client was told had been accepted. Reserving here puts the refusal at the
+        response -- 429, matching what ``ingest_text`` already answers -- and the
+        token is handed to :meth:`ingest_file`, which then owns settling or
+        releasing it, so admission cannot be lost in between.
+
+        Raises :class:`ImportChunkBudgetError` when the window is exhausted.
+        Returns ``None`` when the budget is disabled -- which is an ADMISSION, not
+        an absent one -- so hand the result over as-is together with
+        ``count_toward_import_budget=False``, and let that flag be what tells
+        :meth:`ingest_file` not to enter the budget a second time.
+        """
+        return await self._enter_import_budget(True)
+
+    def release_import_budget(self, token: int | None) -> None:
+        """Reclaim a token from :meth:`reserve_import_budget` that never reached
+        :meth:`ingest_file` -- the caller failed between reserving and handing it
+        over. A no-op for ``None``. Once handed over, ingest_file's own finally
+        owns it and calling this as well would be the double-release that
+        :meth:`ImportChunkBudget.release` is written to tolerate.
+        """
+        self._import_budget.release(token)
+
+    async def _enter_import_budget(self, count_toward_import_budget: bool) -> int | None:
+        """Refresh the explicit-import budget from live config and RESERVE against
+        the rolling window, refusing the call if the window is already exhausted.
+
+        Returns a reservation token to settle/release on the way out, or ``None``
+        when the budget is disabled or this is a non-explicit caller. The
+        automated paths -- both folder-watcher sweeps and artifact sync -- pass
+        ``count_toward_import_budget=False`` because they are already governed by
+        their own budgets; for them this is a no-op that returns ``None``.
+        Raises :class:`ImportChunkBudgetError` when an explicit call is refused.
+
+        The config read is offloaded: ``_import_chunk_budget`` does a synchronous
+        ``KiroCrewConfig.load()`` (stat + read + parse of config.json), which must
+        not run on the event loop.
+        """
+        if not count_toward_import_budget:
+            return None
+        self._import_budget.set_budget(await asyncio.to_thread(_import_chunk_budget))
+        return self._import_budget.reserve()
 
     def _resolve_old_item_ids(self, source_id: str | None) -> list[str]:
         """The source's full pre-existing item group: the ids a replace-all
@@ -277,7 +559,7 @@ class IngestionPipeline:
 
     def _skip_as_duplicate(self, content_hash: str, source_id: str | None,
                            old_item_ids: list[str] | None = None,
-                           on_duplicate: Callable[[], None] | None = None) -> str | None:
+                           on_duplicate: Callable[[str], None] | None = None) -> str | None:
         """Terminal job id when this exact document is already in the Library.
 
         Returns ``None`` when the write should proceed.
@@ -373,7 +655,11 @@ class IngestionPipeline:
             # rolls the gate back too, which is the correct pairing: the delete,
             # the claim and the record land together or not at all.
             if on_duplicate is not None:
-                on_duplicate()
+                # The caller may track file identity in a different hash domain
+                # (folder rows use raw bytes while items use extracted text).
+                # Hand it the exact text hash the gate matched so transformed
+                # documents can remain adoptable after this transaction commits.
+                on_duplicate(content_hash)
             self.store.db.execute("COMMIT")
         except Exception:
             self.store.db.execute("ROLLBACK")
@@ -391,8 +677,7 @@ class IngestionPipeline:
         """True when this source was registered automatically, not chosen by the user.
 
         Read from the source row's own properties rather than passed in, because every
-        auto path (project docs, the agent aggregate, the auto-registered drop folder)
-        already marks itself and a caller-supplied flag would be one more thing each
+        auto path (today the agent aggregate) already marks itself and a caller-supplied flag would be one more thing each
         new path could forget. Failure is treated as NOT auto-added: a missing or
         malformed row must not silently start scrubbing a hand-registered folder.
         """
@@ -450,13 +735,96 @@ class IngestionPipeline:
         except Exception:
             logger.debug("Post-ingest dedup skipped", exc_info=True)
 
-    async def ingest_file(self, path: str, on_progress=None, original_name: str = "", namespace: str = "default", source_id: str = "", old_item_ids: list[str] | None = None, on_committed: Callable[[list[str]], None] | None = None, on_duplicate: Callable[[], None] | None = None) -> str | None:
+    @asynccontextmanager
+    async def _ingestion_in_flight(self) -> AsyncIterator[None]:
+        """Hold the store's ingestion gate for one whole ingest, entered off-loop.
+
+        The deferred orphan sweep (``KnowledgeStore.reclaim_orphans``) runs in a
+        ``maintenance_window`` that waits for every holder of this gate and
+        holds new entrants off while it sweeps, so a source, its items and its
+        entities' mentions are never half-written when the sweep reads them.
+        Entry can block for the length of a running sweep, so it happens on a
+        worker thread; exit is a lock-protected decrement and stays inline so a
+        cancellation cannot skip it.
+
+        Re-entrant per task: a caller that already holds the gate (a handler
+        bracketing its lookup and the ingest call) does not take it again.
+        The store gate holds NEW entrants off as soon as a maintenance window
+        starts waiting for the current holders to drain, so a nested entry
+        from a current holder would wait behind a window that is waiting for
+        that very holder -- a stall the window's timeout ends only after
+        ``MAINTENANCE_WAIT_SECS``. The depth lives in a context variable, which
+        follows the task across ``asyncio.to_thread``.
+        """
+        depth = _INGESTION_GATE_DEPTH.get()
+        if depth > 0:
+            token = _INGESTION_GATE_DEPTH.set(depth + 1)
+            try:
+                yield
+            finally:
+                _INGESTION_GATE_DEPTH.reset(token)
+            return
+        # An admission handed on by the creating holder covers this first hold
+        # only; it is spent here, so anything the task enters later waits like
+        # any other entrant.
+        admitted = _INGESTION_GATE_ADMITTED.get()
+        if admitted:
+            _INGESTION_GATE_ADMITTED.set(False)
+        gate = self.store.ingestion_in_flight(admitted=admitted)
+        await asyncio.to_thread(gate.__enter__)
+        token = _INGESTION_GATE_DEPTH.set(1)
+        try:
+            yield
+        finally:
+            _INGESTION_GATE_DEPTH.reset(token)
+            gate.__exit__(None, None, None)
+
+    def ingestion_in_flight(self) -> AbstractAsyncContextManager[None]:
+        """Hold the ingestion gate across a lookup-then-ingest span.
+
+        Callers that look up an existing source and ingest into it later hold
+        this across the whole span -- from the lookup through the
+        ``ingest_file`` / ``ingest_text`` call -- so the deferred orphan sweep
+        waits for them instead of reading the row between the two steps. The
+        hold is re-entrant per task, so the ingest call's own entry inside the
+        span neither counts twice nor waits behind a maintenance window that is
+        waiting for this very holder.
+        """
+        return self._ingestion_in_flight()
+
+    async def ingest_file(
+        self,
+        path: str,
+        on_progress=None,
+        original_name: str = "",
+        namespace: str = "default",
+        source_id: str = "",
+        old_item_ids: list[str] | None = None,
+        on_committed: Callable[[list[str]], None] | None = None,
+        on_duplicate: Callable[[str], None] | None = None,
+        *,
+        embed_priority: int = PRIORITY_NORMAL,
+        count_toward_import_budget: bool = True,
+        import_budget_token: int | None = None,
+    ) -> str | None:
         """Full pipeline. Returns job_id, or None if content hash unchanged.
+
+        Every write this ingest performs -- the source row when it creates one,
+        the job row, items, entities and mentions -- runs under
+        ``_ingestion_in_flight`` so the deferred orphan sweep waits for it rather
+        than reading it half-written; the folder watcher and the artifact path
+        both arrive here, so they are covered by the same bracket. A caller that
+        passes an existing ``source_id`` looked that row up itself and holds
+        ``ingestion_in_flight`` from that lookup through this call, so the
+        sweep waits for the whole span.
 
         If source_id is provided, ingests into that existing source instead of
         creating a new one (used for remote source sync).
         If old_item_ids is provided, only those items are replaced (folder sources).
         Otherwise all items for the source are replaced (single-file sources).
+
+        ``embed_priority`` is call-scoped so unattended watchers can use the
+        reduced bulk pool without downgrading concurrent attended ingestion.
 
         ``on_committed`` receives the ids this call created -- collected at each
         write, never inferred from a before/after comparison of the source, which
@@ -470,14 +838,75 @@ class IngestionPipeline:
         the same run-to-completion guarantee as the delete it belongs with.
 
         ``on_duplicate`` is that same bargain for the branch where the pre-ingest
-        gate REFUSES the write. It runs inside the gate's own hop, after its
-        transaction commits, and records whatever terminal state the caller keys by
-        document. Leaving it to the caller is not merely riskier here than on the
+        gate REFUSES the write. It receives the extracted-text hash matched by the
+        gate and runs inside the gate's transaction, recording whatever terminal
+        state the caller keys by document. Leaving it to the caller is not merely riskier here than on the
         success branch, it is unsound: ``run_to_completion`` guarantees the gate
         finishes and then re-raises the cancellation, so a shutdown lands with the
         deletion and the location claim durable and the caller's write never
         reached.
+
+        ``count_toward_import_budget`` gates and records this call against the
+        cross-file explicit-import chunk budget (``knowledge.import_chunk_budget``).
+        Explicit callers leave it True; the folder-watcher path passes False
+        because it is already bounded by the per-sweep chunk budgets.
         """
+        # Cross-file cost ceiling for the explicit import paths. Reserved FIRST so
+        # a refused import does no filesystem read, chunking or extraction, and a
+        # reservation is held across the awaits below so concurrent imports cannot
+        # each pass before any records (see ImportChunkBudget). Returns a token to
+        # settle on success / release on any non-success exit; None when disabled
+        # or for the watcher/artifact-sync paths.
+        #
+        # A caller that must answer the client BEFORE this runs -- the multipart
+        # upload route, which replies 'processing' and ingests in the background --
+        # reserves its own admission with :meth:`reserve_import_budget` and passes
+        # ``count_toward_import_budget=False`` plus the token it holds. That flag is
+        # not optional for such a caller, because a DISABLED budget admits with a
+        # token of ``None``: leaving the flag True would send this call down the
+        # reserve branch, entering the budget a SECOND time, and a budget enabled
+        # between the two config reads would then refuse an upload already accepted
+        # and discard its only staged copy. Ownership of whatever this ends up
+        # holding transfers here -- the finally below settles or releases it.
+        # The ingestion gate brackets the budget reservation and the whole impl,
+        # so the deferred orphan sweep waits for every write this call performs.
+        async with self._ingestion_in_flight():
+            budget_token = (
+                import_budget_token
+                if import_budget_token is not None
+                else await self._enter_import_budget(count_toward_import_budget)
+            )
+            try:
+                return await self._ingest_file_impl(
+                    budget_token=budget_token,
+                    path=path, on_progress=on_progress, original_name=original_name,
+                    namespace=namespace, source_id=source_id, old_item_ids=old_item_ids,
+                    on_committed=on_committed, on_duplicate=on_duplicate,
+                    embed_priority=embed_priority,
+                )
+            finally:
+                # Reclaim the reservation on EVERY exit that did not settle it: an
+                # exception, but also the no-op success paths (content-hash unchanged,
+                # dedup-refused) that return before any chunk work. settle() on the
+                # chunking success path marks the token consumed, so this release is a
+                # no-op there -- no double-counting. Without this, a no-op re-ingest
+                # would strand its 50-chunk placeholder and falsely refuse real imports.
+                self._import_budget.release(budget_token)
+
+    async def _ingest_file_impl(
+        self,
+        *,
+        budget_token: int | None,
+        path: str,
+        on_progress=None,
+        original_name: str = "",
+        namespace: str = "default",
+        source_id: str = "",
+        old_item_ids: list[str] | None = None,
+        on_committed: Callable[[list[str]], None] | None = None,
+        on_duplicate: Callable[[str], None] | None = None,
+        embed_priority: int = PRIORITY_NORMAL,
+    ) -> str | None:
         p = Path(path)
         display_name = original_name or p.name
         # Separate copy for the two sinks a name is allowed to reach: the error
@@ -504,7 +933,7 @@ class IngestionPipeline:
             raise PermissionError(f"Refusing to ingest sensitive path: {log_name}")
 
         # Size guard BEFORE reading: chunking a very large file is CPU-bound and
-        # previously hung gateway startup for 25s+ with only a raw faulthandler
+        # can hang gateway startup for 25s+ with only a raw faulthandler
         # dump (no actionable error). Skip with a clear WARNING naming the file.
         limit_mb = _max_ingest_file_mb()
         try:
@@ -553,8 +982,13 @@ class IngestionPipeline:
         # having agreed to it. This is the same scrub the artifact path already applies
         # to its body, in the same position -- ahead of the hash, so the stored text
         # and its identity agree and a re-scan is stable.
-        if source_id and self._source_is_auto_added(source_id):
-            text = _redact_for_ingest(text)
+        # Offloaded like every other store touch in this method: the helper is a
+        # plain `def` that runs a SELECT one frame down, so on the loop it is the
+        # interprocedural take no name-based AST scan can see. Kept out of an
+        # `and` chain so the offloaded call's return type is inferred on its own.
+        if source_id:
+            if await asyncio.to_thread(self._source_is_auto_added, source_id):
+                text = _redact_for_ingest(text)
 
         # 2. Hash check + source resolution
         content_hash = hashlib.sha256(text.encode()).hexdigest()
@@ -570,14 +1004,15 @@ class IngestionPipeline:
                 resolve_old_group = True
             props: dict[str, object] = {}
             existing: dict | None = {"id": source_id}  # sentinel — source already exists
-            src_row = self.store.db.execute(
-                "SELECT uri, properties FROM sources WHERE id = ?", (source_id,)).fetchone()
+            src_row = await asyncio.to_thread(
+                lambda: self.store.db.execute(
+                    "SELECT uri, properties FROM sources WHERE id = ?", (source_id,)).fetchone())
             uri = src_row["uri"] if src_row else display_name
             props = json.loads(src_row["properties"] or "{}") if src_row else {}
         else:
             # Local file path: find or create source by URI
             uri = str(p.resolve())
-            existing = self.store.get_source_by_uri(uri)
+            existing = await asyncio.to_thread(self.store.get_source_by_uri, uri)
             if existing:
                 props = json.loads(existing.get('properties', '{}')) if isinstance(existing.get('properties'), str) else existing.get('properties', {})
                 if props.get('content_hash') == content_hash:
@@ -586,10 +1021,11 @@ class IngestionPipeline:
                 resolve_old_group = True
             else:
                 props = {}
-                source_id = self.store.add_source(
+                source_id = await asyncio.to_thread(functools.partial(
+                    self.store.add_source,
                     name=display_name, source_type='local_file', uri=uri,
                     properties={'content_hash': content_hash, **meta},
-                )
+                ))
 
         # 3. Job record
         # One hop for the whole gate: it resolves the pre-existing item group
@@ -607,10 +1043,19 @@ class IngestionPipeline:
             return dupe_job
         job_id = uuid4().hex[:12]
         now = datetime.now().isoformat()
-        self.store.db.execute(
-            "INSERT INTO ingestion_jobs (id, source_id, status, created_at, updated_at) VALUES (?, ?, 'processing', ?, ?)",
-            (job_id, source_id, now, now))
-        self.store.db.commit()
+
+        # The row below is what every later step keys off, and the failure
+        # handler at the bottom of this method assumes it exists — so it travels
+        # as a run_to_completion hop, not a bare to_thread: a cancellation
+        # arriving while the work item is still queued would drop the INSERT and
+        # leave the body writing progress against a job row nobody created.
+        def _insert_job() -> None:
+            self.store.db.execute(
+                "INSERT INTO ingestion_jobs (id, source_id, status, created_at, updated_at) VALUES (?, ?, 'processing', ?, ?)",
+                (job_id, source_id, now, now))
+            self.store.db.commit()
+
+        await run_to_completion(_insert_job)
 
         # The job row above is persisted as 'processing' BEFORE any fallible
         # work runs, and nothing below ever wrote 'failed' on an uncaught
@@ -625,16 +1070,26 @@ class IngestionPipeline:
                 display_name=display_name, namespace=namespace,
                 existing=existing, old_item_ids=old_item_ids,
                 _old_item_ids=_old_item_ids, path=path, on_progress=on_progress,
-                on_committed=on_committed,
+                embed_priority=embed_priority, on_committed=on_committed,
+                budget_token=budget_token,
             )
         except Exception:
             try:
-                self.store.db.execute(
-                    "UPDATE ingestion_jobs SET status = 'failed', updated_at = ? WHERE id = ?",
-                    (datetime.now().isoformat(), job_id))
-                self.store.db.execute(
-                    "UPDATE sources SET sync_status = 'error' WHERE id = ?", (source_id,))
-                self.store.db.commit()
+                # Also a run_to_completion hop: this is the write that stops the
+                # folder watcher retrying the file every scan, so a cancellation
+                # arriving while this hop is awaited must not drop it. (The
+                # `except Exception` above never sees CancelledError itself --
+                # this is about the await inside the handler, not the failure
+                # that got us here.)
+                def _mark_failed() -> None:
+                    self.store.db.execute(
+                        "UPDATE ingestion_jobs SET status = 'failed', updated_at = ? WHERE id = ?",
+                        (datetime.now().isoformat(), job_id))
+                    self.store.db.execute(
+                        "UPDATE sources SET sync_status = 'error' WHERE id = ?", (source_id,))
+                    self.store.db.commit()
+
+                await run_to_completion(_mark_failed)
             except Exception:  # noqa: BLE001 - never mask the original error
                 logger.warning("failed to mark ingestion job %s failed", job_id, exc_info=True)
             raise
@@ -642,7 +1097,8 @@ class IngestionPipeline:
     async def _ingest_file_body(self, *, job_id, source_id, props, meta, ext, text,
                                 uri, content_hash, display_name, namespace,
                                 existing, old_item_ids, _old_item_ids, path,
-                                on_progress, on_committed=None) -> str | None:
+                                on_progress, embed_priority,
+                                on_committed=None, budget_token=None) -> str | None:
         """Chunk/extract/store/finalize — split out so ingest_file can mark the
         pre-inserted job row 'failed' on ANY exception in one place."""
         # 4. Chunk (use per-source chunk size if configured)
@@ -660,8 +1116,13 @@ class IngestionPipeline:
         chunks = await asyncio.to_thread(_run_chunker, chunker, ext, text, uri)
 
         total = len(chunks)
-        self.store.db.execute("UPDATE ingestion_jobs SET items_total = ? WHERE id = ?", (total, job_id))
-        self.store.db.commit()
+
+        def _set_total() -> None:
+            self.store.db.execute(
+                "UPDATE ingestion_jobs SET items_total = ? WHERE id = ?", (total, job_id))
+            self.store.db.commit()
+
+        await asyncio.to_thread(_set_total)
 
         # 5. Extract all chunks in batch via pool
         chunk_contents = [chunk['content'] for chunk in chunks]
@@ -687,23 +1148,48 @@ class IngestionPipeline:
                     or f"{Path(display_name).stem} chunk {i}"
                 )
                 item_tags = ['content_type:markdown'] if is_markdown else None
-                item_id = self.store.add_item(
-                    title=item_title,
-                    content=chunk['content'],
-                    item_type=extraction.get('category', 'document'),
-                    source_id=source_id,
-                    chunk_index=chunk.get('chunk_index', i),
-                    summary=extraction.get('summary'),
-                    namespace=namespace,
-                    tags=item_tags,
-                    content_hash=content_hash,
-                )
-                created_item_ids.append(item_id)
-                self.store.add_source_location(
-                    item_id=item_id, source_id=source_id,
-                    chunk_range=f"{chunk.get('line_start', 0)}-{chunk.get('line_end', 0)}",
-                    section_title=chunk.get('section_title'),
-                )
+
+                # add_item opens its own BEGIN/COMMIT and add_source_location
+                # commits on the same autocommit connection, so on the loop each
+                # blocked every other session's turn for the connection's whole
+                # busy timeout — the defect the store's on-loop guard reports
+                # from here.
+                #
+                # ONE run_to_completion unit, and both properties matter:
+                #
+                # *Uncancellable*, because to_thread does not stop a worker that
+                # has already started. A cancellation landing between add_item's
+                # COMMIT and this coroutine resuming would skip the append (and
+                # every finalizer above it), leaving a searchable item that no
+                # rollback can name. run_to_completion drains the hop instead, so
+                # the commit and the record of it cannot come apart.
+                #
+                # *One unit*, because the append must sit BETWEEN the two writes:
+                # a chunk whose location write raises has to already be in
+                # created_item_ids or the partial-failure rollback leaves the
+                # item orphaned. Inside the hop that ordering is preserved
+                # exactly as it was inline.
+                def _write_chunk() -> str:
+                    new_id = self.store.add_item(
+                        title=item_title,
+                        content=chunk['content'],
+                        item_type=extraction.get('category', 'document'),
+                        source_id=source_id,
+                        chunk_index=chunk.get('chunk_index', i),
+                        summary=extraction.get('summary'),
+                        namespace=namespace,
+                        tags=item_tags,
+                        content_hash=content_hash,
+                    )
+                    created_item_ids.append(new_id)
+                    self.store.add_source_location(
+                        item_id=new_id, source_id=source_id,
+                        chunk_range=f"{chunk.get('line_start', 0)}-{chunk.get('line_end', 0)}",
+                        section_title=chunk.get('section_title'),
+                    )
+                    return new_id
+
+                item_id = await run_to_completion(_write_chunk)
                 # Entity storage is O(entities): find_entity does a full-table
                 # alias scan and each add_entity/add_mention/add_entity_relation
                 # commits + mutates the graph. On a many-entity chunk this blocked
@@ -712,7 +1198,11 @@ class IngestionPipeline:
                 # and sqlite connections are thread-local, so this is thread-safe.
                 await asyncio.to_thread(self._store_entities, extraction, item_id)
                 await self._embed_item(
-                    item_id, item_title, extraction.get('summary'), chunk['content']
+                    item_id,
+                    item_title,
+                    extraction.get('summary'),
+                    chunk['content'],
+                    embed_priority=embed_priority,
                 )
                 processed += 1
             except Exception:
@@ -778,12 +1268,19 @@ class IngestionPipeline:
             # rebuild). Offloaded so a large source's dedup cannot stall the loop
             # (RLock-guarded graph + thread-local sqlite make this thread-safe).
             await asyncio.to_thread(self._maybe_dedup, source_id, content_hash)
+
+        # Reconcile the reservation to the real chunk count ONLY now, after the
+        # fallible finalize succeeded -- settling earlier would leave a failed
+        # import charged (its exception releases via ingest_file's finally, but a
+        # settled token never releases). total is the extraction cost actually
+        # incurred (extract_batch ran on every chunk). No-op when token is None.
+        self._import_budget.settle(budget_token, total)
         return job_id
 
     async def ingest_text(self, text: str, title: str, source_type: str = 'manual',
                           source_id: str | None = None,
                           old_item_ids: list[str] | None = None,
-                          on_duplicate: Callable[[], None] | None = None) -> str | None:
+                          on_duplicate: Callable[[str], None] | None = None) -> str | None:
         """Ingest raw text (dashboard drop, chat, or a shared aggregate source).
 
         Without ``source_id`` the source is found-or-created by a
@@ -798,7 +1295,38 @@ class IngestionPipeline:
           source hold many independently-replaceable documents -- the
           aggregate "Artifacts" source keys a group per artifact slug, exactly
           as a folder source keys a group per file.
+
+        Every caller of this method is a deliberate import, so it always counts
+        against the cross-file explicit-import chunk budget
+        (``knowledge.import_chunk_budget``). :meth:`ingest_file` takes a
+        ``count_toward_import_budget`` opt-out because the watcher and
+        artifact-sync sweeps reach it and carry their own bounds; nothing reaches
+        this one that way.
         """
+        # Cross-file cost ceiling. Reserved first (held across the awaits below so
+        # concurrent imports cannot each pass before any records); token settled on
+        # success, released on any non-success exit.
+        # Same gate as ingest_file: the deferred orphan sweep waits for the
+        # whole ingest.
+        async with self._ingestion_in_flight():
+            budget_token = await self._enter_import_budget(True)
+            try:
+                return await self._ingest_text_impl(
+                    text, title, source_type=source_type, source_id=source_id,
+                    old_item_ids=old_item_ids, on_duplicate=on_duplicate,
+                    budget_token=budget_token,
+                )
+            finally:
+                # Reclaim on every non-settling exit, including the no-op success
+                # paths (unchanged hash, dedup-refused). settle() on the chunk path
+                # consumes the token so this release is a no-op there. See ingest_file.
+                self._import_budget.release(budget_token)
+
+    async def _ingest_text_impl(self, text: str, title: str, source_type: str = 'manual',
+                                source_id: str | None = None,
+                                old_item_ids: list[str] | None = None,
+                                on_duplicate: Callable[[str], None] | None = None,
+                                budget_token: int | None = None) -> str | None:
         content_hash = hashlib.sha256(text.encode()).hexdigest()
 
         # Resolve the source and the prior item ids this call should replace.
@@ -809,7 +1337,7 @@ class IngestionPipeline:
         resolve_old_group = False
         if source_id is None:
             uri = f"{source_type}://{content_hash[:16]}"
-            existing = self.store.get_source_by_uri(uri)
+            existing = await asyncio.to_thread(self.store.get_source_by_uri, uri)
             if existing:
                 props = json.loads(existing.get('properties', '{}')) if isinstance(existing.get('properties'), str) else existing.get('properties', {})
                 if props.get('content_hash') == content_hash:
@@ -817,10 +1345,11 @@ class IngestionPipeline:
                 source_id = existing['id']
                 resolve_old_group = True
             else:
-                source_id = self.store.add_source(
+                source_id = await asyncio.to_thread(functools.partial(
+                    self.store.add_source,
                     name=title, source_type=source_type, uri=uri,
                     properties={'content_hash': content_hash},
-                )
+                ))
         elif old_item_ids is None:
             # Existing source, replace-all (single-text / remote-sync source).
             resolve_old_group = True
@@ -841,10 +1370,17 @@ class IngestionPipeline:
 
         job_id = uuid4().hex[:12]
         now = datetime.now().isoformat()
-        self.store.db.execute(
-            "INSERT INTO ingestion_jobs (id, source_id, status, created_at, updated_at) VALUES (?, ?, 'processing', ?, ?)",
-            (job_id, source_id, now, now))
-        self.store.db.commit()
+
+        # run_to_completion, not a bare to_thread: every step below keys off this
+        # row, so a cancellation landing while the work item is still queued must
+        # not be able to drop the INSERT (see ingest_file).
+        def _insert_job() -> None:
+            self.store.db.execute(
+                "INSERT INTO ingestion_jobs (id, source_id, status, created_at, updated_at) VALUES (?, ?, 'processing', ?, ?)",
+                (job_id, source_id, now, now))
+            self.store.db.commit()
+
+        await run_to_completion(_insert_job)
 
         chunks = await asyncio.to_thread(self.chunker.chunk, text)
         total = len(chunks)
@@ -867,24 +1403,31 @@ class IngestionPipeline:
                 for ent in extraction.get('entities', []):
                     ent['name'] = _redact(ent.get('name')) or ''
                     ent['description'] = _redact(ent.get('description'))
-                item_id = self.store.add_item(
-                    title=chunk.get('section_title') or f"{title} chunk {i}",
-                    content=chunk['content'],
-                    item_type=extraction.get('category', 'document'),
-                    source_id=source_id,
-                    chunk_index=chunk.get('chunk_index', i),
-                    summary=extraction.get('summary'),
-                    content_hash=content_hash,
-                )
-                # Appended BEFORE add_source_location/_store_entities/_embed_item
-                # so a chunk that raises partway through is still captured for
-                # the partial-failure rollback (mirrors _ingest_file_body).
-                created_item_ids.append(item_id)
-                self.store.add_source_location(
-                    item_id=item_id, source_id=source_id,
-                    chunk_range=f"{chunk.get('line_start', 0)}-{chunk.get('line_end', 0)}",
-                    section_title=chunk.get('section_title'),
-                )
+
+                # ONE uncancellable unit, for both reasons spelled out in
+                # _ingest_file_body: a cancellation must not be able to land
+                # between the COMMIT and the record of it, and the append has to
+                # sit BETWEEN the two writes so a failing location write still
+                # leaves the item nameable by the partial-failure rollback.
+                def _write_chunk() -> str:
+                    new_id = self.store.add_item(
+                        title=chunk.get('section_title') or f"{title} chunk {i}",
+                        content=chunk['content'],
+                        item_type=extraction.get('category', 'document'),
+                        source_id=source_id,
+                        chunk_index=chunk.get('chunk_index', i),
+                        summary=extraction.get('summary'),
+                        content_hash=content_hash,
+                    )
+                    created_item_ids.append(new_id)
+                    self.store.add_source_location(
+                        item_id=new_id, source_id=source_id,
+                        chunk_range=f"{chunk.get('line_start', 0)}-{chunk.get('line_end', 0)}",
+                        section_title=chunk.get('section_title'),
+                    )
+                    return new_id
+
+                item_id = await run_to_completion(_write_chunk)
                 # Entity storage is O(entities): find_entity does a full-table
                 # alias scan and each add_entity/add_mention/add_entity_relation
                 # commits + mutates the graph. On a many-entity chunk this blocked
@@ -950,6 +1493,11 @@ class IngestionPipeline:
             # rebuild). Offloaded so a large source's dedup cannot stall the loop
             # (RLock-guarded graph + thread-local sqlite make this thread-safe).
             await asyncio.to_thread(self._maybe_dedup, source_id, content_hash)
+
+        # Settle only after the fallible finalize succeeded (see _ingest_file_body):
+        # a failure before here releases via ingest_text's finally instead of
+        # staying charged. No-op when token is None.
+        self._import_budget.settle(budget_token, total)
         return job_id
 
     def get_job_status(self, job_id: str) -> dict | None:
@@ -989,13 +1537,20 @@ class IngestionPipeline:
                 )
 
     async def _embed_item(
-        self, item_id: str, title: str, summary: str | None, content: str | None = None
+        self,
+        item_id: str,
+        title: str,
+        summary: str | None,
+        content: str | None = None,
+        *,
+        embed_priority: int = PRIORITY_NORMAL,
     ) -> None:
         """Generate and store embedding for an item. No-op if embedder is None.
 
         Includes chunk ``content`` so vector search matches body text, not just
-        the title/summary (which previously left body-only queries unmatchable).
+        the title/summary -- otherwise body-only queries are unmatchable.
         Respects the global embed rate limiter (knowledge.embed_rate_limit).
+        The caller selects the shared inference scheduling class per ingest.
         """
         if not self.embedder:
             return
@@ -1020,23 +1575,44 @@ class IngestionPipeline:
         # sweep re-embeds it — wasteful, never wrong.
         sig = embedder_signature(self.embedder)
         loop = asyncio.get_running_loop()
-        vec = await loop.run_in_executor(
-            None, self.embedder.embed_for_item, title, summary, content
-        )
+        if embed_priority == PRIORITY_NORMAL:
+            # Preserve the established attended-call contract for lightweight
+            # embedders that do not expose scheduling; bulk is an explicit opt-in.
+            embed_call = functools.partial(
+                self.embedder.embed_for_item, title, summary, content
+            )
+        else:
+            embed_call = functools.partial(
+                self.embedder.embed_for_item,
+                title,
+                summary,
+                content,
+                priority=embed_priority,
+            )
+        vec = await loop.run_in_executor(None, embed_call)
         if vec:
-            self.store.db.execute(
-                "UPDATE items SET embedding = ?, embedding_sig = ?, embedded_at = ? WHERE id = ?",
-                (floats_to_bytes(vec), sig,
-                 datetime.now().isoformat(), item_id))
-            self.store.db.commit()
+            blob = floats_to_bytes(vec)
+            stamped_at = datetime.now().isoformat()
+
+            def _stamp() -> None:
+                self.store.db.execute(
+                    "UPDATE items SET embedding = ?, embedding_sig = ?, embedded_at = ? WHERE id = ?",
+                    (blob, sig, stamped_at, item_id))
+                self.store.db.commit()
+
+            # A dropped stamp is safe in the one direction that matters: the
+            # sig-gated sweep re-embeds an unstamped row, so this needs the plain
+            # to_thread rather than run_to_completion.
+            await asyncio.to_thread(_stamp)
 
     async def generate_source_summary(self, source_id: str) -> None:
         """Generate a file-level summary from chunk summaries via LLM pool. No-op if pool unavailable."""
         if not self.extractor._pool:
             return
-        rows = self.store.db.execute(
-            "SELECT summary FROM items WHERE source_id = ? AND summary IS NOT NULL AND summary != '' ORDER BY chunk_index",
-            (source_id,)).fetchall()
+        rows = await asyncio.to_thread(
+            lambda: self.store.db.execute(
+                "SELECT summary FROM items WHERE source_id = ? AND summary IS NOT NULL AND summary != '' ORDER BY chunk_index",
+                (source_id,)).fetchall())
         if not rows:
             return
         chunk_summaries = "\n".join(r["summary"] for r in rows)
@@ -1060,10 +1636,14 @@ class IngestionPipeline:
             if isinstance(data, dict) and _summary_shaped(data):
                 topic = _redact(data.get("topic", ""))
                 themes = json.dumps([r for t in data.get("themes", [])[:5] if (r := _redact(t))])
-                self.store.db.execute(
-                    "UPDATE sources SET summary_topic = ?, summary_themes = ? WHERE id = ?",
-                    (topic, themes, source_id))
-                self.store.db.commit()
+
+                def _store_summary() -> None:
+                    self.store.db.execute(
+                        "UPDATE sources SET summary_topic = ?, summary_themes = ? WHERE id = ?",
+                        (topic, themes, source_id))
+                    self.store.db.commit()
+
+                await asyncio.to_thread(_store_summary)
         except Exception:
             logger.debug("Source summary generation failed for %s", source_id, exc_info=True)
 
@@ -1077,7 +1657,7 @@ _REBUILD_STALE_AFTER = timedelta(minutes=10)
 
 # Items that just failed a re-embed (vec is None) keep a stale sig but get an
 # `embedded_at` stamp; the watcher backs off from re-triggering on them until this
-# window elapses, so a perpetually-failing item (Ollama down) can't drive a fresh
+# window elapses, so a perpetually-failing item (model not resident) can't drive a fresh
 # rebuild every scan interval. Longer than _REBUILD_STALE_AFTER so a legit retry
 # isn't suppressed but a tight retrigger loop is.
 _REEMBED_RETRY_BACKOFF = timedelta(minutes=15)
@@ -1226,8 +1806,30 @@ def count_stale_items(store, sig: str, *, now: datetime | None = None) -> int:
         (sig, cutoff)).fetchone()["c"]
 
 
+def _embed_row_paced(embedder, title, summary, content, priority: int,
+                     pace: bool) -> "tuple[list[float] | None, float]":
+    """Embed one row and derive its pace delay, both on the worker thread.
+
+    Runs via ``run_in_executor`` — the inference is the CPU floor, and the
+    delay is computed here rather than on the event loop because
+    ``bulk_pace_delay`` re-reads the duty cycle from ``config.json`` on every
+    call (an uncached stat + read + parse that must not run per row on the
+    gateway loop; the no-blocking-call-on-event-loop rule). This is the same
+    division the vector-memory sweep uses: measure and derive on the sweep's
+    own thread, never on the loop. Measuring around the embed call itself also
+    keeps the executor queue wait out of the paced elapsed. The delay derives
+    from measured elapsed time (0.0 for ``elapsed <= 0``), so a row that
+    failed fast paces to nothing on its own — failures need no separate
+    branch. Returns ``(vec, delay)``; ``delay`` is always 0.0 when unpaced.
+    """
+    started = _time.monotonic()
+    vec = embedder.embed_for_item(title, summary, content, priority=priority)
+    delay = bulk_pace_delay(_time.monotonic() - started) if pace else 0.0
+    return vec, delay
+
+
 async def rebuild_embeddings(store, embedder, *, job_id: str | None = None,
-                             force: bool = False) -> int:
+                             force: bool = False, pace: bool = True) -> int:
     """Re-embed active items in place, stamping the current embedding signature.
 
     Sig-gated by default: only items whose stored ``embedding_sig`` differs from the
@@ -1243,9 +1845,24 @@ async def rebuild_embeddings(store, embedder, *, job_id: str | None = None,
 
     Serial single-item embed (the in-process embedder is the CPU floor and fans out
     internally); batch size is only the commit/progress cadence, not a throttle.
+
+    ``pace`` keys the sweep's resource envelope on attendance. This is an
+    unattended corpus loop when the watcher self-heal fires it — to a user, a
+    full-corpus re-embed at full speed is indistinguishable from a runaway
+    process — so the paced default embeds at ``PRIORITY_BULK`` (the reduced
+    ``memory.embedding_bulk_threads`` pool) and idles between rows per
+    ``memory.embedding_bulk_duty`` (see :func:`kiro_crew.embeddings.bulk_pace_delay`).
+    Paced is the default so a caller that forgets the argument gets the quiet
+    behaviour. ``pace=False`` is for a sweep a human explicitly asked for and is
+    watching a progress bar on: it embeds at ``PRIORITY_NORMAL`` and never idles.
+    ``pace`` selects the scheduling class as well as the idling — an attended
+    sweep that only skipped the pauses would stay on the reduced bulk pool and
+    run several times slower than before pacing existed, on exactly the path
+    declared "full speed".
     """
     loop = asyncio.get_running_loop()
     sig = embedder_signature(embedder)
+    priority = PRIORITY_BULK if pace else PRIORITY_NORMAL
     processed = 0
     failed = 0
     # Keep the COUNT predicate and the page predicate as separate strings so neither
@@ -1274,9 +1891,30 @@ async def rebuild_embeddings(store, embedder, *, job_id: str | None = None,
         if not rows:
             break
         for row in rows:
-            vec = await loop.run_in_executor(
-                None, embedder.embed_for_item, row["title"], row["summary"], row["content"]
+            # functools.partial rather than a local closure: run_in_executor
+            # forwards positional args only, and the partial names the bound
+            # arguments at the call site instead of one hop away in a nested
+            # def. Embed + delay derivation both happen on the worker thread
+            # (see _embed_row_paced); only the idle itself runs here.
+            vec, delay = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    _embed_row_paced,
+                    embedder,
+                    row["title"], row["summary"], row["content"],
+                    priority, pace,
+                ),
             )
+            if delay > 0:
+                # Idle between this row's inference and its write — the
+                # interruption-safe point: a sweep killed mid-pause leaves the
+                # row's sig stale and the next sweep re-embeds it, the same
+                # idempotent contract every row it never reached already has.
+                # ``await asyncio.sleep`` is this coroutine's equivalent of the
+                # vector-memory sweep's on-thread pause: it yields the event
+                # loop and holds neither the DB connection nor the model, so an
+                # interactive embed arriving mid-pause is served at full speed.
+                await asyncio.sleep(delay)
             now_iso = datetime.now().isoformat()
             # Per-item SQLite writes are OFFLOADED (asyncio.to_thread): a sync
             # write can block up to the busy_timeout under a concurrent writer,
@@ -1307,7 +1945,7 @@ async def rebuild_embeddings(store, embedder, *, job_id: str | None = None,
             last_id = row["id"]
             if job_id is not None:
                 # Heartbeat the job row PER ITEM, not just per batch: a single embed
-                # is the CPU floor (Ollama), so 50 serial embeds can exceed
+                # is the CPU floor, so 50 serial embeds can exceed
                 # _REBUILD_STALE_AFTER on a slow/cold host. If updated_at only
                 # advanced at end-of-batch, the single-flight claimer would judge a
                 # live rebuild abandoned mid-batch and start a second one (duplicated

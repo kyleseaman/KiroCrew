@@ -25,9 +25,9 @@ vi.mock('../api/client', () => ({
 
 vi.mock('framer-motion', () => ({
   motion: {
-    div: ({ children, ...props }: any) => <div {...props}>{children}</div>,
+    div: ({ children, ...props }: { children?: React.ReactNode } & Record<string, unknown>) => <div {...props}>{children}</div>,
   },
-  AnimatePresence: ({ children }: any) => <>{children}</>,
+  AnimatePresence: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
 }))
 
 function renderWithQuery(ui: React.ReactElement) {
@@ -172,7 +172,7 @@ describe('TipCard (single-line strip)', () => {
       <TipCard tip={mockTip} onDismiss={onDismiss} />,
     )
     const link = screen.getByRole('link', { name: /tip settings/i }) as HTMLAnchorElement
-    expect(link.getAttribute('href')).toBe('/settings?tab=chat')
+    expect(link.getAttribute('href')).toBe('/settings/chat')
   })
 
   it('dismiss calls tipsFeedback(id, "dismiss") and hides on success', async () => {

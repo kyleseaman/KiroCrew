@@ -5,7 +5,7 @@
  * transform — see the note in `ui/dialog.tsx`.
  */
 import tailwindcssAnimate from 'tailwindcss-animate'
-import tailwindPlugin from 'tailwindcss/plugin'
+import tailwindPlugin from 'tailwindcss/plugin.js'
 
 /* iOS safe-area utilities, emitted locally.
  *
@@ -29,7 +29,18 @@ import tailwindPlugin from 'tailwindcss/plugin'
  * `top-safe-offset-[42px]` resolve as well as a spacing-scale step.
  */
 const EDGES = ['top', 'right', 'bottom', 'left']
-const inset = edge => `env(safe-area-inset-${edge})`
+/* TOP goes through --safe-area-top (index.css), which is 0 outside the
+ * standalone/fullscreen display modes: with browser chrome on screen the UA's
+ * own bar already sits below the status bar / display cutout, so a non-zero
+ * top env() there is spurious — Android WebView browsers report the cutout
+ * height regardless of where the web view actually sits, which rendered as a
+ * dead band above the header (the app only extends under the cutout when it
+ * IS the window, i.e. an installed PWA). The other three edges are real even
+ * in-browser (iOS landscape notch flanks, home indicator) and stay bare env().
+ * The env() fallback inside var() covers a stylesheet-load race only. */
+const inset = edge => edge === 'top'
+  ? 'var(--safe-area-top, env(safe-area-inset-top))'
+  : `env(safe-area-inset-${edge})`
 
 const safeArea = tailwindPlugin(({ addUtilities, matchUtilities, theme }) => {
   addUtilities({
@@ -188,16 +199,6 @@ export default {
         'gradient-shift': { '0%': { backgroundPosition: '0% 50%' }, '50%': { backgroundPosition: '100% 50%' }, '100%': { backgroundPosition: '0% 50%' } },
         'msg-highlight': { '0%': { boxShadow: 'inset 0 0 0 2px var(--accent)' }, '100%': { boxShadow: 'inset 0 0 0 0px transparent' } },
         float: { '0%,100%': { transform: 'translateY(0)' }, '50%': { transform: 'translateY(-6px)' } },
-        /* margin-based (NOT transform): a transformed ancestor becomes a
-           backdrop root and breaks descendants' backdrop-filter blur.
-           Desktop is a fixed 400px sheet, so a px offset clears it. Mobile is
-           full-width up to the 767px breakpoint, where -420px would leave the
-           sheet half on screen — percentage margins resolve against the
-           containing block's width, so -100% always clears it exactly. */
-        'nc-slide-in': { from: { marginRight: '-420px' }, to: { marginRight: '0px' } },
-        'nc-slide-out': { from: { marginRight: '0px' }, to: { marginRight: '-420px' } },
-        'nc-slide-in-full': { from: { marginRight: '-100%' }, to: { marginRight: '0px' } },
-        'nc-slide-out-full': { from: { marginRight: '0px' }, to: { marginRight: '-100%' } },
       },
       animation: {
         'sage-sweep': 'sage-sweep 1.4s ease-in-out infinite',
@@ -219,10 +220,6 @@ export default {
         'gradient-shift': 'gradient-shift 20s ease infinite',
         'msg-highlight': 'msg-highlight 2s ease-out forwards',
         float: 'float 3s ease-in-out infinite',
-        'nc-slide-in': 'nc-slide-in .32s cubic-bezier(.16,1,.3,1) backwards',
-        'nc-slide-out': 'nc-slide-out .24s cubic-bezier(.3,0,.8,.15) forwards',
-        'nc-slide-in-full': 'nc-slide-in-full .32s cubic-bezier(.16,1,.3,1) backwards',
-        'nc-slide-out-full': 'nc-slide-out-full .24s cubic-bezier(.3,0,.8,.15) forwards',
       },
     },
   },

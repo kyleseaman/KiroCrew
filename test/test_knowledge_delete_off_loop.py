@@ -21,11 +21,11 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
-import pathlib
 import threading
 from unittest.mock import MagicMock
 
 import pytest
+from source_corpus import parsed_candidates, src_root
 
 from kiro_crew.knowledge.folder_watcher import FolderWatcher
 from kiro_crew.knowledge.store import KnowledgeStore
@@ -35,7 +35,7 @@ from kiro_crew.knowledge.store import KnowledgeStore
 # repo's other on-loop guards use.
 _NESTED_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
-_SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
+_SRC = src_root()
 
 
 def _called_names(body: list[ast.stmt]) -> set[tuple[str, int]]:
@@ -101,11 +101,11 @@ def _on_loop_call_sites(name: str) -> list[str]:
     reaches it (see ``_sync_helpers_reaching``).
     """
     found: list[str] = []
-    for path in sorted(_SRC.rglob("*.py")):
-        try:
-            tree = ast.parse(path.read_text(errors="replace"))
-        except SyntaxError:  # pragma: no cover - syntax is enforced elsewhere
-            continue
+    # Only files whose TEXT holds ``name`` can call it (directly, or through a
+    # same-module sync helper that does), so the shared corpus parses just those
+    # instead of re-walking all ~1250 modules for this gate. ``src_root()`` is the
+    # same tree the old ``_SRC`` named, so the relative paths below are unchanged.
+    for path, _text, tree in parsed_candidates(require_all=(name,)):
         indirect = _sync_helpers_reaching(tree, name)
         for fn in (n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)):
             for called, lineno in sorted(_called_names(fn.body), key=lambda c: c[1]):
@@ -290,7 +290,7 @@ async def test_run_to_completion_forwards_the_return_value():
 @pytest.mark.asyncio
 async def test_finalizer_runs_even_when_cancelled_while_queued():
     """A cancellation landing while the finalizer is still QUEUED in the
-    executor must not skip it (GPT round-2 finding on #2336): a bare
+    executor must not skip it: a bare
     ``await asyncio.to_thread(fn)`` cancels the queued future before ``fn``
     starts, stranding the committed new items with no state finalization.
 
@@ -591,8 +591,8 @@ def test_deduped_state_write_drops_the_group_the_gate_just_deleted(tmp_path):
     The scan writes a ``scanning`` marker naming the items this file is about to
     REPLACE, and the gate then deletes exactly those items. Preserving the row's
     ``item_ids`` verbatim would leave the terminal row naming deleted items --
-    a group that cannot be re-deleted and reports content the Library no longer
-    has. Only ids that still exist under this source survive.
+    a group that cannot be re-deleted and reports content the Library does not
+    have. Only ids that still exist under this source survive.
     """
     store = KnowledgeStore(str(tmp_path / "knowledge.db"))
     try:
@@ -623,15 +623,6 @@ def test_deduped_state_write_drops_the_group_the_gate_just_deleted(tmp_path):
         store.close()
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Pre-existing on main, not introduced here: a transformed file's ownership "
-    "bookkeeping is inert because _adopt_reassigned_item matches a folder row on "
-    "COALESCE(text_hash, content_hash) and a refused row's text_hash is derived "
-    "from a byte-identical SIBLING row, which a lone PDF does not have. main "
-    "writes an unconditional empty group here, so the row never named the item "
-    "either. Closing it needs the incoming document's TEXT hash carried out of "
-    "the gate instead of guessed, which changes what the gate reports. Strict, so "
-    "this starts failing the moment someone lands that and the xfail goes stale."))
 @pytest.mark.asyncio
 async def test_deduped_state_write_recovers_a_transformed_files_reassigned_item(tmp_path):
     """A transformed file must not be stranded when adoption silently matched nothing.
@@ -831,7 +822,8 @@ def test_agent_deduped_state_write_keeps_a_late_adoption(tmp_path):
             "VALUES (?, 'doc', ?, ?, '2026-01-01T00:00:00', 'Doc', 'active')",
             (source_id, text_hash, json.dumps([item])))
 
-        _record_deduped_state(store, source_id, "doc", text_hash, "Doc")
+        _record_deduped_state(store, source_id, "doc", text_hash, "Doc",
+                              source_uri="")
 
         row = store.db.execute(
             "SELECT item_ids, status FROM agent_item_state "
@@ -865,7 +857,7 @@ def test_aggregate_deduped_state_write_records_an_empty_group_when_nothing_adopt
             "VALUES (?, 'doc', 'h', ?, '2026-01-01T00:00:00', 'Doc', 'active')",
             (source_id, json.dumps([gone])))
 
-        _record_deduped_state(store, source_id, "doc", "h", "Doc")
+        _record_deduped_state(store, source_id, "doc", "h", "Doc", source_uri="")
 
         row = store.db.execute(
             "SELECT item_ids, status FROM agent_item_state "
@@ -886,7 +878,7 @@ async def test_duplicate_gate_records_terminal_state_even_when_cancelled(tmp_pat
     cancellation, so anything the caller was going to do afterwards is skipped by
     construction -- not merely at risk. The gate commits the delete of the previous
     group, the location claim on the holder's items and the terminal job row, so a
-    shutdown landing there used to leave all three durable with no state row naming
+    shutdown landing there would leave all three durable with no state row naming
     them: the claim cannot be detached (a ``scanning`` row has no ``text_hash``, so
     the detach short-circuits) and the content is orphaned.
 
@@ -923,7 +915,7 @@ async def test_duplicate_gate_records_terminal_state_even_when_cancelled(tmp_pat
         started = asyncio.Event()
         release = threading.Event()
 
-        def finalizer() -> None:
+        def finalizer(_text_hash: str) -> None:
             recorded.append("terminal state written")
 
         real_gate = pipeline._skip_as_duplicate
@@ -1015,7 +1007,7 @@ async def test_duplicate_gate_and_terminal_state_are_one_transaction(tmp_path):
             "SELECT id FROM items WHERE source_id = ?", (target,)).fetchall()]
         assert superseded, "nothing to supersede -- the delete under test is a no-op"
 
-        def exploding_finalizer() -> None:
+        def exploding_finalizer(_text_hash: str) -> None:
             raise RuntimeError("terminal state write failed")
 
         with pytest.raises(RuntimeError, match="terminal state write failed"):

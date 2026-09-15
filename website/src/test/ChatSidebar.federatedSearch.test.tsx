@@ -5,7 +5,9 @@
  * sidebar's history search must call the federated endpoint
  * (`/api/instances/search-sessions`) instead of the plain local search, and:
  *  - remote rows (tagged `instance_id`/`instance_name`) render an instance
- *    badge next to the agent label;
+ *    badge next to the agent label, tinted `info` + carrying a server glyph so
+ *    "this transcript is on another machine" does not read as one more neutral
+ *    meta chip;
  *  - remote rows hide the local delete hover button — `deleteHistorySession`
  *    targets the LOCAL session file, which for a remote row is at best a
  *    same-keyed unrelated conversation;
@@ -160,17 +162,52 @@ describe('ChatSidebar – federated history search across connected instances', 
   })
 
   it('routes the search through the federated endpoint when a warm instance exists', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      renderSidebar({ warm: true })
+      await searchOlderSessions('deploy checklist')
+
+      await waitFor(() => expect(federatedSearchMock).toHaveBeenCalledWith('deploy checklist'))
+      // The federated endpoint REPLACES the local call (backend already merges).
+      expect(sessionsSearchMock).not.toHaveBeenCalled()
+
+      // Both rows render; the remote one carries the instance badge. Their raw
+      // slot keys intentionally collide, so origin-qualified UI identity is what
+      // keeps React from dropping or mis-reconciling either row.
+      await screen.findByText('deploy checklist (remote)')
+      expect(screen.getByText('deploy checklist (local)')).toBeTruthy()
+      expect(screen.getByText('On clouddeskARM')).toBeTruthy()
+      expect(consoleError.mock.calls.flat().join(' ')).not.toMatch(/same key|unique.*key/i)
+    } finally {
+      consoleError.mockRestore()
+    }
+  })
+
+  it('marks the remote badge as remote, not as one more neutral meta chip', async () => {
     renderSidebar({ warm: true })
     await searchOlderSessions('deploy checklist')
 
-    await waitFor(() => expect(federatedSearchMock).toHaveBeenCalledWith('deploy checklist'))
-    // The federated endpoint REPLACES the local call (backend already merges).
-    expect(sessionsSearchMock).not.toHaveBeenCalled()
-
-    // Both rows render; the remote one carries the instance badge.
-    await screen.findByText('deploy checklist (remote)')
-    expect(screen.getByText('deploy checklist (local)')).toBeTruthy()
-    expect(screen.getByText('clouddeskARM')).toBeTruthy()
+    // The localized location label sits in a truncating child of the chip, so
+    // resolve the chip itself: the tint is carried by the chip (and inherited by
+    // the label), and reading the label node's own className would only see
+    // `truncate`. The visible "On" is load-bearing too: on a running peer row the
+    // live state owns the one status line, so this chip is the always-visible
+    // explanation that the bare crew name lacked.
+    const name = await screen.findByText('On clouddeskARM')
+    const badge = name.closest('[data-testid="remote-crew-chip"]') as HTMLElement
+    expect(badge).not.toBeNull()
+    const cls = badge.className
+    // The claim "this transcript is on another machine" must not look like the
+    // neutral chip styling shared by every other meta chip, or it reads as a
+    // tag. Tint classes are the mechanism, so they are what gets pinned.
+    expect(cls).toContain('text-info')
+    expect(cls).toContain('bg-info-subtle')
+    expect(cls).toContain('border-info/40')
+    expect(cls).not.toContain('text-muted')
+    expect(cls).not.toContain('bg-bg-elevated')
+    // Non-colour half of the cue: an icon, so the distinction survives a
+    // colour-vision deficiency rather than resting on hue alone.
+    expect(badge.querySelector('svg')).not.toBeNull()
   })
 
   it('hides the local delete button on remote rows but keeps it on local rows', async () => {

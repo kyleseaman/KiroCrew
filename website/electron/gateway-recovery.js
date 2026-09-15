@@ -1,8 +1,9 @@
 "use strict";
 //
-// Pure, injectable recovery-strategy decision, extracted from main.js so it can
+// Injectable recovery-strategy decisions, extracted from main.js so they can
 // be unit-tested without Electron (mirrors gateway-liveness.js / gateway-wait.js
-// / gateway-stop.js).
+// / gateway-stop.js). Most exports are pure; revealWindowForConnect drives an
+// injected window and is testable with a fake.
 //
 // PROBLEM: the post-handoff liveness monitor fires onUnresponsive whenever
 // /api/status stops answering. main.js used to react ONE way — assume a wedged
@@ -227,9 +228,129 @@ function unrecoverableGatewayDialog({
   };
 }
 
+/**
+ * Reveal a window for a connect/loading flow, raising ONLY when the user asked
+ * for it. Effectful (it drives the injected window) but injectable, so the
+ * raise-vs-silent rule is unit-testable without Electron.
+ *
+ * Cold launch and user-initiated connects (app start, dialog Retry, a new
+ * connection window) keep the historical raise-and-focus `show()`.
+ *
+ * Liveness-recovery reconnects touch NOTHING: the user did nothing, so the
+ * app must not raise, focus, un-minimize, or re-surface itself (the
+ * remote-tunnel setup reconnects on every screen lock/unlock — see #6373).
+ * The splash and dashboard load fine into a background, minimized, or hidden
+ * window; a window the user hid to tray stays hidden until THEY reopen it.
+ * The escalation rule lives in main.js: silent while self-healing, but any
+ * state that needs input (token prompt, failure dialog, the terminal
+ * unrecoverable-gateway dialog) does a full reveal via revealForUserDecision
+ * at the point it is reached.
+ *
+ * @param {object} win  BrowserWindow-like: show().
+ * @param {object} [o]
+ * @param {boolean} [o.reconnect=false]  true on liveness-recovery paths.
+ */
+function revealWindowForConnect(win, { reconnect = false } = {}) {
+  if (reconnect) return;
+  win.show();
+}
+
+// The gateway's own stale-asset watchdog exits with this status when the
+// install directory it was started from has been replaced or pruned underneath
+// it (EX_TEMPFAIL: "retry later"). Mirrors STALE_ASSET_EXIT_CODE in the
+// backend's dashboard/stale_asset_watchdog.py; keep the two in sync.
+const STALE_ASSET_EXIT_CODE = 75;
+
+/**
+ * Decide how the supervisor reacts to a bundled backend that vanished
+ * underneath it on macOS.
+ *
+ * Two signals mean "the bundle we spawned from is gone": the gateway exited
+ * with STALE_ASSET_EXIT_CODE (its watchdog saw its own assets disappear), or a
+ * spawn of a binary that passed the executable probe moments earlier failed
+ * ENOENT (the file was removed between probe and exec). Both happen when an
+ * update replaces the .app in place while a session is running. Nothing inside
+ * the process can learn where the new bundle is -- every Electron path API is
+ * a launch-time snapshot -- so recovery is a fresh filesystem probe of the same
+ * candidate list: when the bundle was swapped at the same path the new backend
+ * is found there; when it was pruned the probe falls through to a user-level
+ * install or a PATH lookup.
+ *
+ * The budget is one re-resolve per incident. A second stale signal in the same
+ * incident means the probe found nothing usable, so the only remaining move is
+ * to restart the whole app -- and only when the caller has verified there is
+ * still something to restart. A pruned bundle takes this app's own executable
+ * with it, so the caller probes that executable first and passes the result
+ * in; when it is gone the verdict is "none" and the ordinary failure dialog is
+ * shown instead of exiting the app into nothing. (The caller then also
+ * confirms the fresh copy actually started before exiting, which closes the
+ * window between the probe and the restart.)
+ *
+ * @param {object} o
+ * @param {boolean} o.isMac             only macOS swaps bundles under a running
+ *                                      app; Linux is restarted by its service
+ *                                      manager and Windows stops the app first.
+ * @param {boolean} o.bundled           the child that failed was the bundled
+ *                                      backend. A PATH or dev install that is
+ *                                      missing or exits 75 has nothing stale to
+ *                                      re-resolve, and a dev machine with no
+ *                                      kirocrew at all must never relaunch.
+ * @param {number|null} [o.exitCode]    the child's exit status, when it exited.
+ * @param {string} [o.spawnErrorCode]   the spawn error's code, when spawn failed.
+ * @param {number} [o.attempts=0]       re-resolves already spent on this incident.
+ * @param {boolean} [o.quitting=false]  the app is shutting down.
+ * @param {boolean} [o.installingUpdate=false] the updater owns the bundle right
+ *                                      now; respawning would race the swap.
+ * @param {boolean} [o.relaunchTargetExists=false] the caller re-probed its own
+ *                                      executable (the one a restart re-runs)
+ *                                      and found it. Defaults to false so a
+ *                                      caller that never checked can only reach
+ *                                      the dialog, never a blind exit.
+ * @returns {"reresolve" | "relaunch" | "none"}
+ *   "reresolve" — probe the candidate list again and respawn.
+ *   "relaunch"  — the re-resolved child is stale too and the app can still be
+ *                 re-run; restart the app.
+ *   "none"      — not a stale-bundle signal, not ours to act on, or nothing
+ *                 launchable remains; take the ordinary failure path.
+ */
+function shouldReresolveBackend({
+  isMac,
+  bundled,
+  exitCode = null,
+  spawnErrorCode = "",
+  attempts = 0,
+  quitting = false,
+  installingUpdate = false,
+  relaunchTargetExists = false,
+}) {
+  if (!isMac || quitting || installingUpdate) return "none";
+  if (!isStaleBundleSignal({ exitCode, spawnErrorCode })) return "none";
+  // Past the first attempt the child under judgment is whatever the re-probe
+  // found (possibly not bundled), and the incident is already established.
+  if (attempts >= 1) return relaunchTargetExists ? "relaunch" : "none";
+  return bundled ? "reresolve" : "none";
+}
+
+/**
+ * True when a child's fate says the bundle it came from is gone: the gateway
+ * exited with STALE_ASSET_EXIT_CODE, or a binary that passed the executable
+ * probe failed to spawn with ENOENT.
+ *
+ * @param {object} o
+ * @param {number|null} [o.exitCode]
+ * @param {string} [o.spawnErrorCode]
+ */
+function isStaleBundleSignal({ exitCode = null, spawnErrorCode = "" }) {
+  return exitCode === STALE_ASSET_EXIT_CODE || spawnErrorCode === "ENOENT";
+}
+
 module.exports = {
   chooseRecoveryStrategy,
   classifyAdoptedGateway,
+  revealWindowForConnect,
+  shouldReresolveBackend,
+  isStaleBundleSignal,
+  STALE_ASSET_EXIT_CODE,
   GATEWAY_OWNERSHIP_STATES,
   waitForServiceRebind,
   waitForProcessExit,

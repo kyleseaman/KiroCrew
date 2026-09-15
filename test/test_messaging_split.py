@@ -19,12 +19,14 @@ from kiro_crew.messaging.split import (
     FENCE_OUTSIDE,
     _Fence,
     _safe_cut,
+    chunk_utf8_bytes,
     iter_fence_lines,
     iter_fence_spans,
+    split_markdown_bytes,
     split_markdown_safe,
 )
 
-# A line that opens or closes a fence. Used to strip fence scaffolding out of a
+# A line that opens or closes a fence. Strips fence scaffolding out of a
 # reassembled split: the reopen duplicates the opener and the seal adds a
 # closer, so those lines are the only text the splitter is allowed to invent.
 _FENCE_START = re.compile(r"^ {0,3}(?:`{3,}|~{3,})")
@@ -37,7 +39,7 @@ _FENCE_DELIMITER = re.compile(r"^ {0,3}(?:`{3,}[^`]*|~{3,}.*)$")
 # A bare delimiter run, i.e. a candidate closer: nothing but the run itself.
 _BARE_RUN = re.compile(r"^ {0,3}((?:`{3,})|(?:~{3,}))[ \t]*$")
 
-# A bare delimiter run of four or more. Used to catch a fence CLOSER a cut
+# A bare delimiter run of four or more. Catches a fence CLOSER a cut
 # invented: a synthetic closer always matches its opener's run length, so a
 # longer bare run in the output can only have come from cut content.
 _LONG_BARE_RUN = re.compile(r"^ {0,3}(?:`{4,}|~{4,})[ \t]*$")
@@ -153,7 +155,7 @@ REMAINDER_CORPUS = (
 
 # The same seam inside an open fence, where an invented remainder acts as a
 # CLOSER: the block ends early and the chunk's own synthetic closer then reads
-# as a fresh opener, so the chunk no longer renders closed.
+# as a fresh opener, so the chunk does not render closed.
 FENCE_REMAINDER_CORPUS = "```py\nzzzz```\nq = 1\n```\n"
 
 # A run no cut can clear at a small budget: every candidate width lands inside
@@ -418,10 +420,10 @@ def test_a_line_that_fits_the_limit_is_placed_whole_when_scaffolding_spends_the_
     """R5: eligibility survives a budget the fence scaffolding consumes whole (item 1).
 
     At limit 8 a ``` fence's reopen line (4 characters) and its reserved closer
-    (4 more) leave a fresh chunk NO room at all, and the ladder used to be
-    skipped entirely there: cut selection never ran, the whole-line test never
-    ran with it, and an 8-character line — exactly the limit — was dirty-cut one
-    character per chunk. Eligibility now reads the line and ``limit`` alone, so
+    (4 more) leave a fresh chunk NO room at all. If the ladder were skipped
+    there, cut selection would not run, the whole-line test would not run with
+    it, and an 8-character line — exactly the limit — would be dirty-cut one
+    character per chunk. Eligibility reads the line and ``limit`` alone, so
     the line is placed whole at 8 exactly as it is at 9, where the room
     arithmetic happens to leave a character to cut.
     """
@@ -792,12 +794,12 @@ def test_prefix_stability_holds_where_lines_are_placed_whole(reserve):
 
 @pytest.mark.parametrize("reserve", [0, 1, 3, 7, 12])
 def test_no_boundary_fabricates_a_delimiter_once_lines_fit_the_limit(reserve):
-    """The boundary invariant, in the regime the residue no longer covers (item 1).
+    """The boundary invariant, in the regime the residue does not cover (item 1).
 
-    Once each no-clean-cut line is no longer than the limit, every such line is
+    Once each no-clean-cut line is at most the limit, every such line is
     placed rather than cut, so no chunk boundary can invent a fence delimiter on
     either side — including when a ``reserve`` puts the line over the working
-    budget, which is where a cut used to be forced. The floor is the LINE's own
+    budget, which is where a cut would otherwise be forced. The floor is the LINE's own
     length: between it and the scaffolded floor the placement still holds, paid
     for by a chunk that carries its reopen and closer past ``limit``.
     """
@@ -1015,7 +1017,7 @@ def test_multibyte_content_inside_a_fence_is_not_corrupted():
 # grammar is reachable (openers, closers, runs that cross the closer threshold,
 # mid-line runs, empty lines, an unterminated last line) crossed with every
 # budget where a fence's scaffolding is comparable to the budget itself —
-# including the room-of-zero regime, where the ladder used to be skipped whole.
+# including the room-of-zero regime, where the ladder would otherwise be skipped whole.
 #
 # Everything below reads the fence grammar from the CONTRACT, never from
 # ``split.py``: no helper of the module is imported here, so a grammar bug in the
@@ -1386,3 +1388,105 @@ class TestIterFenceLines:
             pos = start + len(line)
             expected_inside = role != FENCE_OUTSIDE
             assert (start in inside) is expected_inside, (line, role)
+
+
+class TestSplitMarkdownBytes:
+    """Fence-safe splitting under a UTF-8 BYTE budget.
+
+    A byte-capped platform (Webex: 7439 bytes) rejects a message whose CHARACTER
+    count fits, and a send path that truncates the overflow loses the tail
+    silently. Two properties are load-bearing: every chunk measures under the
+    budget, and no content is lost getting there.
+    """
+
+    def test_empty_and_fitting_text_pass_through(self) -> None:
+        assert split_markdown_bytes("", 100) == []
+        assert split_markdown_bytes("short", 100) == ["short"]
+
+    def test_a_non_positive_budget_disables_splitting(self) -> None:
+        assert split_markdown_bytes("hello", 0) == ["hello"]
+        assert split_markdown_bytes("hello", -1) == ["hello"]
+
+    def test_a_reserve_consuming_the_budget_disables_splitting(self) -> None:
+        assert split_markdown_bytes("hello", 10, reserve=10) == ["hello"]
+
+    def test_ascii_is_not_over_split(self) -> None:
+        """The measure-first design is what keeps this from fragmenting.
+
+        Dividing the budget by the worst case (4 bytes/char) would cut an ASCII
+        answer into quarters, which is the cost the old declaration paid.
+        """
+        text = "\n\n".join(f"para {i} " + "x" * 200 for i in range(40))
+        chunks = split_markdown_bytes(text, 2000)
+        assert all(len(c.encode("utf-8")) <= 2000 for c in chunks)
+        # ~8600 bytes at a 2000-byte budget is 5 chunks, not 20.
+        assert len(chunks) <= 6
+
+    @pytest.mark.parametrize("unit", ["世界", "café", "🦞", "אבג"])
+    def test_multibyte_text_respects_the_byte_budget(self, unit: str) -> None:
+        text = "\n".join(unit * 40 for _ in range(60))
+        chunks = split_markdown_bytes(text, 900)
+        assert chunks
+        assert all(len(c.encode("utf-8")) <= 900 for c in chunks)
+
+    def test_no_chunk_ends_mid_code_point(self) -> None:
+        # Slicing encoded bytes without care produces an undecodable tail; every
+        # chunk must round-trip.
+        text = "世界" * 4000
+        for chunk in split_markdown_bytes(text, 1000):
+            assert chunk.encode("utf-8").decode("utf-8") == chunk
+
+    def test_a_fence_spanning_the_budget_is_reopened_on_both_sides(self) -> None:
+        body = "\n".join(f"line {i} " + "y" * 60 for i in range(80))
+        text = f"before\n\n```python\n{body}\n```\n\nafter"
+        chunks = split_markdown_bytes(text, 1200)
+        assert len(chunks) > 1
+        assert all(len(c.encode("utf-8")) <= 1200 for c in chunks)
+        # Every chunk that continues the block carries the original opener, info
+        # string included, so it still renders as Python rather than prose.
+        continued = [c for c in chunks[1:] if "line " in c]
+        assert continued
+        assert all(c.lstrip().startswith("```python") for c in continued)
+
+    def test_a_single_line_longer_than_the_budget_still_terminates(self) -> None:
+        # The character splitter documents this as its over-budget case, so the
+        # byte floor has to catch it rather than loop.
+        chunks = split_markdown_bytes("世" * 5000, 400)
+        assert all(len(c.encode("utf-8")) <= 400 for c in chunks)
+        assert "".join(chunks) == "世" * 5000
+
+    def test_a_budget_smaller_than_one_code_point_terminates(self) -> None:
+        # Pathological, but it must make forward progress rather than spin.
+        chunks = split_markdown_bytes("🦞🦞🦞", 2)
+        assert "".join(chunks) == "🦞🦞🦞"
+
+    def test_reserve_is_taken_out_of_the_byte_budget(self) -> None:
+        text = "z" * 500
+        chunks = split_markdown_bytes(text, 200, reserve=50)
+        assert all(len(c.encode("utf-8")) <= 150 for c in chunks)
+
+
+class TestChunkUtf8Bytes:
+    """The byte primitive: lossless, code-point-safe, markdown-blind."""
+
+    def test_empty_input_yields_nothing(self) -> None:
+        assert chunk_utf8_bytes("", 10) == []
+
+    def test_a_non_positive_budget_disables_chunking(self) -> None:
+        assert chunk_utf8_bytes("hello", 0) == ["hello"]
+
+    def test_concatenation_equals_the_input(self) -> None:
+        text = "aé世🦞" * 500
+        assert "".join(chunk_utf8_bytes(text, 37)) == text
+
+    def test_every_chunk_fits_the_budget(self) -> None:
+        assert all(len(c.encode("utf-8")) <= 37 for c in chunk_utf8_bytes("aé世🦞" * 500, 37))
+
+    def test_a_code_point_wider_than_the_budget_is_emitted_whole(self) -> None:
+        """Overshoot by a few bytes rather than lose content or hang.
+
+        Dropping the character would silently corrupt the answer, and returning
+        an empty piece would never terminate.
+        """
+        out = chunk_utf8_bytes("🦞x", 2)
+        assert "".join(out) == "🦞x"

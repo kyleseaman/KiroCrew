@@ -1,6 +1,6 @@
 """The subprocess-encoding gate must be real, wired into CI, and ratchet-only.
 
-Follow-up to #3219/#3669 (#5249): text-mode subprocess calls without an
+Text-mode subprocess calls without an
 explicit ``encoding=`` decode with the Windows ANSI code page. The lint gate in
 ``scripts/check_subprocess_encoding.py`` keeps that class from growing back.
 These tests pin the halves that must stay true together: CI actually runs the
@@ -55,9 +55,11 @@ class TestCiWiring:
         raise AssertionError("gate step not found")
 
     def test_scope_resolver_coupling_is_alive(self) -> None:
-        # The gate imports the black gate's private _changed_paths; a rename
-        # there must fail HERE, not as an AttributeError inside a CI run.
-        assert callable(gate._load_changed_paths())
+        # The gate loads scripts/ratchet_scope.py, which OWNS both answers. A
+        # rename there must fail HERE, not as an AttributeError inside a CI run.
+        scope = gate._load_scope()
+        assert callable(scope.changed_paths)
+        assert callable(scope.added_lines)
 
 
 class TestRuleFamilies:
@@ -241,6 +243,17 @@ class TestBaselineRatchet:
             {"src/a.py": 2},
         )
         assert survivors == {"src/a.py": 2}
+
+    def test_cli_server_stays_clean(self) -> None:
+        """cli_server.py once held an unpinned text-mode call the baseline
+        under-counted, so any PR touching the file failed the gate even when
+        the PR added nothing. Both calls are pinned now and the
+        baseline entry is pruned; this pins the file at zero so it can never
+        silently re-enter the list."""
+        rel = "src/kiro_crew/cli_server.py"
+        violations = gate._violations_in_source((ROOT / rel).read_text(encoding="utf-8"))
+        assert violations == []
+        assert rel not in gate._read_baseline(BASELINE)
 
     def test_write_read_roundtrip(self, tmp_path: Path) -> None:
         path = tmp_path / "baseline.txt"

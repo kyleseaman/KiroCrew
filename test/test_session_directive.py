@@ -1,6 +1,6 @@
-"""Tests for the session-directive protocol and forgery gate (issue #755).
+"""Tests for the session-directive protocol and forgery gate.
 
-``session_directive`` is the stateless wire format the five session-bound MCP
+``session_directive`` is the stateless wire format the session-bound MCP
 tools use in the gateway-off topology: the tool validates its arguments and
 returns a human confirmation plus a machine marker carrying the validated
 payload (never a session key). The session-aware consumer decodes the marker
@@ -18,11 +18,14 @@ from kiro_crew import session_directive as sd
 # the protocol (it is just round-tripped as JSON), so any dict suffices.
 _CASES = {
     "monitor_start": {"message": "check PR", "interval_secs": 300},
+    "monitor_watch": {"kind": "github_pull_request", "target": "url"},
     "monitor_update": {"message": "check CI now", "max_cycles": 40},
+    "monitor_stop": {},
     "autonudge_stop": {},
     "set_project": {"project": "/workspace/foo", "clear": False},
     "suggest_followup": {"items": [{"title": "t", "prompt": "p"}]},
     "ask_question": {"questions": [{"question": "Which approach?", "options": [{"label": "A"}]}]},
+    "reset_conversation": {},
 }
 
 
@@ -132,10 +135,22 @@ def test_forgery_gate_malformed_json():
     [
         ("monitor_start", "monitor_start"),
         ("kirocrew-core___monitor_start", "monitor_start"),
-        # Tightened surface (#755 security fix): only exact membership and a
-        # single ``___`` server-qualifier split are accepted. Any other
-        # separator no longer tail-matches, so a crafted title/path cannot
-        # smuggle a directive name in as a namespace tail.
+        # The separator is a RUN of underscores and its length is transport-
+        # specific, so the canonical MCP prefix form must resolve too. Before
+        # this, ``mcp__<server>__<tool>`` fell through and the directive was
+        # dropped on any transport using that spelling — the same both-forms
+        # problem ``channel._blocked_tool_named`` already solved.
+        ("mcp__kirocrew-core__monitor_start", "monitor_start"),
+        ("mcp__kirocrew-core__set_project", "set_project"),
+        # Still bounded to a >= 2 underscore run: single-underscore joins do
+        # NOT tail-match, so neither a flattened name nor a crafted identifier
+        # can smuggle a directive name in.
+        ("mcp_kirocrew_core_monitor_start", ""),
+        ("do_monitor_start", ""),
+        ("evilmonitor_start", ""),
+        # Tightened surface (#755 security fix): a non-underscore separator
+        # never tail-matches, so a crafted title/path cannot smuggle a
+        # directive name in as a namespace tail.
         ("kirocrew-core::set_project", ""),
         ("bash /tmp/set_project", ""),
         ("a.autonudge_stop", ""),
@@ -204,3 +219,103 @@ def test_subagent_isolation_intent():
     for tool in non_directive_tools:
         assert tool not in sd.DIRECTIVE_TOOLS
         assert sd.decode(genuine, tool) is None
+
+
+class TestHasMarker:
+    """``has_marker`` is a DIAGNOSTIC predicate, never an authorization one."""
+
+    def test_marker_present_is_detected(self):
+        out = sd.encode("monitor_start", {"message": "x"}, "human")
+        assert sd.has_marker(out) is True
+
+    def test_plain_text_and_empty_are_not_markers(self):
+        assert sd.has_marker("just a normal tool result") is False
+        assert sd.has_marker("") is False
+        assert sd.has_marker(None) is False
+
+    def test_a_refusal_carries_no_directive_marker(self):
+        """An oversize refusal must not read as "a directive arrived": it has
+        its own sentinel and the model was already told nothing was applied."""
+        refusal = sd.encode("monitor_start", {"message": "x" * 5000}, "human")
+        assert sd.is_refusal(refusal) is True
+        assert sd.has_marker(refusal) is False
+
+    def test_detecting_a_marker_grants_nothing(self):
+        """The forged-marker case: has_marker() says True and the gate still
+        refuses, because authorization runs through directive_tool_for/decode.
+        A diagnostic that could grant would BE the forgery hole."""
+        forged = sd.encode("monitor_start", {"message": "x"}, "human")
+        assert sd.has_marker(forged) is True
+        assert sd.directive_tool_for("", "execute_bash") == ""
+        assert sd.decode(forged, "execute_bash") is None
+
+
+class TestCallInputDigest:
+    """``call_input_digest`` is the out-of-band path's SELECTOR: a one-way handle
+    over the raw arguments a tool was CALLED with. The tool takes it from the
+    ``tools/call`` arguments; the consumer takes it from the ACP ``tool_call``
+    frame's ``rawInput``. Both must land on the same string, and neither reads the
+    tool RESULT, which is what a backend reshapes. It is never a grant: it only
+    picks which parked record to look up, and the record's payload is applied."""
+
+    def test_same_args_same_digest(self):
+        assert sd.call_input_digest(
+            "monitor_start", {"message": "check CI", "interval_secs": 60}
+        ) == (sd.call_input_digest("monitor_start", {"message": "check CI", "interval_secs": 60}))
+
+    def test_key_order_does_not_matter(self):
+        # The two sides serialise independently.
+        assert sd.call_input_digest("monitor_start", {"a": 1, "b": 2}) == sd.call_input_digest(
+            "monitor_start", {"b": 2, "a": 1}
+        )
+
+    def test_meta_is_ignored(self):
+        """kiro-agent strips ``_meta`` before ``callTool`` (it is a transport block,
+        not an argument), so the tool never sees it while the consumer's rawInput
+        does. The KAS conductor frames that motivated this carried a ``_meta`` with
+        ``_isValid`` / ``_activePath`` / ``_completedPaths``."""
+        plain = {"message": "go", "max_cycles": 3}
+        with_meta = {**plain, "_meta": {"_isValid": True, "_activePath": [], "_completedPaths": []}}
+        assert sd.call_input_digest("monitor_start", with_meta) == sd.call_input_digest(
+            "monitor_start", plain
+        )
+
+    def test_different_args_different_digest(self):
+        assert sd.call_input_digest("monitor_start", {"message": "a"}) != sd.call_input_digest(
+            "monitor_start", {"message": "b"}
+        )
+
+    def test_validation_defaults_would_change_it(self):
+        """Why the tool must digest BEFORE validation: the consumer sees what the
+        model sent, and the schema adds defaults the model never typed."""
+        assert sd.call_input_digest("monitor_start", {"message": "a"}) != sd.call_input_digest(
+            "monitor_start", {"message": "a", "max_cycles": 24}
+        )
+
+    def test_unserialisable_value_still_digests(self):
+        # Mirrors encode's default=str so a value only one side could serialise
+        # compares equal instead of raising.
+        assert sd.call_input_digest("monitor_start", {"when": object})
+
+    def test_non_dict_input_digests_by_str(self):
+        assert sd.call_input_digest("monitor_start", "hello") == sd.call_input_digest(
+            "monitor_start", "hello"
+        )
+        assert sd.call_input_digest("monitor_start", None) == sd.call_input_digest(
+            "monitor_start", None
+        )
+
+    def test_it_is_a_full_sha256(self):
+        d = sd.call_input_digest("monitor_start", {})
+        assert len(d) == 64 and all(c in "0123456789abcdef" for c in d)
+
+    def test_the_tool_is_part_of_the_key(self):
+        """Every no-argument tool hashes ``{}``; without the name in the key a
+        planted reset_conversation record was claimable by any empty-arg call."""
+        assert sd.call_input_digest("reset_conversation", {}) != sd.call_input_digest(
+            "resource_status", {}
+        )
+
+    def test_reveals_nothing_of_the_input(self):
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        assert secret not in sd.call_input_digest("monitor_start", {"message": secret})

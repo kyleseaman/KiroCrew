@@ -23,6 +23,9 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.dashboard.handlers import knowledge as kh
+from kiro_crew.embeddings import PRIORITY_NORMAL
+from kiro_crew.knowledge.embedder import embedder_signature
+from kiro_crew.knowledge.ingestion import IngestionPipeline
 from kiro_crew.knowledge.store import KnowledgeStore
 
 MODULE = "kiro_crew.dashboard.handlers.knowledge"
@@ -39,21 +42,26 @@ class _FakeEmbedder:
     """Minimal stand-in for InProcessEmbedder (real model never loaded)."""
 
     def __init__(self, *, available=True, vec=(0.1, 0.2, 0.3, 0.4),
-                 model="fake-embed:1"):
+                 model="fake-embed:1", dim=4):
         self.model = model
+        # Width is part of the vector-space identity embed_signature hashes, so a
+        # stand-in has to declare one just as InProcessEmbedder does.
+        self.dim = dim
         self.content_budget = 2000
         self._available = available
         self._vec = list(vec)
         self.embed_calls: list[str] = []
+        self.priorities: list[int] = []
 
     async def is_available_async(self) -> bool:
         return self._available
 
-    def embed_for_item(self, title, summary, content):
+    def embed_for_item(self, title, summary, content, *, priority=PRIORITY_NORMAL):
         self.embed_calls.append(title or "")
+        self.priorities.append(priority)
         return list(self._vec) if self._vec else None
 
-    def embed(self, text):
+    def embed(self, text, *, priority=PRIORITY_NORMAL):
         return list(self._vec) if self._vec else None
 
 
@@ -646,6 +654,29 @@ class TestImportBundle:
         assert result["entities_created"] == 1
 
     @pytest.mark.asyncio
+    async def test_corrupt_json_column_is_a_clean_400(self, store, monkeypatch):
+        # The store's writer-side invariant rejects this value
+        # AT THE STORE: a lone-surrogate escape passes json.loads (so it gets
+        # through the handler's pre-redaction shape validator) but cannot be
+        # UTF-8-encoded at SQLite bind time. The handler surfaces the store's
+        # typed error as a 400, and the rejected row is not committed.
+        sel_calls = []
+        monkeypatch.setattr(kh, "_sel_log",
+                            lambda tool, **kw: sel_calls.append((tool, kw)))
+        bundle = {"sources": [{"id": "s1", "name": "f", "source_type": "local_file",
+                               "uri": "/tmp/x.md", "properties": '{"x": "\ud800"}'}]}
+        async with _client(_make_app(store)) as client:
+            resp = await client.post("/api/knowledge/import", json=bundle)
+            assert resp.status == 400
+            body = await resp.json()
+        assert body["code"] == "malformed_knowledge_bundle"
+        assert "sources.properties" in body["error"]
+        assert store.db.execute("SELECT COUNT(*) AS c FROM sources").fetchone()["c"] == 0
+        # The refusal of a cross-instance bundle is audited.
+        assert ("import", {"outcome": "rejected",
+                           "reason": "'sources.properties' must be valid UTF-8 text"}) in sel_calls
+
+    @pytest.mark.asyncio
     async def test_missing_text_fields_coerce_to_empty_string(self, store):
         # title/content/name/relation_type are NOT NULL-ish downstream: the
         # handler must substitute "" rather than pass None through.
@@ -711,8 +742,8 @@ class TestImportBundle:
     @pytest.mark.parametrize("payload", [[1, 2, 3], "just a string", 42])
     async def test_non_object_json_is_400_not_500(self, store, payload):
         # request.json() happily parses a bare array/string/number/null. The
-        # shared _json_object_body guard answers the non-object case for all
-        # nine request.json() sites in this module, so it fires before the
+        # shared read_bounded_json guard answers the non-object case for all
+        # nine JSON-body sites in this module, so it fires before the
         # bundle-shape validator and owns this code.
         async with _client(_make_app(store)) as client:
             resp = await client.post("/api/knowledge/import", json=payload)
@@ -1000,13 +1031,28 @@ class TestGetEmbeddingStatus:
         assert data["available"] is True
         assert (data["total_items"], data["embedded_items"]) == (2, 1)
 
+    @pytest.mark.asyncio
+    async def test_status_takes_no_db_connection_on_the_loop(self, store, monkeypatch):
+        """The dashboard polls this endpoint while open; the COUNTs must run
+        in a worker thread. On the loop, a contended knowledge DB busy-waits
+        every task (watchdog heartbeat included) for the connection's whole
+        busy timeout. Strict mode turns an on-loop take into a raise,
+        which aiohttp surfaces as a 500."""
+        await asyncio.to_thread(store.add_item, "a", "body", "note")
+        monkeypatch.setenv("KIROCREW_STRICT_ON_LOOP_STORE", "1")
+        async with _client(_make_app(store)) as client:
+            resp = await client.get("/api/knowledge/embedding/status")
+            assert resp.status == 200
+            data = await resp.json()
+        assert (data["total_items"], data["embedded_items"]) == (1, 0)
+
 
 class TestRebuildEmbeddingsJob:
     @pytest.mark.asyncio
     async def test_completed_job_records_processed_count(self, store, monkeypatch):
         job_id = _add_job(store, "reb-1")
 
-        async def _fake_rebuild(_store, _emb, *, job_id, force):
+        async def _fake_rebuild(_store, _emb, *, job_id, force, pace):
             return 5
 
         monkeypatch.setattr(f"{MODULE}.rebuild_embeddings", _fake_rebuild)
@@ -1258,8 +1304,9 @@ class TestSearchForContext:
         async def _direct(fn, *args, **kwargs):
             return fn(*args, **kwargs)
 
-        def _retriever(_store, embedder=None):
+        def _retriever(_store, embedder=None, *, embed_sig=None):
             seen["embedder"] = embedder
+            seen["embed_sig"] = embed_sig
             return MagicMock(search=MagicMock(return_value=[]))
 
         monkeypatch.setattr(f"{MODULE}.run_in_embed_pool", _direct)
@@ -1269,6 +1316,9 @@ class TestSearchForContext:
             assert (await client.get("/api/knowledge/search-for-context",
                                      params={"q": "z"})).status == 200
         assert seen["embedder"] == emb.embed
+        # Wiring the embedder without its signature would leave the vector leg
+        # scoring items from any space, which is the defect the pair closes.
+        assert seen["embed_sig"] == embedder_signature(emb)
 
     @pytest.mark.asyncio
     async def test_unavailable_embedder_is_not_wired(self, store, monkeypatch, tmp_path):
@@ -1278,8 +1328,9 @@ class TestSearchForContext:
         async def _direct(fn, *args, **kwargs):
             return fn(*args, **kwargs)
 
-        def _retriever(_store, embedder=None):
+        def _retriever(_store, embedder=None, *, embed_sig=None):
             seen["embedder"] = embedder
+            seen["embed_sig"] = embed_sig
             return MagicMock(search=MagicMock(return_value=[]))
 
         monkeypatch.setattr(f"{MODULE}.run_in_embed_pool", _direct)
@@ -1289,6 +1340,7 @@ class TestSearchForContext:
             assert (await client.get("/api/knowledge/search-for-context",
                                      params={"q": "z"})).status == 200
         assert seen["embedder"] is None
+        assert seen["embed_sig"] is None
 
 
 # ------------------------------------------------------------ agent document
@@ -1426,6 +1478,33 @@ class TestIngestText:
             assert (await resp.json())["error"] == "internal server error"
         assert not Path(pipeline.ingest_file.await_args.args[0]).exists()
 
+    @pytest.mark.asyncio
+    async def test_the_gate_is_held_from_the_lookup_through_the_ingest(self, store, monkeypatch):
+        """The body read is an await between the source lookup and the ingest,
+        and the handler holds the store's ingestion gate across it: a
+        maintenance window cannot open while the body is in flight, and can
+        once the request has answered."""
+        sid = store.add_source("s", "web", "https://example.com")
+        store.update_source(sid, sync_status="error")
+        pipeline = IngestionPipeline.__new__(IngestionPipeline)
+        pipeline.store = store
+        pipeline.ingest_file = AsyncMock(return_value="job-9")
+        seen: list[bool] = []
+
+        async def _body_read(request, max_bytes=None):
+            with store.maintenance_window(timeout=0.05) as quiescent:
+                seen.append(quiescent)
+            return {"text": "hello"}, None
+
+        monkeypatch.setattr(kh, "read_bounded_json", _body_read)
+        async with _client(_make_app(store, pipeline=pipeline)) as client:
+            resp = await client.post(f"/api/knowledge/sources/{sid}/ingest-text",
+                                     json={"text": "hello"})
+            assert resp.status == 200
+        assert seen == [False], "the maintenance window opened during the body read"
+        with store.maintenance_window(timeout=0.05) as quiescent:
+            assert quiescent is True, "the gate stayed held after the request answered"
+
 
 # --------------------------------------------------- source delete / agent sync
 
@@ -1437,32 +1516,29 @@ class TestDeleteSourceBranches:
             assert (await client.delete("/api/knowledge/sources/ghost")).status == 404
 
     @pytest.mark.asyncio
-    async def test_auto_added_source_is_tombstoned(self, store, monkeypatch):
-        sid = store.add_source("auto", "local_folder", "/tmp/auto",
-                               properties={kh.AUTO_ADDED_PROP: True})
-        seen = {}
+    async def test_delete_never_tombstones_any_source(self, store, monkeypatch):
+        """No source is recorded as dismissed, auto-added or not.
 
-        def _cascade(source_id, dismiss_uri=None):
-            seen["source_id"] = source_id
-            seen["dismiss_uri"] = dismiss_uri
-
-        monkeypatch.setattr(store, "delete_source_cascade", _cascade)
+        The tombstone existed so a recurring discovery sweep could not re-create the
+        auto source a user had just deleted. Both discovery loops are gone, so a
+        deletion is final on its own and recording it would be a write nothing reads.
+        """
+        auto = store.add_source("auto", "local_folder", "/tmp/auto",
+                                properties={"auto_added": True})
+        manual = store.add_source("manual", "local_folder", "/tmp/manual")
+        seen: list[tuple] = []
+        monkeypatch.setattr(store, "delete_source_cascade",
+                            lambda source_id: seen.append((source_id,)))
         async with _client(_make_app(store)) as client:
-            resp = await client.delete(f"/api/knowledge/sources/{sid}")
-            assert resp.status == 200
-            assert (await resp.json())["status"] == "deleted"
-        assert seen == {"source_id": sid, "dismiss_uri": "/tmp/auto"}
-
-    @pytest.mark.asyncio
-    async def test_hand_added_source_gets_no_tombstone(self, store, monkeypatch):
-        sid = store.add_source("manual", "local_folder", "/tmp/manual")
-        seen = {}
-        monkeypatch.setattr(
-            store, "delete_source_cascade",
-            lambda source_id, dismiss_uri=None: seen.update(uri=dismiss_uri))
-        async with _client(_make_app(store)) as client:
-            assert (await client.delete(f"/api/knowledge/sources/{sid}")).status == 200
-        assert seen == {"uri": None}
+            for sid in (auto, manual):
+                resp = await client.delete(f"/api/knowledge/sources/{sid}")
+                assert resp.status == 200
+                assert (await resp.json())["status"] == "deleted"
+        # One positional argument each: the cascade has no dismissal parameter left
+        # for a caller to pass, so neither row can be tombstoned by mistake.
+        assert seen == [(auto,), (manual,)]
+        assert not store.db.execute(
+            "SELECT 1 FROM dismissed_auto_sources").fetchall()
 
     @pytest.mark.asyncio
     async def test_unreadable_properties_do_not_block_the_delete(self, store,
@@ -1471,8 +1547,7 @@ class TestDeleteSourceBranches:
         store.db.execute("UPDATE sources SET properties = ? WHERE id = ?",
                          ("{not json", sid))
         store.db.commit()
-        monkeypatch.setattr(store, "delete_source_cascade",
-                            lambda source_id, dismiss_uri=None: None)
+        monkeypatch.setattr(store, "delete_source_cascade", lambda source_id: None)
         async with _client(_make_app(store)) as client:
             assert (await client.delete(f"/api/knowledge/sources/{sid}")).status == 200
 
@@ -1480,7 +1555,7 @@ class TestDeleteSourceBranches:
     async def test_cascade_failure_is_500(self, store, monkeypatch):
         sid = store.add_source("s", "local_folder", "/tmp/s")
 
-        def _boom(source_id, dismiss_uri=None):
+        def _boom(source_id):
             raise RuntimeError("locked")
 
         monkeypatch.setattr(store, "delete_source_cascade", _boom)
@@ -1506,7 +1581,10 @@ class TestSyncSourceAgentBranch:
         sid = store.add_source("s", "web", "", properties={"url": "https://e.test/a"})
         seen = {}
 
-        async def _fake_sync(source_id, url, name, st, pipeline, pool):
+        async def _fake_sync(source_id, url, name, st, pipeline, pool, *, claim_settled=None):
+            # The handler holds the ingestion gate until the task reports its claim.
+            if claim_settled is not None:
+                claim_settled.set()
             seen["url"] = url
 
         monkeypatch.setattr(f"{MODULE}._background_agent_sync", _fake_sync)
@@ -1540,7 +1618,10 @@ class TestSyncSourceAgentBranch:
         sid = store.add_source("s", "web", "https://e.test/a")
         ran = asyncio.Event()
 
-        async def _fake_sync(source_id, url, name, st, pipeline, pool):
+        async def _fake_sync(source_id, url, name, st, pipeline, pool, *, claim_settled=None):
+            # The handler holds the ingestion gate until the task reports its claim.
+            if claim_settled is not None:
+                claim_settled.set()
             ran.set()
 
         monkeypatch.setattr(f"{MODULE}._background_agent_sync", _fake_sync)
@@ -1632,8 +1713,8 @@ class TestStartWatcherAsync:
         started = asyncio.Event()
 
         class _FakeWatcher:
-            def __init__(self, *, store, pipeline, project_dirs):
-                self.project_dirs = project_dirs
+            def __init__(self, *, store, pipeline):
+                self.store = store
 
             async def start(self):
                 started.set()
@@ -1642,7 +1723,6 @@ class TestStartWatcherAsync:
                 return None
 
         monkeypatch.setattr(f"{MODULE}.KnowledgeWatcher", _FakeWatcher)
-        monkeypatch.setattr(f"{MODULE}._slot_project_snapshot", lambda _s: ["/proj"])
 
         app = _make_app(store, pipeline=MagicMock(), watcher=old)
         await kh._start_watcher_async(app)
@@ -1650,8 +1730,10 @@ class TestStartWatcherAsync:
             await asyncio.wait_for(started.wait(), timeout=5)
             old.stop.assert_awaited_once()
             assert isinstance(app["knowledge_watcher"], _FakeWatcher)
-            # The dirs callback reads live chat-slot projects, not recents.
-            assert app["knowledge_watcher"].project_dirs() == ["/proj"]
+            # The watcher is constructed with the store and pipeline only: it no
+            # longer receives a project-dirs callback, because nothing registers a
+            # project directory on its own.
+            assert app["knowledge_watcher"].store is store
         finally:
             task = app["_knowledge_watcher_task"]
             task.cancel()
@@ -1795,7 +1877,7 @@ _NON_OBJECT_BODIES = ([1, 2], 7)
 
 class TestJsonObjectBodyGuard:
     """Every ``request.json()`` site answers 400, not 500, on a body that is
-    valid JSON but not an object -- and the two previously-unguarded sites
+    valid JSON but not an object -- and two further sites
     (files/retry, files/skip) now answer 400 on invalid JSON too."""
 
     @pytest.mark.asyncio
@@ -1838,8 +1920,8 @@ class TestJsonObjectBodyGuard:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("endpoint", ["retry", "skip"])
     async def test_file_state_invalid_json_is_400_not_500(self, store, endpoint):
-        # These two sites previously had no try/except at all: a malformed
-        # body escaped as a raw JSONDecodeError and surfaced as a 500.
+        # Without a try/except these two sites would let a malformed
+        # body escape as a raw JSONDecodeError and surface as a 500.
         sid = store.add_source("s", "local_folder", "/tmp/x")
         async with _client(_guard_app(store)) as client:
             resp = await client.post(
@@ -1903,7 +1985,7 @@ class TestJsonObjectBodyGuard:
 
     @pytest.mark.asyncio
     async def test_invalid_json_yields_code_at_every_site(self, store, monkeypatch):
-        # At the previously-guarded sites the parse-failure path's entire
+        # At the already-guarded sites the parse-failure path's entire
         # change is the machine-readable ``code`` field -- pin it everywhere.
         monkeypatch.setattr(f"{MODULE}.KiroCrewConfig.load", staticmethod(_cfg))
         item_id = store.add_item("a", "body", "note")
@@ -1948,31 +2030,9 @@ class TestJsonObjectBodyGuard:
             assert resp.status == 400
             assert (await resp.json())["code"] == "invalid_json"
 
-    @pytest.mark.asyncio
-    async def test_recursion_error_is_400_not_500(self):
-        # A deeply nested document blows the JSON parser's recursion budget:
-        # request.json() raises RecursionError (not a ValueError), which must
-        # also read as a client mistake. The raise threshold varies by Python
-        # version and platform (~1k on 3.10, ~10k on 3.12, lower on
-        # small-stack Windows), so a real payload either misses the threshold
-        # or gambles with the worker's C stack -- pin the contract at the
-        # helper boundary like the transport-error test below.
-        request = MagicMock()
-        request.json = AsyncMock(side_effect=RecursionError())
-        body, err = await kh._json_object_body(request)
-        assert body is None
-        assert err is not None
-        assert err.status == 400
-        assert json.loads(err.text)["code"] == "invalid_json"
-
-    @pytest.mark.asyncio
-    async def test_transport_errors_propagate_not_400(self):
-        # A disconnect mid-body is not a client JSON mistake: the narrowed
-        # ValueError catch must let transport failures keep their 500 class.
-        request = MagicMock()
-        request.json = AsyncMock(side_effect=ConnectionResetError())
-        with pytest.raises(ConnectionResetError):
-            await kh._json_object_body(request)
+    # The RecursionError and transport-error boundaries moved with the guard:
+    # they are properties of ``_shared.read_bounded_json``, not of this module,
+    # and are pinned in ``test_read_bounded_json.py`` (TestDecodeContract).
 
     @pytest.mark.asyncio
     async def test_file_state_object_body_still_works(self, store):

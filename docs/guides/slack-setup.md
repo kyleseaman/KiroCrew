@@ -24,7 +24,7 @@ Both paths require a Slack workspace where you can install apps (see [Prerequisi
 ## Prerequisites
 
 - A **Slack workspace** where you have permission to install apps. If you don't have one, create a free workspace at <https://slack.com/get-started>. You can install your own apps in a workspace you own.
-- Python and Kiro Crew installed (`pip install kirocrew`), so you can run the `kirocrew` CLI.
+- Python and Kiro Crew installed through a [supported install path](install.md#install-paths), so you can run the `kirocrew` CLI.
 
 > **Tip**: Use a personal or test workspace for your first run. You can always export the app manifest and recreate the app in another workspace later (see [Reusing the App in Another Workspace](#reusing-the-app-in-another-workspace)).
 
@@ -424,7 +424,10 @@ quiet.
 Type `sessions` in any Slack DM to list recent sessions. Each entry shows a
 status dot, the session title, the agent name, a bulleted preview of recent
 messages, and a **Resume** button. The same content backs the
-`/<command> sessions` slash command and the App Home tab.
+`/<command> sessions` slash command and the App Home tab. The keyword also
+works in a DM linked to a dashboard session: it falls through link routing
+(after the unauthorized-user deny), so the picker renders instead of the
+message being forwarded to the linked session.
 
 ---
 

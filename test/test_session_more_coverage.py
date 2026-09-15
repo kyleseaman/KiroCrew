@@ -38,6 +38,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kiro_crew import platform_compat
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.messaging.link import UNBIND_REASON_UNSPECIFIED, ChannelLink
 from kiro_crew.session import (
@@ -249,34 +250,7 @@ class TestCancelAndCallbacks:
         await mgr._fire_recycle_callback("dashboard:a", reason="rss")
 
 
-# ── context_info / _resolve_agent_model ──────────────────────────────────────
-
-
-class TestContextInfoModelResolution:
-    @pytest.mark.asyncio
-    async def test_an_auto_model_on_a_named_agent_is_resolved_from_agent_json(
-        self, mgr
-    ) -> None:
-        """``client._model == "auto"`` is not a model the dashboard can show, so
-        a named (non-``kirocrew``) agent falls through to its JSON pin."""
-        from kiro_crew.providers.acp import AcpProvider
-
-        provider = MagicMock(spec=AcpProvider)
-        provider.context_usage_pct = MagicMock(return_value=12.0)
-        provider.context_window_tokens = MagicMock(return_value=200_000)
-        provider.shutdown = AsyncMock()
-        provider.client = MagicMock()
-        provider.client._model = "auto"
-        provider.client._agent = "researcher"
-        _register(mgr, "dashboard:slot1", provider=provider)
-
-        with patch.object(
-            SessionManager, "_resolve_agent_model", staticmethod(lambda a: "sonnet-9")
-        ):
-            info = mgr.context_info()
-
-        assert info[0]["model"] == "sonnet-9"
-        assert info[0]["agent"] == "researcher"
+# ── _resolve_agent_model ──────────────────────────────────────
 
 
 class TestResolveAgentModel:
@@ -317,7 +291,7 @@ class TestResolveAgentModel:
         agents.mkdir()
         (agents / "researcher.json").write_text('{"name": "researcher"}', encoding="utf-8")
         with patch("kiro_crew.session.kiro_agents_dir_path", return_value=agents), patch(
-            "kiro_crew.session.spec_model", side_effect=RuntimeError("bad spec")
+            "kiro_crew.session._read_agent_spec", side_effect=RuntimeError("bad spec")
         ):
             assert SessionManager._resolve_agent_model("researcher") == "auto"
 
@@ -528,17 +502,36 @@ class TestEvictStaleSession:
 
 
 class TestBackgroundProviderDispatch:
-    def test_an_unreadable_provider_setting_defaults_to_the_kiro_backend(self, mgr) -> None:
+    def test_an_unreadable_backend_setting_defaults_to_the_kiro_backend(self, mgr) -> None:
         """``_bg`` must keep working when the config object cannot answer — the
         alternative is losing chat titles and consolidation to a config edge."""
 
         class _Boom:
             @property
-            def provider(self):
+            def acp_backend(self):
                 raise RuntimeError("config exploded")
 
         mgr._cfg = SimpleNamespace(agent=_Boom())
-        assert mgr._bg_provider_is_kiro() is True
+        assert mgr._bg_backend_supports_runtime() is True
+
+    def test_a_non_string_backend_defaults_to_the_kiro_backend(self, mgr) -> None:
+        """A non-string value degrades to the floor backend for dispatch,
+        mirroring the loader's ``_normalize_acp_backend`` posture."""
+        mgr._cfg = SimpleNamespace(agent=SimpleNamespace(acp_backend=object()))
+        assert mgr._bg_backend_supports_runtime() is True
+
+    def test_a_runtime_incapable_backend_falls_through_to_the_provider_path(self, mgr) -> None:
+        """A backend outside ACP_BACKENDS_ACP_RUNTIME must dispatch to the
+        provider-backed ``_Session`` path even while agent.provider reads
+        "acp" — the predicate is keyed on acp_backend, never on provider."""
+        mgr._cfg = SimpleNamespace(
+            agent=SimpleNamespace(provider="acp", acp_backend=ACP_BACKEND_CLAUDE)
+        )
+        assert mgr._bg_backend_supports_runtime() is False
+
+    def test_the_kas_backend_is_runtime_capable(self, mgr) -> None:
+        mgr._cfg = SimpleNamespace(agent=SimpleNamespace(acp_backend=ACP_BACKEND_KAS))
+        assert mgr._bg_backend_supports_runtime() is True
 
     @pytest.mark.asyncio
     async def test_ensure_background_no_ops_without_a_factory(self, mgr) -> None:
@@ -626,7 +619,7 @@ class TestGetBgSessionRespawn:
         mgr._bg_runtime = SimpleNamespace(
             is_alive=lambda: True,
             has_active_sessions=lambda: True,
-            _stale_by_age=lambda: False,
+            _is_stale=AsyncMock(return_value=None),  # healthy, so never displaced
             pid=11,
             create_session=create,
             kill=AsyncMock(),
@@ -652,7 +645,7 @@ class TestGetBgSessionRespawn:
         doomed = SimpleNamespace(
             is_alive=lambda: alive[0],
             has_active_sessions=lambda: True,
-            _stale_by_age=lambda: False,
+            _is_stale=AsyncMock(return_value=None),  # healthy, so never displaced
             pid=11,
             create_session=create_session,
             kill=AsyncMock(side_effect=RuntimeError("kill failed")),

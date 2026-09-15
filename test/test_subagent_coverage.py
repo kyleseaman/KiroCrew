@@ -17,10 +17,11 @@ import math
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, mock_open, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from conftest import absent_sysconf
 from kiro_crew import subagent as sa
 from kiro_crew.subagent import SubagentInfo, SubagentManager
 
@@ -86,32 +87,33 @@ class TestSafeFire:
 
 class TestValidateAgent:
     def test_empty_request_is_the_default(self) -> None:
-        assert sa._validate_agent("") == ("", "")
+        assert sa._validate_agent("") == ("", "", "")
 
     def test_known_user_agent_accepted(self) -> None:
         with patch.object(sa, "list_agents", return_value=[SimpleNamespace(name="scout")]):
-            assert sa._validate_agent("scout") == ("scout", "")
+            assert sa._validate_agent("scout") == ("scout", "", "")
 
     def test_unknown_agent_refused_not_defaulted(self) -> None:
         with patch.object(sa, "list_agents", return_value=[SimpleNamespace(name="scout")]):
-            name, err = sa._validate_agent("typo")
+            name, err, code = sa._validate_agent("typo")
         assert name == ""
         assert "not found" in err
+        assert code == sa.AGENT_NOT_FOUND_CODE
 
     def test_project_scope_widens_known_set(self, tmp_path: Path) -> None:
         with (
             patch.object(sa, "list_agents", return_value=[]),
             patch.object(sa, "cached_project_agent_names", return_value=frozenset({"local"})),
         ):
-            assert sa._validate_agent("local", str(tmp_path)) == ("local", "")
+            assert sa._validate_agent("local", str(tmp_path)) == ("local", "", "")
 
     def test_project_scope_cold_cache_refuses(self, tmp_path: Path) -> None:
         with (
             patch.object(sa, "list_agents", return_value=[]),
             patch.object(sa, "cached_project_agent_names", return_value=None),
         ):
-            name, err = sa._validate_agent("local", str(tmp_path))
-        assert (name, "not found" in err) == ("", True)
+            name, err, code = sa._validate_agent("local", str(tmp_path))
+        assert (name, "not found" in err, code) == ("", True, sa.AGENT_NOT_FOUND_CODE)
 
 
 # ── _vet_spawn_governance ─────────────────────────────────────────────────
@@ -320,83 +322,46 @@ class TestDigestHoldSecs:
 
 
 class TestCheckMemoryAvailable:
-    def test_parses_mem_available(self) -> None:
-        text = "MemTotal:       1000 kB\nMemAvailable:    8388608 kB\n"
-        with patch.object(sa, "safe_read_file", return_value=text):
-            ok, gb = sa.check_memory_available(min_gb=4.0)
+    def test_parses_mem_available(self, tmp_path: Path) -> None:
+        f = tmp_path / "meminfo"
+        f.write_text("MemTotal:       1000 kB\nMemAvailable:    8388608 kB\n")
+        ok, gb = sa.check_memory_available(min_gb=4.0, path=str(f))
         assert ok is True
         assert gb == 8.0
 
-    def test_below_threshold_reports_not_ok(self) -> None:
-        text = "MemAvailable:    1048576 kB\n"
-        with patch.object(sa, "safe_read_file", return_value=text):
-            ok, gb = sa.check_memory_available(min_gb=4.0)
+    def test_below_threshold_reports_not_ok(self, tmp_path: Path) -> None:
+        f = tmp_path / "meminfo"
+        f.write_text("MemAvailable:    1048576 kB\n")
+        ok, gb = sa.check_memory_available(min_gb=4.0, path=str(f))
         assert (ok, gb) == (False, 1.0)
 
-    def test_sensitive_path_fails_open(self) -> None:
-        with patch.object(sa, "safe_read_file", side_effect=PermissionError):
+    def test_path_gate_not_consulted(self, tmp_path: Path) -> None:
+        """The fixed kernel path is read with plain open, never the gate."""
+        f = tmp_path / "meminfo"
+        f.write_text("MemAvailable:    8388608 kB\n")
+        with (
+            patch("kiro_crew.hooks.safe_read_file", side_effect=AssertionError),
+            patch("kiro_crew.hooks.is_sensitive_path", side_effect=AssertionError),
+        ):
+            assert sa.check_memory_available(min_gb=4.0, path=str(f)) == (True, 8.0)
+
+    def test_permission_error_fails_open(self) -> None:
+        with patch("builtins.open", side_effect=PermissionError):
             assert sa.check_memory_available() == (True, -1.0)
 
     def test_read_error_fails_open(self) -> None:
-        with patch.object(sa, "safe_read_file", side_effect=OSError):
-            assert sa.check_memory_available() == (True, -1.0)
-
-    def test_malformed_line_fails_open(self) -> None:
-        with patch.object(sa, "safe_read_file", return_value="MemAvailable:  notanumber kB\n"):
-            assert sa.check_memory_available() == (True, -1.0)
-
-    def test_missing_key_fails_open(self) -> None:
-        with patch.object(sa, "safe_read_file", return_value="MemTotal: 12 kB\n"):
-            assert sa.check_memory_available() == (True, -1.0)
-
-
-class TestProcRssReaders:
-    def test_single_proc_parses_vmrss(self) -> None:
-        with patch("builtins.open", mock_open(read_data="Name:\tx\nVmRSS:\t 2048 kB\n")):
-            assert sa._single_proc_rss_kb(1234) == 2048
-
-    def test_single_proc_missing_returns_minus_one(self) -> None:
         with patch("builtins.open", side_effect=OSError):
-            assert sa._single_proc_rss_kb(1234) == -1
+            assert sa.check_memory_available() == (True, -1.0)
 
-    def test_children_listing_unavailable(self) -> None:
-        with patch.object(os, "listdir", side_effect=OSError):
-            assert sa._proc_children(1234) == []
+    def test_malformed_line_fails_open(self, tmp_path: Path) -> None:
+        f = tmp_path / "meminfo"
+        f.write_text("MemAvailable:  notanumber kB\n")
+        assert sa.check_memory_available(path=str(f)) == (True, -1.0)
 
-    def test_children_parsed_per_thread(self) -> None:
-        with (
-            patch.object(os, "listdir", return_value=["1234"]),
-            patch("builtins.open", mock_open(read_data="11 12 13")),
-        ):
-            assert sa._proc_children(1234) == [11, 12, 13]
-
-    def test_children_garbage_skipped(self) -> None:
-        with (
-            patch.object(os, "listdir", return_value=["1234"]),
-            patch("builtins.open", mock_open(read_data="not-a-pid")),
-        ):
-            assert sa._proc_children(1234) == []
-
-    def test_subtree_rss_falsy_pid(self) -> None:
-        assert sa._proc_rss_kb(None) == -1
-        assert sa._proc_rss_kb(0) == -1
-
-    def test_subtree_rss_unreadable_parent(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(sa, "_single_proc_rss_kb", lambda _pid: -1)
-        assert sa._proc_rss_kb(99) == -1
-
-    def test_subtree_rss_sums_descendants(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        tree = {1: [2, 3], 2: [4], 3: [], 4: []}
-        monkeypatch.setattr(sa, "_single_proc_rss_kb", lambda pid: 100 * pid)
-        monkeypatch.setattr(sa, "_proc_children", lambda pid: tree.get(pid, []))
-        assert sa._proc_rss_kb(1) == 100 + 200 + 300 + 400
-
-    def test_subtree_rss_ignores_cycles_and_dead_children(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(sa, "_single_proc_rss_kb", lambda pid: 100 if pid == 1 else -1)
-        monkeypatch.setattr(sa, "_proc_children", lambda pid: [1, 2] if pid == 1 else [])
-        assert sa._proc_rss_kb(1) == 100
+    def test_missing_key_fails_open(self, tmp_path: Path) -> None:
+        f = tmp_path / "meminfo"
+        f.write_text("MemTotal: 12 kB\n")
+        assert sa.check_memory_available(path=str(f)) == (True, -1.0)
 
 
 class TestReadIntFile:
@@ -506,9 +471,25 @@ class TestAvailableMemoryGb:
         monkeypatch.setattr(sa, "_macos_available_memory_gb", lambda: 3.5)
         assert sa._available_memory_gb() == 3.5
 
+    def test_windows_branch_delegates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(sa.platform_compat, "IS_LINUX", False, raising=False)
+        monkeypatch.setattr(sa.platform_compat, "IS_MACOS", False, raising=False)
+        monkeypatch.setattr(sa.platform_compat, "IS_WINDOWS", True, raising=False)
+        monkeypatch.setattr(sa.platform_compat, "host_available_mib", lambda: 8192)
+        assert sa._available_memory_gb() == 8.0
+
+    def test_windows_unreadable_fails_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``host_available_mib`` answers 0 for "cannot read", never "no memory"."""
+        monkeypatch.setattr(sa.platform_compat, "IS_LINUX", False, raising=False)
+        monkeypatch.setattr(sa.platform_compat, "IS_MACOS", False, raising=False)
+        monkeypatch.setattr(sa.platform_compat, "IS_WINDOWS", True, raising=False)
+        monkeypatch.setattr(sa.platform_compat, "host_available_mib", lambda: 0)
+        assert sa._available_memory_gb() == -1.0
+
     def test_unsupported_platform_fails_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(sa.platform_compat, "IS_LINUX", False, raising=False)
         monkeypatch.setattr(sa.platform_compat, "IS_MACOS", False, raising=False)
+        monkeypatch.setattr(sa.platform_compat, "IS_WINDOWS", False, raising=False)
         assert sa._available_memory_gb() == -1.0
 
 
@@ -517,27 +498,53 @@ class TestMacosAvailableMemory:
     ``raising=False`` — the probe's own ``hasattr`` guard is what CI exercises."""
 
     def test_page_size_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(
-            os, "sysconf", lambda _name: (_ for _ in ()).throw(ValueError), raising=False
-        )
+        real_sysconf = getattr(os, "sysconf", absent_sysconf)
+
+        def fake_sysconf(name):
+            if name == "SC_PAGE_SIZE":
+                raise ValueError("SC_PAGE_SIZE unavailable")
+            return real_sysconf(name)
+
+        monkeypatch.setattr(os, "sysconf", fake_sysconf, raising=False)
         assert sa._macos_available_memory_gb() == -1.0
 
     def test_nonpositive_page_size(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(os, "sysconf", lambda _name: 0, raising=False)
+        real_sysconf = getattr(os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            os, "sysconf", lambda n: 0 if n == "SC_PAGE_SIZE" else real_sysconf(n), raising=False
+        )
         assert sa._macos_available_memory_gb() == -1.0
 
     def test_no_reclaimable_pages(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(os, "sysconf", lambda _name: 4096, raising=False)
+        real_sysconf = getattr(os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            os,
+            "sysconf",
+            lambda n: 4096 if n == "SC_PAGE_SIZE" else real_sysconf(n),
+            raising=False,
+        )
         monkeypatch.setattr(sa, "_macos_vm_reclaimable_pages", lambda: None)
         assert sa._macos_available_memory_gb() == -1.0
 
     def test_zero_pages_fails_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(os, "sysconf", lambda _name: 4096, raising=False)
+        real_sysconf = getattr(os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            os,
+            "sysconf",
+            lambda n: 4096 if n == "SC_PAGE_SIZE" else real_sysconf(n),
+            raising=False,
+        )
         monkeypatch.setattr(sa, "_macos_vm_reclaimable_pages", lambda: 0)
         assert sa._macos_available_memory_gb() == -1.0
 
     def test_computes_gb_from_pages(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(os, "sysconf", lambda _name: 4096, raising=False)
+        real_sysconf = getattr(os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            os,
+            "sysconf",
+            lambda n: 4096 if n == "SC_PAGE_SIZE" else real_sysconf(n),
+            raising=False,
+        )
         monkeypatch.setattr(sa, "_macos_vm_reclaimable_pages", lambda: 262144)
         assert sa._macos_available_memory_gb() == pytest.approx(1.0)
 
@@ -546,36 +553,25 @@ class TestMacosAvailableMemory:
 
 
 class TestCpuJiffies:
-    def test_parses_utime_plus_stime(self) -> None:
-        fields = " ".join(str(i) for i in range(3, 30))
-        raw = f"42 (weird name (x)) S {fields}".encode("ascii")
-        # After the final ')' the tokens start at 'S'; utime/stime are indices 11/12.
-        tokens = raw[raw.rindex(b")") + 2 :].split()
-        expected = int(tokens[11]) + int(tokens[12])
-        assert sa._parse_cpu_jiffies(raw) == expected
+    """``_subtree_cpu_jiffies`` — the Sessions rows' CPU reading.
 
-    @pytest.mark.parametrize("raw", [b"", b"no-parens-here", b"1 (x) S 1 2 3"])
-    def test_malformed_returns_zero(self, raw: bytes) -> None:
-        assert sa._parse_cpu_jiffies(raw) == 0
-
-    def test_proc_cpu_jiffies_missing_pid(self) -> None:
-        with patch("builtins.open", side_effect=OSError):
-            assert sa._proc_cpu_jiffies(1234) == 0
-
-    def test_proc_cpu_jiffies_reads_stat(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(sa, "_parse_cpu_jiffies", lambda _raw: 77)
-        with patch("builtins.open", mock_open(read_data=b"whatever")):
-            assert sa._proc_cpu_jiffies(1234) == 77
+    The per-process reads and the walk itself belong to
+    ``platform_compat.proc_subtree_sample`` and are pinned in
+    ``test_proc_subtree_sample.py``; what is subagent's own is that this wrapper
+    asks for the CPU column of that walk.
+    """
 
     def test_subtree_sums_descendants(self, monkeypatch: pytest.MonkeyPatch) -> None:
         tree = {1: [2], 2: [3], 3: []}
-        monkeypatch.setattr(sa, "_proc_cpu_jiffies", lambda pid: pid * 10)
-        monkeypatch.setattr(sa, "_proc_children", lambda pid: tree.get(pid, []))
+        monkeypatch.setattr(sa.platform_compat, "_proc_cpu_jiffies", lambda pid: pid * 10)
+        monkeypatch.setattr(sa.platform_compat, "_proc_children", lambda pid: tree.get(pid, []))
         assert sa._subtree_cpu_jiffies(1) == 10 + 20 + 30
 
     def test_subtree_skips_already_seen(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(sa, "_proc_cpu_jiffies", lambda pid: 5)
-        monkeypatch.setattr(sa, "_proc_children", lambda pid: [1] if pid == 1 else [])
+        monkeypatch.setattr(sa.platform_compat, "_proc_cpu_jiffies", lambda pid: 5)
+        monkeypatch.setattr(
+            sa.platform_compat, "_proc_children", lambda pid: [1] if pid == 1 else []
+        )
         assert sa._subtree_cpu_jiffies(1) == 5
 
 
@@ -753,7 +749,7 @@ class TestPidHelpers:
 
 class TestLiveSharedCount:
     def test_no_pid_counts_as_one(self) -> None:
-        assert _manager()._live_shared_count(None) == 1
+        assert _manager()._live_shared_count(None, []) == 1
 
     def test_counts_live_sharers_on_the_same_pid(self) -> None:
         mgr = _manager()
@@ -766,56 +762,23 @@ class TestLiveSharedCount:
         dead._session_sharing = True
         dead._pid = 777
         mgr._agents["dead"] = dead
-        assert mgr._live_shared_count(777) == 3
+        assert mgr._live_shared_count(777, list(mgr._agents.values())) == 3
 
     def test_unknown_pid_floors_at_one(self) -> None:
-        assert _manager()._live_shared_count(31337) == 1
+        mgr = _manager()
+        assert mgr._live_shared_count(31337, list(mgr._agents.values())) == 1
 
-
-class TestProcSubtreeCounts:
-    """``_proc_subtree_counts`` — the reading task rows were missing entirely."""
-
-    def test_no_pid_is_unmeasurable(self) -> None:
-        assert sa._proc_subtree_counts(None) == (None, None)
-
-    def test_non_linux_is_unmeasurable_not_zero(self) -> None:
-        with patch.object(sa.platform_compat, "IS_LINUX", False):
-            assert sa._proc_subtree_counts(4242) == (None, None)
-
-    def test_dead_pid_is_unmeasurable(self) -> None:
-        with (
-            patch.object(sa.platform_compat, "IS_LINUX", True),
-            patch.object(sa, "_single_proc_rss_kb", return_value=-1),
-        ):
-            assert sa._proc_subtree_counts(4242) == (None, None)
-
-    def test_counts_the_subtree_and_its_stubs(self) -> None:
-        # 1 runtime + 3 children, two of which are stubs.
-        children = {10: [11, 12, 13], 11: [], 12: [], 13: []}
-        stub_pids = {11, 12}
-        with (
-            patch.object(sa.platform_compat, "IS_LINUX", True),
-            patch.object(sa, "_single_proc_rss_kb", return_value=1024),
-            patch.object(sa, "_proc_children", side_effect=lambda p: children.get(p, [])),
-            patch.object(
-                sa.platform_compat,
-                "process_matches",
-                side_effect=lambda p, needles: p in stub_pids and needles == (sa.STUB_MODULE,),
-            ),
-        ):
-            assert sa._proc_subtree_counts(10) == (4, 2)
-
-    def test_walk_is_bounded(self) -> None:
-        """A pathological tree cannot walk past the shared subtree ceiling."""
-        with (
-            patch.object(sa.platform_compat, "IS_LINUX", True),
-            patch.object(sa, "_single_proc_rss_kb", return_value=1024),
-            patch.object(sa, "_proc_children", side_effect=lambda p: [p * 10, p * 10 + 1]),
-            patch.object(sa.platform_compat, "process_matches", return_value=False),
-        ):
-            procs, stubs = sa._proc_subtree_counts(2)
-        assert stubs == 0
-        assert procs is not None and procs < sa._RSS_SUBTREE_MAX_PROCS * 3
+    def test_snapshot_is_required_not_read_from_the_live_registry(self) -> None:
+        """The sole caller runs off-loop, so the count must never touch
+        ``self._agents``: it can only see what the caller snapshotted."""
+        mgr = _manager()
+        info = _info("s0")
+        info._session_sharing = True
+        info._pid = 777
+        mgr._agents[info.id] = info
+        assert mgr._live_shared_count(777, []) == 1, "an empty snapshot means no sharers seen"
+        with pytest.raises(TypeError):
+            mgr._live_shared_count(777)  # type: ignore[call-arg]
 
 
 class TestAttributedCount:
@@ -843,11 +806,8 @@ class TestSampleLiveCounts:
     """The sweep must write procs/mcp on both the shared and exclusive paths."""
 
     def _patched(self, counts: tuple[int, int]):
-        return (
-            patch.object(sa, "_proc_rss_kb", return_value=1024 * 1024),
-            patch.object(sa, "_subtree_cpu_jiffies", return_value=0),
-            patch.object(sa, "_proc_subtree_counts", return_value=counts),
-        )
+        sample = sa.platform_compat.SubtreeSample(1024 * 1024, 0, counts[0], counts[1])
+        return (patch.object(sa, "_proc_subtree_sample", return_value=sample),)
 
     def test_shared_runtime_counts_are_split_per_sharer(self) -> None:
         mgr = _manager()
@@ -856,8 +816,8 @@ class TestSampleLiveCounts:
             info._session_sharing = True
             info._pid = 777
             mgr._agents[info.id] = info
-        rss, cpu, counts = self._patched((21, 18))
-        with rss, cpu, counts:
+        (sample,) = self._patched((21, 18))
+        with sample:
             mgr._sample_live_costs()
         for info in mgr._agents.values():
             assert info.last_procs == 7
@@ -868,8 +828,8 @@ class TestSampleLiveCounts:
         info = _info("solo")
         info._pid = 999
         mgr._agents["solo"] = info
-        rss, cpu, counts = self._patched((7, 6))
-        with rss, cpu, counts:
+        (sample,) = self._patched((7, 6))
+        with sample:
             mgr._sample_live_costs()
         assert info.last_procs == 7
         assert info.last_stubs == 6
@@ -880,13 +840,35 @@ class TestSampleLiveCounts:
         info._pid = 999
         info.last_procs, info.last_stubs = 7, 6
         mgr._agents["solo"] = info
-        with (
-            patch.object(sa, "_proc_rss_kb", return_value=-1),
-            patch.object(sa, "_subtree_cpu_jiffies", return_value=0),
-            patch.object(sa, "_proc_subtree_counts", return_value=(None, None)),
+        with patch.object(
+            sa,
+            "_proc_subtree_sample",
+            return_value=sa.platform_compat.SubtreeSample(-1, 0, None, None),
         ):
             mgr._sample_live_costs()
         assert (info.last_procs, info.last_stubs) == (7, 6)
+
+    def test_one_walk_per_agent_not_one_per_metric(self) -> None:
+        """The whole point: RSS, CPU and both counts come off ONE walk.
+
+        Patching the shared sample is not enough to prove that — a sweep that
+        still called three readers would also pass the assertions above. Count
+        the walks instead.
+        """
+        mgr = _manager()
+        for idx in range(2):
+            info = _info(f"s{idx}")
+            info._pid = 900 + idx
+            mgr._agents[info.id] = info
+        walks: list[object] = []
+
+        def _sample(pid, **kwargs):  # noqa: ANN001, ANN003 — test double
+            walks.append(pid)
+            return sa.platform_compat.SubtreeSample(1024, 0, 4, 2)
+
+        with patch.object(sa, "_proc_subtree_sample", side_effect=_sample):
+            mgr._sample_live_costs()
+        assert walks == [900, 901], "exactly one subtree walk per live agent"
 
     def test_sweep_reads_the_registry_once_so_it_is_thread_safe(self) -> None:
         """The sweep runs on an executor thread, so it must not iterate the live
@@ -908,8 +890,8 @@ class TestSampleLiveCounts:
                 return super().values()
 
         mgr._agents = _CountingRegistry(real)  # type: ignore[assignment]
-        rss, cpu, counts = self._patched((4, 2))
-        with rss, cpu, counts:
+        (sample,) = self._patched((4, 2))
+        with sample:
             mgr._sample_live_costs()
         assert reads["n"] == 1, "the registry must be snapshotted exactly once"
 
@@ -1134,6 +1116,31 @@ class TestReadSurfaces:
         mgr._agents["queued"] = _info("queued", queued=True)
         assert mgr.task_memory_rows() == []
 
+    def test_task_memory_rows_redact_before_truncate(self) -> None:
+        """A credential straddling the 80-char cut must not leak a fragment.
+
+        The old spelling ``_redact(a.task[:80])`` sliced first, so a key cut at
+        the boundary loses its tail and does not match the credential regex —
+        the raw prefix escaped into the session-memory surface.
+        The fabricated AKIA-shaped literal is inlined rather than bound to a
+        ``secret``-named variable, which would trip CodeQL's name-based
+        sensitive-source heuristic on this real call path.
+        """
+        # cut lands 8 chars into the fabricated 20-char key
+        task = "x" * 72 + "AKIAIOSFODNN7EXAMPLE" + " trailing"
+        mgr = _manager()
+        mgr._agents["a"] = _info("a", task=task, parent_session_key="dash:1")
+        row = {r["id"]: r for r in mgr.task_memory_rows()}["a"]
+        assert "AKIA" not in row["task"]
+        assert len(row["task"]) <= 80
+
+    def test_task_memory_rows_plain_task_truncation_unchanged(self) -> None:
+        """Ordinary path is result-preserving: no secret ⇒ the same 80-char slice."""
+        mgr = _manager()
+        mgr._agents["a"] = _info("a", task="t" * 100, parent_session_key="dash:1")
+        row = {r["id"]: r for r in mgr.task_memory_rows()}["a"]
+        assert row["task"] == "t" * 80
+
     def test_get_running_all_and_count(self) -> None:
         mgr = _manager()
         live = _info("live")
@@ -1148,6 +1155,30 @@ class TestReadSurfaces:
         mgr = _manager(max_concurrent=7)
         mgr._running_count = 4
         assert (mgr.max_concurrent, mgr.running_count) == (7, 4)
+
+    @pytest.mark.asyncio
+    async def test_pending_work_count_covers_post_slot_lifecycle_tasks(self) -> None:
+        mgr = _manager()
+        release = asyncio.Event()
+        recovery = asyncio.create_task(release.wait())
+        report = asyncio.create_task(release.wait())
+        followup = asyncio.create_task(release.wait())
+        reconcile = asyncio.create_task(release.wait())
+        completed = asyncio.create_task(asyncio.sleep(0))
+        await completed
+        mgr._running_count = 0
+        mgr._queue = [{"parent_session_key": "dash:1"}]
+        mgr._tasks = {"run:recovery": recovery, "done": completed}
+        mgr._report_tasks = {report}
+        mgr._followup_watchers = {"run": followup}
+        mgr._reconcile_task = reconcile
+        mgr._abandoned_state_writers = {"state-writer"}
+        try:
+            # queue + recovery + report + follow-up + reconciliation + writer
+            assert mgr.pending_work_count == 6
+        finally:
+            release.set()
+            await asyncio.gather(recovery, report, followup, reconcile)
 
 
 class TestQueueDepth:
@@ -1262,6 +1293,134 @@ class TestNotifyInjectionFailed:
             side_effect=RuntimeError("no dashboard"),
         ):
             mgr.notify_injection_failed(_info(parent_session_key="dash:1"))
+
+
+# ── Injection-failure notice: outcome-aware copy ──────────────────────────
+
+
+class TestInjectionNoticeOutcome:
+    """The pure helper maps a terminal record to a truthful outcome line."""
+
+    def test_completed_keeps_the_finished_copy(self) -> None:
+        info = _info(done=True, result="ok")
+        assert sa._injection_notice_outcome(info) == (
+            "The agent finished but result delivery timed out."
+        )
+
+    def test_failed_run_does_not_claim_finished(self) -> None:
+        info = _info(done=True, error="Timed out after 30 minutes", _exec_started=123.0)
+        line = sa._injection_notice_outcome(info)
+        assert line == "The agent failed before a result could be delivered."
+
+    def test_stopped_mid_run_reads_as_stopped(self) -> None:
+        info = _info(
+            done=True, user_stopped=True, _exec_started=123.0, tool_count=3, result="partial"
+        )
+        assert sa._injection_notice_outcome(info) == "The run was stopped before it completed."
+
+    def test_stopped_in_startup_window_is_not_before_start(self) -> None:
+        # Execution began (_exec_started set) but no turn, tool call, or output
+        # landed yet — the run DID start, so the before-start copy would lie.
+        info = _info(done=True, user_stopped=True, _exec_started=123.0)
+        assert sa._injection_notice_outcome(info) == "The run was stopped before it completed."
+
+    def test_stopped_before_execution_says_it_never_ran(self) -> None:
+        # A stop landing on a registered run before _run_inner ever executed:
+        # no _exec_started marker and no output of any kind.
+        info = _info(done=True, user_stopped=True)
+        assert sa._injection_notice_outcome(info) == (
+            "The run was stopped before it started, so there is no result to deliver."
+        )
+
+    def test_rejections_read_as_failed_before_start(self) -> None:
+        # Every spawn-rejection site constructs its record without
+        # _exec_started, so the never-ran refinement covers them all — the
+        # sentinel-worded ones AND the unknown-agent refusal, whose exact
+        # wording is consumed by _is_unknown_agent_refusal and cannot change.
+        for err in (
+            "spawn rejected",
+            "spawn refused: only 1.0 GB memory available (need 4 GB)",
+            "agent 'ghost' not found; available: scout, probe",
+        ):
+            info = _info(done=True, error=err)
+            assert sa._injection_notice_outcome(info) == (
+                "The run failed before it started, so there is no result to deliver."
+            ), err
+
+    def test_error_with_output_keeps_the_recovery_hint_honest(self) -> None:
+        # Defensive: a record carrying output must never be described as
+        # having no result to deliver — the generic failed copy stays truthful.
+        info = _info(done=True, error="spawn rejected", result_path="/tmp/r.txt")
+        assert sa._injection_notice_outcome(info) == (
+            "The agent failed before a result could be delivered."
+        )
+
+
+class TestNotifyInjectionFailedOutcomeCopy:
+    """End-to-end: the queued failure message carries the outcome-aware line.
+
+    Four regression paths: stop before execution, approval rejection, queued
+    rejection, and the ordinary post-run delivery timeout (whose copy is
+    unchanged).
+    """
+
+    async def _notice_for(self, info: SubagentInfo) -> str:
+        seen: list[dict] = []
+
+        async def _on_event(_etype: str, _info: SubagentInfo, extra: dict) -> None:
+            seen.append(extra)
+
+        mgr = _manager(on_event=_on_event)
+        with patch("kiro_crew.dashboard.chat_utils.dashboard_slot_key", return_value="slot-1"):
+            mgr.notify_injection_failed(info)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert seen, "expected a subagent_injection_failed event"
+        return str(seen[0]["failure_msg"])
+
+    @pytest.mark.asyncio
+    async def test_stop_before_execution_does_not_claim_the_agent_finished(self) -> None:
+        # A user stop landing on a registered run before execution began marks
+        # the record user_stopped with no _exec_started and no output: it never
+        # ran. (A cancel on a spawn still WAITING in the stagger queue is
+        # unqueued without a record and never reaches this notice at all.)
+        info = _info(parent_session_key="dash:1", done=True, user_stopped=True)
+        msg = await self._notice_for(info)
+        assert "The run was stopped before it started" in msg
+        assert "finished" not in msg
+
+    @pytest.mark.asyncio
+    async def test_approval_rejection_reads_as_never_started(self) -> None:
+        info = _info(parent_session_key="dash:1", done=True, error="spawn rejected")
+        msg = await self._notice_for(info)
+        assert "The run failed before it started" in msg
+        assert "finished" not in msg
+
+    @pytest.mark.asyncio
+    async def test_queued_rejection_reads_as_never_started_without_mechanism_detail(self) -> None:
+        info = _info(
+            parent_session_key="dash:1",
+            done=True,
+            error="spawn refused: only 1.0 GB memory available (need 4 GB)",
+        )
+        msg = await self._notice_for(info)
+        assert "The run failed before it started" in msg
+        # Mechanism details stay out of the user-facing notice.
+        assert "GB" not in msg
+        assert "finished" not in msg
+
+    @pytest.mark.asyncio
+    async def test_post_run_delivery_timeout_keeps_existing_copy_and_hint(
+        self, tmp_path: Path
+    ) -> None:
+        result = tmp_path / "result.txt"
+        result.write_text("hello", newline="\n")
+        info = _info(
+            parent_session_key="dash:1", done=True, result="hello", result_path=str(result)
+        )
+        msg = await self._notice_for(info)
+        assert "The agent finished but result delivery timed out." in msg
+        assert "Result saved at" in msg
 
 
 # ── Manager: continuable conversations ────────────────────────────────────
@@ -1821,13 +1980,33 @@ class TestGetParentRuntime:
 
 
 class TestIsCcProvider:
-    def test_delegates_to_backend_probe(self) -> None:
-        with patch("kiro_crew.providers.acp.is_claude_backend", return_value=True):
-            assert SubagentManager._is_cc_provider(object()) is True
+    """Which HOME tree a session's files live in, asked as a capability.
 
-    def test_non_claude_backend(self) -> None:
-        with patch("kiro_crew.providers.acp.is_claude_backend", return_value=False):
-            assert SubagentManager._is_cc_provider(object()) is False
+    ``_is_cc_provider`` reads ``SessionCapabilities.provider_seam`` through
+    ``capabilities_of``, so these tests hand it a provider carrying a real
+    capability record instead of patching a module-level predicate. The third case
+    is the one a bare attribute read gets wrong: a shape that is not a provider
+    must answer False, which is what the ``isinstance`` gate in ``capabilities_of``
+    buys.
+    """
+
+    @staticmethod
+    def _provider(backend: str) -> SimpleNamespace:
+        from kiro_crew.agent_sdk.capabilities import capabilities_for
+
+        return SimpleNamespace(capabilities=capabilities_for(backend))
+
+    def test_claude_seam_routes_to_the_claude_home(self) -> None:
+        from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE
+
+        assert SubagentManager._is_cc_provider(self._provider(ACP_BACKEND_CLAUDE)) is True
+
+    @pytest.mark.parametrize("backend", ["", "kas", "codex"])
+    def test_non_claude_backend(self, backend: str) -> None:
+        assert SubagentManager._is_cc_provider(self._provider(backend)) is False
+
+    def test_a_shape_that_is_not_a_provider_answers_false(self) -> None:
+        assert SubagentManager._is_cc_provider(object()) is False
 
 
 # ── Manager: intentional cancel contract ──────────────────────────────────
@@ -2028,7 +2207,3 @@ class TestPlatformConstants:
         back to 100 there."""
         assert isinstance(sa._CLK_TCK, int)
         assert sa._CLK_TCK > 0
-
-    def test_subtree_walk_caps_are_bounded(self) -> None:
-        assert sa._RSS_SUBTREE_MAX_PROCS > 0
-        assert sa._CPU_SUBTREE_MAX_PROCS > 0

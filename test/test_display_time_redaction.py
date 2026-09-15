@@ -1,7 +1,7 @@
 """Regression tests for splitting redaction between load time and display time.
 
-The startup restore used to redact BOTH `content` and `meta` on every message it
-loaded, and that pass was silently covering for four emit sites that did not
+A startup restore that redacts BOTH `content` and `meta` on every message it
+loads silently covers for four emit sites that do not
 redact. Removing it wholesale then leaked stored content through three further
 paths that build model prompts (side-chat, orchestrator stage file, title model).
 
@@ -69,14 +69,14 @@ def _rewrite_last_meta(log, key: str, meta: dict) -> None:
 @pytest.mark.parametrize("role", ["assistant", "system", "tool"])
 def test_prepare_messages_redacts_every_non_user_role(role: str) -> None:
     """`system` was excluded by the old gate, so stored secrets were emitted raw."""
-    out = _prepare_messages([{"role": role, "content": f"key {SECRET}", "cls": "msg"}], False)
+    out = _prepare_messages([{"role": role, "content": f"key {SECRET}", "cls": "msg"}], False, live_child="")
     assert SECRET not in json.dumps(out), f"{role} content emitted unredacted"
 
 
 def test_prepare_messages_leaves_user_content_alone() -> None:
     """User content is deliberately NOT redacted — the author is the only reader."""
     out = _prepare_messages(
-        [{"role": "user", "content": f"key {SECRET}", "cls": "msg msg-u"}], False
+        [{"role": "user", "content": f"key {SECRET}", "cls": "msg msg-u"}], False, live_child=""
     )
     assert SECRET in out[0]["content"]
 
@@ -89,7 +89,9 @@ def test_prepare_messages_redacts_stored_meta_not_just_cls_meta() -> None:
     redaction was the only guard.
     """
     out = _prepare_messages(
-        [{"role": "tool", "content": "ok", "cls": "msg", "meta": {"tool_input": SECRET}}], False
+        [{"role": "tool", "content": "ok", "cls": "msg", "meta": {"tool_input": SECRET}}],
+        False,
+        live_child="",
     )
     assert SECRET not in json.dumps(out), "stored meta emitted unredacted"
 
@@ -163,20 +165,27 @@ def test_side_chat_parent_snapshot_keeps_user_text() -> None:
 
 
 def test_stage_result_capture_redacts_before_writing_to_disk(tmp_path, monkeypatch) -> None:
-    """_capture_stage_result writes assistant text to a NEW file on disk.
+    """The stage-result capture writes assistant text to a NEW file on disk.
 
     A gateway restart mid-orchestration leaves restored (now unredacted) turns in
     the window, so without redaction here those bytes would be written out.
+
+    Composed from the two halves the stage loop itself calls: the message walk
+    runs on the caller (it reads live slot state) and the redact-plus-write half
+    takes only strings, which is what makes it safe to hand to a worker thread.
     """
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
     monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator.config_dir", lambda: tmp_path)
-    from kiro_crew.dashboard.chat_orchestrator import _capture_stage_result
+    from kiro_crew.dashboard.chat_orchestrator import (
+        _collect_stage_result_parts,
+        _write_stage_result,
+    )
     from kiro_crew.dashboard.state import _ChatSlot
 
     slot = _ChatSlot("chat-1-stage")
     slot.append("assistant", f"result with {SECRET}", "msg msg-a", broadcast=False)
 
-    path = _capture_stage_result(slot, 1)
+    path = _write_stage_result(slot.key, 1, _collect_stage_result_parts(slot))
     written = pathlib.Path(path).read_text()
     assert SECRET not in written, "stage result persisted an unredacted credential"
 
@@ -231,7 +240,7 @@ def test_rehydrate_does_not_broadcast_replayed_messages(tmp_path, monkeypatch) -
     """Replayed history must not be broadcast even though content is now redacted.
 
     _broadcast_chat_message redacts non-user *content* (parity with
-    _prepare_messages, #1713) but deliberately not *meta* — so replaying history
+    _prepare_messages) but deliberately not *meta* — so replaying history
     through it would still push unredacted meta straight to connected clients.
     This helper also runs for on-demand cold-slot rehydrates, i.e. while clients
     are connected.
@@ -293,7 +302,7 @@ def test_load_redacts_content_restoring_the_chokepoint(tmp_path, monkeypatch) ->
     loaded = " ".join(m.get("content", "") for m in slot.messages)
     assert SECRET not in loaded, "content must be clean in memory (the chokepoint)"
     # …and still clean on the way out.
-    assert SECRET not in json.dumps(_prepare_messages(slot.messages, False))
+    assert SECRET not in json.dumps(_prepare_messages(slot.messages, False, live_child=""))
 
 
 def test_load_leaves_user_content_raw(tmp_path, monkeypatch) -> None:
@@ -363,7 +372,7 @@ def test_load_does_not_redact_meta_keeping_boot_fast(tmp_path, monkeypatch) -> N
     loaded_meta = json.dumps([m.get("meta") for m in slot.messages])
     assert SECRET in loaded_meta, "meta was scanned on load — the ~5.5s cost is back"
     # …and the emit path still cleans it on the way out.
-    assert SECRET not in json.dumps(_prepare_messages(slot.messages, False))
+    assert SECRET not in json.dumps(_prepare_messages(slot.messages, False, live_child=""))
 
 
 # ── 6. the META side: a non-emit reader that RE-EMITS the dict ────────────────
@@ -444,10 +453,22 @@ def test_oauth_url_corpus_survives_the_emit_path(monkeypatch) -> None:
                     "role": "mcp_oauth",
                     "content": "authorize",
                     "cls": "msg msg-info",
-                    "meta": {"server_name": "acme", "oauth_url": url},
+                    # Stamped with the child the caller resolves as LIVE, which is
+                    # what a banner the user can still act on always carries:
+                    # `_emit_mcp_oauth_request` is the only producer of these rows
+                    # and it always stamps. An unstamped row means a dead flow and
+                    # is withdrawn on purpose -- pinned by
+                    # the next test, so this one keeps measuring what it was
+                    # written to measure: the redaction gate.
+                    "meta": {
+                        "server_name": "acme",
+                        "oauth_url": url,
+                        "child": "live-child",
+                    },
                 }
             ],
             False,
+            live_child="live-child",
         )
         if out[0]["meta"].get("oauth_url") != url:
             blanked.append(provider)
@@ -455,6 +476,33 @@ def test_oauth_url_corpus_survives_the_emit_path(monkeypatch) -> None:
         "the emit path blanked a legitimate consent URL — the Authorize banner "
         f"would silently vanish for: {blanked}"
     )
+
+
+def test_a_legitimate_url_from_a_dead_child_is_withdrawn() -> None:
+    """The other side of the corpus test: a real URL is not a live one.
+
+    A banner carrying no child stamp was persisted by an earlier build, so the
+    process that owned its loopback listener and PKCE verifier is gone. The URL is
+    still a perfectly well-formed provider URL — that is exactly why the scheme and
+    credential gates cannot catch it, and why the liveness gate has to.
+    """
+    from oauth_url_corpus import LEGIT_OAUTH_URLS
+
+    _, url = LEGIT_OAUTH_URLS[0]
+    out = _prepare_messages(
+        [
+            {
+                "role": "mcp_oauth",
+                "content": "authorize",
+                "cls": "msg msg-info",
+                "meta": {"server_name": "acme", "oauth_url": url},
+            }
+        ],
+        False,
+        live_child="live-child",
+    )
+    assert out[0]["meta"]["expired"] is True
+    assert not out[0]["meta"].get("oauth_url"), "a dead flow still offered its link"
 
 
 def test_oauth_url_gate_still_blocks_a_tampered_url() -> None:
@@ -520,11 +568,11 @@ def test_oauth_completion_preserves_a_legitimate_url() -> None:
     assert meta.get("completed") is True
 
 
-# ── 7. WS broadcast redaction parity with the HTTP history path (#1713) ──────
+# ── 7. WS broadcast redaction parity with the HTTP history path ──────
 #
 # _prepare_messages (HTTP history) redacts non-user content at display time;
-# _broadcast_chat_message (live WS push) used to ship the same row verbatim, so
-# one chat row left the backend in two different byte forms depending on which
+# _broadcast_chat_message (live WS push) must redact too, or one chat row leaves
+# the backend in two different byte forms depending on which
 # consumer received it. These pin the parity on both sides of the role gate.
 
 
@@ -560,3 +608,199 @@ def test_ws_broadcast_leaves_user_content_raw(tmp_path, monkeypatch) -> None:
 
     assert len(sent) == 1, "precondition: exactly one payload was broadcast"
     assert sent[0]["content"] == text, "user-authored content must survive verbatim"
+
+
+# ── 8. structured (non-string) content: one shared guard on both paths ───────
+#
+# No current writer produces non-string content (`ConversationLog.append` and
+# `_ChatSlot.append` type it str, and the session-transfer import validator
+# rejects it), but a pre-rule, legacy, or hand-edited transcript row can carry
+# a list/dict — exactly the class of row read-side redaction exists for.
+# `redact_display_content` is the single shared guard: str leaves are
+# redacted, containers are recursed, scalars pass through — never skipped,
+# never raising. Both display paths (`_prepare_messages` and
+# `_broadcast_chat_message`) route through it.
+
+
+def test_redact_display_content_redacts_a_str_leaf() -> None:
+    from kiro_crew.dashboard.chat_utils import redact_display_content
+
+    out = redact_display_content(f"key {SECRET}")
+    assert isinstance(out, str)
+    assert SECRET not in out
+
+
+def test_redact_display_content_recurses_nested_containers() -> None:
+    """A credential leaf nested in list/dict/tuple gets the same form as the str path."""
+    from kiro_crew.dashboard.chat_utils import redact_display_content
+
+    leaf = f"key {SECRET}"
+    expected = redact_display_content(leaf)
+    out = redact_display_content([{"type": "text", "text": leaf}, ("tuple", leaf)])
+    assert isinstance(out, str), "container result must be serialized to wire-safe text"
+    assert SECRET not in out
+    parsed = json.loads(out)
+    assert parsed[0]["text"] == expected, "nested dict leaf diverged from the str path"
+    assert parsed[1][1] == expected, "tuple leaf diverged from the str path"
+
+
+def test_redact_display_content_redacts_dict_keys_on_the_wire_text() -> None:
+    """The recursive walker leaves dict KEYS alone (rewriting entries in place
+    could collapse two distinct keys into one), but the final pass over the
+    serialized wire string covers them — a credential-shaped key must not
+    reach the dashboard raw."""
+    from kiro_crew.dashboard.chat_utils import redact_display_content
+
+    key = f"key-{SECRET}"
+    out = redact_display_content({key: None, "i": 3, "f": 1.5, "b": True})
+    assert isinstance(out, str), "container result must be serialized to wire-safe text"
+    assert SECRET not in out, "credential-shaped dict KEY leaked raw"
+    parsed = json.loads(out)
+    assert parsed["i"] == 3, "scalar values must survive the text pass"
+    assert parsed["f"] == 1.5
+    assert parsed["b"] is True
+    assert len(parsed) == 4, "redaction must not drop or merge entries"
+
+
+def test_redact_display_content_does_not_mutate_input() -> None:
+    """Rows are shared by reference; the helper must return new containers."""
+    from kiro_crew.dashboard.chat_utils import redact_display_content
+
+    original = [{"text": f"key {SECRET}"}]
+    snapshot = json.dumps(original)
+    redact_display_content(original)
+    assert json.dumps(original) == snapshot, "input mutated in place"
+
+
+def test_prepare_messages_redacts_structured_assistant_content() -> None:
+    """A structured non-user content is redacted recursively — not raised on."""
+    row = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": f"key {SECRET}"}],
+        "cls": "msg msg-a",
+    }
+    out = _prepare_messages([row], False, live_child="")
+    assert SECRET not in json.dumps(out), "structured content emitted unredacted"
+    # Serialized at the boundary: every frontend consumer treats content as str.
+    assert isinstance(out[0]["content"], str), "wire content must be a string"
+    assert json.loads(out[0]["content"])[0]["type"] == "text", "structure lost in text"
+    # The stored row is shared by reference and must stay untouched.
+    assert SECRET in json.dumps(row["content"]), "stored row mutated in place"
+
+
+def test_prepare_messages_serializes_user_structured_content_unredacted() -> None:
+    """User content is never redacted, but the wire-string shape covers every role."""
+    row = {"role": "user", "content": [{"text": f"key {SECRET}"}], "cls": "msg msg-u"}
+    out = _prepare_messages([row], False, live_child="")
+    content = out[0]["content"]
+    assert isinstance(content, str), "wire content must be a string for every role"
+    assert SECRET in content, "user content must not be redacted"
+    assert json.loads(content) == row["content"], "serialization altered the value"
+
+
+def test_serialize_wire_content_turns_none_into_empty_text() -> None:
+    """None is the absent-content shape a hand-edited row can carry; the wire
+    contract is string-for-every-row, and its display rendering is empty."""
+    from kiro_crew.dashboard.chat_utils import serialize_wire_content
+
+    assert serialize_wire_content(None) == ""
+    assert serialize_wire_content("keep") == "keep"
+
+
+def test_prepare_messages_serializes_none_content_as_empty_string() -> None:
+    """A null-content row must not ship None to the client render."""
+    row = {"role": "user", "content": None, "cls": "msg msg-u"}
+    out = _prepare_messages([row], False, live_child="")
+    assert out[0]["content"] == ""
+
+
+def test_ws_broadcast_serializes_none_content_as_empty_string(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    state = _make_state(tmp_path / "sessions")
+    sent: list[dict] = []
+    monkeypatch.setattr(state, "_broadcast", lambda payload: sent.append(payload))
+
+    state._broadcast_chat_message(
+        "chat-1-wsnone", {"role": "assistant", "content": None, "ts": "1"}
+    )
+
+    assert len(sent) == 1, "precondition: exactly one payload was broadcast"
+    assert sent[0]["content"] == ""
+
+
+def test_prepare_messages_serializes_falsy_container_content() -> None:
+    """An empty container is falsy, skips the redaction gate, and must still
+    leave as text rather than a raw container."""
+    row = {"role": "assistant", "content": [], "cls": "msg msg-a"}
+    out = _prepare_messages([row], False, live_child="")
+    assert out[0]["content"] == "[]"
+
+
+def test_ws_broadcast_serializes_user_structured_content_unredacted(
+    tmp_path, monkeypatch
+) -> None:
+    """Same two-invariant split on the WS path: shape for all, redaction for non-user."""
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    state = _make_state(tmp_path / "sessions")
+    sent: list[dict] = []
+    monkeypatch.setattr(state, "_broadcast", lambda payload: sent.append(payload))
+
+    original = [{"text": f"key {SECRET}"}]
+    state._broadcast_chat_message(
+        "chat-1-wsuser", {"role": "user", "content": original, "ts": "1"}
+    )
+
+    assert len(sent) == 1, "precondition: exactly one payload was broadcast"
+    assert isinstance(sent[0]["content"], str), "wire content must be a string"
+    assert SECRET in sent[0]["content"], "user content must not be redacted"
+    assert json.loads(sent[0]["content"]) == original
+
+
+def test_build_stream_chunk_serializes_structured_content() -> None:
+    """The SSE/relay chunk builder shares the guard: redacted and wire-safe."""
+    from kiro_crew.dashboard.chat_utils import _build_stream_chunk
+
+    rec = json.loads(
+        _build_stream_chunk(
+            {"role": "assistant", "content": [{"text": f"key {SECRET}"}], "ts": "1"}
+        )
+    )
+    assert isinstance(rec["content"], str), "wire content must be a string"
+    assert SECRET not in rec["content"], "structured leaf leaked raw"
+
+
+def test_prepare_messages_redacts_structured_variant_content() -> None:
+    """The variants branch shares the same tolerance — one guard, no third copy."""
+    row = {
+        "role": "assistant",
+        "content": "fine",
+        "cls": "msg msg-a",
+        "variants": [{"content": [{"text": f"key {SECRET}"}]}],
+    }
+    out = _prepare_messages([row], False, live_child="")
+    assert SECRET not in json.dumps(out), "structured variant content emitted unredacted"
+    assert isinstance(out[0]["variants"][0]["content"], str), "wire content must be a string"
+
+
+def test_ws_broadcast_redacts_structured_content(tmp_path, monkeypatch) -> None:
+    """A structured non-user content is redacted on the WS path — not skipped."""
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    state = _make_state(tmp_path / "sessions")
+    sent: list[dict] = []
+    monkeypatch.setattr(state, "_broadcast", lambda payload: sent.append(payload))
+
+    state._broadcast_chat_message(
+        "chat-1-wsstruct",
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": f"key {SECRET}"}],
+            "ts": "1",
+        },
+    )
+
+    assert len(sent) == 1, "precondition: exactly one payload was broadcast"
+    assert sent[0]["_type"] == "chat_message"
+    assert isinstance(sent[0]["content"], str), "wire content must be a string"
+    assert SECRET not in sent[0]["content"], "structured leaf leaked raw"

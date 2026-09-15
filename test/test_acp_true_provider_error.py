@@ -4,13 +4,13 @@ kiro-cli wraps every mid-stream provider failure in one envelope::
 
     Encountered an error in the response stream: <the real cause>
 
-``_RE_5XX_HINT`` used to match the literal ``response stream``, i.e. the
-ENVELOPE rather than anything about the failure inside it. Because the 5xx
-branch sits near the end of the if/elif chain, that made it a catch-all: every
-provider failure without an earlier curated branch was rewritten to "The model
-backend hit a transient error (HTTP 5xx) ... retry in a moment", the real cause
-was discarded, and ``_is_transient_raw_error`` agreed it was retryable so the
-turn burned the whole retry ladder first.
+``_RE_5XX_HINT`` must NOT match the literal ``response stream`` -- that is the
+ENVELOPE, not anything about the failure inside it. Because the 5xx branch sits
+near the end of the if/elif chain, matching the envelope makes it a catch-all:
+every provider failure without an earlier curated branch is rewritten to "The
+model backend hit a transient error (HTTP 5xx) ... retry in a moment", the real
+cause is discarded, and ``_is_transient_raw_error`` agrees it is retryable so the
+turn burns the whole retry ladder first.
 
 Reported case: a monthly-usage-limit rejection. The terminal CLI printed "The
 monthly usage limit has been reached" while the dashboard, for the same class of
@@ -19,7 +19,7 @@ succeed until the allowance resets.
 
 Two changes are pinned here:
 
-1. The envelope is no longer a transient token, and unrecognised failures show
+1. The envelope is not a transient token, and unrecognised failures show
    the provider's own text (CLI parity) instead of a ``repr`` of the JSON-RPC
    dict.
 2. Usage-limit exhaustion is a first-class TERMINAL branch, so it is never
@@ -144,4 +144,61 @@ class TestProviderDetail:
     def test_opaque_shape_keeps_the_raw_dict(self):
         """With no usable detail the dict is still better than nothing."""
         out = _format_acp_error({"code": -32603, "message": "Internal error", "data": ""})
+        assert "Prompt error: {" in out
+
+
+class TestMalformedRequestIsTerminalAndActionable:
+    """A structural "Improperly formed request" rejection must become
+    actionable repair guidance and lock a terminal (non-retryable) verdict, so a
+    deterministically-rejected payload is never re-sent in a loop."""
+
+    # The provider passes this string through verbatim with a request id.
+    _MALFORMED = _err(f"Improperly formed request. (request_id: {_REQ})")
+
+    def test_rewrites_into_actionable_prose(self):
+        """Not the raw dict, and not the bare provider string — real guidance."""
+        out = _format_acp_error(self._MALFORMED)
+        # The raw dict repr is gone.
+        assert "'code': -32603" not in out
+        assert str(self._MALFORMED) not in out
+        # It names the failure class (malformed / structural).
+        assert "malformed" in out.lower()
+        assert "structural" in out.lower()
+        # It says retrying as-is won't help.
+        assert "will not help" in out.lower()
+        # It offers a concrete repair affordance. Only `/compact` is accepted;
+        # the non-existent `/chat new` is not, per
+        # docs/system-specs/common/error-handling.md.
+        assert "/compact" in out
+
+    def test_request_id_is_preserved(self):
+        out = _format_acp_error(self._MALFORMED)
+        assert out.count(_REQ) == 1
+
+    def test_is_terminal_not_retried(self):
+        """The retry ladder must not re-send a structurally-rejected payload."""
+        assert _is_transient_raw_error(self._MALFORMED) is False
+
+    def test_matches_case_insensitively(self):
+        """The phrase can arrive lower-cased inside the stream envelope."""
+        err = _err(f"{_ENVELOPE}improperly formed request")
+        assert _is_transient_raw_error(err) is False
+        assert "malformed" in _format_acp_error(err).lower()
+
+    def test_phrase_in_message_field_alone_does_not_trigger(self):
+        """Scoping guard (mirrors the message-field-echo tests): the phrase
+        appearing only in the JSON-RPC ``message`` — never the provider
+        ``data`` — must NOT trip the branch, since ``data`` is the provider's
+        own text and ``message`` is often boilerplate."""
+        # Phrase only in `message`; `data` carries an unrelated, opaque payload.
+        err = {
+            "code": -32603,
+            "message": "Improperly formed request",
+            "data": "",
+        }
+        assert _is_transient_raw_error(err) is False  # opaque data -> still terminal
+        out = _format_acp_error(err)
+        # Because `data` is empty the malformed branch does not fire; the
+        # unknown-shape fallback keeps the raw dict rather than the repair prose.
+        assert "malformed" not in out.lower()
         assert "Prompt error: {" in out

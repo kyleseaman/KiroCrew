@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import requires_symlinks
+from conftest import make_dir_link, requires_symlinks
 from kiro_crew.artifacts import (
     MAX_CONTENT_BYTES,
     MAX_VERSIONS,
@@ -20,6 +20,7 @@ from kiro_crew.artifacts import (
     ArtifactValidationError,
     _infer_kind,
     detect_editor_kind,
+    has_unthemed_hardcoded_colors,
     slugify,
 )
 
@@ -33,6 +34,55 @@ def store(tmp_path: Path) -> ArtifactStore:
 
 
 # ── slugify ─────────────────────────────────────────────────────────────────
+
+
+class TestHasUnthemedHardcodedColors:
+    # Direct unit tests for the shared theme-contrast detector — the ONE
+    # place the verdict is computed (the gateway handlers stamp it on
+    # responses; MCP + CLI relay it).
+
+    def test_fires_on_hardcoded_hex(self) -> None:
+        assert has_unthemed_hardcoded_colors("widget", '<div style="color:#111">x</div>')
+
+    def test_fires_on_rgb_function(self) -> None:
+        assert has_unthemed_hardcoded_colors(
+            "html", "<style>body{background:rgb(255,255,255)}</style>"
+        )
+
+    def test_fires_on_uppercase_color_function(self) -> None:
+        # CSS functions are case-insensitive: RGB(...) is as hardcoded as
+        # rgb(...). Locks the IGNORECASE flag.
+        assert has_unthemed_hardcoded_colors("widget", '<div style="color:RGB(1,2,3)">x</div>')
+
+    def test_silent_on_href_fragment_links(self) -> None:
+        # href="#abc" is a fragment link, not a color — including the
+        # whitespace-spaced form (href = "#abc"), which is valid HTML a
+        # fixed-width lookbehind could not exempt. Locks the strip-based
+        # href exclusion.
+        assert not has_unthemed_hardcoded_colors(
+            "widget", '<a href="#abc">jump</a> <a href = "#facade">also</a>'
+        )
+
+    def test_silent_when_theme_vars_present(self) -> None:
+        # The recommended fallback form carries a hex literal AND a
+        # var(--…) reference — theme-aware content must not flag.
+        assert not has_unthemed_hardcoded_colors(
+            "widget", '<div style="color:var(--text,#111);background:var(--bg,#fff)">x</div>'
+        )
+
+    def test_silent_for_non_iframe_kinds(self) -> None:
+        # markdown/text/json/svg render natively (no injected theme
+        # defaults to clash with) — the lint is widget/html only.
+        assert not has_unthemed_hardcoded_colors("markdown", "color: #ff0000")
+
+    def test_silent_on_empty_content(self) -> None:
+        assert not has_unthemed_hardcoded_colors("widget", "")
+
+    def test_hex_shaped_id_selector_at_value_position_is_accepted_noise(self) -> None:
+        # Documented residual: a whitespace-preceded hex-shaped id selector
+        # can fire, because whitespace must stay in the prefix class or true
+        # positives like "border: 1px solid #ccc" are lost. Soft warning only.
+        assert has_unthemed_hardcoded_colors("widget", "<style>border: 1px solid #ccc</style>")
 
 
 class TestSlugify:
@@ -391,10 +441,10 @@ class TestList:
         assert {a.slug for a in results} == {"ok"}
 
     def test_list_skips_meta_with_bad_int_or_tags(self, store: ArtifactStore) -> None:
-        # Regression: _read_meta_file used to bubble ValueError (int("abc") on
-        # bad version field) and TypeError (list(non_iterable) on bad tags
-        # field) up through list(), crashing the whole library page on a
-        # single corrupted meta.json. Ensure those are now skipped+warned.
+        # _read_meta_file must skip a corrupted meta.json instead of bubbling a
+        # ValueError (int("abc") on a bad version field) or TypeError
+        # (list(non_iterable) on bad tags) up through list() and crashing the
+        # whole library page on a single bad file.
         store.create(name="ok", content="a")
 
         bad_version = store.root / "bad-version"
@@ -487,8 +537,8 @@ class TestSecurity:
     def test_snapshot_version_routes_through_read_gate(
         self, store: ArtifactStore, monkeypatch
     ) -> None:
-        # Regression: _snapshot_version() used to call src.read_text(encoding="utf-8") directly,
-        # bypassing the is_sensitive_path() gate enforced by self._read_text().
+        # _snapshot_version() reads through self._read_text(), not src.read_text()
+        # directly, so the is_sensitive_path() gate always applies.
         # If the gate ever started flagging artifact-internal paths (e.g. a
         # symlink expansion landing on a sensitive path), the snapshot read
         # must refuse rather than silently leak. Verify the gated helper is
@@ -512,6 +562,56 @@ class TestSecurity:
         monkeypatch.setattr(art_mod, "is_sensitive_path", _selective)
         with pytest.raises(ArtifactError):
             store.update("x", content="v3", snapshot=True)
+
+
+class TestSharedLockAcrossInstances:
+    """Two ``ArtifactStore`` instances pointed at the same root must
+    serialize against EACH OTHER, not just against themselves.
+
+    A fresh ``threading.Lock()`` per instance is correct for a single long-lived
+    store, but any code constructing its own
+    ``ArtifactStore()`` against the shared default root (rather than going
+    through :func:`get_default_store`) got an unserialized lock: a concurrent
+    write from that second instance was never mutually exclusive with the
+    singleton's own reads/writes on the same slug, exactly the class of race
+    that can make ``get()`` (no version) observe content mid-write.
+    """
+
+    def test_two_instances_on_the_same_root_share_one_lock(self, tmp_path: Path) -> None:
+        root = tmp_path / "artifacts"
+        a = ArtifactStore(root=root)
+        b = ArtifactStore(root=root)
+        assert a._lock is b._lock
+
+    def test_instances_on_different_roots_do_not_share_a_lock(self, tmp_path: Path) -> None:
+        a = ArtifactStore(root=tmp_path / "artifacts-a")
+        b = ArtifactStore(root=tmp_path / "artifacts-b")
+        assert a._lock is not b._lock
+
+    def test_a_write_through_a_second_instance_is_visible_to_the_first(
+        self, tmp_path: Path
+    ) -> None:
+        """Not just the same lock OBJECT -- an update from a second instance
+        must actually be observable (and mutually exclusive) through the
+        first, which is what the shared lock is for."""
+        root = tmp_path / "artifacts"
+        a = ArtifactStore(root=root)
+        a.create(name="x", content="v1", kind="text")
+        b = ArtifactStore(root=root)
+        b.update("x", content="v2")
+        assert a.get("x").content == "v2"
+
+    def test_resolved_symlinked_root_shares_the_same_lock(self, tmp_path: Path) -> None:
+        real = tmp_path / "real-artifacts"
+        real.mkdir()
+        link = tmp_path / "linked-artifacts"
+        # A directory link: the subject is that the two spellings RESOLVE to one
+        # root, which a junction exercises on Windows without the symlink
+        # privilege (see testing-conventions "Links").
+        make_dir_link(link, real)
+        a = ArtifactStore(root=real)
+        b = ArtifactStore(root=link)
+        assert a._lock is b._lock
 
 
 # ── Tolerant load / persistence ─────────────────────────────────────────────
@@ -737,7 +837,7 @@ class TestSourcePath:
         assert results[0].name == "a"
 
 
-# ── Live-pointer behavior for file-backed artifacts (round 3) ──
+# ── Live-pointer behavior for file-backed artifacts ──
 
 
 class TestLivePointer:
@@ -826,7 +926,7 @@ class TestLivePointer:
 
 
 class TestExplicitSnapshotModel:
-    """round 5: saves don't bump version unless snapshot=True.
+    """Saves don't bump version unless snapshot=True.
 
     Versioning is now deliberate — like git commits. Saves silently update
     the live state. Snapshots create new numbered versions. This makes
@@ -897,7 +997,7 @@ class TestExplicitSnapshotModel:
 
 
 class TestLiveDirtyAndSnapshotAnytime:
-    """round 6: snapshot button works whenever live differs
+    """The snapshot button works whenever live differs
     from the latest version, not just when there are unsaved edits."""
 
     def test_live_dirty_false_immediately_after_create(self, store: ArtifactStore) -> None:
@@ -983,7 +1083,7 @@ class TestLiveDirtyAndSnapshotAnytime:
 
 
 class TestSourcePathSecurityHardening:
-    """review-bot round 12 fixes: path traversal + symlink bypass + UTF-8
+    """Source-path hardening: path traversal, symlink bypass, and UTF-8
     truncation arithmetic."""
 
     def test_traversal_path_resolves_before_sensitive_check(
@@ -1054,7 +1154,7 @@ class TestSourcePathSecurityHardening:
         f.write_text("😀" * 30, encoding="utf-8")
         result = store._try_read_source_path(str(f))
         assert result is not None
-        # Round 13: bounded read caps the disk-IO at MAX_CONTENT_BYTES+1
+        # Bounded read caps the disk-IO at MAX_CONTENT_BYTES+1
         # bytes regardless of file size. The decoded string may contain
         # U+FFFD replacement chars at the truncation boundary so its
         # re-encoded byte length CAN exceed MAX_CONTENT_BYTES — that's
@@ -1065,8 +1165,7 @@ class TestSourcePathSecurityHardening:
 
 
 class TestRoundThirteenFixes:
-    """review-bot round 13 fixes: bounded read, event_type pre-validation,
-    live_dirty not persisted."""
+    """Bounded read, event_type pre-validation, and live_dirty not persisted."""
 
     def test_oversized_file_does_not_load_full_content_into_memory(
         self, store: ArtifactStore, tmp_path: Path, monkeypatch
@@ -1099,7 +1198,7 @@ class TestRoundThirteenFixes:
     def test_invalid_event_type_does_not_leave_orphaned_version_file(
         self, store: ArtifactStore
     ) -> None:
-        # Round 13: validation happens BEFORE version bump and snapshot
+        # Validation happens BEFORE version bump and snapshot
         # write. An invalid event_type must not leave a versions/v{N}.html
         # on disk.
         store.create(name="x", content="v1", slug="x")
@@ -1120,7 +1219,7 @@ class TestRoundThirteenFixes:
         assert loaded.version == 1
 
     def test_live_dirty_not_persisted_in_meta_json(self, store: ArtifactStore) -> None:
-        # Round 13: live_dirty is computed at GET time and must not be
+        # live_dirty is computed at GET time and must not be
         # written to meta.json. Persisting would create staleness bugs.
         store.create(name="x", content="v1", slug="x")
         # Trigger a GET that sets live_dirty, then write_meta via update
@@ -1454,7 +1553,7 @@ class TestBlankDocumentKind:
         store.create(name="Untitled", content="", slug="u")
         pinned = store.update("u", content="# prose", kind="text")
         assert (pinned.kind, pinned.kind_auto) == ("text", False)
-        # Now that it's pinned, JSON content no longer re-types it.
+        # Once pinned, JSON content does not re-type it.
         assert store.update("u", content='{"a": 1}').kind == "text"
 
     def test_snapshot_records_the_detected_kind_for_the_version(
@@ -2320,7 +2419,7 @@ class TestSourceRootBarrier:
         home_dst = Path.home() / "moved.md"
         home_dst.write_text("# moved", encoding="utf-8")
         art = home_store.relocate("spec", str(home_dst))
-        # The old project root no longer authorizes anything about the new path.
+        # The old project root does not authorize anything about the new path.
         assert art.source_path == str(home_dst)
         assert art.source_root == ""
 
@@ -2467,7 +2566,7 @@ class TestAllowedRootsSingleProducer:
         assert verifiable.resolve() in home_store.allowed_source_roots(str(verifiable))
 
     def test_data_home_path_accepted_by_read_and_write(self, home_store) -> None:
-        # The root the relocate handler used to omit. Read and write must agree.
+        # The data-home root the relocate handler must include. Read and write must agree.
         data_home = home_store._root.resolve().parent
         target = data_home / "note.md"
         target.write_text("in the data home", encoding="utf-8")

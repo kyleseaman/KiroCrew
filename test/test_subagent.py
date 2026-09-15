@@ -101,6 +101,37 @@ class TestSpawnWithoutApprovalCallback:
         assert info.error == "spawn rejected: no approval mechanism configured"
 
     @pytest.mark.asyncio
+    async def test_spawn_refused_while_gateway_admission_is_closed(self) -> None:
+        sessions = _mock_sessions()
+        sessions.admission_closed = True
+        manager = SubagentManager(
+            sessions=sessions,
+            ctx_builder=_mock_ctx_builder_auto_spawn(),
+        )
+
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            info = manager.spawn("must wait for update")
+
+        assert info is not None
+        assert info.done is True
+        assert info.error == "spawn refused: gateway admission is closed"
+        assert manager._tasks == {}
+
+    def test_total_queued_count_includes_every_parent(self) -> None:
+        manager = SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=_mock_ctx_builder(),
+        )
+        manager._queue.extend(
+            [
+                {"parent_session_key": "dashboard:a"},
+                {"parent_session_key": "slack:b"},
+            ]
+        )
+
+        assert manager.queued_count == 2
+
+    @pytest.mark.asyncio
     async def test_spawn_auto_approved_with_flag(self) -> None:
         """Spawn is auto-approved when auto_approve_subagent_spawn is True."""
         manager = SubagentManager(
@@ -148,7 +179,9 @@ class TestSpawnWithoutApprovalCallback:
             sessions=sessions,
             ctx_builder=ctx,
         )
-        info = SubagentInfo(id="test01", task="tool approval task", parent_session_key="slack:C123:T456")
+        info = SubagentInfo(
+            id="test01", task="tool approval task", parent_session_key="slack:C123:T456"
+        )
 
         with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
             await manager._run_inner(info, "subagent:test01")
@@ -156,9 +189,9 @@ class TestSpawnWithoutApprovalCallback:
         # Subagent session should be created with parent_policy="auto"
         sessions.get_or_create.assert_awaited_once()
         call_kwargs = sessions.get_or_create.call_args.kwargs
-        assert call_kwargs.get("approval_policy") == "auto", (
-            f"Expected approval_policy=auto, got {call_kwargs}"
-        )
+        assert (
+            call_kwargs.get("approval_policy") == "auto"
+        ), f"Expected approval_policy=auto, got {call_kwargs}"
 
     @pytest.mark.asyncio
     async def test_spawn_without_callback_yolo_on_executes(self) -> None:
@@ -228,7 +261,10 @@ class TestSpawnWithoutApprovalCallback:
 
         assert queued is not None and queued.queued is True
         # The queued member is invisible to `running`-based checks...
-        assert not any(a.parent_session_key == "cron:j1" and a.queued is False and a.id == queued.id for a in manager.running)
+        assert not any(
+            a.parent_session_key == "cron:j1" and a.queued is False and a.id == queued.id
+            for a in manager.running
+        )
         # ...but the pending-work predicates must still report it.
         assert manager.queued_count_for("cron:j1") == 1
         assert manager.has_pending_work_for("cron:j1") is True
@@ -636,8 +672,10 @@ class TestSubagentReaper:
         manager._agents["done0001"] = info
 
         # Run one real reaper sweep — first sleep succeeds, second raises CancelledError
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch(
-            "asyncio.sleep", AsyncMock(side_effect=[None, asyncio.CancelledError])
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("asyncio.sleep", AsyncMock(side_effect=[None, asyncio.CancelledError])),
         ):
             with pytest.raises(asyncio.CancelledError):
                 await manager._reaper_loop()
@@ -674,9 +712,12 @@ class TestSubagentReaper:
         # _sigkill_session is async (offloaded the Windows taskkill
         # to subprocess_executor via kill_process_tree_async), so callers now
         # await it — the patch must be AsyncMock or asyncio complains.
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch(
-            "kiro_crew.subagent._RESET_TIMEOUT", 0.1
-        ), patch.object(manager, "_sigkill_session", new_callable=AsyncMock) as mock_kill:
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.1),
+            patch.object(manager, "_sigkill_session", new_callable=AsyncMock) as mock_kill,
+        ):
             await manager._force_reap("hang0001", info, _TIMEOUT_SECS + 60)
 
         assert info.done is True
@@ -705,9 +746,12 @@ class TestSubagentReaper:
         manager._running_count = 1
 
         # _sigkill_session is async — patch with AsyncMock.
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch(
-            "kiro_crew.subagent._RESET_TIMEOUT", 0.1
-        ), patch.object(manager, "_sigkill_session", new_callable=AsyncMock):
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent._RESET_TIMEOUT", 0.1),
+            patch.object(manager, "_sigkill_session", new_callable=AsyncMock),
+        ):
             await manager._run(info)
 
         # Should complete without hanging
@@ -1086,8 +1130,10 @@ class TestOnDoneTimeout:
             is_yolo=lambda: True,
         )
 
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch(
-            "kiro_crew.subagent._ON_DONE_TIMEOUT", 0.1
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent._ON_DONE_TIMEOUT", 0.1),
         ):
             info = manager.spawn("timeout test", parent_session_key="dashboard:test-slot")
             assert info is not None
@@ -1121,8 +1167,10 @@ class TestOnDoneTimeout:
             is_yolo=lambda: True,
         )
 
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch(
-            "kiro_crew.subagent._ON_DONE_TIMEOUT", 0.1
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent._ON_DONE_TIMEOUT", 0.1),
         ):
             info = manager.spawn("path test", parent_session_key="dashboard:slot-x")
             assert info is not None
@@ -1164,8 +1212,10 @@ class TestOnDoneTimeout:
         manager._agents["hang0002"] = info
         manager._running_count = 1
 
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch(
-            "kiro_crew.subagent._ON_DONE_TIMEOUT", 0.1
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent._ON_DONE_TIMEOUT", 0.1),
         ):
             await manager._force_reap("hang0002", info, _TIMEOUT_SECS + 60)
 
@@ -1198,8 +1248,11 @@ class TestOnDoneTimeout:
         info.error = "Timed out after 30 minutes"
         manager._agents["done0001"] = info
 
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), \
-             patch.object(manager, "_write_tombstone") as mock_ts:
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch.object(manager, "_write_tombstone") as mock_ts,
+        ):
             await manager._force_reap("done0001", info, _TIMEOUT_SECS + 60)
 
         assert info.reaped is True
@@ -1242,8 +1295,10 @@ class TestOnDoneTimeout:
             is_yolo=lambda: True,
         )
 
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch(
-            "kiro_crew.subagent._ON_DONE_TIMEOUT", 0.1
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent._ON_DONE_TIMEOUT", 0.1),
         ):
             info = manager.spawn("timeout reset test", parent_session_key="dashboard:slot-1")
             assert info is not None
@@ -1511,16 +1566,41 @@ class TestCheckMemoryAvailable:
         ok, _ = check_memory_available(min_gb=4.0, path=str(f))
         assert ok is True
 
-    def test_sensitive_path_rejected(self, tmp_path):
-        """Returns (True, -1.0) for sensitive paths — fails open."""
+    def test_does_not_route_through_path_gate(self, tmp_path):
+        """The constant kernel path bypasses the agent-path gate.
+
+        A gate refusal under load must not silently disable spawn
+        back-pressure, so the read is a plain ``open``. A function-local
+        re-route through either gate helper makes this test fail loudly.
+        """
         from unittest.mock import patch
 
         from kiro_crew.subagent import check_memory_available
 
         f = tmp_path / "meminfo"
         f.write_text("MemAvailable:    8388608 kB\n")
-        with patch("kiro_crew.subagent.safe_read_file", side_effect=PermissionError("blocked")):
-            ok, avail = check_memory_available(path=str(f))
+        with (
+            patch(
+                "kiro_crew.hooks.safe_read_file",
+                side_effect=AssertionError("gate must not be consulted"),
+            ),
+            patch(
+                "kiro_crew.hooks.is_sensitive_path",
+                side_effect=AssertionError("gate must not be consulted"),
+            ),
+        ):
+            ok, avail = check_memory_available(min_gb=4.0, path=str(f))
+        assert ok is True
+        assert avail == 8.0
+
+    def test_permission_error_fails_open(self, tmp_path):
+        """A real EACCES from open() is an OSError and fails open (True, -1.0)."""
+        from unittest.mock import patch
+
+        from kiro_crew.subagent import check_memory_available
+
+        with patch("builtins.open", side_effect=PermissionError("denied")):
+            ok, avail = check_memory_available(path="/proc/meminfo")
         assert ok is True
         assert avail == -1.0
 
@@ -1551,9 +1631,11 @@ class TestSpawnMemoryGuard:
             max_concurrent=3,
         )
 
-        with patch("kiro_crew.subagent.check_memory_available", return_value=(False, 2.5)), \
-             patch("kiro_crew.subagent.KiroCrewConfig") as mock_cfg, \
-             patch("kiro_crew.subagent.sel") as mock_sel:
+        with (
+            patch("kiro_crew.subagent.check_memory_available", return_value=(False, 2.5)),
+            patch("kiro_crew.subagent.KiroCrewConfig") as mock_cfg,
+            patch("kiro_crew.subagent.sel") as mock_sel,
+        ):
             mock_cfg.load.return_value.agent.spawn_min_memory_gb = 4.0
             mock_sel.return_value.log_tool_invocation = MagicMock()
 
@@ -1700,7 +1782,8 @@ class TestSubagentPostToolUseHook:
         # once for PostToolUse. Verify the PostToolUse call carried the cached
         # tool_name (with "Running: " stripped) and the tool_response payload.
         post_calls = [
-            c for c in manager.hook_store.fire.await_args_list
+            c
+            for c in manager.hook_store.fire.await_args_list
             if c.args and c.args[0] == "PostToolUse"
         ]
         assert len(post_calls) == 1, (
@@ -1760,7 +1843,8 @@ class TestSubagentPostToolUseHook:
             await manager._run_inner(info, "subagent:t02")
 
         post_calls = [
-            c for c in manager.hook_store.fire.await_args_list
+            c
+            for c in manager.hook_store.fire.await_args_list
             if c.args and c.args[0] == "PostToolUse"
         ]
         assert len(post_calls) == 1
@@ -1951,7 +2035,7 @@ class TestCompletionKeepLoader:
 
 
 class TestSubagentUsageRow:
-    """Issue #647: a completed subagent turn appends one usage row tagged
+    """A completed subagent turn appends one usage row tagged
     surface='subagent', carrying the resolved agent and context occupancy."""
 
     @pytest.mark.asyncio
@@ -1981,12 +2065,15 @@ class TestSubagentUsageRow:
         )
 
         persist = AsyncMock()
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch(
-            "kiro_crew.dashboard.handlers.usage.persist_token_record_async", persist
-        ), patch(
-            "kiro_crew.dashboard.handlers.usage.read_context_tokens",
-            MagicMock(return_value=(999, 200000)),
-            create=True,
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.dashboard.handlers.usage.persist_token_record_async", persist),
+            patch(
+                "kiro_crew.dashboard.handlers.usage.read_context_tokens",
+                MagicMock(return_value=(999, 200000)),
+                create=True,
+            ),
         ):
             await manager._run_inner(info, "subagent:usage01")
 
@@ -2025,22 +2112,243 @@ class TestSubagentUsageRow:
         )
 
         persist = AsyncMock()
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch(
-            "kiro_crew.dashboard.handlers.usage.persist_token_record_async", persist
-        ), patch(
-            "kiro_crew.dashboard.handlers.usage.read_context_tokens",
-            MagicMock(return_value=(1, 2)),
-            create=True,
-        ), patch(
-            # The shared parent runtime reports the parent's agent.
-            "kiro_crew.dashboard.handlers.usage.read_effective_agent",
-            MagicMock(return_value="kirocrew"),
-            create=True,
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.dashboard.handlers.usage.persist_token_record_async", persist),
+            patch(
+                "kiro_crew.dashboard.handlers.usage.read_context_tokens",
+                MagicMock(return_value=(1, 2)),
+                create=True,
+            ),
+            patch(
+                # The shared parent runtime reports the parent's agent.
+                "kiro_crew.dashboard.handlers.usage.read_effective_agent",
+                MagicMock(return_value="kirocrew"),
+                create=True,
+            ),
         ):
             await manager._run_inner(info, "subagent:usage02")
 
         persist.assert_awaited_once()
         assert persist.await_args.kwargs["agent"] == "researcher"
+
+
+class TestIdentityTrustedChildParentPolicyAuto:
+    """A low-fidelity child MCP permission event whose canonical identity IS
+    verified (remote server streamed no rawInput) honors an
+    unconditional ``parent_policy=auto`` grant instead of stalling on the
+    interactive downgrade; without the verified identity the same event stays
+    fail-closed.
+    """
+
+    def _manager_and_stream(self, event):
+        from kiro_crew.hooks import ToolHookResult
+        from kiro_crew.subagent import SubagentInfo, SubagentManager
+
+        sessions = _mock_sessions()
+        sessions.get_approval_policy = MagicMock(return_value="auto")
+        provider = sessions.get_or_create.return_value[0]
+
+        async def _stream(*_a, **_kw):
+            yield event
+
+        provider.stream = MagicMock(side_effect=lambda *a, **kw: _stream())
+        provider.approve_tool = AsyncMock()
+        provider.reject_tool = AsyncMock()
+
+        ctx = MagicMock()
+        ctx.build_message = MagicMock(return_value=("msg", None))
+        # ALLOW (not auto-approve): the approval must come from the
+        # parent_policy grant, not the hook shortcut.
+        ctx.hooks.on_tool_call = MagicMock(return_value=ToolHookResult.allow())
+
+        manager = SubagentManager(sessions=sessions, ctx_builder=ctx, default_turn_limit=1)
+        info = SubagentInfo(id="idmcp01", task="t", parent_session_key="dashboard:default")
+        manager._agents["idmcp01"] = info
+        return manager, info, provider
+
+    @staticmethod
+    def _child_mcp_event(**overrides):
+        from kiro_crew.providers.base import EVENT_PERMISSION_REQUEST, LLMEvent
+
+        base: dict = dict(
+            kind=EVENT_PERMISSION_REQUEST,
+            title="@example-server/get-item",
+            request_id=7001,
+            sub_session_id="child-a",
+            shell_classified=True,
+            is_shell=False,
+            mcp_server_name="example-server",
+            tool_name="get-item",
+            # Identity provenance flag: the real permission builder sets it
+            # when the pair above resolves from the origin-scoped caches.
+            mcp_identity_trusted=True,
+        )
+        base.update(overrides)
+        return LLMEvent(**base)
+
+    @pytest.mark.asyncio
+    async def test_identity_trusted_child_approved_under_parent_policy_auto(self) -> None:
+        event = self._child_mcp_event()
+        assert event.child_low_fidelity and event.child_mcp_identity_trusted
+        manager, info, provider = self._manager_and_stream(event)
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent.update_state"),
+            patch("kiro_crew.subagent.create_agent_folder", MagicMock(), create=True),
+        ):
+            await manager._run_inner(info, "subagent:idmcp01")
+
+        provider.approve_tool.assert_awaited_once_with(7001)
+        provider.reject_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_identity_missing_child_still_fails_closed(self) -> None:
+        """Counterfactual: same grant, same event shape, identity caches
+        missed — the request must NOT be auto-approved (headless: rejected)."""
+        event = self._child_mcp_event(mcp_server_name="", tool_name="")
+        assert event.child_low_fidelity and not event.child_mcp_identity_trusted
+        manager, info, provider = self._manager_and_stream(event)
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent.update_state"),
+            patch("kiro_crew.subagent.create_agent_folder", MagicMock(), create=True),
+        ):
+            await manager._run_inner(info, "subagent:idmcp01")
+
+        provider.approve_tool.assert_not_awaited()
+        provider.reject_tool.assert_awaited_once_with(7001)
+
+    @pytest.mark.asyncio
+    async def test_identity_trusted_child_without_auto_policy_not_approved(self) -> None:
+        """Identity verification is not itself a grant: with no auto policy
+        (and no interactive approver) the event stays fail-closed."""
+        event = self._child_mcp_event()
+        manager, info, provider = self._manager_and_stream(event)
+        manager._sessions.get_approval_policy = MagicMock(return_value="")
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent.update_state"),
+            patch("kiro_crew.subagent.create_agent_folder", MagicMock(), create=True),
+        ):
+            await manager._run_inner(info, "subagent:idmcp01")
+
+        provider.approve_tool.assert_not_awaited()
+        provider.reject_tool.assert_awaited_once_with(7001)
+
+
+class TestIdentityTrustedChildHookIdentityGrant:
+    """A low-fidelity child MCP event with a VERIFIED canonical identity honors
+    a hook auto-approve that was decided by that identity
+    (``ToolHookResult.identity_grant``) — the user's own narrow grant — with no
+    ``parent_policy=auto``. A hook grant that read the title, or the same grant
+    on a child whose identity is NOT verified, stays fail-closed.
+    """
+
+    def _manager_and_stream(self, event, hook_result):
+        from kiro_crew.subagent import SubagentInfo, SubagentManager
+
+        sessions = _mock_sessions()
+        # No unconditional grant: only the hook can approve.
+        sessions.get_approval_policy = MagicMock(return_value="")
+        provider = sessions.get_or_create.return_value[0]
+
+        async def _stream(*_a, **_kw):
+            yield event
+
+        provider.stream = MagicMock(side_effect=lambda *a, **kw: _stream())
+        provider.approve_tool = AsyncMock()
+        provider.reject_tool = AsyncMock()
+
+        ctx = MagicMock()
+        ctx.build_message = MagicMock(return_value=("msg", None))
+        ctx.hooks.on_tool_call = MagicMock(return_value=hook_result)
+
+        manager = SubagentManager(sessions=sessions, ctx_builder=ctx, default_turn_limit=1)
+        info = SubagentInfo(id="idhook01", task="t", parent_session_key="dashboard:default")
+        manager._agents["idhook01"] = info
+        return manager, info, provider
+
+    @staticmethod
+    def _child_mcp_event(**overrides):
+        from kiro_crew.providers.base import EVENT_PERMISSION_REQUEST, LLMEvent
+
+        base: dict = dict(
+            kind=EVENT_PERMISSION_REQUEST,
+            title="Running: @memory-mcp/search_memory",
+            request_id=7101,
+            sub_session_id="child-a",
+            is_shell=False,
+            mcp_server_name="memory-mcp",
+            tool_name="search_memory",
+            mcp_identity_trusted=True,
+        )
+        base.update(overrides)
+        return LLMEvent(**base)
+
+    def _patches(self):
+        return (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent.update_state"),
+            patch("kiro_crew.subagent.create_agent_folder", MagicMock(), create=True),
+        )
+
+    @pytest.mark.asyncio
+    async def test_identity_grant_approves_identity_trusted_child(self) -> None:
+        from kiro_crew.hooks import ToolHookResult
+
+        event = self._child_mcp_event()
+        assert event.child_low_fidelity and event.child_mcp_identity_trusted
+        manager, info, provider = self._manager_and_stream(
+            event, ToolHookResult.auto_approve(identity_grant=True)
+        )
+        p1, p2, p3, p4 = self._patches()
+        with p1, p2, p3, p4:
+            await manager._run_inner(info, "subagent:idhook01")
+
+        provider.approve_tool.assert_awaited_once_with(7101)
+        provider.reject_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_title_grant_stays_downgraded_for_child(self) -> None:
+        """The same auto-approve WITHOUT identity provenance (a title-keyed
+        match) is still fail-closed for the low-fidelity child."""
+        from kiro_crew.hooks import ToolHookResult
+
+        event = self._child_mcp_event()
+        manager, info, provider = self._manager_and_stream(event, ToolHookResult.auto_approve())
+        p1, p2, p3, p4 = self._patches()
+        with p1, p2, p3, p4:
+            await manager._run_inner(info, "subagent:idhook01")
+
+        provider.approve_tool.assert_not_awaited()
+        provider.reject_tool.assert_awaited_once_with(7101)
+
+    @pytest.mark.asyncio
+    async def test_identity_grant_needs_verified_identity(self) -> None:
+        """An identity grant cannot carry a child whose own identity did not
+        verify (cache miss): nothing ties the grant to the tool that runs."""
+        from kiro_crew.hooks import ToolHookResult
+
+        event = self._child_mcp_event(mcp_identity_trusted=False)
+        assert event.child_low_fidelity and not event.child_mcp_identity_trusted
+        manager, info, provider = self._manager_and_stream(
+            event, ToolHookResult.auto_approve(identity_grant=True)
+        )
+        p1, p2, p3, p4 = self._patches()
+        with p1, p2, p3, p4:
+            await manager._run_inner(info, "subagent:idhook01")
+
+        provider.approve_tool.assert_not_awaited()
+        provider.reject_tool.assert_awaited_once_with(7101)
 
 
 class TestChildEscalationLimit:
@@ -2087,9 +2395,12 @@ class TestChildEscalationLimit:
             side_effect=lambda _i, cause: tombstones.append(cause)
         )
 
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch(
-            "kiro_crew.subagent.update_state"
-        ), patch("kiro_crew.subagent.create_agent_folder", MagicMock(), create=True):
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch("kiro_crew.subagent.update_state"),
+            patch("kiro_crew.subagent.create_agent_folder", MagicMock(), create=True),
+        ):
             await manager._run_inner(info, "subagent:esc01")
 
         assert tombstones == ["child_escalation_limit"]
@@ -2100,3 +2411,97 @@ class TestChildEscalationLimit:
         answered = {c.args[0] for c in provider.reject_tool.await_args_list}
         assert 1000 + 60 in answered, "triggering request was not answered"
         assert len(answered) == 61
+
+
+class TestSpawnMemoryModeSnapshot:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["incognito", "temporary"])
+    async def test_queue_keeps_admission_mode_after_parent_replacement(self, mode):
+        from kiro_crew.subagent_persistence import read_run_memory_mode
+
+        parent_modes = {"dashboard:parent": mode}
+        resolver = MagicMock(side_effect=lambda key: parent_modes[key])
+        manager = SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=None,
+            max_concurrent=1,
+            is_yolo=lambda: True,
+            memory_mode_for_session=resolver,
+        )
+        manager._spawn_stagger_secs = 0
+        manager._running_count = 1
+        manager._run = AsyncMock()
+        info = manager.spawn("queued task", parent_session_key="dashboard:parent")
+        assert info is not None and info.queued
+        assert info.memory_mode == mode
+        assert manager._queue[0]["_memory_mode"] == mode
+        parent_modes["dashboard:parent"] = "persistent"
+        manager._running_count = 0
+        manager._drain_queue()
+        await asyncio.wait_for(asyncio.gather(*manager._tasks.values()), timeout=5)
+        running = manager.get(info.id)
+        assert running is not None and running.memory_mode == mode
+        assert read_run_memory_mode(info.id) == mode
+        resolver.assert_called_once_with("dashboard:parent")
+
+    @pytest.mark.asyncio
+    async def test_unknown_mode_refuses_before_queue_or_execution(self):
+        manager = SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=None,
+            memory_mode_for_session=lambda key: "unknown",
+        )
+        info = manager.spawn("task", parent_session_key="dashboard:parent")
+        assert info is not None and info.done
+        assert info.error.startswith("memory_unavailable:")
+        assert not manager._queue and not manager._tasks
+
+    @pytest.mark.asyncio
+    async def test_global_binding_write_failure_blocks_provider(self):
+        from kiro_crew.subagent import SubagentInfo
+
+        sessions = _mock_sessions()
+        manager = SubagentManager(sessions=sessions, ctx_builder=None)
+        info = SubagentInfo(id="mode-write-failure", task="task", memory_mode="temporary")
+        with patch("kiro_crew.subagent.create_agent_folder", side_effect=OSError("write failed")):
+            manager._log_spawned(info)
+        assert info.error.startswith("memory_unavailable:")
+        with pytest.raises(RuntimeError, match="memory_unavailable"):
+            await manager._run_inner(info, f"subagent:{info.id}")
+        sessions.get_or_create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["incognito", "temporary"])
+    async def test_approval_wait_keeps_mode_after_parent_closes(self, mode):
+        from kiro_crew.subagent_persistence import read_run_memory_mode
+
+        modes = {"dashboard:parent": mode}
+        entered = asyncio.Event()
+        approved = asyncio.get_running_loop().create_future()
+
+        async def approve(request_id, description, parent):
+            entered.set()
+            return await approved
+
+        manager = SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=None,
+            on_spawn_approval=approve,
+            memory_mode_for_session=lambda key: modes[key],
+        )
+        manager._run = AsyncMock()
+        info = manager.spawn("approved task", parent_session_key="dashboard:parent")
+        assert info is not None
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            modes.clear()
+            approved.set_result(True)
+            await asyncio.wait_for(asyncio.gather(*manager._tasks.values()), timeout=5)
+            assert info.memory_mode == mode
+            assert read_run_memory_mode(info.id) == mode
+        finally:
+            if not approved.done():
+                approved.set_result(False)
+            await asyncio.wait_for(
+                asyncio.gather(*manager._tasks.values(), return_exceptions=True), timeout=5
+            )

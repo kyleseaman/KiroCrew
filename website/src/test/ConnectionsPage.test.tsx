@@ -1,17 +1,21 @@
-import { isValidLoopbackReturnAddress } from '../utils/loopbackReturnAddress'
+import { isValidLoopbackReturnAddress, normalizeLoopbackReturnAddress } from '../utils/loopbackReturnAddress'
 import { describe, expect, it } from 'vitest'
+import type { ConnectionStatus } from '../api/client'
 import type { ChatMessage, McpServer } from '../types'
 import {
+  confirmedGrantPresent,
   connectionStateFor,
   disconnectFeedback,
   effectiveOAuth,
   latestOAuthByServer,
   mintOutcome,
+  probeIndicatesConnected,
   uninstallOnCancel,
   withMintedUrl,
   type OAuthState,
   type PendingConnect,
 } from '../pages/connections/ConnectionsPage'
+import { CONNECTION_PROVIDERS, isPreregisteredProvider, type ConnectionProvider } from '../pages/connections/registry'
 
 const server = (status: string): McpServer => ({
   name: 'notion',
@@ -20,6 +24,14 @@ const server = (status: string): McpServer => ({
   status,
   source: 'mcp.json',
   enabled: true,
+})
+
+/** One entry of the /api/connections/status authorization feed. */
+const status = (over: Partial<ConnectionStatus> = {}): ConnectionStatus => ({
+  slug: 'notion',
+  status: 'connected',
+  grantPresent: true,
+  ...over,
 })
 
 describe('Connections card states', () => {
@@ -59,13 +71,50 @@ describe('Connections card states', () => {
       .toBe('waiting-for-approval')
     expect(connectionStateFor(server('needs_auth'), undefined, false, false, true))
       .toBe('waiting-for-approval')
-    // Precedence is unchanged: a live grant (cached-ok probe, no confirmed
-    // absence) still outranks a stale awaiting verdict from the 30s poll.
-    expect(connectionStateFor(server('ok'), undefined, false, true, true)).toBe('connected')
+    // A live mint attempt now outranks a cached-ok probe too: the mint side of
+    // this fix validates an existing grant before ever reporting `granted`, so a
+    // genuinely fresh `awaitingConsent` here means the old grant did not hold up
+    // and a real consent flow is in progress. Claiming Connected from the stale
+    // probe over that is the exact defect this fix closes.
+    expect(connectionStateFor(server('ok'), undefined, false, true, true))
+      .toBe('waiting-for-approval')
     // And a refused grant is still a real failure, not a spinner.
     expect(connectionStateFor(server('needs_auth'), {
       completed: false, failed: true, oauthUrl: '', error: 'denied', timestamp: 1,
     }, false, false, true)).toBe('needs-attention')
+  })
+
+  /**
+   * The reported defect: clicking Connect on Stripe or Vercel (an already
+   * -configured provider whose `/api/mcp` probe answers `ok` from a cached
+   * handshake) flipped the card to Connected instantly, before the mint had
+   * validated whether that old grant still worked. Test then forced kiro-cli's
+   * real refresh, the pair turned out dead, and the card fell to not-authorized
+   * — an authorization claim the card made with nothing behind it.
+   *
+   * A fresh mint attempt in THIS tab (`locallyWaiting`) or one the backend's
+   * mint table reports in flight (`awaitingConsent`) must hold the card in the
+   * waiting state regardless of what the 30-second status poll cached, until
+   * the mint itself resolves the attempt one way or the other.
+   */
+  it('holds the waiting card through a fresh Connect click even over a cached-ok probe', () => {
+    // The exact shape of the bug: server.status is the stale cached 'ok', and
+    // this tab just started its own attempt. The click, not the cache, owns
+    // the card until the mint answers.
+    expect(connectionStateFor(server('ok'), undefined, true)).toBe('waiting-for-approval')
+    // Same shape via the backend's mint table rather than local tab state —
+    // covers a second tab watching the same provider's attempt.
+    expect(connectionStateFor(server('ok'), undefined, false, true, true))
+      .toBe('waiting-for-approval')
+    // Once the flow completes in THIS session, completed evidence still wins
+    // over everything, exactly as it always has.
+    expect(connectionStateFor(server('ok'), { completed: true }, true))
+      .toBe('connected')
+    // And a refusal during that same attempt is a real failure, not a spinner
+    // that quietly reverts to the stale cached 'ok'.
+    expect(connectionStateFor(server('ok'), {
+      completed: false, failed: true, oauthUrl: '', error: 'denied', timestamp: 1,
+    }, true)).toBe('needs-attention')
   })
 
   it('lets live OAuth evidence outrank a tokenless needs_auth probe', () => {
@@ -350,6 +399,33 @@ describe('loopback OAuth return-address validation', () => {
   ])('rejects unsafe or incomplete return address %s', value => {
     expect(isValidLoopbackReturnAddress(value)).toBe(false)
   })
+
+  // #7406: iOS Safari copies address-bar URLs without the scheme; the
+  // scheme-less paste must normalize to http:// and validate.
+  it.each([
+    '127.0.0.1:43123/?code=one-time&state=s',
+    'localhost:43123/callback?code=one-time',
+    '[::1]:43123/?code=one-time',
+  ])('accepts a scheme-less loopback paste %s via the http default', value => {
+    expect(normalizeLoopbackReturnAddress(value)).toBe(`http://${value}`)
+    expect(isValidLoopbackReturnAddress(value)).toBe(true)
+  })
+
+  it.each([
+    // The http default must not widen containment beyond the strict form.
+    '10.0.0.5:43123/?code=x',
+    'evil.example:43123/?code=x',
+    '127.0.0.1/?code=x',
+    // An explicit non-http scheme stays rejected — no rewrite to http.
+    'ftp://127.0.0.1:43123/?code=x',
+  ])('scheme default still rejects %s', value => {
+    expect(isValidLoopbackReturnAddress(value)).toBe(false)
+  })
+
+  it('leaves an already-schemed value untouched', () => {
+    expect(normalizeLoopbackReturnAddress(' http://127.0.0.1:43123/?code=x '))
+      .toBe('http://127.0.0.1:43123/?code=x')
+  })
 })
 
 describe('the authorization axis resolves the needs_auth ambiguity', () => {
@@ -382,5 +458,122 @@ describe('the authorization axis resolves the needs_auth ambiguity', () => {
       .toBe('needs-attention')
     // A grant says nothing about an endpoint that is actually broken.
     expect(connectionStateFor(server('error'), undefined, false, true)).toBe('needs-attention')
+  })
+})
+
+describe('one probe reading serves both the badge and the Test button', () => {
+  // The badge and the Test button used to fold the SAME probe answer twice, and
+  // disagreed: a connected provider showed Connected beside a "test failed".
+  // This is the single predicate both now consume, so the truth table is pinned
+  // here rather than inferred from either surface.
+  it('reads a tokenless needs_auth beside a grant as connected', () => {
+    expect(probeIndicatesConnected('needs_auth', true)).toBe(true)
+  })
+
+  it('refuses needs_auth when no grant is held', () => {
+    // Absent AND indeterminate: neither is a grant, so neither may claim health.
+    expect(probeIndicatesConnected('needs_auth', false)).toBe(false)
+    expect(probeIndicatesConnected('needs_auth', undefined)).toBe(false)
+  })
+
+  it('accepts ok unless the grant is CONFIRMED absent', () => {
+    // Reachability is cached, so it outlives revocation — only a confirmed
+    // absence is a fresher fact than it. Indeterminate keeps the prior verdict.
+    expect(probeIndicatesConnected('ok', true)).toBe(true)
+    expect(probeIndicatesConnected('ok', undefined)).toBe(true)
+    expect(probeIndicatesConnected('ok', false)).toBe(false)
+  })
+
+  it('never lets a grant launder a broken or unknown probe', () => {
+    for (const status of ['error', 'disabled', 'unknown', 'probing', 'outdated']) {
+      expect(probeIndicatesConnected(status, true)).toBe(false)
+      expect(probeIndicatesConnected(status, undefined)).toBe(false)
+    }
+  })
+
+  it('collapses an indeterminate grant lookup to the honest hedge', () => {
+    // `grantPresent: false` from a lookup that FAILED means "could not look" —
+    // it must not reach either surface as a confirmed absence.
+    expect(confirmedGrantPresent(undefined)).toBeUndefined()
+    expect(confirmedGrantPresent(status({ grantPresent: false, grantIndeterminate: true })))
+      .toBeUndefined()
+    expect(confirmedGrantPresent(status({ grantPresent: false }))).toBe(false)
+    expect(confirmedGrantPresent(status({ grantPresent: true }))).toBe(true)
+  })
+})
+
+/**
+ * A PRE-REGISTERED provider (GitHub, Asana) cannot register its own OAuth client,
+ * so until an operator enters one under Settings → OAuth Apps the status feed
+ * flags the row with `needsClientConfig`. The card is then an instruction, not
+ * an offer to connect -- unless a consent is genuinely in flight, in which case
+ * the live approval URL still has to be honoured.
+ */
+describe('a pre-registered provider without an operator client', () => {
+  it('renders needs-configuration when nothing is in flight', () => {
+    expect(connectionStateFor(undefined, undefined, false, false, false, true)).toBe('needs-configuration')
+    // The flag outranks the not-connected fold even without a grant verdict.
+    expect(connectionStateFor(undefined, undefined, false, undefined, false, true)).toBe('needs-configuration')
+  })
+
+  it('keeps a consent in flight as waiting-for-approval', () => {
+    // The backend's mint table says a flow is live right now: an operator
+    // configured, clicked Connect, then cleared the record. The URL is still
+    // valid, so the card must stay in the waiting state and let the poll settle.
+    expect(connectionStateFor(undefined, undefined, false, false, true, true)).toBe('waiting-for-approval')
+    // The same holds for THIS tab's own pending click …
+    expect(connectionStateFor(undefined, undefined, true, false, false, true)).toBe('waiting-for-approval')
+    // … and for a chat-delivered approval URL, which never sets awaitingConsent.
+    // The entry exists here because the chat banner only fires once Connect has
+    // written it; with NO entry a lone URL never meant "waiting" (the `!server`
+    // fold), and this flag does not change that rule.
+    const oauth: OAuthState = { oauthUrl: 'https://github.com/login/oauth/authorize?state=x' }
+    expect(connectionStateFor(server('needs_auth'), oauth, false, false, false, true)).toBe('waiting-for-approval')
+    expect(connectionStateFor(undefined, oauth, false, false, false, true)).toBe('not-connected')
+  })
+
+  it('defaults the flag off so every existing call site is unchanged', () => {
+    expect(connectionStateFor(undefined, undefined, false, false, false)).toBe('not-connected')
+    expect(connectionStateFor(undefined, undefined, false, false, true)).toBe('waiting-for-approval')
+  })
+})
+
+/**
+ * The gallery roster mirrors the backend's `get_visible_providers`: launch-gated
+ * providers ship, a pre-registered provider ships REGARDLESS of the gate (its
+ * card is the instruction the operator needs to see), and vendor approval stays
+ * a hard hide either way.
+ */
+describe('the visible provider roster', () => {
+  const bySlug = (slug: string) => CONNECTION_PROVIDERS.find(p => p.slug === slug)
+
+  it('includes the pre-registered providers even though they have not passed the launch gate', () => {
+    for (const slug of ['github', 'asana']) {
+      const provider = bySlug(slug)
+      expect(provider, `${slug} should be visible`).toBeDefined()
+      expect(provider!.launch_gate_passed).toBe(false)
+      expect(isPreregisteredProvider(provider!)).toBe(true)
+      expect(provider!.auth?.confidential).toBe(true)
+    }
+  })
+
+  it('still hides a provider awaiting vendor approval', () => {
+    // Figma is vendor_approval_pending in the registry today; assert on the
+    // predicate rather than only the slug so the test says WHY it is hidden.
+    expect(bySlug('figma')).toBeUndefined()
+    const hidden: ConnectionProvider = {
+      name: 'Pending', slug: 'pending', tier: 3, mcp_url: 'https://mcp.pending.example/mcp',
+      revoke_page_url: '', docs_url: '', gotcha_copy: '', smoke_fixture: { tool: 't', args: {} },
+      launch_gate_passed: false, vendor_approval_pending: true,
+      auth: { mode: 'preregistered', confidential: true, redirect_port: 48199, registration_guide: 'oauth-app-registration/pending.md' },
+    }
+    // Same rule the filter applies: pre-registration does not override the veto.
+    expect(!hidden.vendor_approval_pending && (hidden.launch_gate_passed || isPreregisteredProvider(hidden))).toBe(false)
+  })
+
+  it('treats an absent or dcr auth block as not pre-registered', () => {
+    const notion = bySlug('notion')!
+    expect(isPreregisteredProvider(notion)).toBe(false)
+    expect(isPreregisteredProvider({ ...notion, auth: { mode: 'dcr' } })).toBe(false)
   })
 })

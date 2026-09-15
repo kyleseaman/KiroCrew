@@ -8,6 +8,18 @@ See also the SEL section in [`security.md`](security.md) for the threat-model vi
 
 Storage: `~/.kiro/crew/security_events.jsonl` (append-only JSONL with HMAC-SHA256 chain).
 
+Private member subprocesses keep a separate diagnostic chain in their isolated
+execution log directory: the host path is
+`memory_stores/.execution-logs/member-<random>/audit-<pid>/security_events.jsonl`.
+This host location is hidden from Global V1 and private peers. Linux exposes only
+that execution directory at the child's `agent-logs/`; outer Seatbelt denies peer
+execution paths. The directory choice is established at launch, before protected
+PID publication, so early MCP initialization cannot append to the global chain.
+These are process-local diagnostics with their own keys, not trusted gateway
+audit or session-identity authority. The gateway continues to record memory API
+mutations in its original chain. CLI text logs are persisted beside these local
+chains; write failures remain explicit. V1 storage and verification are unchanged.
+
 ## Event Schema
 
 Each entry records:
@@ -22,14 +34,14 @@ Each entry records:
 | `source` | Interface: `slack`, `dashboard`, `cli`, `cron`, `subagent`, `taskrunner`, `mcp`, `background`, `acp` (ACP-transport events, e.g. `tool_interrupted`), `token_auth` / `refresh_tokens` (dashboard auth), `host` (the `_host` sentinel — an in-process host action like app activation / workspace admission), `unknown` (empty/unrecognized session key, which must NOT be mis-tagged `slack`). This is a closed interface vocabulary — component attribution does not extend it; see `caller` below |
 | `operation` | Tool name or `METHOD /api/path` |
 | `tool_kind` | Tool category (`execute_bash`, `fs_write`, `mcp_core`, `mcp_cron`, etc.) |
-| `outcome` | `invoked`, `auto_approved`, `approved`, `rejected`, `denied`, `completed`, `failed`, `clamped`, `degraded` (a governance chokepoint failed OPEN), `one_shot_completed` (a one-shot cron consumed by its own completion — an automated removal, not an operator delete) |
+| `outcome` | `invoked`, `auto_approved`, `auto_approve_declined` (a name-based auto-approve was withheld by the name-grant check and the request took the surface's normal path — see `name_grant.log_decline`), `approved`, `rejected`, `denied`, `completed`, `failed`, `clamped`, `degraded` (a governance chokepoint failed OPEN), `one_shot_completed` (a one-shot cron consumed by its own completion — an automated removal, not an operator delete) |
 | `resources` | Affected resources summary (redacted, then truncated to 500 chars — see `metadata`) |
 | `downstream_service` | MCP server name if applicable (`kirocrew-core`, `kirocrew-cron`, `internal-mcp`) |
 | `request_id` | ACP permission request ID |
 | `error` | Error message if failed/denied |
 | `prev_hash` | HMAC of previous entry (chain link) |
 | `entry_hash` | HMAC-SHA256 of this entry |
-| `metadata` | Additional context (approval reason, step index, etc.). Free-form string values are **redacted at write time**: the writer applies `security.redact` (credential + exfiltration-URL passes) to string values at any nesting depth before the entry is hashed and persisted, so caller-supplied text (a search query, a document title) never lands a secret on disk. Keys and non-string values pass through; the caller's dict is never mutated (the writer redacts a copy). The same write-time pass covers the free-form top-level strings `operation` / `resources` / `error` (an exception message can quote a command body or URL); identity-shaped fields (`caller_identity`, `agent`, `source`, `downstream_service`, `request_id`) are constrained vocabularies and stay verbatim. Where a `log_*` helper CLIPS a field to 500 chars it redacts first and clips second: clipping first can cut a credential in half, and the surviving prefix matches no full-token grammar, so the writer's pass could not recover it. The HMAC chain signs the redacted bytes |
+| `metadata` | Additional context (approval reason, step index, etc.). Free-form string values are **redacted at write time**: the writer applies `security.redact` (credential + exfiltration-URL passes) to string values at any nesting depth before the entry is hashed and persisted, so caller-supplied text (a search query, a document title) never lands a secret on disk. Keys and non-string values pass through; the caller's dict is never mutated (the writer redacts a copy). The same write-time pass covers the free-form top-level strings `operation` / `resources` / `error` (an exception message can quote a command body or URL); identity-shaped fields (`caller_identity`, `agent`, `source`, `downstream_service`, `request_id`) are constrained vocabularies and stay verbatim. `outcome` is NOT in the writer's set for the same reason, but `log_api_access` scrubs it at the helper: it reads as a vocabulary and is one for in-tree callers, while an installed app reaches that helper through `ctx.audit`, so the value can be caller text. The pass is the identity function on every in-tree spelling, so no existing row changes. Where a `log_*` helper CLIPS a field to 500 chars it redacts first and clips second: clipping first can cut a credential in half, and the surviving prefix matches no full-token grammar, so the writer's pass could not recover it. The HMAC chain signs the redacted bytes |
 
 The `config_bounds_clamped` event (`outcome=clamped`, `source=background`, `operation=config.load`, `caller_identity=config_loader`) is emitted by `config/loader.py`'s `_log_config_clamp_event` when an out-of-range security-bounded knob (`agent.subagent_auto_max` / `agent.max_subagents` / `agent.subagent_max_turns` / `session.pool_size`) is clamped to its API-enforced ceiling at load time, recording `metadata` `{file_value, clamped_to, min, max}`. Best-effort: a SEL failure never makes config loading raise.
 
@@ -67,6 +79,23 @@ computing the HMAC chain in enqueue order and batching up to `_QUEUE_DRAIN_BATCH
 events into one `open()`+write. The writer starts lazily on first `log()` and
 registers an `atexit` flush.
 
+The singleton itself is warmed at gateway startup: both async server start
+paths await `warm_sel_singleton()` (an `asyncio.to_thread(sel)`, best-effort)
+before building the middleware chain, so when the warm succeeds
+`_init_locked` — blocking file I/O — never runs on the event loop as a
+handler's first touch, and non-critical call sites need no per-site thread
+hop (#8608). A failed warm logs a warning and leaves that init retry to the
+first later touch, on its caller's thread. `critical=True` writes are
+synchronous by design and their call sites still offload themselves when
+reached from the loop.
+
+Private-member authorization denials keep their typed 403 responses even when
+SEL initialization or event submission fails. Their shared denial audit resolves
+the singleton and submits the event in a worker thread, including after an
+unsuccessful startup warm. Audit failure is diagnostic only: it cannot grant
+access or allow the protected handler to read or mutate a resource. Critical
+grant audits retain their audit-or-deny contract.
+
 - **Durability**: eventually-durable, not synchronously-durable — a crash/kill
   can lose at most the events still queued. Acceptable for an audit log; the
   hot path (e.g. per-message skill triggering) no longer pays fsync/lock latency.
@@ -95,11 +124,15 @@ Default 365 days. Pruned daily by heartbeat service (`_PRUNE_TICKS`).
 | Background tasks | Permission requests via `_resolve_permission()` | `llm_helpers.py` |
 | MCP core tools | `spawn_run`, `learn_add`, `task_run` calls and outcomes | `mcp_core.py` |
 | MCP cron tools | `cron_add`, `cron_remove`, etc. calls and outcomes | `mcp_cron.py` |
-| Dashboard API | All POST/PUT/DELETE operations via middleware, plus allowed and denied project-skill trust and app-slot authorization decisions | `dashboard/server.py`, `dashboard/handlers/prompts.py` |
+| Session directives | Structured monitor create/update/stop application outcomes; every refusal records `denied` rather than `success` | `dashboard/session_directive_apply.py` |
+| Dashboard API | All POST/PUT/DELETE operations via middleware, plus allowed and denied project-skill trust, app-slot, saved-workflow, strict session-monitor read authorization, and in-app update authorization decisions (`update.arm` / `update.approve`; denial audits are best-effort, while a granted approval fails closed when its audit is unwritable) | `dashboard/server.py`, `dashboard/handlers/prompts.py`, `dashboard/handlers/workflows.py`, `dashboard/handlers/autonudge.py`, `dashboard/handlers/updates.py` |
 | ACP worker-pool audit | Per-`tool_call` `auto_approved` `tool_invocation` (`source=subagent`), bounded by `_SEL_AUDIT_TIMEOUT_SECONDS` (5.0s) and offloaded off the event loop so a wedged SEL backend never gates dispatch. Two emitters: the knowledge LLMPool via `AcpClient._maybe_audit_tool_call` (gated on the `audit_source` ctor param, offloaded to `subprocess_executor()`); and **code-review-sage's ReviewPool**, which migrated to the shared `AcpRuntime` (no `audit_source`) and re-emits the same per-tool record itself | `acp/client.py`, `apps/builtins/code_review_sage/sage_lib/review_pool.py` |
+| Structured monitor mutation audit | Critical `monitor_update` / `monitor_stop` invocation records are audit-before-mutation. Both singleton resolution and the synchronous write run in a worker thread, so SEL initialization or disk latency cannot block the gateway event loop | `autonudge_authz.py` |
+| Structured provider probes | Credential-free invocation and completion/failure events; protected-binary resolution failures, revoked GitLab hosts, and incomplete Bitbucket credentials also record `denied`. Denial audit failure never allows the rejected request | `monitoring/provider_cli.py`, `monitoring/gitlab_merge_request.py`, `monitoring/bitbucket_pull_request.py` |
 | Token auth | `internal_auth`, `app_scope_check`, `dashboard_sessions_revoked`, `refresh_token_initial_mint`, `nonce_evicted` (`source=token_auth`) | `dashboard/token_auth.py` |
 | Refresh tokens | `refresh_token_use`, `refresh_token_logout`, `access_cookie_revoked` (`source=refresh_tokens`) | `dashboard/handlers/auth_refresh.py` |
 | ACP transport | `tool_interrupted` per-turn cancellation audit (`source=acp`) | `acp/client.py` |
+| Installed apps | `api_access` rows an app writes about its own decisions via `ctx.audit` (`source=app`, `caller=app:<name>`, `operation=<name>.<verb>`). Attribution is minted from the app name the context was built with, so there is no `caller=` parameter to pass the wrong value into — cooperative, not unforgeable, since in-process hook code can construct another app's SDK or reach `sel()` directly; `record` swallows a write failure, because auditing must not break the operation it only describes; `outcome` is not narrowed to a vocabulary (rewriting it would record something other than what happened), and the SDK adds no scrubbing of its own — `log_api_access` now puts `outcome` through `_redact_and_clip` for every caller, because this seam is what turns that slot from an in-tree constant into caller text and the fix belongs at the boundary all fillers cross | `apps/audit_sdk.py` |
 
 ## APIs
 
@@ -117,8 +150,44 @@ kirocrew security verify            # Verify HMAC chain integrity
 
 ## Thread Safety
 
-Singleton pattern. The chain state (`_last_hash`) and the file append are
-guarded by `threading.Lock`, held only inside the writer thread (and the
-synchronous fallback / `prune`), never by enqueuing callers. Enqueue is
-lock-free via the thread-safe `queue.Queue`. Safe for concurrent access from the
-asyncio event loop + MCP server stdio processes.
+Singleton pattern. Two locks guard the chain, and they are always taken in this
+order: the cross-process **chain lock** first, then the in-process
+`threading.Lock`.
+
+`threading.Lock` guards the chain state (`_last_hash`) and the file append inside
+one interpreter, held only by the writer thread (and the synchronous fallback /
+`prune`), never by enqueuing callers. Enqueue is lock-free via the thread-safe
+`queue.Queue`.
+
+A `threading.Lock` cannot order the gateway against the MCP server stdio
+processes, which are separate processes sharing one log file — each holds its own
+singleton with its own cached chain tip, so two of them chaining off the same
+`prev_hash` fork the HMAC chain permanently. Cross-process ordering therefore
+comes from an advisory lock on a sidecar file, `trust/security_events.lock`. The
+sidecar lives in the trust subdirectory (owner-only, inside the sensitive-path
+floor) so the audited agent cannot unlink or hold it out from under the writers;
+a linked or hard-linked sidecar is refused rather than followed. When the trust
+directory could not be created at init and the HMAC key fell back to its legacy
+location beside the log, the lock is taken on the legacy key file itself — the
+one sibling of the log the deny list has protected all along — rather than
+failing every append on a mkdir that cannot succeed.
+
+The chain lock is taken **before** `threading.Lock`. The reverse order would let
+a cross-process wait stall the event loop indirectly: a writer thread holding the
+thread lock while it waits leaves a loop-side critical audit blocking on that
+lock, which has no bound of its own.
+
+On the event-loop thread neither potentially-slow step may wait:
+
+- **Acquire** — a SINGLE nonblocking `try_acquire_lock` attempt, then a
+  fail-closed refusal. No retry and no sleep: a poll spin would sleep the
+  gateway's event loop, stalling every session it serves, so contention is
+  refused here and absorbed off-loop (the background writer and `prune` in an
+  executor take the blocking lock).
+- **Chain-tip read** — capped at a single tail chunk. A healthy log yields the
+  tip from one read; only an already-corrupt multi-kilobyte tail would walk
+  further, and exhausting the cap raises rather than returning a genesis tip.
+
+Both refusals surface as `OSError`, which the append path turns into a rollback
+plus warning, or into a propagated error for a `critical=True` audit — the
+audit-or-deny contract. Off the loop, both steps are unbounded and recover fully.

@@ -179,14 +179,25 @@ def _clean(text: str) -> str:
 
 
 async def _json_body(request: web.Request) -> dict[str, Any]:
-    """Read a JSON object body, or raise a 400 ``HTTPException``."""
+    """Read a JSON object body, or raise a 400 ``HTTPException``.
+
+    Same Q1/Q2 posture as ``dashboard/handlers/_shared.read_bounded_json`` (a
+    non-object is refused, and the catch spans the client-input failure set of
+    ``LookupError``/``RecursionError``/``ValueError`` so an unknown ``charset=``
+    codec is a 400, not a 500). Two deliberate divergences: the refusal is raised
+    as an ``HTTPException`` rather than returned as a ``(body, response)`` tuple,
+    matching this module's raise-based error envelope; and the ``MAX_BODY_BYTES``
+    Content-Length cap is enforced up front. The catch is narrowed from the
+    previous ``except Exception`` so a mid-read transport error propagates instead
+    of being reported as a client mistake.
+    """
     if request.content_length is not None and request.content_length > MAX_BODY_BYTES:
         raise web.HTTPRequestEntityTooLarge(
             max_size=MAX_BODY_BYTES, actual_size=request.content_length
         )
     try:
         body = await request.json()
-    except Exception as exc:
+    except (LookupError, RecursionError, ValueError) as exc:
         raise web.HTTPBadRequest(reason="request body must be JSON") from exc
     if not isinstance(body, dict):
         raise web.HTTPBadRequest(reason="request body must be a JSON object")
@@ -368,8 +379,8 @@ async def _handle_create_project(request: web.Request) -> web.StreamResponse:
             # authoritative answer to "did someone else take this name", and it is the
             # only one free of a check/use window. `_project_for_create`'s `exists()`
             # probe above narrows the window but cannot close it — two worker threads
-            # can both pass it — so the loser used to raise an unhandled
-            # FileExistsError and the request 500'd on what is really a 409.
+            # can both pass it — so the loser's FileExistsError is caught here rather
+            # than 500ing the request on what is really a 409.
             #
             # Same conflict, same status, as the probe reports; the user sees "project
             # already exists" either way rather than a server error for a name clash

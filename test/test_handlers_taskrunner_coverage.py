@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from body_stream_helpers import BodyStreamPayload
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, EVENT_TEXT_CHUNK, AcpEvent
 from kiro_crew.dashboard.handlers.taskrunner import (
@@ -75,6 +76,16 @@ def _runner(tmp_path: Path) -> MagicMock:
     runner._plan_task = None
     runner._apersist_runs = AsyncMock()
     runner._group_parallel_tasks = MagicMock(return_value=[])
+    runner._auto_name = MagicMock(side_effect=lambda text: text)
+    runner._workflow_begin = AsyncMock()
+
+    async def _delete_run(task_id: str) -> bool:
+        runner._runs.pop(task_id, None)
+        runner._stall_cancelled_ids.discard(task_id)
+        await runner._apersist_runs()
+        return True
+
+    runner.delete_run = AsyncMock(side_effect=_delete_run)
     runner.start_background = AsyncMock(return_value="tid-1")
     runner.update_task = AsyncMock(return_value={"index": 0})
     runner.update_plan = AsyncMock()
@@ -99,17 +110,36 @@ def _request(
     raw_json_error: bool = False,
     request_app: str = "",
     with_content_length: bool = True,
+    body_present: bool = False,
 ) -> web.Request:
     app = web.Application()
     app["state"] = state
-    headers = {"Content-Length": "32"} if (json_body is not None and with_content_length) else {}
+    if raw_json_error:
+        raw = b"{bad json"
+    elif json_body is not None or body_present:
+        # ``body_present`` distinguishes a body whose CONTENT is the JSON
+        # literal ``null`` from no body at all -- the allow_absent handlers
+        # branch on that difference, and conflating them hides a non-object
+        # body behind a silent default.
+        raw = json.dumps(json_body).encode()
+    else:
+        raw = b""
+    headers = {"Content-Length": str(len(raw))} if (raw and with_content_length) else {}
     req = make_mocked_request(
-        method, path, app=app, match_info=match_info or {}, headers=headers
+        method,
+        path,
+        app=app,
+        match_info=match_info or {},
+        headers=headers,
+        payload=BodyStreamPayload(raw),
     )
     req["app"] = request_app
+    # Kept alive: the uncapped handlers (``max_bytes=None`` -- start, plan,
+    # update_plan, update_task, from_chat, refine) consume ``request.json()``;
+    # the capped ones drain the payload stream instead.
     if raw_json_error:
         req.json = AsyncMock(side_effect=ValueError("bad json"))  # type: ignore[method-assign]
-    elif json_body is not None:
+    elif json_body is not None or body_present:
         req.json = AsyncMock(return_value=json_body)  # type: ignore[method-assign]
     return req
 
@@ -229,9 +259,7 @@ class TestStart:
         spec = tmp_path / "creds.md"
         spec.write_text("# t", encoding="utf-8")
         runner = _runner(tmp_path)
-        with patch(
-            "kiro_crew.dashboard.handlers.taskrunner.is_sensitive_path", return_value=True
-        ):
+        with patch("kiro_crew.dashboard.handlers.taskrunner.is_sensitive_path", return_value=True):
             resp = await api_taskrunner_start(
                 _request(_state(runner), json_body={"spec": str(spec)})
             )
@@ -279,9 +307,7 @@ class TestStart:
     async def test_unknown_source_coerced_to_dashboard(self, tmp_path: Path) -> None:
         runner = _runner(tmp_path)
         await api_taskrunner_start(
-            _request(
-                _state(runner), json_body={"spec": "__inline__:# t", "source": "bogus"}
-            )
+            _request(_state(runner), json_body={"spec": "__inline__:# t", "source": "bogus"})
         )
         assert runner.start_background.call_args.kwargs["source"] == "dashboard"
 
@@ -461,9 +487,7 @@ class TestUpdateTask:
     @pytest.mark.asyncio
     async def test_non_numeric_index_is_400(self, tmp_path: Path) -> None:
         resp = await api_taskrunner_update_task(
-            _request(
-                _state(_runner(tmp_path)), match_info={"task_id": "t1", "index": "abc"}
-            )
+            _request(_state(_runner(tmp_path)), match_info={"task_id": "t1", "index": "abc"})
         )
         assert resp.status == 400
         assert _body(resp)["error"] == "invalid index"
@@ -529,9 +553,7 @@ class TestRetry:
     @pytest.mark.asyncio
     async def test_default_from_step_is_one(self, tmp_path: Path) -> None:
         runner = _runner(tmp_path)
-        resp = await api_taskrunner_retry(
-            _request(_state(runner), match_info={"task_id": "t1"})
-        )
+        resp = await api_taskrunner_retry(_request(_state(runner), match_info={"task_id": "t1"}))
         assert _body(resp) == {"ok": True, "task_id": "t1"}
         assert runner.retry_from_task.await_args.args == ("t1", 1)
 
@@ -842,9 +864,7 @@ class TestPlan:
         assert runner._plan_task is None
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "exc", [FileNotFoundError("missing spec"), ValueError("empty input")]
-    )
+    @pytest.mark.parametrize("exc", [FileNotFoundError("missing spec"), ValueError("empty input")])
     async def test_expected_errors_are_400(self, tmp_path: Path, exc: Exception) -> None:
         runner = _runner(tmp_path)
         runner.plan = AsyncMock(side_effect=exc)
@@ -878,7 +898,9 @@ class TestUpdatePlan:
     async def test_invalid_json_is_400(self, tmp_path: Path) -> None:
         resp = await api_taskrunner_update_plan(
             _request(
-                _state(_runner(tmp_path)), "PUT", match_info={"task_id": "p1"},
+                _state(_runner(tmp_path)),
+                "PUT",
+                match_info={"task_id": "p1"},
                 raw_json_error=True,
             )
         )
@@ -889,9 +911,7 @@ class TestUpdatePlan:
         runner = _runner(tmp_path)
         runner.update_plan = AsyncMock(side_effect=ValueError("run is not planned"))
         resp = await api_taskrunner_update_plan(
-            _request(
-                _state(runner), "PUT", match_info={"task_id": "p1"}, json_body={"steps": []}
-            )
+            _request(_state(runner), "PUT", match_info={"task_id": "p1"}, json_body={"steps": []})
         )
         assert resp.status == 400
         assert _body(resp)["error"] == "run is not planned"
@@ -1022,7 +1042,9 @@ class TestFromChat:
         assert created.source == "chat"
         assert created.status == "planned"
         assert created.original_input == "make it"
+        assert created.name == "make it"
         assert Path(created.work_dir).is_dir()
+        runner._workflow_begin.assert_awaited_once_with(created)
 
     @pytest.mark.asyncio
     async def test_failed_new_plan_is_rolled_back(self, tmp_path: Path) -> None:
@@ -1035,6 +1057,35 @@ class TestFromChat:
         assert _body(resp)["error"] == "bad step"
         # The placeholder run must not survive a rejected plan.
         assert runner._runs == {}
+        runner.delete_run.assert_awaited_once()
+        assert list(runner._work_dir.glob("plan_*")) == []
+
+    @pytest.mark.asyncio
+    async def test_cancelled_new_plan_is_rolled_back(self, tmp_path: Path) -> None:
+        runner = _runner(tmp_path)
+        update_started = asyncio.Event()
+
+        async def block_update(_task_id: str, _steps: list[Any]) -> TaskRun:
+            update_started.set()
+            await asyncio.Future()
+
+        runner.update_plan = AsyncMock(side_effect=block_update)
+        request_task = asyncio.create_task(
+            api_taskrunner_from_chat(
+                _request(_state(runner), json_body={"steps": [{"title": "first"}]})
+            )
+        )
+        await asyncio.wait_for(update_started.wait(), timeout=1)
+        created = next(iter(runner._runs.values()))
+        created.workflow_run_id = "workflow-orphan-candidate"
+        request_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+
+        runner.delete_run.assert_awaited_once_with(created.task_id)
+        assert runner._runs == {}
+        assert list(runner._work_dir.glob("plan_*")) == []
 
 
 # ── refine ──
@@ -1067,9 +1118,7 @@ class TestRefineStart:
 
     @pytest.mark.asyncio
     async def test_blank_input_is_400(self) -> None:
-        resp = await api_taskrunner_refine(
-            _request(_refine_state(), json_body={"input": "  "})
-        )
+        resp = await api_taskrunner_refine(_request(_refine_state(), json_body={"input": "  "}))
         assert resp.status == 400
         assert _body(resp)["error"] == "input is required"
 
@@ -1144,9 +1193,7 @@ class TestRefineStatusAndCancel:
 class TestRefineAnswer:
     @pytest.mark.asyncio
     async def test_invalid_json_is_400(self) -> None:
-        resp = await api_taskrunner_refine_answer(
-            _request(_refine_state(), raw_json_error=True)
-        )
+        resp = await api_taskrunner_refine_answer(_request(_refine_state(), raw_json_error=True))
         assert resp.status == 400
 
     @pytest.mark.asyncio
@@ -1171,9 +1218,7 @@ class TestRefineAnswer:
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         future.set_result("earlier")
         state._refine_answer_future = future
-        resp = await api_taskrunner_refine_answer(
-            _request(state, json_body={"answer": "yes"})
-        )
+        resp = await api_taskrunner_refine_answer(_request(state, json_body={"answer": "yes"}))
         assert resp.status == 409
         assert _body(resp)["error"] == "no pending question"
 
@@ -1191,9 +1236,7 @@ class TestRefineAnswer:
 
         state = _refine_state()
         state._refine_answer_future = _RacingFuture()
-        resp = await api_taskrunner_refine_answer(
-            _request(state, json_body={"answer": "yes"})
-        )
+        resp = await api_taskrunner_refine_answer(_request(state, json_body={"answer": "yes"}))
         assert resp.status == 409
         assert _body(resp)["error"] == "question already resolved"
 
@@ -1202,9 +1245,7 @@ class TestRefineAnswer:
         state = _refine_state()
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         state._refine_answer_future = future
-        resp = await api_taskrunner_refine_answer(
-            _request(state, json_body={"answer": "  yes  "})
-        )
+        resp = await api_taskrunner_refine_answer(_request(state, json_body={"answer": "  yes  "}))
         assert _body(resp) == {"ok": True}
         assert future.result() == "yes"
         # `waiting` flips to False once the question is answered.
@@ -1334,3 +1375,280 @@ class TestRunRefine:
         state.sessions = sessions
         await _run_refine(state, "x")
         assert state._refine_status == "cancelled"
+
+
+class TestNonObjectBodiesAcrossConvertedHandlers:
+    """Every converted handler answers 400, never 5xx, on a non-object body.
+
+    ``[]`` / ``"s"`` / ``5`` / ``true`` / ``null`` are all VALID JSON, so
+    ``request.json()`` returned them and the ``.get()`` each handler performs
+    next raised ``AttributeError`` from OUTSIDE the parse ``try`` -- a 500 for
+    what is really malformed client input. Enumerated rather than
+    one test per handler so a handler that loses the guard fails by
+    construction; the cap decision for each of these sites is recorded in
+    ``_CAP_REGISTER`` in ``test_json_object_body_guard.py``.
+    """
+
+    _HANDLERS = [
+        (api_taskrunner_start, {}),
+        (api_taskrunner_cancel, {}),
+        (api_taskrunner_rename, {"task_id": "t1"}),
+        (api_taskrunner_update_task, {"task_id": "t1", "index": "0"}),
+        (api_taskrunner_retry, {"task_id": "t1"}),
+        (api_taskrunner_plan, {}),
+        (api_taskrunner_update_plan, {"task_id": "t1"}),
+        (api_taskrunner_execute_plan, {"task_id": "t1"}),
+        (api_taskrunner_from_chat, {}),
+        (api_taskrunner_refine, {}),
+        (api_taskrunner_refine_answer, {}),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("payload", [[], "a string", 5, 1.5, True, None], ids=repr)
+    @pytest.mark.parametrize(
+        "handler,match_info", _HANDLERS, ids=lambda v: getattr(v, "__name__", "")
+    )
+    async def test_non_object_body_is_400_not_500(
+        self, handler: Any, match_info: dict[str, str], payload: Any, tmp_path: Path
+    ) -> None:
+        runner = _runner(tmp_path)
+        runner._runs["t1"] = TaskRun(spec_path="s.md", spec_content="s", task_id="t1")
+        req = _request(_state(runner), json_body=payload, match_info=match_info, body_present=True)
+        resp = await handler(req)
+        assert resp.status == 400, f"{handler.__name__} on {payload!r}: expected 400"
+        assert _body(resp)["code"] == "body_not_object", handler.__name__
+
+
+@pytest.fixture
+def private_task_caller(monkeypatch):
+    from kiro_crew import member_memory_auth as auth
+
+    stores = {"dashboard:alice": "alice-store", "taskrunner:private-run:runtime": "alice-store"}
+    monkeypatch.setattr(auth, "private_memory_boundaries_active", lambda: True)
+    monkeypatch.setattr(auth, "memory_request_identity", lambda request: ("dashboard:alice", True))
+    monkeypatch.setattr(auth, "private_memory_store_for_session", lambda key: stores.get(key, ""))
+    return stores
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handler", [api_taskrunner_start, api_taskrunner_plan])
+async def test_private_task_file_ingress_refuses_before_host_file_read(
+    tmp_path, private_task_caller, handler
+):
+    runner = _runner(tmp_path)
+    request = _request(
+        _state(runner), json_body={"source": "file", "spec": str(tmp_path / "peer-history.jsonl")}
+    )
+    request["internal_auth"] = True
+    response = await handler(request)
+    assert response.status == 409
+    assert _body(response)["code"] == "private_task_file_unsupported"
+    runner.plan.assert_not_called()
+    runner.start_background.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_private_inline_plan_uses_authenticated_origin(tmp_path, private_task_caller):
+    runner = _runner(tmp_path)
+    runner.plan.return_value = TaskRun(spec_path="", spec_content="", task_id="new-plan")
+    request = _request(
+        _state(runner),
+        json_body={
+            "input": "make my plan",
+            "source": "text",
+            "session_key": "dashboard:peer",
+            "memory_store": "peer-store",
+        },
+    )
+    request["internal_auth"] = True
+    response = await api_taskrunner_plan(request)
+    assert response.status == 200
+    assert runner.plan.await_args.kwargs["session_key"] == "dashboard:alice"
+
+
+@pytest.mark.asyncio
+async def test_private_from_chat_uses_verified_origin_not_claimed_actor(
+    tmp_path, private_task_caller
+):
+    runner = _runner(tmp_path)
+    runner._ctx = SimpleNamespace()
+
+    async def updated(task_id, _steps):
+        return runner._runs[task_id]
+
+    runner.update_plan.side_effect = updated
+    request = _request(
+        _state(runner),
+        json_body={
+            "steps": [{"title": "private step", "description": "work"}],
+            "original_input": "private supplied text",
+            "session_key": "dashboard:peer",
+            "created_by": "dashboard:peer",
+            "memory_store": "peer-store",
+        },
+    )
+    request["internal_auth"] = True
+    with patch("kiro_crew.context.inherit_session_memory", AsyncMock()) as inherit:
+        response = await api_taskrunner_from_chat(request)
+    assert response.status == 200
+    task_id = _body(response)["task_id"]
+    inherit.assert_awaited_once_with(
+        runner._ctx, "dashboard:alice", f"taskrunner:{task_id}:runtime"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["planned", "completed"])
+async def test_private_task_to_chat_binds_fresh_slot_before_content(
+    tmp_path, private_task_caller, status
+):
+    runner = _runner(tmp_path)
+    runner._runs["private-run"] = TaskRun(
+        spec_path="s.md", spec_content="private material", task_id="private-run", status=status
+    )
+    runner.plan_to_chat_context.return_value = "private plan"
+    state = _chat_state(runner)
+    state.context_builder = SimpleNamespace()
+    slot = state.get_or_create_slot.return_value
+    request = _request(state, match_info={"task_id": "private-run"})
+    request["internal_auth"] = True
+    with (
+        patch("kiro_crew.context.inherit_session_memory", AsyncMock()) as inherit,
+        patch("kiro_crew.dashboard.chat._run_chat", AsyncMock()) as chat,
+    ):
+
+        def create(*args, **kwargs):
+            assert inherit.await_count == 1
+            assert args[0].startswith("task-review-")
+            assert kwargs["linked_session_key"] == inherit.await_args.args[2]
+            return slot
+
+        state.get_or_create_slot.side_effect = create
+        slot.append.side_effect = lambda *_args: (
+            None if slot.memory_store == "alice-store" else pytest.fail("unbound private append")
+        )
+        response = await api_taskrunner_to_chat(request)
+        await asyncio.gather(*list(state._background_tasks))
+    assert response.status == 200
+    assert inherit.await_args.args[1] == "taskrunner:private-run:runtime"
+    chat.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "handler",
+    [api_taskrunner_pause, api_taskrunner_update_task, api_taskrunner_retry],
+)
+async def test_task_alias_is_resolved_before_member_authorization(
+    tmp_path, private_task_caller, handler
+):
+    runner = _runner(tmp_path)
+    runner._runs["foreign-run"] = TaskRun(
+        spec_path="s.md", spec_content="peer", task_id="foreign-run", name="friendly-name"
+    )
+    private_task_caller["taskrunner:foreign-run:runtime"] = "peer-store"
+    request = _request(
+        _state(runner), match_info={"task_id": "friendly-name", "index": "1"}, json_body={}
+    )
+    request["internal_auth"] = True
+    response = await handler(request)
+    assert response.status == 404
+    assert _body(response)["code"] == "task_scope_denied"
+    runner.pause.assert_not_called()
+    runner.update_task.assert_not_called()
+    runner.retry_from_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_internal_caller_cannot_cancel_shared_planning(tmp_path, private_task_caller):
+    runner = _runner(tmp_path)
+    request = _request(_state(runner))
+    request["internal_auth"] = True
+    response = await api_taskrunner_plan_cancel(request)
+    assert response.status == 403
+    assert _body(response)["code"] == "task_scope_denied"
+    runner.cancel_plan.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_owner_can_cancel_shared_planning_with_private_members(tmp_path, private_task_caller):
+    runner = _runner(tmp_path)
+    response = await api_taskrunner_plan_cancel(_request(_state(runner)))
+    assert response.status == 200
+    runner.cancel_plan.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_global_only_internal_caller_can_cancel_planning(tmp_path, monkeypatch):
+    from kiro_crew import member_memory_auth as auth
+
+    monkeypatch.setattr(auth, "private_memory_boundaries_active", lambda: False)
+    runner = _runner(tmp_path)
+    request = _request(_state(runner))
+    request["internal_auth"] = True
+    response = await api_taskrunner_plan_cancel(request)
+    assert response.status == 200
+    runner.cancel_plan.assert_called_once_with()
+
+
+def test_exact_task_cancel_does_not_follow_another_runs_colliding_name():
+    from kiro_crew.taskrunner import TaskRunner
+
+    runner = object.__new__(TaskRunner)
+    own = TaskRun(spec_path="own", spec_content="", task_id="own-id", status="running")
+    peer = TaskRun(
+        spec_path="peer", spec_content="", task_id="peer-id", name="own-id", status="running"
+    )
+    runner._runs = {"own-id": own, "peer-id": peer}
+    runner._tasks = {}
+    runner.cancel("own-id", exact=True)
+    assert own.status == "cancelling"
+    assert peer.status == "running"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "handler",
+    [
+        api_taskrunner_cancel,
+        api_taskrunner_pause,
+        api_taskrunner_delete,
+        api_taskrunner_rename,
+        api_taskrunner_update_task,
+        api_taskrunner_retry,
+        api_taskrunner_plan_context,
+        api_taskrunner_export_yaml,
+        api_taskrunner_to_chat,
+        api_taskrunner_update_plan,
+        api_taskrunner_execute_plan,
+        api_taskrunner_from_chat,
+    ],
+)
+async def test_runtime_bound_routes_refuse_a_peer_before_read_or_mutation(
+    tmp_path, private_task_caller, handler
+):
+    runner = _runner(tmp_path)
+    runner._runs["peer-id"] = TaskRun(
+        spec_path="peer", spec_content="peer secret", task_id="peer-id", status="planned"
+    )
+    private_task_caller["taskrunner:peer-id:runtime"] = "peer-store"
+    request = _request(
+        _state(runner),
+        match_info={"task_id": "peer-id", "index": "1"},
+        json_body={"task_id": "peer-id", "steps": [{"title": "replace peer"}]},
+    )
+    request["internal_auth"] = True
+    response = await handler(request)
+    assert response.status == 404
+    assert _body(response)["code"] == "task_scope_denied"
+    for method in (
+        "cancel",
+        "pause",
+        "delete_run",
+        "update_task",
+        "retry_from_task",
+        "plan_to_chat_context",
+        "update_plan",
+        "execute_plan",
+    ):
+        getattr(runner, method).assert_not_called()

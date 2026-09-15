@@ -523,7 +523,7 @@ def build_post_task(change_link: str) -> str:
     )
     # FAIL CLOSED on host resolution — the host decides which GitHub instance
     # every `gh api` call in this prompt targets. `_confirmed_host` raises when
-    # the link names a host that no longer revalidates (a GHE host removed from
+    # the link names a host that does not revalidate (a GHE host removed from
     # `github_hosts` mid-run, an unreadable config); producing a prompt then
     # would let every call default to PUBLIC github.com and post an internal
     # enterprise draft onto a public same-slug PR. The raise is converted to a
@@ -825,7 +825,7 @@ def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = No
         return {"post_ok": False, "post_error": staged, "posted_comments": 0,
                 "design_comment_posted": False, "pending": len(pending),
                 "expected_units": 0, "posted_keys": list(already)}
-    # The prompt builder FAILS CLOSED when the link's host no longer revalidates
+    # The prompt builder FAILS CLOSED when the link's host does not revalidate
     # (see build_post_task): a prompt built with an unconfirmed host would let
     # its `gh api` calls default to public github.com and land this draft on a
     # public same-slug PR. Surface that as a per-change post failure — the
@@ -915,8 +915,8 @@ def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = No
             spawn.get("error", "")
             or ("" if confirmed else
                 "the posted draft could not be confirmed on the pull request")),
-        # Authoritative once confirmed: `after["posted_comments"]` was replaced with
-        # the payload's own unit count above, so this no longer echoes the poster.
+        # Authoritative once confirmed: `after["posted_comments"]` holds the payload's
+        # own unit count from above, so this does not echo the poster.
         "posted_comments": int(after.get("posted_comments", 0) or 0),
         "design_comment_posted": bool(after.get("design_comment_posted")),
         "pending": len(pending),
@@ -1037,12 +1037,12 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
                concurrency: int = 0, timeout: int = DEFAULT_TASK_TIMEOUT,
                generate_report: bool = True, root: Path | None = None,
                progress=None, run_id: str | None = None, cancelled=None,
-               post: bool | None = None, confirm=None) -> dict:
+               post: bool | None = None, confirm=None, preflight=None) -> dict:
     """Two-stage per change (bounded concurrency): a Phase-1 gate task, then a
     Phase-2 deep-review task for every usable verdict (PASS / CONCERNS / BLOCK).
     Each task is dispatched to the reusable worker pool (``dispatch``) and the
     call returns when that task's session finishes its turn. The driver reads
-    the gate verdict; a BLOCK no longer skips Phase 2 (it only informs the ship
+    the gate verdict; a BLOCK does not skip Phase 2 (it only informs the ship
     decision), then builds the Focus Report. Returns a deterministic summary.
 
     ``dispatch`` is an injected ``(task, timeout) -> {ok, output, error}`` callable
@@ -1065,7 +1065,16 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
     published back to the pull request as a PENDING (draft) review only when it is
     enabled. It defaults to OFF, because the review is meant to be READ in the
     app, and writing to a pull request is a side effect the user asks for rather
-    than a consequence of running a review."""
+    than a consequence of running a review.
+
+    ``preflight`` is an optional zero-arg callable returning ``""`` when the
+    runtime the dispatched sessions need is available, else a message naming
+    what is missing (the app backend wires ``review_pool.runtime_preflight``).
+    A non-empty answer fails the run fast — every change is recorded as
+    ``runtime_unavailable`` with that message, and nothing is dispatched — so a
+    host that cannot spawn a reviewer reports the cause instead of completing
+    with nothing written. ``None`` (tests, callers owning their own dispatch)
+    skips the check."""
     if run_id:
         store.ensure_run_layout(run_id, root)
     store.ensure_layout(root)
@@ -1075,6 +1084,35 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
     dispatch = dispatch or _unconfigured_dispatch
     progress = progress or (lambda *a, **k: None)   # (change_id, phase, extra) sink
     is_cancelled = cancelled or (lambda: False)
+
+    # Fail-fast runtime preflight. Runs BEFORE the clean-slate resets below, so a
+    # host that cannot spawn a reviewer keeps its previous report and staged
+    # records intact, and every change carries a reason that names the missing
+    # runtime instead of the untriageable "produced no result record".
+    runtime_error = str(preflight() or "") if preflight is not None else ""
+    if runtime_error:
+        failed_records: list[dict] = []
+        for link in changes:
+            change_id = _cid(link)
+            progress(change_id, "failed", {
+                "error": runtime_error, "reason": "runtime_unavailable"})
+            failed_records.append({
+                "change": link, "change_id": change_id,
+                "gate_spawn_ok": False, "gate_error": runtime_error,
+                "gate_verdict": "UNKNOWN", "phase2_ran": False,
+                "deep_spawn_ok": False, "deep_error": runtime_error,
+                "deep_reviewed": False, "result_recorded": False,
+                "design_block": False, "deep_rounds": 0,
+                "skipped_reason": "runtime_unavailable",
+            })
+        return {
+            "ok": False, "error": runtime_error,
+            "changes": len(failed_records), "gate_spawns": 0, "deep_spawns": 0,
+            "design_blocked": 0, "phase2_skipped_on_block": 0, "cancelled": 0,
+            "deep_reviewed": 0, "deep_rounds": 0, "design_comments_posted": 0,
+            "result_records": 0, "failures": failed_records,
+            "per_change": failed_records,
+        }
 
     # Whether to publish findings back to the pull request. Read ONCE per run so a
     # mid-run config edit cannot post some PRs and not others. Explicit `is True`
@@ -1167,7 +1205,7 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
         # someone else's findings on this pull request. If the slot cannot be cleared, skip
         # adoption rather than trust it.
         # Build the prompt BEFORE staking the shared slot: the builder FAILS
-        # CLOSED (raises) when the link's host no longer revalidates against
+        # CLOSED (raises) when the link's host does not revalidate against
         # `allowed_hosts()`, and a fetch instruction with an unconfirmed host
         # would route the worker at public github.com — reviewing (and later
         # posting about) a same-slug public PR instead of the intended one.
@@ -1175,7 +1213,8 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
             review_prompt = build_review_task(link)
         except pipeline.adapters.AdapterError as exc:
             refused = f"refusing to review: {exc}"
-            progress(change_id, "failed", {"error": refused})
+            progress(change_id, "failed", {
+                "error": refused, "reason": "review_failed"})
             return {
                 "change": link, "change_id": change_id,
                 "gate_spawn_ok": False, "gate_error": refused,
@@ -1227,11 +1266,29 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
         # already-written verdicts/findings.
         if not review_spawn.get("ok", False):
             rec["skipped_reason"] = "review_failed"
-            progress(change_id, "failed", {"error": review_spawn.get("error", "review failed")})
+            progress(change_id, "failed", {
+                "error": review_spawn.get("error", "review failed"),
+                "reason": "review_failed"})
             return rec
         if not rec["deep_reviewed"]:
-            rec["skipped_reason"] = "no_review_recorded"  # turn completed but wrote no review
-            progress(change_id, "failed", {"error": "review produced no result record"})
+            if rev_rec is None:
+                # Turn completed but wrote no record at all — the residual case
+                # (a genuinely empty review, or a worker whose commands ran no
+                # Python). Kept as the ``no_review_recorded`` value existing
+                # consumers key on; environment failures are discriminated by
+                # the preflight before any dispatch.
+                rec["skipped_reason"] = "no_review_recorded"
+                progress(change_id, "failed", {
+                    "error": "review produced no result record",
+                    "reason": "no_review_recorded"})
+            else:
+                # A record landed but never marked the review complete: the
+                # worker got far enough to write, then stopped short. Distinct
+                # from "wrote nothing" so the two can be triaged apart.
+                rec["skipped_reason"] = "review_record_incomplete"
+                progress(change_id, "failed", {
+                    "error": "review wrote a result record but never completed the review",
+                    "reason": "review_record_incomplete"})
             return rec
 
         # --- Bounded coverage backstop: AT MOST ONE targeted follow-up, and only
@@ -1349,7 +1406,7 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
         #
         # The report is written to the run's own dir FIRST and kept there
         # regardless of whether the artifact archive succeeds — the in-app report
-        # view reads that file, so a failed archive no longer means "no report".
+        # view reads that file, so a failed archive does not mean "no report".
         try:
             rep = report.generate(root, run_id=run_id)
             summary["report"] = rep["index"]

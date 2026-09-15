@@ -92,7 +92,7 @@ _PUSH_REQ_PREFIX = "aibot_send_msg-"
 _PUSH_ACK_TIMEOUT_SECS = 10.0
 
 # Reply-ACK errcodes that mean THIS stream bubble can never be written again:
-# 846605 the req_id is not (or no longer) routable, 846608 the bubble passed the
+# 846605 the req_id is not routable, 846608 the bubble passed the
 # platform's 10-minute lifetime and is sealed. Both are terminal for the
 # stream_id, not for the connection, so the renderer's answer is recoverable —
 # but only if it learns the frame was refused. ``send_stream`` returning True
@@ -246,26 +246,43 @@ class WeComClient:
         invariant; ``TeamsClient.close`` owns the same one.
         """
         self._closed = True
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
-        if self._task:
-            self._task.cancel()
+        # Session close in a `finally` -- see DiscordClient.close() for why the
+        # steps above it can raise and what leaking the session costs.
+        try:
+            if self._ws and not self._ws.closed:
+                # Guarded like DiscordClient.close(): closing a websocket whose
+                # transport is already broken raises, and this one is on the way out
+                # either way.
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
+            if self._task:
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    self._task = None
+        finally:
+            # Fail any push still waiting on an ACK: the socket is going away, so the
+            # answer is "not delivered", and leaving the future pending would hang the
+            # caller until its timeout for no reason.
+            #
+            # The drain below awaits, so a cancellation landing DURING it would
+            # exit this finally before the session close -- the nested finally
+            # keeps the close unconditional either way.
             try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
-        # Fail any push still waiting on an ACK: the socket is going away, so the
-        # answer is "not delivered", and leaving the future pending would hang the
-        # caller until its timeout for no reason.
-        for waiter in list(self._pending_acks.values()):
-            if not waiter.done():
-                waiter.set_result(-1)
-        self._pending_acks.clear()
-        await self._drain_handler_tasks()
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
+                for waiter in list(self._pending_acks.values()):
+                    if not waiter.done():
+                        waiter.set_result(-1)
+                self._pending_acks.clear()
+                await self._drain_handler_tasks()
+            finally:
+                if self._session and not self._session.closed:
+                    await self._session.close()
+                    self._session = None
 
     async def _drain_handler_tasks(self) -> None:
         """Cancel and await the in-flight turn tasks.
@@ -807,10 +824,10 @@ class WeComClient:
         """Believe the subscribe ACK instead of inferring auth from a close.
 
         A rejected ``bot_id``/``secret`` is reported here, in band, with its
-        code. Previously the only signal was the connection closing straight
+        code. Without it the only signal is the connection closing straight
         away, which the run loop reports as the generic "server closed
         connection immediately" — indistinguishable from an anti-kick, so an
-        operator with a bad secret was told to check something else. The badge is
+        operator with a bad secret is told to check something else. The badge is
         the documented compensating control for not verifying credentials at save
         time, so it has to carry the real reason.
 

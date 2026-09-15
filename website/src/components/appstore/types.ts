@@ -24,6 +24,8 @@ export type RegistryApp = {
   iconUrlDark?: string
   tags?: string[]
   highlights?: string[]
+  useCases?: string[]
+  configuration?: string[]
   screenshots?: string[]
   heroImage?: string
   heroImageDark?: string
@@ -31,8 +33,16 @@ export type RegistryApp = {
   heroImageDetailDark?: string
   license?: string
   repo?: string
+  /** Server-resolved clone target shown and echoed by the trust consent flow. */
+  trustRepository?: string
   branch?: string
   featured?: boolean | number
+  /**
+   * GitHub star count baked into git-type third-party rows by the publisher.
+   * Display-only; the server sanitizes it to a non-negative int
+   * (``_apply_trust_fields``) and built-ins never carry it.
+   */
+  stargazersCount?: number
   _registry?: string
   /**
    * Server-computed trust fields — the API trust boundary of
@@ -67,6 +77,16 @@ export type InstalledApp = {
   installedAt: string
   source?: string
   origin?: string     // "builtin" | "registry" | "local" | "external"
+  /**
+   * The git URL this app was installed from, recorded at install time. It is
+   * the only repo identifier that survives independently of the store's
+   * registry caches, so art resolution falls back to it when neither the row
+   * nor the manifest names a repo. Empty on a built-in, a local-directory
+   * install, and on records written before provenance was captured.
+   */
+  sourceUrl?: string
+  /** Server-normalized source URL used as the trust-consent scope. */
+  trustRepository?: string
   resources?: string  // "gateway" | "app"
   lifecycle?: string  // "gateway" | "app" | "locked"
   migratedTo?: string
@@ -94,12 +114,27 @@ export type InstalledApp = {
        */
       overlays?: { id: string; replaces: string }[]
     }
+    /**
+     * Rows this app adds to host-owned surfaces. Declared here for the same reason
+     * `ui.overlays` above is: the manifest serializes it, and a reader outside
+     * `contributedCommands.ts` (which carries its own record type, and validates the
+     * shape because this data is third-party) could not otherwise see the field
+     * exists. Left as `unknown` on purpose — the only code allowed to decide what a
+     * contribution IS is the module that checks it. `panelTabs` is read the same way,
+     * by `hooks/panelTabRegistry.ts`.
+     */
+    contributes?: {
+      commands?: unknown
+      panelTabs?: unknown
+    }
     permissions?: { api?: string[]; events?: string[]; mcpTools?: string[]; storage?: boolean; cron?: boolean; network?: boolean }
     setup?: { onInstall?: string; onUpdate?: string; onUninstall?: string; onEnable?: string; onDisable?: string }
     minKiroCrewVersion?: string
     iconPath?: string
     repo?: string
     screenshots?: string[]
+    /** Dark-appearance screenshots, when the manifest ships a second set. */
+    screenshotsDark?: string[]
     heroImage?: string
     heroImageDark?: string
     // The wide detail-page banners. Ten of the twelve builtins ship them, but
@@ -108,6 +143,8 @@ export type InstalledApp = {
     heroImageDetail?: string
     heroImageDetailDark?: string
     highlights?: string[]
+    useCases?: string[]
+    configuration?: string[]
     license?: string
     iconUrl?: string
     iconUrlDark?: string
@@ -201,6 +238,22 @@ export function isRegistrySourced(app: Pick<InstalledApp, 'source' | 'origin'>):
 }
 
 /**
+ * Sanitize a self-reported GitHub star count for display.
+ *
+ * Shared by every path that turns a registry payload into a rendered row:
+ * `normalizeRegistryApp` (the Discover query boundary) AND `AppDetailPage`'s
+ * own row builds, which spread the raw `listRegistry()` payload without going
+ * through normalize. An older gateway does not sanitize this field
+ * server-side and external indexes are user-supplied JSON, so the client must
+ * hold the line alone: only a safe non-negative integer renders (`1e308` is
+ * finite but compact-formats into hundreds of digits; `NaN`/`-1`/`3.5` are
+ * `typeof number` and would pass a bare typeof gate).
+ */
+export function sanitizeStargazersCount(v: unknown): number | undefined {
+  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : undefined
+}
+
+/**
  * Normalize a registry row for rendering.
  *
  * ``registry.py`` intentionally yields a MINIMAL index row when an app's
@@ -220,6 +273,7 @@ export function normalizeRegistryApp(raw: RegistryApp): RegistryApp {
     version: str(raw?.version, '0.0.0'),
     author: str(raw?.author),
     tags: Array.isArray(raw?.tags) ? raw.tags.filter((t): t is string => typeof t === 'string') : [],
+    stargazersCount: sanitizeStargazersCount(raw?.stargazersCount),
   }
 }
 
@@ -271,8 +325,27 @@ export function normalizeInstalledApp<T extends InstalledApp>(raw: T): T {
       sops: strings(manifest.sops),
       tags: strings(manifest.tags),
       jobFamilies: strings(manifest.jobFamilies),
-      screenshots: strings(manifest.screenshots),
       highlights: strings(manifest.highlights),
+      useCases: strings(manifest.useCases),
+      configuration: strings(manifest.configuration),
+      // Art fields, coerced here for the reason in this function's docstring: the
+      // payload's entry point is where a wrong TYPE stops being every consumer's
+      // problem. `screenshots` was coerced and its dark sibling was not, which is
+      // how `"screenshotsDark": {}` reached a bare `.map`, and `"iconPath": {}` a
+      // bare `startsWith` — each throwing on the surface that read it rather than
+      // degrading. `repo` rides along because it is the base the others resolve
+      // against, so a non-string there produces a nonsense request instead of none.
+      iconUrl: str(manifest.iconUrl),
+      iconUrlDark: str(manifest.iconUrlDark),
+      iconPath: str(manifest.iconPath),
+      iconPathDark: str(manifest.iconPathDark),
+      heroImage: str(manifest.heroImage),
+      heroImageDark: str(manifest.heroImageDark),
+      heroImageDetail: str(manifest.heroImageDetail),
+      heroImageDetailDark: str(manifest.heroImageDetailDark),
+      repo: str(manifest.repo),
+      screenshots: strings(manifest.screenshots),
+      screenshotsDark: strings(manifest.screenshotsDark),
       // A cron entry is only useful for its name, which is also the only field
       // the dashboard reads, so an entry without one is dropped rather than
       // rendered as a blank row.

@@ -26,6 +26,8 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from .ledger_lock import LEDGER_WRITE_LOCK
+
 # The outcome statuses a finding can land on. Mirrors the source ledger so the
 # morning-collection step (``grep '"status": "filed"'``) is unchanged (M5).
 STATUS_SEEN = "seen"
@@ -73,8 +75,8 @@ VALID_STATUSES = frozenset(
 # error, or a fix ATTEMPT that didn't verify must NOT permanently poison the ledger (the
 # bug bringing this in: 3 speculative seeds recorded as ``error`` blocked the loop forever,
 # so it idled with "0 fresh"; and a real defect whose FIRST fix attempt failed verification
-# was never retried even though a different fix might pass — observed 2026-06-17: a scoped
-# run re-discovered 5 real surfaces, all deduped as terminal, kept=0 filed=0).
+# was never retried even though a different fix might pass — a scoped run re-discovers 5
+# real surfaces, all deduped as terminal, kept=0 filed=0).
 #   * ``error`` / ``no_defect`` — transient miss; retry after cooldown.
 #   * ``failed_verify`` — the reproducing test was written but THIS fix attempt didn't make
 #     it pass; that's "this attempt didn't work", NOT "there's no bug here", so a later
@@ -229,7 +231,7 @@ class Ledger:
     def _load(self) -> None:
         if not self.path.exists():
             return
-        for line in self.path.read_text().splitlines():
+        for line in self.path.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -279,9 +281,16 @@ class Ledger:
     def record(self, entry: LedgerEntry) -> None:
         if entry.ts == 0.0:
             entry.ts = time.time()
-        with self._lock:
+        # The process-wide ledger write lock, NOT this instance's own lock: the same
+        # file is written by the operator's forget / purge / manual-filed / commit
+        # paths in `backend.ledger_admin`, which hold `LEDGER_WRITE_LOCK` across their
+        # read → decide → append. Sharing one lock makes this append atomic against a
+        # concurrent `forget`'s read → decide → `purged`, so a stale purge cannot
+        # supersede a just-filed row. `self._lock` still guards the in-memory
+        # `_seen` map for readers on this instance.
+        with LEDGER_WRITE_LOCK, self._lock:
             self._seen[entry.fp] = entry
-            with self.path.open("a") as f:
+            with self.path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(asdict(entry)) + "\n")
 
     def counts(self) -> dict[str, int]:

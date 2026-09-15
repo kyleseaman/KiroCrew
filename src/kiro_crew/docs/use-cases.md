@@ -10,20 +10,33 @@ The most powerful workflow: Kiro Crew digs through your issue backlog, picks up
 tasks, implements them, runs tests, opens pull requests, and handles review
 comments — all autonomously. It can push 20+ PRs overnight.
 
-```
-run docs/task-specs/backlog-crusher.md
+The task runner reads a spec you write. Save the steps below as
+`backlog-crusher.md`:
+
+```markdown
+# Backlog crusher
+
+1. List open issues in the project's tracker.
+2. Pick the highest-priority unassigned issue.
+3. Read the issue description and the code it links to.
+4. Implement the change.
+5. Run the test suite (e.g. `pytest`).
+6. Open a pull request targeting the correct branch.
+7. Move to the next issue.
 ```
 
-A typical spec:
-1. List open issues in the project's tracker
-2. Pick the highest-priority unassigned issue
-3. Read the issue description and linked code
-4. Implement the change
-5. Run the test suite (e.g. `pytest`)
-6. Open a pull request targeting the correct branch
-7. Move to the next issue
+Then hand that file to the runner. The path is resolved as given, so run this from
+the directory holding the file, or pass its absolute path:
 
-Best paired with `!yolo on` for unattended operation.
+```
+kirocrew run backlog-crusher.md
+```
+
+`kirocrew run --help` lists the flags that matter for a long run: `--fresh`
+ignores an existing checkpoint, `--no-test` skips verification between steps,
+and `--timeout` caps the whole run.
+
+For unattended operation with the `yolo` approval mode, use an isolated `KIROCREW_HOME`; the gateway refuses `--approval yolo` for the main data home.
 
 ## Repetitive Refactors
 
@@ -37,9 +50,8 @@ Monitor a Slack channel for incoming requests and auto-create issues. Your
 coding Kiro Crew instance picks them up automatically.
 
 Setup:
-1. Set the channel to `observe` mode: `!channel observe`
-2. Create a cron job: "Every hour, check #my-channel for new requests and
-   create issues for actionable items"
+1. Enable observe mode for the source channel.
+2. Create a cron job: "Every hour, check #my-channel for new requests and create issues for actionable items"
 3. Your backlog crusher picks up the new tasks
 
 ## Daily Briefings
@@ -77,15 +89,11 @@ gather data from your sources and publish to a dashboard or static site.
 
 ## Code Review Assistance
 
-Switch to a code-reviewer agent for focused review work:
+Select an installed review agent from the terminal:
 
 ```
-!agent code-reviewer
-```
-
-Or set it per-thread in Slack:
-```
-!ta set code-reviewer
+kirocrew agent list
+kirocrew chat --agent <installed-review-agent>
 ```
 
 The agent reads the pull-request diff, checks for common issues, and posts
@@ -93,23 +101,13 @@ review comments.
 
 ## Multi-Agent Workflows
 
-Run different agents for different concerns:
+List available agents with `kirocrew agent list`, then select one for a CLI chat with `kirocrew chat --agent <agent-name>`.
 
-| Agent | Purpose | Trigger |
-|-------|---------|---------|
-| `kirocrew` (default) | General tasks, chat | Always |
-| `code-reviewer` | CR review | `!ta set code-reviewer` in review threads |
-| `oncall-agent` | Incident response | Cron-triggered on alarm channels |
-| `doc-writer` | Documentation | Per-tab in dashboard |
-
-Each agent has its own system prompt, tools, and skills — scoped via
+Each installed agent has its own system prompt, tools, and skills — scoped via
 per-agent MCP configuration.
 
 ## Tips from the Community
 
-- **Unattended overnight runs**: Use `!yolo on` + task runner for long
-  autonomous sessions. Review the CRs in the morning.
-- **Workspace isolation**: Use `KIROCREW_HOME` and `KIROCREW_PORT` env vars
-  to run multiple Kiro Crew instances with separate data.
-- **Background gateway**: Use a macOS Launch Agent or systemd service to keep
-  the gateway running across reboots (see [Getting Started](getting-started.md)).
+- **Unattended overnight runs**: Use an isolated `KIROCREW_HOME` when running the gateway with `--approval yolo`. Review the CRs in the morning.
+- **Workspace isolation**: Use `KIROCREW_HOME` and `KIROCREW_PORT` env vars to run multiple Kiro Crew instances with separate data.
+- **Background gateway**: Use a macOS Launch Agent or systemd service to keep the gateway running across reboots (see [Getting Started](getting-started.md)).

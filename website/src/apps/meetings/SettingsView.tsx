@@ -7,10 +7,11 @@
 
 import { useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, ArrowRight, CalendarClock, ListChecks, Plus, Trash2 } from 'lucide-react'
+import { ArrowLeft, ArrowRight, CalendarClock, Languages, ListChecks, Plus, Trash2 } from 'lucide-react'
 
 import { i18nT } from '../../i18n/t'
 import SimpleSelect from '../../components/SimpleSelect'
+import ErrorNotice from '../../components/ErrorNotice'
 import {
   Badge,
   Btn,
@@ -55,6 +56,7 @@ export default function SettingsView({ onBack, notify }: Props) {
   const config = configQuery.data?.config
   const calendarProviders = configQuery.data?.calendar_providers ?? []
   const taskProviders = configQuery.data?.task_providers ?? []
+  const translationLanguages = configQuery.data?.translation_languages ?? []
   const terms = dictionaryQuery.data?.terms ?? []
 
   const saveConfig = useMutation({
@@ -170,6 +172,11 @@ export default function SettingsView({ onBack, notify }: Props) {
         }
       />
       <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+        {/* The toast is transient feedback; a save that did not persist is a state
+            the page must keep showing. No hand-off: the term inputs below are unsaved. */}
+        {saveConfig.isError ? (
+          <ErrorNotice className="mb-4" message={i18nT('apps.meetings.settings.saveFailed')} />
+        ) : null}
         <Card>
           <CardTitle>
             <ListChecks className="lucide-inline" />
@@ -188,6 +195,29 @@ export default function SettingsView({ onBack, notify }: Props) {
           />
         </Card>
 
+        <Card>
+          <CardTitle>
+            <Languages className="lucide-inline" />
+            {i18nT('apps.meetings.settings.translationTitle')}
+          </CardTitle>
+          <p className="text-[13px] text-muted mb-3">
+            {i18nT('apps.meetings.settings.translationHelp')}
+          </p>
+          {/* "Off" is the default and the only translated entry here — every other
+              option is a language's own endonym, which is exactly what a reader
+              looking for that language will recognise. */}
+          <SimpleSelect
+            options={['', ...translationLanguages.map(row => row.id)]}
+            optionLabels={[
+              i18nT('apps.meetings.settings.translationOff'),
+              ...translationLanguages.map(row => row.label),
+            ]}
+            value={config?.translation_language ?? ''}
+            aria-label={i18nT('apps.meetings.settings.translationTitle')}
+            onChange={value => patch({ translation_language: value })}
+            style={{ maxWidth: 280 }}
+          />
+        </Card>
         <Card>
           <CardTitle>
             <CalendarClock className="lucide-inline" />
@@ -306,6 +336,15 @@ export default function SettingsView({ onBack, notify }: Props) {
               ))}
             </div>
           )}
+          {/* addTerm was toast-only and removeTerm reported nothing at all. One notice per
+              mutation, not a chain: a persistent earlier failure must not mask a later one.
+              No hand-off: the alias / correct-spelling inputs below are unsaved until Add. */}
+          {addTerm.isError ? (
+            <ErrorNotice className="mb-3" message={i18nT('apps.meetings.settings.termFailed')} />
+          ) : null}
+          {removeTerm.isError ? (
+            <ErrorNotice className="mb-3" message={(removeTerm.error as Error).message} />
+          ) : null}
           <div className="flex items-center gap-2 flex-wrap">
             <Input
               ref={aliasRef}

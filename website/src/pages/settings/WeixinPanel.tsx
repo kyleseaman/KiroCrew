@@ -3,8 +3,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { QrCode, Loader2, Check, TriangleAlert, RefreshCw } from 'lucide-react'
 import { api, type WeixinConfigSave } from '../../api/client'
 import { WeixinLogo } from '../../components/WeixinLogo'
-import SimpleSelect from '../../components/SimpleSelect'
-import { SettingsInput, SettingsToggle } from '../../components/settings'
+import { SettingsInput, SettingsSelect, SettingsToggle } from '../../components/settings'
+import ErrorNotice from '../../components/ErrorNotice'
 import { useChannelFolderSave } from '../../hooks/useChannelFolderSave'
 import { TagListEditor } from './SlackPanel'
 
@@ -19,6 +19,13 @@ const SETUP_GUIDE =
 const POLL_MS = 1500
 /** Give up on an unscanned QR after this long (Tencent expires them anyway). */
 const QR_TTL_MS = 5 * 60 * 1000
+/**
+ * Consecutive failed status polls before the failure is said out loud. One or
+ * two are the long-poll endpoint's ordinary weather; three in a row (~5s) is a
+ * gateway that has stopped answering, and a QR that silently never confirms is
+ * indistinguishable from one nobody scanned.
+ */
+const QR_POLL_FAILURES_TO_REPORT = 3
 
 type Phase = 'idle' | 'starting' | 'waiting' | 'scanned' | 'confirmed' | 'expired' | 'error'
 
@@ -49,14 +56,29 @@ export function WeixinPanel() {
   // and stops as soon as the flow reaches a terminal phase, so there is no
   // hand-rolled timer to leak on unmount.
   const polling = phase === 'waiting' || phase === 'scanned'
+  // Counted here, not read from React Query's `failureCount`: with `retry: false`
+  // that counter is reset at the start of EVERY `refetchInterval` fetch (each
+  // fetch gets a fresh retry budget), so it never exceeds 1 and a gate on it
+  // would never fire. Cleared by any successful poll and by a fresh login.
+  const [qrPollFailures, setQrPollFailures] = useState(0)
   const { data: qrStatus } = useQuery({
     queryKey: ['weixin-qr-status', sessionId],
-    queryFn: () => api.weixinQrStatus(sessionId),
+    queryFn: async () => {
+      try {
+        const r = await api.weixinQrStatus(sessionId)
+        setQrPollFailures(0)
+        return r
+      } catch (e) {
+        setQrPollFailures(n => n + 1)
+        throw e
+      }
+    },
     enabled: polling && !!sessionId,
     refetchInterval: polling ? POLL_MS : false,
     retry: false,
     // A long-poll endpoint fails transiently; keep the last value rather than
-    // flipping the UI to an error state.
+    // flipping the UI to an error state. A poll that keeps failing is reported
+    // below once the consecutive count reaches QR_POLL_FAILURES_TO_REPORT.
     gcTime: 0,
   })
 
@@ -98,6 +120,7 @@ export function WeixinPanel() {
     mutationFn: () => api.weixinQrStart(),
     onMutate: () => {
       setErrMsg('')
+      setQrPollFailures(0)
       setPhase('starting')
     },
     onSuccess: r => {
@@ -189,7 +212,11 @@ export function WeixinPanel() {
         data-testid="weixin-status"
       >
         {isError ? (
-          <span className="text-[12.5px] text-muted">{i18nT('pages.settings.weixinPanel.status_unavailable')}</span>
+          // Read failure. askAgent ON: the only editable field on this panel is
+          // the session-folder name, and it commits `onBlur` — moving focus to
+          // the hand-off button is itself what saves it (the WhatsApp panel
+          // records the same reasoning).
+          <ErrorNotice variant="inline" message={i18nT('pages.settings.weixinPanel.status_unavailable')} askAgent />
         ) : connected ? (
           <>
             <span className="w-1.5 h-1.5 rounded-full bg-ok shrink-0" />
@@ -253,6 +280,19 @@ export function WeixinPanel() {
               <Loader2 size={12} className="animate-spin" />
               {phase === 'scanned' ? i18nT('pages.settings.weixinPanel.scanned_confirm_in_wechat') : i18nT('pages.settings.weixinPanel.waiting_for_scan')}
             </div>
+            {/* The status poll has stopped answering (see QR_POLL_FAILURES_TO_REPORT).
+                The code stays up because a scan may still land; the hand-off is on
+                because a gateway that stops answering is the agent's to diagnose and
+                nothing on this panel is an unsaved draft (the folder name commits
+                onBlur). */}
+            {qrPollFailures >= QR_POLL_FAILURES_TO_REPORT && (
+              <ErrorNotice
+                variant="inline"
+                message={i18nT('pages.settings.weixinPanel.scan_status_poll_failing')}
+                askAgent
+                testId="weixin-poll-failing"
+              />
+            )}
           </div>
         )}
 
@@ -271,10 +311,18 @@ export function WeixinPanel() {
           </div>
         )}
 
+        {/* The login service's own failure (`r.error` body or a rejected start).
+            askAgent ON: reachability of Tencent's login service is exactly what
+            the agent can diagnose, and the folder name below commits `onBlur`, so
+            the navigation cannot lose it. */}
         {phase === 'error' && (
-          <div className="mt-3 flex items-center gap-1.5 text-[12.5px] text-danger" data-testid="weixin-error">
-            <TriangleAlert size={13} /> {errMsg}
-          </div>
+          <ErrorNotice
+            variant="inline"
+            className="mt-3 text-[12.5px]"
+            message={errMsg}
+            askAgent
+            testId="weixin-error"
+          />
         )}
       </div>
 
@@ -299,17 +347,14 @@ export function WeixinPanel() {
       </div>
 
       <div>
-        {/* Not a <label>: SimpleSelect renders a button, so `htmlFor` would point
-            at no form control. The caption keeps its key and is reused verbatim as
-            the trigger's accessible name. data-testid moves to this wrapper so the
-            Playwright drive (scripts/test-weixin-panel.mjs) still finds the field. */}
-        <div className="block" data-testid="weixin-dm-policy">
-          <span className="block text-[11px] text-muted mb-1.5">{i18nT('pages.settings.weixinPanel.who_can_message_the_bot')}</span>
-          {/* maxWidth: the native select was content-sized; the Radix trigger is
-              w-full and this field is a stretch flex item, so without a cap it
-              would span the whole panel while every neighbouring control stays
-              content-scaled. */}
-          <SimpleSelect
+        {/* maxWidth: the trigger is w-full and this field is a stretch flex item,
+            so without a cap it would span the whole panel while every
+            neighbouring control stays content-scaled. data-testid stays on this
+            wrapper so the Playwright drive (scripts/test-weixin-panel.mjs)
+            still finds the field. */}
+        <div className="block" data-testid="weixin-dm-policy" style={{ maxWidth: 280 }}>
+          <SettingsSelect
+            label={i18nT('pages.settings.weixinPanel.who_can_message_the_bot')}
             options={['open', 'allowlist', 'disabled']}
             optionLabels={[
               i18nT('pages.settings.weixinPanel.anyone_who_messages_the_bot'),
@@ -319,8 +364,6 @@ export function WeixinPanel() {
             value={data?.dm_policy || 'allowlist'}
             disabled={readOnly}
             onChange={v => save({ dm_policy: v })}
-            aria-label={i18nT('pages.settings.weixinPanel.who_can_message_the_bot')}
-            style={{ maxWidth: 280 }}
           />
         </div>
       </div>
@@ -400,16 +443,16 @@ export function WeixinPanel() {
         {/* Outside the `folderOn` block on purpose: when an ENABLE is rejected
             the revert returns the switch to the server's value — off, since the
             server has no folder — so an error nested in that block would unmount
-            before it could paint and the failure would be silent. */}
-        {saveError && (
-          <p
-            className="text-[11.5px] text-danger mt-1 mb-0"
-            role="alert"
-            data-testid="weixin-session-folder-error"
-          >
-            {saveError}
-          </p>
-        )}
+            before it could paint and the failure would be silent.
+            No hand-off: `folderName` is the rejected draft this failure is about —
+            the hook deliberately keeps the typed text so it can be corrected, and
+            the navigation would discard it. */}
+        <ErrorNotice
+          variant="inline"
+          className="mt-1 text-[11.5px]"
+          message={saveError}
+          testId="weixin-session-folder-error"
+        />
       </div>
 
       <p className="text-[11.5px] text-muted m-0">

@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, fireEvent, act, waitFor } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 import RunInTerminalBtn from '../components/RunInTerminalBtn'
+import { RUN_IN_TERMINAL_RESULT_FALLBACK_MS } from '../utils/fenceShell'
 
 // "Run in terminal" dispatches a `mc:run-in-terminal` request on window;
 // ChatPage opens a terminal tab in the active chat, runs it, and replies with a
@@ -9,7 +10,7 @@ import RunInTerminalBtn from '../components/RunInTerminalBtn'
 //
 // A click does not run anything on its own — it opens a confirmation dialog
 // showing the exact command, and only the dialog's Run button dispatches.
-let requests: { code: string; reqId: string }[] = []
+let requests: { code: string; reqId: string; lang?: string }[] = []
 function onReq(e: Event) { requests.push((e as CustomEvent).detail) }
 function replyLast(ok: boolean) {
   const last = requests[requests.length - 1]
@@ -60,6 +61,13 @@ describe('RunInTerminalBtn', () => {
     clickAndConfirm()
     expect(requests).toHaveLength(1)
     expect(requests[0].code).toBe('echo hello')
+  })
+
+  it('carries the fence language in the run request', () => {
+    renderWithProviders(<RunInTerminalBtn code="set greeting hello" lang="fish" />)
+    clickAndConfirm()
+    expect(requests).toHaveLength(1)
+    expect(requests[0].lang).toBe('fish')
   })
 
   it('does not run when the dialog is cancelled', () => {
@@ -132,7 +140,7 @@ describe('RunInTerminalBtn', () => {
   it('shows error when no result arrives (timeout)', () => {
     renderWithProviders(<RunInTerminalBtn code="ls" />)
     clickAndConfirm()
-    act(() => { vi.advanceTimersByTime(8000) })
+    act(() => { vi.advanceTimersByTime(RUN_IN_TERMINAL_RESULT_FALLBACK_MS) })
     expect(screen.getByLabelText("Couldn't run in terminal")).toBeInTheDocument()
   })
 

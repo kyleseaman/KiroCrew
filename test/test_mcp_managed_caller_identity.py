@@ -28,13 +28,14 @@ from kiro_crew.mcp_discovery import (
 #: Managed server name -> the function that starts its stdio loop. Separate from
 #: the discovery map because that map points at the module whose ``_list_tools``
 #: is read; this names the entry point whose argument is the fact under test.
-#: ``kirocrew-core`` is the odd one out — the other three all call theirs
+#: ``kirocrew-core`` is the odd one out — the others all call theirs
 #: ``run_mcp_server``.
 _SERVE_ENTRY = {
     "kirocrew-core": "run_mcp_core_server",
     "kirocrew-cron": "run_mcp_server",
     "kirocrew-computer": "run_mcp_server",
     "kirocrew-dashboard": "run_mcp_server",
+    "kirocrew-work": "run_mcp_server",
 }
 
 
@@ -79,9 +80,9 @@ def test_session_bound_follows_advertising_modulo_the_withheld_set(name: str, mo
     Advertising is necessary for the shareable classification but not
     sufficient: ``_MANAGED_SERVERS_ADVERTISING_BUT_WITHHELD`` names servers
     whose pooled attribution is correct for every caller the gateway can name
-    but whose UNNAMED co-tenants would collide (#5322), so they are kept
-    session-bound deliberately. Every other server must follow the inverse
-    rule exactly.
+    but whose UNNAMED co-tenants are not provably separated on every gateway
+    generation, so they are kept session-bound deliberately. Every other server
+    must follow the inverse rule exactly.
     """
     module_name = _MANAGED_SERVER_TOOL_MODULES[name]
     advertised = _advertised_by_serve_entry(module_name, _SERVE_ENTRY[name], monkeypatch)
@@ -95,8 +96,8 @@ def test_session_bound_follows_advertising_modulo_the_withheld_set(name: str, mo
 def test_the_withheld_set_is_a_real_exception_not_a_stale_one(monkeypatch) -> None:
     """Each withheld name must be managed, actually advertise, and not also
     be claimed caller-aware — otherwise the exception is stale (the server
-    stopped advertising, or #5322 landed and the name was promoted without
-    deleting it here) or self-contradictory.
+    stopped advertising, or the hazard behind it was fixed and the name was
+    promoted without deleting it here) or self-contradictory.
     """
     withheld = mcp_discovery._MANAGED_SERVERS_ADVERTISING_BUT_WITHHELD
     assert withheld <= set(_MANAGED_SERVER_TOOL_MODULES)
@@ -114,21 +115,25 @@ def test_the_concrete_verdicts_are_spelled_out() -> None:
     """The concrete answers the dashboard renders, spelled out.
 
     Kept alongside the derived checks above because those pass just as happily if
-    every managed server flipped at once. ``kirocrew-core``, ``kirocrew-cron``
-    and ``kirocrew-dashboard`` consume the injected caller block and refuse or
-    safely namespace an unidentified caller, so none is session-bound.
-    ``kirocrew-computer`` also advertises and consumes the block (#4659 — its
-    pooled attribution is correct for every caller the gateway can name), but
-    it stays session-bound DELIBERATELY: an unnamed caller proceeds under
-    ``unresolved:<pid>``, which on a pooled backend is one shared namespace for
-    every unnamed co-tenant (#5322) — and unnamed is the normal case on macOS,
-    the only platform with a driver. It flips when #5322 gives unnamed callers
-    isolated namespaces.
+    every managed server flipped at once. ``kirocrew-core``, ``kirocrew-cron``,
+    ``kirocrew-dashboard`` and ``kirocrew-work`` consume the injected caller block
+    and refuse or safely namespace an unidentified caller, so none is
+    session-bound — ``kirocrew-work`` refuses outright, since a work-ledger tool
+    with no verifiable session has no ledger and no binding to reach.
+    ``kirocrew-computer`` also advertises and consumes the block (its pooled
+    attribution is correct for every caller the gateway can name), but it stays
+    session-bound DELIBERATELY: the per-connection nonce removes the namespace
+    collision on a CURRENT
+    gateway, while this classification is what ``seed.py`` turns into a config
+    write, and the daemon serving those shared frames may be a pre-nonce one
+    ``manager.py`` adopted across an upgrade. Promotion waits on a negotiated
+    guarantee that a nonce-blind gateway cannot serve a pooled computer backend.
     """
     assert managed_server_is_session_bound("kirocrew-core") is False
     assert managed_server_is_session_bound("kirocrew-cron") is False
     assert managed_server_is_session_bound("kirocrew-computer") is True
     assert managed_server_is_session_bound("kirocrew-dashboard") is False
+    assert managed_server_is_session_bound("kirocrew-work") is False
 
 
 def test_a_third_party_server_is_not_claimed_either_way() -> None:

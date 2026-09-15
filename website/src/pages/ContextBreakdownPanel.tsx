@@ -2,8 +2,12 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 
 import { api } from '../api/client'
-import { fmtNumber, fmtPercent } from '../i18n/format'
+import ErrorNotice from '../components/ErrorNotice'
+import { fmtNumber, fmtPercent, fmtUnit } from '../i18n/format'
 import { i18nT } from '../i18n/t'
+import type { SubagentActivity } from '../types'
+import { SessionBreakdownTree } from './SessionBreakdownTree'
+import { SOURCE_MUTE, sourceFg, sourceFill } from './contextSourceColors'
 
 /**
  * One turn's injection record, as GET /api/telemetry/context-trace returns it.
@@ -18,6 +22,10 @@ export interface ContextTurn {
   context_used: number
   context_window: number
   model: string
+  /** Real billing from the same shard row — absent on rows written before the
+   *  recorder carried it, so render as unknown rather than zero. */
+  credits?: number
+  duration_ms?: number
 }
 
 export interface ContextTrace {
@@ -116,16 +124,19 @@ export function rampShade(rank: number, count: number): { fill: string; fg: stri
   return { fill: `var(--ctx-k${step})`, fg: `var(--ctx-fg${step})` }
 }
 
-/** Stable colour per label, ranked by WHOLE-SESSION size so a block keeps one
- *  shade across every row. */
+/** Colour per label from the shared per-SOURCE hue map (see
+ *  `contextSourceColors`), so every composition bar — the per-turn rows here AND
+ *  the Session Breakdown tree above — colours a source the same way. Hue is the
+ *  data channel; the long tail of unrecognised blocks shares the neutral mute.
+ *  (Previously a size-ranked grey ramp, which made the two surfaces disagree and
+ *  buried the composition signal.) */
 function buildColorMap(totals: Record<string, number>): Map<string, { fill: string; fg: string }> {
   const grouped = groupBlocks(totals)
-  const ranked = Object.entries(grouped)
-    .filter(([label]) => label !== USER_LABEL)
-    .sort((a, b) => b[1] - a[1])
-    .map(([label]) => label)
   const map = new Map<string, { fill: string; fg: string }>()
-  ranked.forEach((label, i) => map.set(label, rampShade(i, ranked.length)))
+  for (const label of Object.keys(grouped)) {
+    if (label === USER_LABEL) continue
+    map.set(label, { fill: sourceFill(label), fg: sourceFg() })
+  }
   return map
 }
 
@@ -204,6 +215,7 @@ function Bar({ segs, widthPct }: { segs: Seg[]; widthPct: number }) {
         style={{ width: `${widthPct}%` }}
       >
         {segs.map(seg => (
+          // eslint-disable-next-line jsx-a11y/no-static-element-interactions -- hover-reveal only: the three listeners position a tooltip and the segment has no action to perform, so there is nothing for a keyboard to activate. The same colour→label mapping is spelled out by the legend below, so a non-pointer reader is not left without the information.
           <div
             key={seg.key}
             className="h-full min-w-0 cursor-default"
@@ -247,19 +259,24 @@ function TurnRow({
   turn,
   maxTotal,
   colorOf,
+  showCredits,
 }: {
   n: number
   turn: ContextTurn
   maxTotal: number
   colorOf: (label: string) => { fill: string; fg: string }
+  /** Rendered only when SOME turn in the trace carries billing, so an all-dash
+   *  column never appears on pre-recorder history. */
+  showCredits: boolean
 }) {
   const isStart = turn.phase === 'session_start'
   const total = turn.total_chars
   const width = barWidthPct(total, maxTotal)
   const segs = turnSegments(turn.blocks, total, colorOf)
+  const grid = showCredits ? 'grid-cols-[3.5rem_1fr_5rem_4rem]' : 'grid-cols-[3.5rem_1fr_5rem]'
 
   return (
-    <div className="grid grid-cols-[3.5rem_1fr_5rem] gap-2.5 items-center px-3.5 py-[3px] hover:bg-[var(--bg-hover)] rounded">
+    <div className={`grid ${grid} gap-2.5 items-center px-3.5 py-[3px] hover:bg-[var(--bg-hover)] rounded`}>
       <div className="font-mono text-[11px] text-muted text-right whitespace-nowrap">
         <b className="text-text font-medium">{n}</b>
         {isStart ? <> {i18nT('pages.contextBreakdown.row_start')}</> : null}
@@ -268,6 +285,27 @@ function TurnRow({
         <Bar segs={segs} widthPct={width} />
       </div>
       <div className="font-mono text-[11px] text-text text-right tabular-nums">{fmtN(total)}</div>
+      {showCredits ? <CreditsCell turn={turn} /> : null}
+    </div>
+  )
+}
+
+/** One turn's credits, with the duration in the tooltip when the row has it. */
+function CreditsCell({ turn }: { turn: ContextTurn }) {
+  if (turn.credits === undefined) {
+    return <div className="font-mono text-[11px] text-muted text-right tabular-nums">—</div>
+  }
+  const credits = fmtNumber(turn.credits, { maximumFractionDigits: 2 })
+  const title =
+    turn.duration_ms === undefined
+      ? i18nT('pages.contextBreakdown.turn_credits_title', { credits })
+      : i18nT('pages.contextBreakdown.turn_credits_duration_title', {
+          credits,
+          duration: fmtUnit(turn.duration_ms / 1000, 'second', { maximumFractionDigits: 1 }),
+        })
+  return (
+    <div className="font-mono text-[11px] text-text text-right tabular-nums" title={title}>
+      {credits}
     </div>
   )
 }
@@ -318,8 +356,8 @@ export function ContextBreakdownPanel({
 
 function ContextBreakdownCard({ trace }: { trace: ContextTrace }) {
   const colorMap = buildColorMap(trace.totals)
-  const darkest = rampShade(1, 1)
-  const colorOf = (label: string) => colorMap.get(label) ?? darkest
+  const fallback = { fill: SOURCE_MUTE, fg: sourceFg() }
+  const colorOf = (label: string) => colorMap.get(label) ?? fallback
 
   const totalWindow = trace.injected_chars + trace.estimated_other_chars
   const kirocrewAdded = Math.max(0, trace.injected_chars - trace.user_chars)
@@ -329,6 +367,10 @@ function ContextBreakdownCard({ trace }: { trace: ContextTrace }) {
   const starts = numbered.filter(t => t.turn.phase === 'session_start')
   const perTurn = numbered.filter(t => t.turn.phase !== 'session_start')
   const maxTotal = Math.max(1, ...trace.turns.map(t => t.total_chars))
+  // Billing rides the same rows; the column appears only when at least one
+  // turn actually carries it, so pre-recorder history stays three columns.
+  const hasCredits = trace.turns.some(t => t.credits !== undefined)
+  const totalCredits = trace.turns.reduce((sum, t) => sum + (t.credits ?? 0), 0)
 
   // Whole-window summary: aggregate blocks + the estimated non-KiroCrew remainder.
   const groupedTotals = groupBlocks(trace.totals)
@@ -423,14 +465,19 @@ function ContextBreakdownCard({ trace }: { trace: ContextTrace }) {
         />
       </div>
 
-      <div className="grid grid-cols-[3.5rem_1fr_5rem] gap-2.5 px-3.5 pt-2.5 pb-1 font-mono text-[10px] text-muted-strong tracking-wide">
+      <div
+        className={`grid ${hasCredits ? 'grid-cols-[3.5rem_1fr_5rem_4rem]' : 'grid-cols-[3.5rem_1fr_5rem]'} gap-2.5 px-3.5 pt-2.5 pb-1 font-mono text-[10px] text-muted-strong tracking-wide`}
+      >
         <span>{i18nT('pages.contextBreakdown.axis_turn')}</span>
         <span>{i18nT('pages.contextBreakdown.axis_bar')}</span>
         <span className="text-right">{i18nT('pages.contextBreakdown.axis_chars')}</span>
+        {hasCredits ? (
+          <span className="text-right uppercase">{i18nT('pages.contextBreakdown.col_credits')}</span>
+        ) : null}
       </div>
 
       {starts.map(({ turn, n }) => (
-        <TurnRow key={n} n={n} turn={turn} maxTotal={maxTotal} colorOf={colorOf} />
+        <TurnRow key={n} n={n} turn={turn} maxTotal={maxTotal} colorOf={colorOf} showCredits={hasCredits} />
       ))}
 
       {perTurn.length > 0 ? (
@@ -443,14 +490,16 @@ function ContextBreakdownCard({ trace }: { trace: ContextTrace }) {
       ) : null}
 
       {perTurn.map(({ turn, n }) => (
-        <TurnRow key={n} n={n} turn={turn} maxTotal={maxTotal} colorOf={colorOf} />
+        <TurnRow key={n} n={n} turn={turn} maxTotal={maxTotal} colorOf={colorOf} showCredits={hasCredits} />
       ))}
 
       <div className="px-3.5 pt-3 pb-1 border-t border-border mt-1.5">
         <div className="font-mono text-[10px] text-muted-strong uppercase tracking-wide pb-1">
           {i18nT('pages.contextBreakdown.group_whole_window')}
         </div>
-        <div className="grid grid-cols-[3.5rem_1fr_5rem] gap-2.5 items-center py-[3px]">
+        <div
+          className={`grid ${hasCredits ? 'grid-cols-[3.5rem_1fr_5rem_4rem]' : 'grid-cols-[3.5rem_1fr_5rem]'} gap-2.5 items-center py-[3px]`}
+        >
           <div className="font-mono text-[11px] text-muted text-right">
             <b className="text-text font-medium">{i18nT('pages.contextBreakdown.row_all')}</b>
           </div>
@@ -458,6 +507,14 @@ function ContextBreakdownCard({ trace }: { trace: ContextTrace }) {
             <Bar segs={windowSegs} widthPct={100} />
           </div>
           <div className="font-mono text-[11px] text-text text-right tabular-nums">{fmtN(totalWindow)}</div>
+          {hasCredits ? (
+            <div
+              className="font-mono text-[11px] text-text text-right tabular-nums"
+              title={i18nT('pages.contextBreakdown.total_credits_title')}
+            >
+              {fmtNumber(totalCredits, { maximumFractionDigits: 1 })}
+            </div>
+          ) : null}
         </div>
       </div>
 
@@ -493,8 +550,8 @@ function ContextBreakdownCard({ trace }: { trace: ContextTrace }) {
  *  per-turn drill-down — it made the reader pick a session before the view could
  *  say anything.
  */
-export function ContextBreakdownTab({ slot }: { slot: string }) {
-  const { data, isLoading } = useQuery<ContextTrace>({
+export function ContextBreakdownTab({ slot, subagents }: { slot: string; subagents?: Record<string, SubagentActivity> }) {
+  const { data, isLoading, error } = useQuery<ContextTrace>({
     queryKey: ['context-trace', slot],
     queryFn: () => api.telemetryContextTrace(slot),
     enabled: !!slot,
@@ -504,6 +561,10 @@ export function ContextBreakdownTab({ slot }: { slot: string }) {
 
   return (
     <div className="h-full overflow-auto p-3">
+      <SessionBreakdownTree subagents={subagents ?? {}} />
+      {/* A failed trace read otherwise rendered as an empty panel. Read-only
+          side tab, so the hand-off loses nothing; the poll above retries. */}
+      <ErrorNotice message={error ? (error instanceof Error ? error.message : String(error)) : null} askAgent className="mb-3" />
       <ContextBreakdownPanel trace={data} isLoading={isLoading} />
     </div>
   )

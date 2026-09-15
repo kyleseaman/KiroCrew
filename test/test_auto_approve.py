@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from body_stream_helpers import BodyStreamPayload
 
 from kiro_crew.dashboard.handlers.taskrunner import (
     api_taskrunner_execute_plan,
@@ -113,6 +115,12 @@ class TestAutoApproveDefault:
 # ══════════════════════════════════════════════════════════════════════
 
 
+def _discard_scheduled_coroutine(coro):
+    """Model create_task ownership without running execute_plan's worker."""
+    coro.close()
+    return MagicMock()
+
+
 class TestSettersSetAutoApprove:
     @pytest.mark.asyncio
     async def test_execute_plan_sets_auto_approve(self, tmp_path: Path) -> None:
@@ -121,7 +129,10 @@ class TestSettersSetAutoApprove:
         run.tasks = [Step(index=1, title="A", description="d")]
         runner._runs = {"t1": run}
         # Prevent the background _execute task from actually running.
-        with patch("kiro_crew.taskrunner.asyncio.create_task", return_value=MagicMock()):
+        with patch(
+            "kiro_crew.taskrunner.asyncio.create_task",
+            side_effect=_discard_scheduled_coroutine,
+        ):
             await runner.execute_plan("t1", auto_approve=True)
         assert run.auto_approve is True
         assert safety_override().is_scope_active(_auto_approve_scope("t1")) is True
@@ -132,7 +143,10 @@ class TestSettersSetAutoApprove:
         run = TaskRun(spec_path="s.md", spec_content="s", status="planned", task_id="t1")
         run.tasks = [Step(index=1, title="A", description="d")]
         runner._runs = {"t1": run}
-        with patch("kiro_crew.taskrunner.asyncio.create_task", return_value=MagicMock()):
+        with patch(
+            "kiro_crew.taskrunner.asyncio.create_task",
+            side_effect=_discard_scheduled_coroutine,
+        ):
             await runner.execute_plan("t1")
         assert run.auto_approve is False
         assert safety_override().is_scope_active(_auto_approve_scope("t1")) is False
@@ -315,6 +329,7 @@ class TestAutoApproveRespectsHookDeny:
 
         # ctx.hooks.on_tool_call returns TOOL_DENY (deny-list / sensitive-path block).
         ctx = MagicMock()
+        ctx.conversation_log.get_metadata_status.return_value = ({}, True)
         ctx.build_message = MagicMock(return_value=("prompt", {}))
         ctx.hooks.on_tool_call = MagicMock(return_value=MagicMock(action=TOOL_DENY))
 
@@ -345,6 +360,7 @@ class TestAutoApproveRespectsHookDeny:
         sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
 
         ctx = MagicMock()
+        ctx.conversation_log.get_metadata_status.return_value = ({}, True)
         ctx.build_message = MagicMock(return_value=("prompt", {}))
         ctx.hooks.on_tool_call = MagicMock(return_value=MagicMock(action=TOOL_AUTO_APPROVE))
 
@@ -443,15 +459,19 @@ class TestAutoApproveProvenanceGating:
         runner.start_background = MagicMock(return_value="tid")
         app = web.Application()
         app["state"] = SimpleNamespace(task_runner=runner)
-        req = make_mocked_request("POST", "/api/taskrunner", app=app)
-        req["app"] = request_app  # set by token_auth_middleware; "" == dashboard itself
-        req.json = AsyncMock(
-            return_value={
-                "spec": "__inline__:# t\n## Steps\n1. do",
-                "source": source,
-                "auto_approve": auto_approve,
-            }
+        start_body = {
+            "spec": "__inline__:# t\n## Steps\n1. do",
+            "source": source,
+            "auto_approve": auto_approve,
+        }
+        req = make_mocked_request(
+            "POST", "/api/taskrunner", app=app,
+            payload=BodyStreamPayload(json.dumps(start_body).encode()),
         )
+        req["app"] = request_app  # set by token_auth_middleware; "" == dashboard itself
+        # Kept alive: ``api_taskrunner_start`` reads uncapped (``max_bytes=None``)
+        # and consumes ``request.json()``.
+        req.json = AsyncMock(return_value=start_body)
         await api_taskrunner_start(req)
         return runner.start_background.call_args.kwargs["auto_approve"]
 
@@ -477,12 +497,13 @@ class TestAutoApproveProvenanceGating:
         runner.execute_plan = AsyncMock(return_value=None)
         app = web.Application()
         app["state"] = SimpleNamespace(task_runner=runner)
+        exec_body = {"auto_approve": auto_approve}
+        raw = json.dumps(exec_body).encode()
         req = make_mocked_request(
             "POST", "/api/taskrunner/t1/execute", app=app, match_info={"task_id": "t1"},
-            headers={"Content-Length": "32"},
+            headers={"Content-Length": str(len(raw))}, payload=BodyStreamPayload(raw),
         )
         req["app"] = request_app
-        req.json = AsyncMock(return_value={"auto_approve": auto_approve})
         await api_taskrunner_execute_plan(req)
         return runner.execute_plan.call_args.kwargs["auto_approve"]
 
@@ -510,12 +531,12 @@ class TestAutoApproveProvenanceGating:
         runner.execute_plan = AsyncMock(return_value=None)
         app = web.Application()
         app["state"] = SimpleNamespace(task_runner=runner)
+        raw = json.dumps({"auto_approve": True}).encode()
         req = make_mocked_request(
             "POST", "/api/taskrunner/t1/execute", app=app, match_info={"task_id": "t1"},
-            headers={"Content-Length": "32"},
+            headers={"Content-Length": str(len(raw))}, payload=BodyStreamPayload(raw),
         )
         req["app"] = ""  # dashboard context → requested trust is honored, so the gate audits
-        req.json = AsyncMock(return_value={"auto_approve": True})
 
         boom = MagicMock()
         boom.log_tool_invocation.side_effect = RuntimeError("sel backend down: SECRET-INTERNAL-DETAIL")
@@ -534,3 +555,91 @@ class TestAutoApproveProvenanceGating:
         # (async) SEL write failure reaches this fail-closed handler rather than
         # being swallowed by the background writer after the gate has returned.
         assert boom.log_tool_invocation.call_args.kwargs["critical"] is True
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Inline spec ownership: a rejected start must not leak its temp file
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestInlineSpecCleanup:
+    """POST /api/taskrunner writes inline specs to work/TASK_<id>.md before
+    calling start_background; when the start path raises, the handler owns
+    that file and must remove it — while a caller-supplied external path is
+    never the handler's to delete."""
+
+    async def _start(self, tmp_path: Path, body: dict, raising: bool):
+        runner = MagicMock()
+        runner._work_dir = str(tmp_path)
+        if raising:
+            runner.start_background = AsyncMock(side_effect=RuntimeError("boom: rejected"))
+        else:
+            runner.start_background = AsyncMock(return_value="tid")
+        app = web.Application()
+        app["state"] = SimpleNamespace(task_runner=runner)
+        req = make_mocked_request(
+            "POST", "/api/taskrunner", app=app,
+            payload=BodyStreamPayload(json.dumps(body).encode()),
+        )
+        req["app"] = ""
+        # Kept alive: ``api_taskrunner_start`` reads uncapped (``max_bytes=None``)
+        # and consumes ``request.json()``.
+        req.json = AsyncMock(return_value=body)
+        return await api_taskrunner_start(req), runner
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_inline_start_leaves_no_task_file_behind(self, tmp_path: Path) -> None:
+        resp, _ = await self._start(
+            tmp_path,
+            {"spec": "__inline__:# rejected plan", "source": "dashboard"},
+            raising=True,
+        )
+        assert resp.status == 400
+        assert list(tmp_path.glob("TASK_*.md")) == []
+
+    @pytest.mark.asyncio
+    async def test_the_original_error_survives_even_if_cleanup_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A best-effort unlink that itself fails must not replace the startup
+        # error the client is about to receive.
+        calls = {"n": 0}
+
+        def _flaky(self: Path, missing_ok: bool = False) -> None:
+            calls["n"] += 1
+            raise OSError("disk gone")
+
+        monkeypatch.setattr(Path, "unlink", _flaky, raising=False)
+        resp, _ = await self._start(
+            tmp_path,
+            {"spec": "__inline__:# rejected plan", "source": "dashboard"},
+            raising=True,
+        )
+        assert calls["n"] >= 1  # the cleanup was attempted
+        assert resp.status == 400
+        assert json.loads(resp.text)["error"].startswith("boom: rejected")
+
+    @pytest.mark.asyncio
+    async def test_an_external_spec_is_never_deleted_on_a_rejected_start(
+        self, tmp_path: Path
+    ) -> None:
+        external = tmp_path / "caller-owned.md"
+        external.write_text("# caller's own spec")
+        resp, _ = await self._start(
+            tmp_path,
+            {"spec": str(external), "source": "dashboard"},
+            raising=True,
+        )
+        assert resp.status == 400
+        assert external.exists(), "the handler deleted a caller-owned spec file"
+
+    @pytest.mark.asyncio
+    async def test_a_successful_inline_start_keeps_its_spec_file(self, tmp_path: Path) -> None:
+        resp, _ = await self._start(
+            tmp_path,
+            {"spec": "__inline__:# good plan", "source": "dashboard"},
+            raising=False,
+        )
+        assert resp.status == 200
+        payload = json.loads(resp.text)
+        assert Path(payload["spec"]).is_file()

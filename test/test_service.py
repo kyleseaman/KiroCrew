@@ -20,7 +20,8 @@ import plistlib
 import re
 import shlex
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -82,6 +83,49 @@ class TestPlatformDetection:
             assert current_platform() == Platform.UNSUPPORTED
 
 
+class TestManagedServiceMarkerDetection:
+    def test_no_installed_definition_is_not_applicable(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(controller, "current_platform", lambda: Platform.SYSTEMD)
+        monkeypatch.setattr(controller.linux, "UNIT_PATH", tmp_path / "missing.service")
+        assert controller.installed_service_has_managed_marker() is None
+
+    def test_systemd_definition_requires_explicit_marker(self, monkeypatch, tmp_path):
+        path = tmp_path / "kirocrew.service"
+        monkeypatch.setattr(controller, "current_platform", lambda: Platform.SYSTEMD)
+        monkeypatch.setattr(controller.linux, "UNIT_PATH", path)
+        path.write_text("[Service]\nExecStart=kirocrew gateway\n", encoding="utf-8")
+        assert controller.installed_service_has_managed_marker() is False
+        path.write_text(
+            '[Service]\nEnvironment="KIROCREW_SERVICE_MANAGED=1"\n',
+            encoding="utf-8",
+        )
+        assert controller.installed_service_has_managed_marker() is True
+
+    def test_launchd_definition_reads_environment_dictionary(self, monkeypatch, tmp_path):
+        path = tmp_path / "dev.kirocrew.gateway.plist"
+        monkeypatch.setattr(controller, "current_platform", lambda: Platform.LAUNCHD)
+        monkeypatch.setattr(controller.macos, "PLIST_PATH", path)
+        path.write_bytes(plistlib.dumps({"Label": "dev.kirocrew.gateway"}))
+        assert controller.installed_service_has_managed_marker() is False
+        path.write_bytes(
+            plistlib.dumps(
+                {"EnvironmentVariables": {"KIROCREW_SERVICE_MANAGED": "1"}}
+            )
+        )
+        assert controller.installed_service_has_managed_marker() is True
+
+    def test_malformed_launchd_definition_is_reported_stale(self, monkeypatch, tmp_path):
+        path = tmp_path / "dev.kirocrew.gateway.plist"
+        monkeypatch.setattr(controller, "current_platform", lambda: Platform.LAUNCHD)
+        monkeypatch.setattr(controller.macos, "PLIST_PATH", path)
+        path.write_text(
+            "<plist><dict><key>Label</key><string>Kiro & Crew</string></dict></plist>",
+            encoding="utf-8",
+        )
+
+        assert controller.installed_service_has_managed_marker() is False
+
+
 class TestShutdownBudget:
     def test_service_deadline_covers_gateway_grace(self):
         from kiro_crew.gateway_shutdown_budget import (
@@ -119,7 +163,11 @@ class TestLinuxUnitRendering:
         # `in unit` check for the prefix passes even if the flag is dropped,
         # because the prefix is still a substring of the shorter line.
         assert 'ExecStart="/home/u/.toolbox/bin/kirocrew" gateway --no-open' in unit
-        assert "Restart=on-failure" in unit
+        # `always`, not `on-failure`: the stale-asset watchdog exits the
+        # gateway cleanly so the supervisor relaunches a fresh install, and
+        # on-failure never restarts an exit 0 (gateway stranded for hours).
+        assert "Restart=always" in unit
+        assert "Restart=on-failure" not in unit
         assert "RestartSec=10" in unit
         # System-level unit must run as the invoking user with the user's
         # actual primary group (which on Amazon Linux is `amazon`, not the
@@ -168,9 +216,17 @@ class TestLinuxUnitRendering:
         assert 'Environment="USER=tester"\n' in unit
         assert 'Environment="HOME=' in unit
         assert 'Environment="PATH=' in unit
+        assert 'Environment="KIROCREW_SERVICE_MANAGED=1"\n' in unit
         service = unit.index("[Service]")
         install = unit.index("[Install]")
-        for key in ("HOME", "USER", "PATH", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        for key in (
+            "HOME",
+            "USER",
+            "PATH",
+            "KIROCREW_SERVICE_MANAGED",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ):
             at = unit.index(f'Environment="{key}=')
             assert service < at < install, f"Environment={key} escaped [Service]"
         assert unit.index('Environment="PATH=') < unit.index('Environment="XDG_RUNTIME_DIR=')
@@ -206,6 +262,7 @@ class TestLinuxUnitRendering:
         keys = set(service_environment("/home/tester"))
         assert "XDG_RUNTIME_DIR" not in keys
         assert "DBUS_SESSION_BUS_ADDRESS" not in keys
+        assert service_environment("/home/tester")["KIROCREW_SERVICE_MANAGED"] == "1"
 
     def test_current_uid_returns_none_for_an_unknown_user(self):
         from kiro_crew.service import linux as svc_linux
@@ -418,7 +475,7 @@ class TestLinuxPrivilegeResolution:
 
     def test_install_raises_clean_error_when_sudo_missing(self, monkeypatch):
         """The reported bug: on a root-only/minimal host without sudo, install
-        used to crash with an uncaught FileNotFoundError. It must raise the
+        must not crash with an uncaught FileNotFoundError; it must raise the
         friendly ServiceInstallError instead."""
         from kiro_crew.service import linux as svc_linux
 
@@ -593,6 +650,171 @@ class TestLinuxEnvironmentFile:
         monkeypatch.setattr(svc_linux, "_systemctl", lambda *a, **k: MagicMock(returncode=0))
         svc_linux.uninstall()
         assert str(env_file) in removed
+
+
+def _text_writes_missing_encoding(source: str) -> list[str]:
+    """Return ``"<line>: <call>"`` for every TEXT-mode open in ``source`` that
+    does not name an explicit ``encoding=``.
+
+    Binary mode is skipped -- it has no encoding to name. A call whose mode is
+    not a literal is treated as text, which is the conservative direction: a
+    dynamic mode still needs an encoding on the text branch.
+    """
+    import ast
+
+    found: list[str] = []
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            name = func.id
+        elif isinstance(func, ast.Attribute):
+            name = func.attr
+        else:
+            continue
+        if name not in ("open", "fdopen"):
+            continue
+        # Mode is the second positional arg for both builtins.open and
+        # os.fdopen, or the `mode=` keyword.
+        mode = None
+        if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+            mode = node.args[1].value
+        for kw in node.keywords:
+            if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+                mode = kw.value.value
+        if isinstance(mode, str) and "b" in mode:
+            continue
+        if any(kw.arg == "encoding" for kw in node.keywords):
+            continue
+        found.append(f"{node.lineno}: {name}(...)")
+    return found
+
+
+class TestLinuxServiceWritesUtf8:
+    """systemd reads unit and environment files as UTF-8. The writers here must
+    therefore EMIT UTF-8, not whatever ``locale.getpreferredencoding()`` happens
+    to return on the installing host.
+
+    Both staging writes went through ``os.fdopen(fd, "w")`` with no
+    ``encoding=``, so the bytes handed to ``sudo install`` were locale-dependent
+    while the consumer's contract is fixed. The same module already reads its
+    environment file back with ``encoding="utf-8"`` (``linux.py:448``), so the
+    round trip crossed two different encodings.
+
+    The same argument applies here as to the drop-in case.
+    """
+
+    def _capture_staged_bytes(self, call, contents: str) -> bytes:
+        """Run ``call(contents)`` with the privileged step stubbed, and return
+        the raw bytes of the temp file it staged.
+
+        The bytes must be read from inside the stub: both writers unlink the
+        temp file in a ``finally``, so by the time the call returns there is
+        nothing left to inspect.
+        """
+        import subprocess
+        from pathlib import Path
+
+        staged: dict[str, bytes] = {}
+
+        def _fake_run(argv, *a, **kw):
+            # The staged temp path is the second-to-last argv entry for both
+            # writers (`install -m MODE -o root -g root <tmp> <dest>`).
+            staged["raw"] = Path(argv[-2]).read_bytes()
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        with (
+            patch("kiro_crew.service.linux.subprocess.run", side_effect=_fake_run),
+            patch("kiro_crew.service.linux._privilege_prefix", return_value=["sudo"]),
+        ):
+            call(contents)
+        return staged["raw"]
+
+    def test_a_non_ascii_home_reaches_the_unit_writer(self, monkeypatch):
+        """Premise, not a regression pin: the unit is not ASCII by construction.
+
+        ``render_unit`` interpolates the account name and its home directory
+        into ``User=``, ``WorkingDirectory=`` and every ``Environment=`` line,
+        and both are ordinary UTF-8 filesystem values on Linux. So the string
+        handed to the writer can legitimately carry non-ASCII, which is what
+        makes the writer's encoding load-bearing rather than cosmetic.
+        """
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setenv("USER", "usuário")
+        gid_result = MagicMock(returncode=0, stdout="usuário\n", stderr="")
+        with (
+            patch(
+                "kiro_crew.service.common.shutil.which", return_value="/home/usuario/bin/kirocrew"
+            ),
+            patch("kiro_crew.service.linux.subprocess.run", return_value=gid_result),
+            patch("kiro_crew.service.linux._home_for_user", return_value="/home/usuario"),
+        ):
+            unit = svc_linux.render_unit()
+
+        assert not unit.isascii(), "expected the rendered unit to carry the non-ASCII home"
+        assert "User=usuário" in unit
+
+    def test_the_unit_write_stages_utf8_bytes(self):
+        """``_write_unit_via_sudo`` must hand ``install`` UTF-8 bytes."""
+        from kiro_crew.service import linux as svc_linux
+
+        contents = "[Service]\nWorkingDirectory=/home/usuario\nEnvironment=USER=usuário\n"
+        raw = self._capture_staged_bytes(svc_linux._write_unit_via_sudo, contents)
+
+        # Assert the ENCODING, not the line terminator: text mode translates
+        # newlines on Windows, which this Linux-only module never sees in
+        # production but a developer box does.
+        assert "usuário".encode("utf-8") in raw
+        assert raw.decode("utf-8").replace("\r\n", "\n") == contents
+
+    def test_the_install_file_write_stages_utf8_bytes(self, tmp_path):
+        """``_install_file_via_sudo`` is the same staging shape and the same
+        contract. Its one current caller seeds an ASCII template, so this is a
+        contract pin rather than a live-harm test -- but the helper takes
+        arbitrary ``contents`` and publishes to a root-owned path, so the
+        encoding must not be left to the host."""
+        from kiro_crew.service import linux as svc_linux
+
+        contents = "# Kiro Crew — überschrift\nKIROCREW_PORT=5477\n"
+        raw = self._capture_staged_bytes(
+            lambda c: svc_linux._install_file_via_sudo(c, tmp_path / "env"), contents
+        )
+
+        assert "— überschrift".encode("utf-8") in raw
+        assert raw.decode("utf-8").replace("\r\n", "\n") == contents
+
+    def test_every_text_write_in_the_linux_service_names_its_encoding(self):
+        """Ratchet. This is the assertion that goes red on the unfixed tree, and
+        it is what stops the seam decaying again -- the two sites here were
+        themselves the residue of an earlier pass that fixed a sibling."""
+        from pathlib import Path
+
+        from kiro_crew.service import linux as svc_linux
+
+        source = Path(svc_linux.__file__).read_text(encoding="utf-8")
+        offenders = _text_writes_missing_encoding(source)
+
+        assert offenders == [], (
+            "text-mode open without encoding= in service/linux.py: "
+            + "; ".join(offenders)
+            + " — systemd reads these files as UTF-8, so the writer must not "
+            "depend on the installing host's locale"
+        )
+
+    def test_the_encoding_ratchet_can_actually_fail(self):
+        """A scan that matches nothing passes as green and proves nothing. Pin
+        that the detector fires on a violation and stays quiet on the fixed
+        form and on binary mode."""
+        offending = 'import os\nwith os.fdopen(fd, "w") as fh:\n    fh.write(x)\n'
+        fixed = 'import os\nwith os.fdopen(fd, "w", encoding="utf-8") as fh:\n    fh.write(x)\n'
+        binary = 'import os\nwith os.fdopen(fd, "wb") as fh:\n    fh.write(x)\n'
+
+        assert len(_text_writes_missing_encoding(offending)) == 1
+        assert _text_writes_missing_encoding(fixed) == []
+        assert _text_writes_missing_encoding(binary) == []
 
 
 class TestMacOSPlistRendering:
@@ -867,8 +1089,8 @@ class TestControllerDispatch:
 
     def test_restart_service_returns_false_when_systemd_restart_fails(self):
         # The core false-success bug: an unprivileged/failed `systemctl
-        # restart` exits non-zero, but restart_service() historically returned
-        # True regardless (it never checked restart()'s result), printing a
+        # restart` exits non-zero; restart_service() must not return
+        # True regardless (it must check restart()'s result), or it prints a
         # bogus success. The controller must propagate the restart outcome so
         # the caller falls back to the foreground path instead of assuming the
         # service manager handled it.
@@ -931,6 +1153,54 @@ class TestControllerDispatch:
             return_value=Platform.UNSUPPORTED,
         ):
             assert controller.restart_service() is False
+
+    def test_manual_restart_hint_systemd_names_sudo_systemctl(self):
+        # The hint is printed precisely when the CLI restart path just failed
+        # for privileges, so it must name the privileged command — never a
+        # circular "kirocrew restart".
+        from kiro_crew.service import controller
+
+        with patch(
+            "kiro_crew.service.controller.current_platform",
+            return_value=Platform.SYSTEMD,
+        ), patch(
+            "kiro_crew.service.common.current_platform",
+            return_value=Platform.SYSTEMD,
+        ):
+            hint = controller.manual_restart_hint()
+        assert hint == "sudo systemctl restart kirocrew"
+
+    def test_manual_restart_hint_launchd_names_a_recovery_pair(self):
+        # Not kickstart: macos.restart() already ran kickstart and it was
+        # refused, so the hint must be a different mechanism (bootout +
+        # bootstrap from the installed plist), not a retry of the failure.
+        from kiro_crew.service import controller
+        from kiro_crew.service import macos as svc_macos
+        from kiro_crew.service.common import LAUNCHD_LABEL
+
+        with patch(
+            "kiro_crew.service.controller.current_platform",
+            return_value=Platform.LAUNCHD,
+        ), patch("kiro_crew.service.controller.os.getuid", return_value=501, create=True):
+            hint = controller.manual_restart_hint()
+        assert "kickstart" not in hint
+        assert f"launchctl bootout gui/501/{LAUNCHD_LABEL}" in hint
+        assert f'launchctl bootstrap gui/501 "{svc_macos.PLIST_PATH}"' in hint
+
+    def test_manual_restart_hint_never_circular(self):
+        # Whatever the platform, the hint must not send the operator back into
+        # the command that just failed.
+        from kiro_crew.service import controller
+
+        for plat in (Platform.SYSTEMD, Platform.LAUNCHD, Platform.UNSUPPORTED):
+            with patch(
+                "kiro_crew.service.controller.current_platform",
+                return_value=plat,
+            ), patch(
+                "kiro_crew.service.common.current_platform",
+                return_value=plat,
+            ):
+                assert controller.manual_restart_hint() != "kirocrew restart"
 
     def test_install_systemd_handles_install_error(self, capsys):
         """If linux.install raises ServiceInstallError, controller catches it,
@@ -1233,13 +1503,20 @@ class TestLinuxControlPaths:
     def _run_responder(self, *steps_and_results: tuple):
         """Helper: route subprocess.run by inspecting the command being run.
 
-        Each step is (substring_to_match, result_mock). The first step
-        whose substring appears in the command is returned. Anything
+        Each step is (argv_token_to_match, result_mock). The first step whose
+        token equals one of the command's argv elements is returned. Anything
         unmatched returns a default-success mock.
 
         This is more robust than a positional list because ``render_unit``
         also calls ``subprocess.run`` (for ``id -gn``), and the count of
         calls during install is not stable.
+
+        The match is whole-token, never substring: the unit-file write's argv
+        carries a ``tempfile.mkstemp`` path, and that path inherits ``TMPDIR``,
+        which the suite's per-test mode names after the test's own nodeid. A
+        substring match on ``"restart"`` would then select the *write* step of
+        ``test_install_propagates_failure_at_restart`` and the failure under
+        test would never be reached.
         """
         ok = MagicMock(returncode=0, stdout="", stderr="")
 
@@ -1247,9 +1524,9 @@ class TestLinuxControlPaths:
             # subprocess.run is called positionally as run([...], **kwargs).
             # MagicMock side_effect receives the same args, so cmd_list is
             # the list of argv strings.
-            cmd = " ".join(cmd_list) if isinstance(cmd_list, list) else str(cmd_list)
+            tokens = list(cmd_list) if isinstance(cmd_list, list) else [str(cmd_list)]
             for needle, result in steps_and_results:
-                if needle in cmd:
+                if needle in tokens:
                     return result
             return ok
 
@@ -1697,6 +1974,7 @@ class TestServiceEnvironment:
             plist = svc_macos.render_plist()
         envs = plist.split("<key>EnvironmentVariables</key>", 1)[1].split("</dict>", 1)[0]
         assert "<key>KIROCREW_PORT</key>" in envs and "<string>5477</string>" in envs
+        assert "<key>KIROCREW_SERVICE_MANAGED</key>" in envs
 
         monkeypatch.setenv("USER", "tester")
         gid = MagicMock(returncode=0, stdout="staff\n", stderr="")
@@ -1705,6 +1983,7 @@ class TestServiceEnvironment:
         ), patch("kiro_crew.service.linux.subprocess.run", return_value=gid):
             unit = svc_linux.render_unit()
         assert "KIROCREW_PORT=5477" in unit
+        assert "KIROCREW_SERVICE_MANAGED=1" in unit
 
     def test_propagates_kiro_bin_pin_only_when_set(self, monkeypatch):
         monkeypatch.delenv("KIROCREW_KIRO_BIN", raising=False)
@@ -2239,24 +2518,20 @@ class TestAppArmorGate:
 class TestAppArmorProfileRendering:
     """The rendered profile's shape is load-bearing for security."""
 
-    def test_has_no_attachment_path(self):
-        """A path attachment here would be a privilege leak, not a detail.
+    _EXEC = Path("/opt/kirocrew-venv/bin/kirocrew")
 
-        The gateway's interpreter (``~/.kiro/crew-venv/bin/python3``) is a
-        SYMLINK to the system python, and AppArmor matches the resolved path. So
-        attaching to the venv path silently never matches, and attaching to the
-        resolved path grants unprivileged userns to EVERY Python process on the
-        host. The profile is therefore named-only and applied by systemd to the
-        one unit. This test fails if anyone reintroduces an attachment.
+    def test_attaches_to_the_given_path_and_nothing_else(self):
+        """The attachment is the whole point, and it must be exactly the
+        validated launcher path — never the interpreter behind its shebang,
+        which is a symlink to the system python: attaching there would grant
+        unprivileged userns to EVERY Python process on the host.
         """
         from kiro_crew.service import apparmor as aa
 
-        text = aa.render_profile("4.0")
+        text = aa.render_profile("4.0", self._EXEC)
 
-        assert f"profile {aa.PROFILE_NAME} flags=(unconfined) {{" in text
-        # The declaration line must carry no path between the name and the flags.
         decl = [ln for ln in text.splitlines() if ln.startswith(f"profile {aa.PROFILE_NAME}")]
-        assert decl == [f"profile {aa.PROFILE_NAME} flags=(unconfined) {{"]
+        assert decl == [f'profile {aa.PROFILE_NAME} "{self._EXEC}" flags=(unconfined) {{']
         # And no interpreter path anywhere in the RULES (comments may explain why).
         body = text.split("{", 1)[1]
         assert "python" not in body
@@ -2265,7 +2540,7 @@ class TestAppArmorProfileRendering:
     def test_grants_only_userns(self):
         from kiro_crew.service import apparmor as aa
 
-        body = aa.render_profile("4.0").split("{", 1)[1]
+        body = aa.render_profile("4.0", self._EXEC).split("{", 1)[1]
 
         assert "userns," in body
         # No capability/file grants smuggled in alongside.
@@ -2275,14 +2550,14 @@ class TestAppArmorProfileRendering:
     def test_abi_line_matches_the_detected_abi(self):
         from kiro_crew.service import apparmor as aa
 
-        assert "abi <abi/4.0>," in aa.render_profile("4.0")
-        assert "abi <abi/5.0>," in aa.render_profile("5.0")
+        assert "abi <abi/4.0>," in aa.render_profile("4.0", self._EXEC)
+        assert "abi <abi/5.0>," in aa.render_profile("5.0", self._EXEC)
 
     def test_abi_line_is_omitted_when_none_is_available(self):
         """Declaring an abi file the host lacks makes the profile fail to load."""
         from kiro_crew.service import apparmor as aa
 
-        assert "abi <" not in aa.render_profile(None)
+        assert "abi <" not in aa.render_profile(None, self._EXEC)
 
     def test_detect_abi_picks_the_highest_numeric_file(self, monkeypatch, tmp_path):
         """Ubuntu 25.10 ships parser 5.x but only abi/3.0 and abi/4.0 on disk."""
@@ -2304,13 +2579,17 @@ class TestAppArmorProfileRendering:
         """The file is the only record a future reader has — it must say why."""
         from kiro_crew.service import apparmor as aa
 
-        text = aa.render_profile("4.0")
-        assert "Managed by KiroCrew" in text
+        text = aa.render_profile("4.0", self._EXEC)
+        assert "Managed by Kiro Crew" in text
         assert "Removing this file" in text
 
 
 class TestAppArmorInstall:
     """Install must be fail-soft, validate before loading, and verify enforcement."""
+
+    # A stand-in launcher path for tests that exercise branches past exec-path
+    # validation; tests that reach validation stub validate_exec_path to accept it.
+    _EXEC = "/opt/kirocrew-venv/bin/kirocrew"
 
     @staticmethod
     def _writers():
@@ -2325,13 +2604,28 @@ class TestAppArmorInstall:
 
         return writes, runs, write, run
 
+    @staticmethod
+    def _accept_exec_path(monkeypatch):
+        """Stub exec-path validation so a test can reach the branch it is about.
+
+        Validation itself has its own tests (TestValidateExecPath); here it
+        would otherwise refuse the stand-in path for not existing on disk.
+        """
+        from kiro_crew.service import apparmor as aa
+
+        monkeypatch.setattr(
+            aa,
+            "validate_exec_path",
+            lambda raw, expected_uid=None: (Path(raw), ""),
+        )
+
     def test_skips_cleanly_when_the_host_does_not_need_it(self, monkeypatch):
         from kiro_crew.service import apparmor as aa
 
         writes, runs, write, run = self._writers()
         monkeypatch.setattr(aa, "should_install", lambda: (False, "no restriction here"))
 
-        outcome = aa.install(write, run, lambda *_a: (0, ""), 1000, 1000)
+        outcome = aa.install(write, run, lambda *_a: (0, ""), 1000, 1000, self._EXEC)
 
         assert outcome.changed is False
         assert outcome.ok is True  # a skip is not a failure
@@ -2347,8 +2641,9 @@ class TestAppArmorInstall:
         monkeypatch.setattr(aa, "parser_version", lambda _p: (5, 0))
         monkeypatch.setattr(aa, "detect_abi", lambda: "5.0")
         monkeypatch.setattr(aa, "validate", lambda _p, _t: (False, "syntax error at line 9"))
+        self._accept_exec_path(monkeypatch)
 
-        outcome = aa.install(write, run, lambda *_a: (0, ""), 1000, 1000)
+        outcome = aa.install(write, run, lambda *_a: (0, ""), 1000, 1000, self._EXEC)
 
         assert outcome.ok is False
         assert outcome.changed is False
@@ -2364,11 +2659,12 @@ class TestAppArmorInstall:
         monkeypatch.setattr(aa, "parser_version", lambda _p: (5, 0))
         monkeypatch.setattr(aa, "detect_abi", lambda: "5.0")
         monkeypatch.setattr(aa, "validate", lambda _p, _t: (True, ""))
+        self._accept_exec_path(monkeypatch)
 
         def boom(*_a, **_k):
             raise RuntimeError("sudo: a password is required")
 
-        outcome = aa.install(boom, lambda *_a: None, lambda *_a: (0, ""), 1000, 1000)
+        outcome = aa.install(boom, lambda *_a: None, lambda *_a: (0, ""), 1000, 1000, self._EXEC)
 
         assert outcome.ok is False
         assert outcome.changed is False
@@ -2386,8 +2682,9 @@ class TestAppArmorInstall:
         monkeypatch.setattr(aa, "detect_abi", lambda: "5.0")
         monkeypatch.setattr(aa, "validate", lambda _p, _t: (True, ""))
         monkeypatch.setattr(aa, "verify_enforcement", lambda _c, _u, _g: (False, "probe still fails"))
+        self._accept_exec_path(monkeypatch)
 
-        outcome = aa.install(write, run, lambda *_a: (0, ""), 1000, 1000)
+        outcome = aa.install(write, run, lambda *_a: (0, ""), 1000, 1000, self._EXEC)
 
         assert outcome.changed is True  # the file WAS written
         assert outcome.ok is False
@@ -2419,7 +2716,11 @@ class TestAppArmorInstall:
             order.append("load")
             run(*argv)
 
-        outcome = aa.install(tracked_write, tracked_run, lambda *_a: (0, ""), 1000, 1000)
+        self._accept_exec_path(monkeypatch)
+
+        outcome = aa.install(
+            tracked_write, tracked_run, lambda *_a: (0, ""), 1000, 1000, self._EXEC
+        )
 
         assert outcome.ok is True and outcome.changed is True
         assert str(aa.PROFILE_PATH) in outcome.message
@@ -2427,6 +2728,67 @@ class TestAppArmorInstall:
         assert order == ["validate", "write", "load", "verify"]
         assert writes[0][1] == str(aa.PROFILE_PATH)
         assert runs[0][1:] == ("-r", "-W", str(aa.PROFILE_PATH))
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="validate_exec_path refuses Windows paths outright (backslash is an "
+        "AppArmor glob metachar); the service profile is Linux-only",
+    )
+    def test_exec_path_attaches_the_profile_to_the_resolved_launcher(
+        self, monkeypatch, durable_dir
+    ):
+        """A valid ``exec_path`` makes the WRITTEN profile text carry an
+        attachment to the resolved script, not just a bare named profile.
+
+        ``durable_dir`` (not raw ``tmp_path``): on Linux CI the pytest temp dir
+        lives under ``/tmp``, which the prefix denylist and the mode walk both
+        refuse — correctly, and each refusal has its own test. This test is
+        about the RENDERED attachment, so those rules are neutralised.
+        """
+        from kiro_crew.service import apparmor as aa
+
+        launcher = durable_dir / "kirocrew"
+        launcher.write_text("#!/bin/sh\n")
+        os.chmod(launcher, 0o755)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions -- a launcher fixture must carry the exec bit a real venv launcher has; the file lives in a test-owned tmp dir.  # noqa: E501
+        writes, runs, write, run = self._writers()
+        monkeypatch.setattr(aa, "should_install", lambda: (True, "restricted"))
+        monkeypatch.setattr(aa, "parser_path", lambda: "/usr/sbin/apparmor_parser")
+        monkeypatch.setattr(aa, "parser_version", lambda _p: (5, 0))
+        monkeypatch.setattr(aa, "detect_abi", lambda: None)
+        monkeypatch.setattr(aa, "validate", lambda _p, _t: (True, ""))
+        monkeypatch.setattr(aa, "verify_enforcement", lambda _c, _u, _g: (True, None))
+        expected_uid = launcher.stat().st_uid
+
+        outcome = aa.install(
+            write, run, lambda *_a: (0, ""), 1000, 1000,
+            exec_path=str(launcher), expected_uid=expected_uid,
+        )
+
+        assert outcome.ok is True and outcome.changed is True
+        assert str(launcher.resolve()) in outcome.message
+        written_text = writes[0][0]
+        assert f'profile {aa.PROFILE_NAME} "{launcher.resolve()}"' in written_text
+
+    def test_an_unresolvable_exec_path_is_a_clean_non_fatal_skip(self, monkeypatch):
+        """A launcher path that fails validation must not write anything, and
+        must not be confused with a compile failure or a sudo failure — it is
+        its own named case with its own message."""
+        from kiro_crew.service import apparmor as aa
+
+        writes, runs, write, run = self._writers()
+        monkeypatch.setattr(aa, "should_install", lambda: (True, "restricted"))
+        monkeypatch.setattr(aa, "parser_path", lambda: "/usr/sbin/apparmor_parser")
+        monkeypatch.setattr(aa, "parser_version", lambda _p: (5, 0))
+
+        outcome = aa.install(
+            write, run, lambda *_a: (0, ""), 1000, 1000,
+            exec_path="/nonexistent/path/kirocrew",
+        )
+
+        assert outcome.ok is False
+        assert outcome.changed is False
+        assert "AppArmor profile not installed" in outcome.message
+        assert writes == [] and runs == []
 
     def test_uninstall_is_a_noop_when_no_profile_is_present(self, monkeypatch, tmp_path):
         from kiro_crew.service import apparmor as aa
@@ -2457,7 +2819,11 @@ class TestAppArmorInstall:
 
 
 class TestAppArmorUnitDirective:
-    """The unit carries the profile, so it applies to this service only."""
+    """The retired ``AppArmorProfile=`` directive must never reappear in the unit.
+
+    The profile is attached by path; when both mechanisms are present,
+    systemd's ``change_onexec`` silently wins and defeats the path attachment.
+    """
 
     def test_no_directive_by_default(self, monkeypatch):
         from kiro_crew.service import linux as svc_linux
@@ -2471,25 +2837,94 @@ class TestAppArmorUnitDirective:
 
         assert "AppArmorProfile" not in unit
 
-    def test_directive_is_best_effort_when_requested(self, monkeypatch):
-        """The "-" prefix matters: a missing profile must not stop the gateway.
-
-        Without it systemd refuses to start the unit when the profile is absent,
-        turning a hardening step into an outage. With it the gateway starts and
-        simply fails closed per-spawn, which is the pre-existing behaviour.
-        """
+    def test_install_never_writes_the_directive_even_when_the_host_needs_a_profile(
+        self, monkeypatch
+    ):
+        """The unit ``linux.install()`` writes must never carry the
+        directive — a unit written WITH it silently defeats the path-attached
+        profile it installs (systemd's change_onexec wins over the kernel's
+        automatic path attachment). Asserted end-to-end through ``install()``,
+        not just on ``render_unit`` in isolation, so a regression that starts
+        threading a profile name back into the written unit is caught."""
         from kiro_crew.service import apparmor as aa
         from kiro_crew.service import linux as svc_linux
 
         monkeypatch.setenv("USER", "tester")
-        gid = MagicMock(returncode=0, stdout="tester\n", stderr="")
-        with patch(
-            "kiro_crew.service.common.shutil.which", return_value="/usr/bin/kirocrew"
-        ), patch("kiro_crew.service.linux.subprocess.run", return_value=gid):
-            unit = svc_linux.render_unit(aa.PROFILE_NAME)
+        monkeypatch.setattr(svc_linux, "_current_user", lambda: "tester")
+        monkeypatch.setattr(svc_linux, "_current_uid", lambda _u: 1000)
+        monkeypatch.setattr(aa, "should_install", lambda: (True, "restricted"))
+        monkeypatch.setattr(
+            svc_linux, "install_apparmor_profile", lambda _uid: aa.ProfileOutcome(True, "ok")
+        )
+        monkeypatch.setattr(svc_linux, "_seed_env_file", lambda: None)
+        written: list[str] = []
+        monkeypatch.setattr(
+            svc_linux,
+            "_write_unit_via_sudo",
+            lambda contents: (written.append(contents), MagicMock(returncode=0))[1],
+        )
+        ok = MagicMock(returncode=0, stdout="", stderr="")
+        monkeypatch.setattr(svc_linux, "_systemctl", lambda *a, **k: ok)
 
-        assert f"AppArmorProfile=-{aa.PROFILE_NAME}" in unit
-        assert "AppArmorProfile=kirocrew" not in unit  # never the hard form
+        svc_linux.install()
+
+        assert written, "render_unit's output was never written"
+        assert "AppArmorProfile" not in written[0]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="install_apparmor_profile() calls os.getuid(), absent on Windows; "
+    "the systemd service path is Linux-only",
+)
+class TestInstallApparmorProfileAttachesToTheLauncher:
+    """The service caller must hand ``apparmor.install`` the launcher
+    path and the SERVICE account's uid, not the installer process's own uid."""
+
+    def test_passes_kirocrew_bin_as_exec_path_and_threads_expected_uid(self, monkeypatch):
+        from kiro_crew.service import apparmor as aa
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setattr(svc_linux, "kirocrew_bin", lambda: "/opt/kirocrew-venv/bin/kirocrew")
+        calls = []
+
+        def fake_install(*args, **kwargs):
+            calls.append((args, kwargs))
+            return aa.ProfileOutcome(True, "ok")
+
+        monkeypatch.setattr(aa, "install", fake_install)
+
+        outcome = svc_linux.install_apparmor_profile(4242)
+
+        assert outcome.ok is True
+        assert len(calls) == 1
+        _args, kwargs = calls[0]
+        assert kwargs["exec_path"] == "/opt/kirocrew-venv/bin/kirocrew"
+        assert kwargs["expected_uid"] == 4242
+
+    def test_an_unresolved_service_account_skips_the_install(self, monkeypatch):
+        """``_current_uid`` returns None on a lookup failure; the install must
+        SKIP rather than forward None: ``_substitutable_by_others`` reads None
+        as "check against the calling process's uid", which under ``sudo`` is
+        root — a root-owned shared launcher would then pass the ownership
+        check and the userns grant would extend to every account on the host
+        (GPT review finding on this PR)."""
+        from kiro_crew.service import apparmor as aa
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setattr(svc_linux, "kirocrew_bin", lambda: "/opt/kirocrew-venv/bin/kirocrew")
+        calls = []
+        monkeypatch.setattr(
+            aa, "install", lambda *a, **kw: (calls.append(kw), aa.ProfileOutcome(True, "ok"))[1]
+        )
+
+        outcome = svc_linux.install_apparmor_profile(None)
+
+        assert calls == [], "apparmor.install must not run without a resolved service uid"
+        assert outcome.changed is False
+        assert outcome.ok is False
+        assert "could not be resolved" in outcome.message
+        assert "re-run" in outcome.message.lower()
 
 
 class TestAppArmorNeverFailsTheInstall:
@@ -2726,7 +3161,7 @@ class TestProfileLoadsBeforeTheServiceStarts:
         monkeypatch.setattr(
             svc_linux,
             "install_apparmor_profile",
-            lambda: (order.append("load-profile"), aa.ProfileOutcome(True, "installed"))[1],
+            lambda _uid: (order.append("load-profile"), aa.ProfileOutcome(True, "installed"))[1],
         )
         monkeypatch.setattr(
             svc_linux,
@@ -2763,7 +3198,7 @@ def durable_dir(tmp_path, monkeypatch):
     from kiro_crew.service import apparmor as aa
 
     monkeypatch.setattr(aa, "_UNSAFE_EXEC_PARENTS", ())
-    monkeypatch.setattr(aa, "_substitutable_by_others", lambda _p: None)
+    monkeypatch.setattr(aa, "_substitutable_by_others", lambda _p, expected_uid=None: None)
     return tmp_path
 
 
@@ -2773,6 +3208,28 @@ def durable_dir(tmp_path, monkeypatch):
 posix_only = pytest.mark.skipif(
     sys.platform == "win32", reason="POSIX path semantics; the feature is Linux-only"
 )
+
+
+def _trust_ancestors_above(monkeypatch, base, *, extra=None):
+    """Pin ancestor owners while preserving fixture ownership and permission bits."""
+    owners = dict.fromkeys(base.resolve().parents, 0)
+    owners.update(extra or {})
+    real_stat = Path.stat
+
+    def fake_stat(self, **kwargs):
+        info = real_stat(self, **kwargs)
+        if self not in owners:
+            return info
+
+        class AncestorStat:
+            st_uid = owners[self]
+
+            def __getattr__(self, name):
+                return getattr(info, name)
+
+        return AncestorStat()
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
 
 
 class TestLauncherExecPathIsSafeToAttach:
@@ -2940,8 +3397,7 @@ class TestATakeoverOfTheAttachedPathIsRefused:
     A world-writable directory outside the denylist — `/srv/shared` at 0777, a
     group-writable `/opt/apps`, a permissive network mount — would sail past a
     prefix check, and an attachment there lets any local user drop in their own
-    executable and inherit the userns grant. Raised as blocking in review of
-    #1653; these pin the fix.
+    executable and inherit the userns grant. These tests pin that refusal.
     """
 
     def test_a_world_writable_directory_outside_the_denylist_is_refused(
@@ -2953,7 +3409,7 @@ class TestATakeoverOfTheAttachedPathIsRefused:
         shared.mkdir()
         app = shared / "kirocrew.AppImage"
         app.write_text("#!/bin/sh\n")
-        os.chmod(shared, 0o777)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions -- the lax mode IS the fixture, not the behaviour under test: this stages a world-writable directory outside the prefix denylist precisely so the assertion below can prove validate_exec_path() refuses to attach an AppArmor userns grant there. Removing it deletes the regression test for the blocking finding in #1653.  # noqa: E501
+        os.chmod(shared, 0o777)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions -- the lax mode IS the fixture, not the behaviour under test: this stages a world-writable directory outside the prefix denylist precisely so the assertion below can prove validate_exec_path() refuses to attach an AppArmor userns grant there. Removing it deletes this regression test.  # noqa: E501
         # Empty the denylist so this can only be caught by the mode walk — the
         # whole point of the finding is that a prefix list does not cover it.
         monkeypatch.setattr(aa, "_UNSAFE_EXEC_PARENTS", ())
@@ -2998,7 +3454,7 @@ class TestATakeoverOfTheAttachedPathIsRefused:
         assert str(outer) in problem
 
     def test_a_root_owned_system_binary_is_refused(self):
-        """Raised as blocking in review of #1653.
+        """Pins the reviewed refusal behaviour.
 
         The shared-interpreter regex is a BLOCKLIST and blocklists leak: it names
         python, perl, ruby, node and the shells, but not java, mono, dotnet, php,
@@ -3049,7 +3505,7 @@ class TestATakeoverOfTheAttachedPathIsRefused:
 
         assert aa._substitutable_by_others(stand_in) is not None
 
-    def test_a_file_you_own_under_a_tight_chain_is_accepted(self, tmp_path):
+    def test_a_file_you_own_under_a_tight_chain_is_accepted(self, tmp_path, monkeypatch):
         """Positive control: an AppImage you downloaded is owned by you."""
         from kiro_crew.service import apparmor as aa
 
@@ -3058,7 +3514,11 @@ class TestATakeoverOfTheAttachedPathIsRefused:
         os.chmod(app, 0o755)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions -- an executable must be executable; the point of this test is that a user-owned 0755 file under a tight chain is ACCEPTED.  # noqa: E501
         # The ancestor chain of a pytest tmp_path is 0700 on macOS but includes
         # /tmp on Linux, so only assert the ownership half here; the mode walk has
-        # its own tests above.
+        # its own tests above. On an NFS host the mount roots stat as uid 65534
+        # (nobody), which the ownership walk would refuse; simulate the normal
+        # root-owned chain above tmp_path so this positive control is not a
+        # test-environment artifact (the fixture's own file keeps its real stat).
+        _trust_ancestors_above(monkeypatch, tmp_path)
         problem = aa._substitutable_by_others(app)
 
         assert problem is None or "world-writable" in problem, problem
@@ -3101,6 +3561,154 @@ class TestATakeoverOfTheAttachedPathIsRefused:
         assert problem is not None
         assert "uid 4242" in problem
         assert "not by you" in problem
+
+
+@posix_only
+class TestExpectedUidOverride:
+    """The systemd service case checks ownership against the SERVICE
+    account, not the installer process's own uid — a different account when
+    ``kirocrew service install`` itself runs as root or under ``sudo``."""
+
+    def test_a_file_owned_by_the_expected_uid_is_accepted(self, tmp_path, monkeypatch):
+        from kiro_crew.service import apparmor as aa
+
+        app = tmp_path / "kirocrew"
+        app.write_text("#!/bin/sh\n")
+        os.chmod(app, 0o755)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501
+        real_uid = app.stat().st_uid
+
+        # Simulate the normal root-owned ancestor chain above tmp_path; on an
+        # NFS host the real mount roots stat as uid 65534 (nobody) and would
+        # wrongly fail this accept case (see _trust_ancestors_above).
+        _trust_ancestors_above(monkeypatch, tmp_path)
+        problem = aa._substitutable_by_others(app, expected_uid=real_uid)
+
+        assert problem is None or "world-writable" in problem, problem
+        assert problem is None or "owned by" not in problem
+
+    def test_a_file_owned_by_the_installer_but_not_the_expected_account_is_refused(
+        self, tmp_path, monkeypatch
+    ):
+        """The critical case: the venv script IS owned by
+        whoever is running this Python process (e.g. root, under ``sudo
+        kirocrew service install``), but that is not the account the SERVICE
+        runs as -- checking against the installer's own uid would wrongly
+        accept an attachment that grants a different human's process the
+        namespace capability."""
+        from kiro_crew.service import apparmor as aa
+
+        app = tmp_path / "kirocrew"
+        app.write_text("#!/bin/sh\n")
+        os.chmod(app, 0o755)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501
+        installer_uid = app.stat().st_uid
+        monkeypatch.setattr(os, "getuid", lambda: installer_uid, raising=False)
+        # Simulate the normal root-owned ancestor chain above tmp_path so the
+        # accept-half below is not defeated by this NFS host's nobody-owned
+        # (uid 65534) mount roots; the fixture's own file keeps its real owner.
+        _trust_ancestors_above(monkeypatch, tmp_path)
+
+        # Accepted against the installer's own uid (legacy AppImage
+        # semantics): the OWNERSHIP rule must not fire. Assert only that half —
+        # the ancestor mode walk legitimately flags ``/tmp`` on Linux CI, as
+        # ``test_a_file_you_own_under_a_tight_chain_is_accepted`` documents.
+        problem_own = aa._substitutable_by_others(app)
+        assert problem_own is None or "world-writable" in problem_own, problem_own
+        assert problem_own is None or "owned by" not in problem_own
+        # ...but refused once an expected_uid names a DIFFERENT account, even
+        # though the file's real owner never changed. Ownership is checked
+        # before the mode walk, so this message is deterministic.
+        problem = aa._substitutable_by_others(app, expected_uid=installer_uid + 1)
+
+        assert problem is not None
+        assert f"uid {installer_uid}" in problem
+        assert "not by the expected account" in problem
+
+    def test_a_foreign_owned_ancestor_is_refused(self, tmp_path, monkeypatch):
+        """A directory's OWNER can rename or
+        replace what is inside it regardless of the 0o022 mode bits, so a
+        tight-mode ancestor owned by a THIRD account (not root, not the
+        expected owner) still makes the whole path substitutable — the mode
+        walk alone must not accept it."""
+        from kiro_crew.service import apparmor as aa
+
+        foreign = tmp_path / "foreign"
+        foreign.mkdir()
+        app = foreign / "kirocrew"
+        app.write_text("#!/bin/sh\n")
+        os.chmod(app, 0o755)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501
+        os.chmod(foreign, 0o755)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions -- deliberately TIGHT against the 0o022 walk; the foreign OWNER below is what this test exercises.  # noqa: E501
+        real_uid = app.stat().st_uid
+        foreign_resolved = foreign.resolve()
+        real_stat = Path.stat
+
+        def fake_stat(self, **kwargs):
+            info = real_stat(self, **kwargs)
+            if self == foreign_resolved:
+
+                class ForeignStat:
+                    st_uid = real_uid + 7
+                    st_mode = info.st_mode
+
+                return ForeignStat()
+            return info
+
+        monkeypatch.setattr(Path, "stat", fake_stat)
+
+        problem = aa._substitutable_by_others(app, expected_uid=real_uid)
+
+        assert problem is not None
+        assert f"owned by uid {real_uid + 7}" in problem
+        assert "rename or replace" in problem
+
+    def test_a_root_owned_ancestor_stays_trusted(self, tmp_path, monkeypatch):
+        """The system chain (/, /home, /opt) is root-owned; the ancestor
+        ownership rule must not reject it — root can already edit
+        /etc/apparmor.d directly, so refusing root-owned ancestors would
+        reject every real install for no gain."""
+        from kiro_crew.service import apparmor as aa
+
+        parent = tmp_path / "sys"
+        parent.mkdir()
+        app = parent / "kirocrew"
+        app.write_text("#!/bin/sh\n")
+        os.chmod(app, 0o755)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501
+        os.chmod(parent, 0o755)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501
+        real_uid = app.stat().st_uid
+        parent_resolved = parent.resolve()
+
+        # Pin the fixture's own parent to root (the property under test: a
+        # root-owned ancestor stays trusted). The same helper also reports the
+        # ancestors ABOVE tmp_path as root-owned, so this host's nobody-owned
+        # (uid 65534) NFS mount roots do not defeat the assertion.
+        _trust_ancestors_above(monkeypatch, tmp_path, extra={parent_resolved: 0})
+
+        problem = aa._substitutable_by_others(app, expected_uid=real_uid)
+
+        # The mode walk may still flag /tmp on Linux CI (an ancestor outside
+        # this fixture); assert only that the OWNERSHIP rules did not fire.
+        assert problem is None or "owned by" not in problem, problem
+
+    def test_validate_exec_path_forwards_expected_uid(self, tmp_path, monkeypatch):
+        """End-to-end through the public entry point, not just the private
+        ownership helper -- a regression that stops threading the kwarg
+        through validate_exec_path would not be caught by the unit test above
+        alone."""
+        from kiro_crew.service import apparmor as aa
+
+        app = tmp_path / "kirocrew"
+        app.write_text("#!/bin/sh\n")
+        os.chmod(app, 0o755)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501
+        real_uid = app.stat().st_uid
+        # On Linux CI ``tmp_path`` lives under ``/tmp``, which the prefix
+        # denylist refuses before ownership is ever consulted. Neutralise ONLY
+        # that rule; the ownership check under test runs unstubbed, and it
+        # fires before the mode walk so the message below is deterministic.
+        monkeypatch.setattr(aa, "_UNSAFE_EXEC_PARENTS", ())
+
+        resolved, problem = aa.validate_exec_path(str(app), expected_uid=real_uid + 1)
+
+        assert resolved is None
+        assert "not by the expected account" in problem
 
 
 class TestLauncherProfileRendering:
@@ -3659,7 +4267,7 @@ class TestHeadlessApiKeyWarning:
     launchd/systemd hand the gateway a minimal environment, so a key exported in
     the installing shell is absent when the service starts and the readiness
     probe reports a signed-out state on a host where kiro-cli itself is
-    authenticated (issue #3257). The install path warns instead of pretending
+    authenticated. The install path warns instead of pretending
     nothing was lost — and never bakes the credential into the unit.
     """
 
@@ -3680,7 +4288,7 @@ class TestHeadlessApiKeyWarning:
         assert warning, "a dropped credential must produce a warning"
         assert self.API_KEY in warning
         assert str(dotenv) in warning, "the warning must name the file to edit"
-        assert "kirocrew service restart" in warning
+        assert common.restart_command_hint() in warning
 
     def test_the_signed_out_claim_is_qualified(self, monkeypatch, tmp_path):
         """A login credential store under the baked `HOME` can still authenticate.
@@ -3857,3 +4465,252 @@ class TestHeadlessApiKeyWarning:
         ):
             assert controller.install_service() == 0
         assert "Note: dropped key" in capsys.readouterr().out
+
+
+class TestAppArmorProfileValidation:
+    """``validate`` parses a profile WITHOUT loading it.
+
+    Loading needs root and a wrong profile that loads is a confined gateway that
+    cannot start; parsing first is what turns that into a message. ``--skip-cache``
+    is load-bearing: writing ``/var/cache/apparmor`` needs root and this runs
+    before any privileged step.
+    """
+
+    @staticmethod
+    def _fake_run(monkeypatch, *, returncode=0, stdout="", stderr="", raises=None):
+        from kiro_crew.service import apparmor as aa
+
+        seen: dict = {}
+
+        def _run(argv, **kw):
+            seen["argv"] = list(argv)
+            seen["kw"] = kw
+            if raises is not None:
+                raise raises
+            return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+        monkeypatch.setattr(aa.subprocess, "run", _run)
+        return seen
+
+    def test_a_clean_parse_reports_ok(self, monkeypatch):
+        from kiro_crew.service import apparmor as aa
+
+        seen = self._fake_run(monkeypatch)
+        ok, detail = aa.validate("/usr/sbin/apparmor_parser", "profile x {}")
+
+        assert (ok, detail) == (True, "")
+        assert seen["argv"][:3] == ["/usr/sbin/apparmor_parser", "-Q", "--skip-cache"]
+
+    def test_the_profile_text_reaches_the_parser_and_the_temp_file_is_removed(self, monkeypatch):
+        from kiro_crew.service import apparmor as aa
+
+        seen = self._fake_run(monkeypatch)
+        written: dict = {}
+
+        def _capture(argv, **kw):
+            written["text"] = Path(argv[-1]).read_text(encoding="utf-8")
+            written["path"] = argv[-1]
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(aa.subprocess, "run", _capture)
+        aa.validate("/usr/sbin/apparmor_parser", "profile marker {}")
+
+        assert written["text"] == "profile marker {}"
+        # The temp file carries a profile, not a secret, but leaving one per
+        # install attempt is still a leak of /tmp entries.
+        assert not Path(written["path"]).exists()
+        assert seen == {}
+
+    def test_a_parse_failure_returns_the_parsers_own_words(self, monkeypatch):
+        from kiro_crew.service import apparmor as aa
+
+        self._fake_run(monkeypatch, returncode=1, stderr="  syntax error at line 3  ")
+        assert aa.validate("/usr/sbin/apparmor_parser", "bad") == (
+            False,
+            "syntax error at line 3",
+        )
+
+    def test_stdout_is_used_when_stderr_is_empty(self, monkeypatch):
+        from kiro_crew.service import apparmor as aa
+
+        self._fake_run(monkeypatch, returncode=1, stdout="told you so")
+        assert aa.validate("/usr/sbin/apparmor_parser", "bad") == (False, "told you so")
+
+    def test_a_missing_parser_is_a_failure_not_a_crash(self, monkeypatch):
+        from kiro_crew.service import apparmor as aa
+
+        self._fake_run(monkeypatch, raises=OSError("no such file"))
+        ok, detail = aa.validate("/usr/sbin/apparmor_parser", "profile x {}")
+
+        assert ok is False
+        assert "no such file" in detail
+
+    def test_a_parser_timeout_is_a_failure_not_a_crash(self, monkeypatch):
+        import subprocess
+
+        from kiro_crew.service import apparmor as aa
+
+        self._fake_run(monkeypatch, raises=subprocess.TimeoutExpired("p", 30))
+        assert aa.validate("/usr/sbin/apparmor_parser", "profile x {}")[0] is False
+
+
+#: The AppImage path the attachment scan matches on, POSIX-flavoured on purpose.
+#: ``conflicting_attachment`` interpolates the path into a literal needle, and on
+#: Windows a plain ``Path("/opt/x")`` renders with BACKSLASHES — so the needle
+#: would never match the forward-slash profile text and the test would assert a
+#: platform artefact instead of the matching logic. AppArmor is Linux-only, so
+#: PurePosixPath is also what production actually passes here.
+_APPIMAGE = PurePosixPath("/opt/KiroCrew.AppImage")
+
+
+class TestAppArmorConflictingAttachment:
+    """Two profiles claiming one attachment is an ambiguous load.
+
+    A hand-written profile attached to the same AppImage is the workaround people
+    find first, so it is common rather than exotic — and the caller can only warn
+    about it if this finds it. Best effort by design: a literal scan, no policy
+    parsing, and an unreadable file is skipped rather than failing the install.
+    """
+
+    @staticmethod
+    def _dir(monkeypatch, tmp_path):
+        from kiro_crew.service import apparmor as aa
+
+        monkeypatch.setattr(aa, "LAUNCHER_PROFILE_PATH", tmp_path / aa.LAUNCHER_PROFILE_NAME)
+        return aa
+
+    def test_no_other_profile_means_no_conflict(self, monkeypatch, tmp_path):
+        aa = self._dir(monkeypatch, tmp_path)
+        assert aa.conflicting_attachment(_APPIMAGE) is None
+
+    def test_our_own_profile_is_never_the_conflict(self, monkeypatch, tmp_path):
+        aa = self._dir(monkeypatch, tmp_path)
+        (tmp_path / aa.LAUNCHER_PROFILE_NAME).write_text('"/opt/KiroCrew.AppImage" {}')
+        assert aa.conflicting_attachment(_APPIMAGE) is None
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            '"/opt/KiroCrew.AppImage" flags=(attach_disconnected) {}',
+            "profile local /opt/KiroCrew.AppImage {}",
+            "profile local\n/opt/KiroCrew.AppImage",
+        ],
+    )
+    def test_each_attachment_spelling_is_found(self, body: str, monkeypatch, tmp_path):
+        aa = self._dir(monkeypatch, tmp_path)
+        other = tmp_path / "local-kirocrew"
+        other.write_text(body)
+        assert aa.conflicting_attachment(_APPIMAGE) == str(other)
+
+    def test_a_profile_for_another_path_is_not_a_conflict(self, monkeypatch, tmp_path):
+        aa = self._dir(monkeypatch, tmp_path)
+        (tmp_path / "other").write_text('"/opt/SomethingElse.AppImage" {}')
+        assert aa.conflicting_attachment(_APPIMAGE) is None
+
+    def test_a_subdirectory_is_skipped(self, monkeypatch, tmp_path):
+        # /etc/apparmor.d has abstractions/ and tunables/ subdirectories; reading
+        # one as a file would raise, and this scan must not fail the install.
+        aa = self._dir(monkeypatch, tmp_path)
+        (tmp_path / "abstractions").mkdir()
+        assert aa.conflicting_attachment(_APPIMAGE) is None
+
+    def test_an_unreadable_file_is_skipped_not_fatal(self, monkeypatch, tmp_path):
+        aa = self._dir(monkeypatch, tmp_path)
+        (tmp_path / "unreadable").write_text("x")
+        good = tmp_path / "zz-real"
+        good.write_text('"/opt/KiroCrew.AppImage" {}')
+        real_read = Path.read_text
+
+        def _read(self, *a, **kw):
+            if self.name == "unreadable":
+                raise OSError("EACCES")
+            return real_read(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "read_text", _read)
+        assert aa.conflicting_attachment(_APPIMAGE) == str(good)
+
+    def test_a_missing_directory_is_not_an_error(self, monkeypatch, tmp_path):
+        aa = self._dir(monkeypatch, tmp_path / "absent")
+        assert aa.conflicting_attachment(_APPIMAGE) is None
+
+
+class TestAppArmorLauncherUninstall:
+    """Unloading is idempotent and never raises.
+
+    An uninstall that fails hard leaves the user with a half-removed profile and
+    no way to finish; the file is what matters, so a failed UNLOAD is logged and
+    the removal still runs.
+    """
+
+    def test_nothing_to_do_when_no_profile_is_installed(self, monkeypatch, tmp_path):
+        from kiro_crew.service import apparmor as aa
+
+        monkeypatch.setattr(aa, "LAUNCHER_PROFILE_PATH", tmp_path / "absent")
+        outcome = aa.uninstall_launcher(lambda *a: None)
+        assert (outcome.changed, outcome.ok) == (False, True)
+
+    def test_it_unloads_then_removes(self, monkeypatch, tmp_path):
+        from kiro_crew.service import apparmor as aa
+
+        path = tmp_path / "kirocrew-launcher"
+        path.write_text("profile")
+        monkeypatch.setattr(aa, "LAUNCHER_PROFILE_PATH", path)
+        monkeypatch.setattr(aa, "parser_path", lambda: "/usr/sbin/apparmor_parser")
+        calls: list[tuple] = []
+
+        outcome = aa.uninstall_launcher(lambda *a: calls.append(a))
+
+        assert calls == [
+            ("/usr/sbin/apparmor_parser", "-R", str(path)),
+            ("rm", "-f", str(path)),
+        ]
+        assert outcome.changed is True and outcome.ok is True
+
+    def test_a_failed_unload_still_removes_the_file(self, monkeypatch, tmp_path):
+        from kiro_crew.service import apparmor as aa
+
+        path = tmp_path / "kirocrew-launcher"
+        path.write_text("profile")
+        monkeypatch.setattr(aa, "LAUNCHER_PROFILE_PATH", path)
+        monkeypatch.setattr(aa, "parser_path", lambda: "/usr/sbin/apparmor_parser")
+        calls: list[tuple] = []
+
+        def _sudo(*a):
+            if a[1] == "-R":
+                raise RuntimeError("kernel said no")
+            calls.append(a)
+
+        outcome = aa.uninstall_launcher(_sudo)
+
+        assert calls == [("rm", "-f", str(path))]
+        assert outcome.ok is True
+
+    def test_a_failed_removal_is_reported(self, monkeypatch, tmp_path):
+        from kiro_crew.service import apparmor as aa
+
+        path = tmp_path / "kirocrew-launcher"
+        path.write_text("profile")
+        monkeypatch.setattr(aa, "LAUNCHER_PROFILE_PATH", path)
+        monkeypatch.setattr(aa, "parser_path", lambda: None)
+
+        def _sudo(*a):
+            raise RuntimeError("read-only /etc")
+
+        outcome = aa.uninstall_launcher(_sudo)
+
+        assert outcome.ok is False
+        assert "read-only /etc" in outcome.message
+
+    def test_no_parser_skips_the_unload_and_still_removes(self, monkeypatch, tmp_path):
+        from kiro_crew.service import apparmor as aa
+
+        path = tmp_path / "kirocrew-launcher"
+        path.write_text("profile")
+        monkeypatch.setattr(aa, "LAUNCHER_PROFILE_PATH", path)
+        monkeypatch.setattr(aa, "parser_path", lambda: None)
+        calls: list[tuple] = []
+
+        outcome = aa.uninstall_launcher(lambda *a: calls.append(a))
+
+        assert calls == [("rm", "-f", str(path))]
+        assert outcome.changed is True

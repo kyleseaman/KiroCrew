@@ -14,6 +14,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -63,6 +64,33 @@ class PreferenceStoreTestCase(unittest.TestCase):
 
 
 class TestKeywordFallbackSafety(PreferenceStoreTestCase):
+    def test_tag_filter_applies_before_result_limit(self) -> None:
+        """Other groups' stronger matches cannot hide the requested group's hits."""
+        with _no_embedder():
+            store = self._store()
+            for _ in range(7):
+                store.add("latex", tags=["other"])
+            first = store.add("avoid latex gloves for cleaning", tags=["health"])
+            second = store.add(
+                "avoid latex in all clothing and household products", tags=["clothing"]
+            )
+
+            # Prove the excluded rows fill the over-fetch window, without ties
+            # between the excluded and requested groups determining the result.
+            unfiltered = store.search("latex", top_k=9)
+            self.assertTrue(all(r.tags == ["other"] for r in unfiltered[:7]))
+            self.assertEqual([r.id for r in unfiltered[7:]], [first, second])
+
+            for limit in (1, 2):
+                with self.subTest(top_k=limit):
+                    results = store.search(
+                        "latex", top_k=limit, tag_filter=["health", "clothing"]
+                    )
+                    self.assertEqual([r.id for r in results], [first, second][:limit])
+                    self.assertTrue(all(not r.semantic for r in results))
+            self.assertEqual(store.search("latex", tag_filter=["missing"]), [])
+            self.assertEqual(store.search("latex", top_k=2, tag_filter=[]), unfiltered[:2])
+
     def test_keyword_fallback_never_dedups(self) -> None:
         """Two preferences that merely SHARE A WORD must both survive.
 
@@ -176,7 +204,9 @@ class TestVectorStaleness(PreferenceStoreTestCase):
         with _no_embedder():
             store.update(entry_id, text="budget under $400")
 
-        with sqlite3.connect(str(self.db)) as conn:
+        # sqlite's context manager commits/rolls back but does NOT close the
+        # handle.  Close explicitly so Windows can remove the WAL directory.
+        with closing(sqlite3.connect(str(self.db))) as conn:
             text, blob = conn.execute(
                 "SELECT text, embedding FROM preferences WHERE id = ?", (entry_id,)
             ).fetchone()
@@ -191,7 +221,7 @@ class TestVectorStaleness(PreferenceStoreTestCase):
         with _with_embedder(_FakeEmbedder({"prefers minimalist style": [0.0, 1.0]})):
             self.assertEqual(store.reembed_all(), 1)
 
-        with sqlite3.connect(str(self.db)) as conn:
+        with closing(sqlite3.connect(str(self.db))) as conn:
             (blob,) = conn.execute("SELECT embedding FROM preferences").fetchone()
         self.assertIsNotNone(blob)
 
@@ -205,7 +235,7 @@ class TestVectorStaleness(PreferenceStoreTestCase):
 
 class TestFtsIndexSync(PreferenceStoreTestCase):
     def test_update_replaces_the_indexed_text(self) -> None:
-        """After an edit the OLD wording must no longer be findable."""
+        """After an edit the OLD wording must not be findable."""
         with _no_embedder():
             store = self._store()
             entry_id = store.add("prefers wool coats")

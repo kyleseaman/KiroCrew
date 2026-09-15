@@ -7,9 +7,11 @@ logic, so a regression in the shard parser or percentile math fails the test.
 
 import json
 import math
+import sys
 from pathlib import Path
 
 from kiro_crew.dashboard.handlers.telemetry import _aggregate, _Hist, _pct_from_buckets
+from kiro_crew.metrics.schema import RESOURCE_ATTR_PROCESS_START_TIME
 
 _BOUNDS = [10, 20, 30, 40, 50]
 
@@ -106,8 +108,8 @@ def test_aggregate_counts_only_the_end_to_end_startup_point(tmp_path: Path):
 def test_aggregate_kiro_startup_counts_as_cold(tmp_path: Path):
     """spawned=True on the kiro path must land in cold, not warm.
 
-    Regression guard: the kiro emit previously carried no ``spawned`` attribute,
-    so bool(None) filed every cold start as warm and cold read as empty forever.
+    The attribute is what splits cold from warm: without it bool(None) files
+    every cold start as warm and cold reads as empty forever.
     """
     startup = {
         "name": "kirocrew.session.startup.duration",
@@ -262,6 +264,185 @@ def test_aggregate_cumulative_sums_are_window_relative_and_add_across_pids(tmp_p
     assert rows[0]["total"] == 70.0
 
 
+def test_aggregate_lifetime_total_gauges_are_reduced_window_relative(tmp_path: Path):
+    """A lifetime-total GAUGE reports the window's activity, not the total.
+
+    The process CPU/GC readings became observable gauges so that nothing
+    Kiro Crew exports is cumulative, but their value is still "since this
+    process started". Reporting the newest sample the way a state gauge is
+    reported would put an ever-growing number on the panel; they take the
+    window-relative path instead, so this reads 40 (150-110), not 150.
+    """
+    metric = {
+        "name": "kirocrew.process.cpu.seconds",
+        "data": {  # no aggregation_temporality / is_monotonic: a Gauge block
+            "data_points": [
+                {"attributes": {}, "value": 110.0, "time_unix_nano": 100},
+                {"attributes": {}, "value": 130.0, "time_unix_nano": 200},
+                {"attributes": {}, "value": 150.0, "time_unix_nano": 300},
+            ],
+        },
+    }
+    result = _aggregate([_write_shard(tmp_path, [metric])])
+    rows = [o for o in result["other"] if o["name"] == "kirocrew.process.cpu.seconds"]
+    assert rows and rows[0]["kind"] == "counter"
+    assert rows[0]["total"] == 40.0
+
+
+def test_aggregate_stitches_a_lifetime_total_across_the_instrument_switch(tmp_path: Path):
+    """One continuous series across shards written before AND after the switch.
+
+    The window outlives the change: shards written while these were observable
+    counters carry CUMULATIVE sums, newer ones carry gauges. Both shapes must
+    reduce into ONE row for the metric — routing the gauge to the gauge reducer
+    would split the window into a counter row and a gauge row, and the panel
+    would show the same instrument twice with two different meanings.
+    """
+    old_shape = {
+        "name": "kirocrew.process.cpu.seconds",
+        "data": {
+            "aggregation_temporality": 2,
+            "is_monotonic": True,
+            "data_points": [
+                {"attributes": {}, "value": 100.0, "time_unix_nano": 100},
+                {"attributes": {}, "value": 120.0, "time_unix_nano": 200},
+            ],
+        },
+    }
+    new_shape = {
+        "name": "kirocrew.process.cpu.seconds",
+        "data": {
+            "data_points": [
+                {"attributes": {}, "value": 160.0, "time_unix_nano": 300},
+            ],
+        },
+    }
+    result = _aggregate([_write_shard(tmp_path, [old_shape, new_shape])])
+    rows = [o for o in result["other"] if o["name"] == "kirocrew.process.cpu.seconds"]
+    assert len(rows) == 1, f"the switch split one instrument into {len(rows)} rows: {rows}"
+    # Same process, same stream: baseline 100 (first in window), newest 160.
+    assert rows[0]["total"] == 60.0
+
+
+def test_aggregate_state_gauges_are_not_reduced_like_lifetime_totals(tmp_path: Path):
+    """Only the DECLARED lifetime totals take the differencing path.
+
+    RSS is the counter-example that matters: memory falls as well as rises, so
+    differencing it would report a leak as "0 bytes" and a release as a drop.
+    Its newest sample IS the answer.
+    """
+    metric = {
+        "name": "kirocrew.process.memory.rss_bytes",
+        "data": {
+            "data_points": [
+                {"attributes": {}, "value": 400.0, "time_unix_nano": 100},
+                {"attributes": {}, "value": 900.0, "time_unix_nano": 200},
+            ],
+        },
+    }
+    result = _aggregate([_write_shard(tmp_path, [metric])])
+    rows = [o for o in result["other"] if o["name"] == "kirocrew.process.memory.rss_bytes"]
+    assert rows and rows[0]["kind"] == "gauge"
+    assert rows[0]["latest"] == 900.0
+
+
+def test_the_instrument_modules_stay_off_the_import_path(tmp_path: Path):
+    """Importing this handler must not pull the instrument modules in.
+
+    The gateway imports its handlers while it is still assembling routes, before
+    the socket is bound. Importing ``process_gauges`` there costs a measured 22ms
+    and 14 extra modules (sqlite3 among them, via platform_compat) for a telemetry
+    subsystem that is off by default. The lifetime-total roster is needed only
+    inside ``_aggregate``, so it is imported on first use -- this pins that, and
+    pins that the deferred import still works when the aggregation path runs.
+    """
+    handler = sys.modules["kiro_crew.dashboard.handlers.telemetry"]
+    assert not hasattr(handler, "LIFETIME_TOTAL_METRICS"), (
+        "the roster was imported at module scope again, putting the instrument "
+        "modules back on the gateway boot path"
+    )
+
+    names = handler._lifetime_total_gauge_names()
+    assert "kirocrew.process.cpu.seconds" in names
+    assert "kirocrew.inventory.probe.failures" in names, "the inventory half is missing"
+    # Memoized: the second call must hand back the same object, not re-import.
+    assert handler._lifetime_total_gauge_names() is names
+
+    # And the deferred path is what _aggregate actually consults.
+    metric = {
+        "name": "kirocrew.inventory.probe.failures",
+        "data": {
+            "data_points": [
+                {"attributes": {"probe": "crons"}, "value": 2.0, "time_unix_nano": 100},
+                {"attributes": {"probe": "crons"}, "value": 5.0, "time_unix_nano": 200},
+            ]
+        },
+    }
+    rows = [
+        o
+        for o in _aggregate([_write_shard(tmp_path, [metric])])["other"]
+        if o["name"] == "kirocrew.inventory.probe.failures"
+    ]
+    assert rows and rows[0]["kind"] == "counter", rows
+    assert rows[0]["by_attr"] == {"probe=crons": 3.0}, rows[0]
+
+
+def test_a_reused_pid_cannot_make_a_lifetime_total_go_negative(tmp_path: Path):
+    """PID reuse across a restart must not produce a negative increment here.
+
+    A lifetime-total GAUGE has no counter-reset semantics of its own, so a naive
+    consumer differencing consecutive samples would read the restart as a large
+    negative step once the kernel wraps `pid_max` and a new process inherits the
+    old PID. This aggregator is not exposed to that: the local exporter stamps
+    each record with the writing process's OS start-time token, and streams are
+    keyed by (PID, token), so the reuser is a brand-new stream whose own
+    first-in-window sample is its baseline. Both processes contribute their own
+    in-window activity and the row stays positive.
+    """
+
+    def cpu(identity: str, first: float, second: float, t0: int) -> dict:
+        return {
+            "resource": {"attributes": {RESOURCE_ATTR_PROCESS_START_TIME: identity}},
+            "scope_metrics": [
+                {
+                    "metrics": [
+                        {
+                            "name": "kirocrew.process.cpu.seconds",
+                            "data": {  # Gauge block: no temporality markers
+                                "data_points": [
+                                    {"attributes": {}, "value": first, "time_unix_nano": t0},
+                                    {
+                                        "attributes": {},
+                                        "value": second,
+                                        "time_unix_nano": t0 + 100,
+                                    },
+                                ],
+                            },
+                        }
+                    ]
+                }
+            ],
+        }
+
+    # One shard file = one PID by name. The first process ran for hours (900s of
+    # CPU); the reuser starts from nothing.
+    shard = tmp_path / "metrics-2026-07-11-4242.jsonl"
+    shard.write_text(
+        json.dumps({"resource_metrics": [cpu("proc-a", 900.0, 940.0, 100)]})
+        + "\n"
+        + json.dumps({"resource_metrics": [cpu("proc-b", 2.0, 7.0, 300)]})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = _aggregate([shard])
+    rows = [o for o in result["other"] if o["name"] == "kirocrew.process.cpu.seconds"]
+    assert len(rows) == 1, f"one instrument must yield one row, got {rows}"
+    # 40 from the first process + 5 from the reuser. Never negative, and never
+    # the 938 a single-stream reading would subtract.
+    assert rows[0]["total"] == 45.0, rows[0]
+
+
 def test_aggregate_cumulative_detects_counter_reset_on_pid_reuse(tmp_path: Path):
     """A cumulative stream dropping below its own max is a process boundary.
 
@@ -287,6 +468,148 @@ def test_aggregate_cumulative_detects_counter_reset_on_pid_reuse(tmp_path: Path)
     result = _aggregate([_write_shard(tmp_path, [metric])])
     rows = [o for o in result["other"] if o["name"] == "kirocrew.process.cpu.seconds"]
     assert rows and rows[0]["total"] == 30.0
+
+
+def _cumulative_metric(points: list[tuple[int, float]]) -> dict:
+    return {
+        "name": "kirocrew.process.cpu.seconds",
+        "data": {
+            "aggregation_temporality": 2,
+            "is_monotonic": True,
+            "data_points": [
+                {"attributes": {}, "value": v, "time_unix_nano": ts} for ts, v in points
+            ],
+        },
+    }
+
+
+def _identity_line(metrics: list, identity: str | None) -> str:
+    """One export-cycle line, optionally stamped like the local exporter.
+
+    The attribute key is spelled literally on purpose: it pins the WIRE format
+    already sitting in shards on disk, so renaming the schema constant cannot
+    silently orphan every stamped shard.
+    """
+    rm: dict = {"scope_metrics": [{"metrics": metrics}]}
+    if identity is not None:
+        rm["resource"] = {"attributes": {"kirocrew.process.start_time": identity}}
+    return json.dumps({"resource_metrics": [rm]})
+
+
+def test_aggregate_cumulative_identity_splits_reused_pid_without_a_value_drop(tmp_path: Path):
+    """A changed identity is a process boundary even when no value drop exists.
+
+    The value heuristic's one blind spot: PID reuse where the new process's
+    FIRST snapshot (150) already exceeds the old process's max (140), so no
+    drop is ever observed and the two lifetimes merge into one stream —
+    reporting 175-100=75, which credits the 140→150 gap between the processes
+    as if it were observed activity. The resource-level identity makes the
+    boundary deterministic: each process is its own stream with its own
+    window-relative baseline, (140-100) + (175-150) = 65.
+    """
+    shard = tmp_path / "metrics-2026-08-21-1234.jsonl"
+    shard.write_text(
+        _identity_line([_cumulative_metric([(100, 100.0), (200, 140.0)])], "111")
+        + "\n"
+        + _identity_line([_cumulative_metric([(300, 150.0), (400, 175.0)])], "222")
+        + "\n",
+        encoding="utf-8",
+    )
+    result = _aggregate([shard])
+    rows = [o for o in result["other"] if o["name"] == "kirocrew.process.cpu.seconds"]
+    assert rows and rows[0]["total"] == 65.0
+
+
+def test_aggregate_cumulative_same_identity_stitches_across_provider_rebuild(tmp_path: Path):
+    """An unchanged identity keeps rebuild segments in ONE stream.
+
+    A telemetry off/on toggle rebuilds the provider in-process; the rebuilt
+    exporter stamps the SAME module-cached token, so its re-emitted snapshots
+    join the existing stream and stay idempotent no-ops — 150-100=50, never a
+    doubled total and never a fresh baseline per rebuild.
+    """
+    shard = tmp_path / "metrics-2026-08-21-1234.jsonl"
+    shard.write_text(
+        _identity_line([_cumulative_metric([(100, 100.0), (200, 140.0)])], "111")
+        + "\n"
+        + _identity_line([_cumulative_metric([(300, 140.0), (400, 150.0)])], "111")
+        + "\n",
+        encoding="utf-8",
+    )
+    result = _aggregate([shard])
+    rows = [o for o in result["other"] if o["name"] == "kirocrew.process.cpu.seconds"]
+    assert rows and rows[0]["total"] == 50.0
+
+
+def test_aggregate_cumulative_identity_stream_treats_a_drop_as_garbage_not_reset(tmp_path: Path):
+    """Within one identity, a value below the running max is never banked.
+
+    One identity is one OS process, whose observable counters are monotonic —
+    so a lower sample is shard garbage. Banking it as a reset would count the
+    pre-drop segment AND the recovery: 140+150-100=190 for a stream whose real
+    in-window growth is 150-100=50.
+    """
+    shard = tmp_path / "metrics-2026-08-21-1234.jsonl"
+    shard.write_text(
+        _identity_line(
+            [_cumulative_metric([(100, 100.0), (200, 140.0), (300, 5.0), (400, 150.0)])],
+            "111",
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    result = _aggregate([shard])
+    rows = [o for o in result["other"] if o["name"] == "kirocrew.process.cpu.seconds"]
+    assert rows and rows[0]["total"] == 50.0
+
+
+def test_aggregate_cumulative_non_string_identity_reads_as_identity_less(tmp_path: Path):
+    """A malformed identity type must not mint a stream or mute the heuristic.
+
+    The exporter only ever writes a string token. A corrupt shard carrying a
+    number/list/object there would, if stringified, create an identity-keyed
+    stream and silently disable reset banking — turning a genuine 100→10→30
+    reset (30 of activity) into max-baseline arithmetic (0). Non-strings read
+    as identity-less, so the value heuristic still banks the reset.
+    """
+    line = {
+        "resource_metrics": [
+            {
+                "resource": {"attributes": {"kirocrew.process.start_time": 12345}},
+                "scope_metrics": [
+                    {"metrics": [_cumulative_metric([(100, 100.0), (200, 10.0), (300, 30.0)])]}
+                ],
+            }
+        ]
+    }
+    shard = tmp_path / "metrics-2026-08-21-1234.jsonl"
+    shard.write_text(json.dumps(line) + "\n", encoding="utf-8")
+    result = _aggregate([shard])
+    rows = [o for o in result["other"] if o["name"] == "kirocrew.process.cpu.seconds"]
+    assert rows and rows[0]["total"] == 30.0
+
+
+def test_aggregate_cumulative_legacy_lines_keep_the_value_heuristic(tmp_path: Path):
+    """Identity-less shards aggregate bit-for-bit as before, alongside stamped ones.
+
+    The legacy stream (no resource field, written before the identity existed)
+    still banks on a value drop — baseline 100, reset to 10, growth to 30 ⇒ 30
+    — while an identity-carrying stream from another process contributes its
+    own window-relative delta (175-150=25). Streams add: 55.
+    """
+    legacy = tmp_path / "metrics-2026-08-21-1234.jsonl"
+    legacy.write_text(
+        _identity_line([_cumulative_metric([(100, 100.0), (200, 10.0), (300, 30.0)])], None) + "\n",
+        encoding="utf-8",
+    )
+    stamped = tmp_path / "metrics-2026-08-21-5678.jsonl"
+    stamped.write_text(
+        _identity_line([_cumulative_metric([(400, 150.0), (500, 175.0)])], "222") + "\n",
+        encoding="utf-8",
+    )
+    result = _aggregate([legacy, stamped])
+    rows = [o for o in result["other"] if o["name"] == "kirocrew.process.cpu.seconds"]
+    assert rows and rows[0]["total"] == 55.0
 
 
 def test_aggregate_cumulative_totals_are_shard_order_independent(tmp_path: Path):
@@ -809,23 +1132,29 @@ def test_fault_rate_counts_exhausted_stall_turns_as_faults(tmp_path: Path):
 
 
 def test_every_turn_outcome_label_is_classified_fault_or_excluded():
-    """Cross-module drift gate between _turn_outcome and the fault allowlist.
+    """Cross-module drift gate between turn_outcome and the fault allowlist.
 
-    ``_turn_outcome`` (chat_runner) mints the labels; ``_TERMINAL_FAULT_OUTCOMES``
+    ``metrics.turns.turn_outcome`` mints the labels; ``_TERMINAL_FAULT_OUTCOMES``
     (telemetry) decides which count toward fault_rate. They are hand-synced lists
     in different modules, and because the aggregator is an allowlist, a label
     added to the emitter but classified in neither set would silently fall out of
     the fault_rate numerator while still growing the denominator — an optimistic
-    dashboard with no failing test. Labels are harvested from _turn_outcome's
-    return statements via AST so a new branch cannot dodge this gate."""
+    dashboard with no failing test. Labels are harvested from turn_outcome's
+    return statements via AST so a new branch cannot dodge this gate.
+
+    Harvested from ``metrics.turns`` rather than ``chat_runner``: the mapping
+    moved there when the emit was widened to every dispatch surface, and
+    ``chat_runner._turn_outcome`` is now a delegate whose source carries no label
+    constants at all — pointed at it, this gate would harvest an empty set and
+    pass no matter what the emitter did."""
     import ast
     import inspect
 
-    from kiro_crew.dashboard.chat_runner import _turn_outcome
     from kiro_crew.dashboard.handlers.telemetry import _TERMINAL_FAULT_OUTCOMES
+    from kiro_crew.metrics.turns import turn_outcome
 
     labels: set[str] = set()
-    for node in ast.walk(ast.parse(inspect.getsource(_turn_outcome))):
+    for node in ast.walk(ast.parse(inspect.getsource(turn_outcome))):
         if isinstance(node, ast.Return) and node.value is not None:
             labels |= {
                 c.value
@@ -838,9 +1167,14 @@ def test_every_turn_outcome_label_is_classified_fault_or_excluded():
 
     # Non-faults, each with its exclusion reason pinned by the tests above:
     # "ok" succeeded; "tool_stall"/"stale_recover" are recovered-in-place stalls
-    # tracked under kirocrew.watchdog.recovery.outcome. Add a new label here or
-    # to _TERMINAL_FAULT_OUTCOMES — never leave it unclassified.
-    excluded = {"ok", "tool_stall", "stale_recover"}
+    # tracked under kirocrew.watchdog.recovery.outcome; "cancelled" is the
+    # operator pressing Stop, so counting it would report a deliberate user
+    # action as the system failing — which is what folding it into "error"
+    # does; "unclassified" is a turn whose surface had no stop reason to give,
+    # so calling it a fault would invent one for every clean background turn. Add
+    # a new label here or to _TERMINAL_FAULT_OUTCOMES — never leave it
+    # unclassified.
+    excluded = {"ok", "tool_stall", "stale_recover", "cancelled", "unclassified"}
     unclassified = labels - _TERMINAL_FAULT_OUTCOMES - excluded
     assert not unclassified, (
         f"_turn_outcome label(s) {sorted(unclassified)} are neither terminal "
@@ -934,7 +1268,7 @@ def test_total_count_is_the_full_population_not_the_group_count():
 
 
 def test_other_histograms_report_dropped_generations(tmp_path: Path):
-    """Regression: the ``other`` surface used to omit other_generations."""
+    """The ``other`` surface must report other_generations, not omit it."""
     acquire = {
         "name": "kirocrew.mcp.backend.acquire.duration",
         "data": {

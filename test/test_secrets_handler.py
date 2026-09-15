@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 from aiohttp import web
 
-from kiro_crew.dashboard.handlers.secrets import setup_secrets_routes
+from kiro_crew.config import loader as config_loader
+from kiro_crew.config.loader import MANAGED_VAULT_FIXED_CONSUMERS
+from kiro_crew.dashboard.handlers.secrets import (
+    _managed_secret_catalog,
+    _sanitize_for_log,
+    _unused_stored_secrets,
+    setup_secrets_routes,
+)
 from kiro_crew.secrets import SecretVault
 
 
@@ -57,8 +65,27 @@ def empty_vault_dir(tmp_path: Path) -> Path:
     return tmp_path
 
 
+_WAKATIME_MANAGED = {"name": "WAKATIME_API_KEY", "kind": "wakatime_api_key"}
+
+
 class TestApiSecretsList:
     """Tests for GET /api/secrets."""
+
+    def test_fixed_vault_consumer_registry_drives_catalog(self) -> None:
+        catalog = _managed_secret_catalog([], ["example.com"], True, True)
+        assert {entry["name"] for entry in catalog} == set(MANAGED_VAULT_FIXED_CONSUMERS)
+
+    def test_unused_stored_reasons_follow_runtime_applicability(self) -> None:
+        assert _unused_stored_secrets(["WAKATIME_API_KEY"], [], False, False) == [
+            {"name": "WAKATIME_API_KEY", "reason": "wakatime_disabled"}
+        ]
+        assert _unused_stored_secrets(["JIRA_API_TOKEN"], ["a", "b"], False, True) == [
+            {"name": "JIRA_API_TOKEN", "reason": "jira_multi_host"}
+        ]
+        host_name = config_loader.jira_host_token_name("example.com")
+        assert _unused_stored_secrets(
+            ["JIRA_API_TOKEN", host_name], ["example.com"], True, True
+        ) == [{"name": "JIRA_API_TOKEN", "reason": "jira_host_precedence"}]
 
     @pytest.mark.asyncio
     async def test_lists_names_sorted(self, vault_dir: Path) -> None:
@@ -71,7 +98,7 @@ class TestApiSecretsList:
                 resp = await client.get("/api/secrets")
                 assert resp.status == 200
                 data = await resp.json()
-                assert data == {"names": ["DB_PASS", "TEST_KEY"]}
+                assert data == {"names": ["DB_PASS", "TEST_KEY"], "managed": []}
 
     @pytest.mark.asyncio
     async def test_empty_vault(self, empty_vault_dir: Path) -> None:
@@ -86,7 +113,261 @@ class TestApiSecretsList:
                 resp = await client.get("/api/secrets")
                 assert resp.status == 200
                 data = await resp.json()
-                assert data == {"names": []}
+                assert data == {"names": [], "managed": []}
+
+    @pytest.mark.asyncio
+    async def test_classifies_only_actual_jira_vault_consumers(self, tmp_path: Path) -> None:
+        vault = SecretVault(tmp_path)
+        vault._set_sync("JIRA_API_TOKEN", "global-token")
+        vault._set_sync("JIRA_TOKEN_6578616D706C652E636F6D", "host-token")
+        vault._set_sync("JIRA_TOKEN_6F727068616E2E636F6D", "orphan-token")
+        vault._set_sync("JIRA_TOKEN_not_hex", "ordinary-entry")
+        app = _app()
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        jira_config = SimpleNamespace(
+            wakatime=SimpleNamespace(enabled=True),
+            dashboard=SimpleNamespace(jira_auth=[SimpleNamespace(host="example.com")]),
+        )
+        with (
+            patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(tmp_path)),
+            patch(
+                "kiro_crew.dashboard.handlers.secrets.KiroCrewConfig.load",
+                return_value=jira_config,
+            ),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.get("/api/secrets")
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert data["names"] == [
+            "JIRA_API_TOKEN",
+            "JIRA_TOKEN_6578616D706C652E636F6D",
+            "JIRA_TOKEN_6F727068616E2E636F6D",
+            "JIRA_TOKEN_not_hex",
+        ]
+        assert data["managed"] == [
+            _WAKATIME_MANAGED,
+            {
+                "name": "JIRA_TOKEN_6578616D706C652E636F6D",
+                "kind": "jira_host_token",
+                "host": "example.com",
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_multiple_jira_hosts_omit_global_and_advertise_per_host_slots(
+        self, tmp_path: Path
+    ) -> None:
+        app = _app()
+        jira_config = SimpleNamespace(
+            wakatime=SimpleNamespace(enabled=True),
+            dashboard=SimpleNamespace(
+                jira_auth=[
+                    SimpleNamespace(host="One.Example:443"),
+                    SimpleNamespace(host="two.example"),
+                ]
+            ),
+        )
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        with (
+            patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(tmp_path)),
+            patch(
+                "kiro_crew.dashboard.handlers.secrets.KiroCrewConfig.load",
+                return_value=jira_config,
+            ),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.get("/api/secrets")
+                assert resp.status == 200
+                managed = (await resp.json())["managed"]
+
+        assert managed == [
+            _WAKATIME_MANAGED,
+            {
+                "name": "JIRA_TOKEN_6F6E652E6578616D706C65",
+                "kind": "jira_host_token",
+                "host": "one.example",
+            },
+            {
+                "name": "JIRA_TOKEN_74776F2E6578616D706C65",
+                "kind": "jira_host_token",
+                "host": "two.example",
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_port_only_jira_entry_is_ignored(self, tmp_path: Path) -> None:
+        app = _app()
+        jira_config = SimpleNamespace(
+            wakatime=SimpleNamespace(enabled=False),
+            dashboard=SimpleNamespace(jira_auth=[SimpleNamespace(host=":443")]),
+        )
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        with (
+            patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(tmp_path)),
+            patch(
+                "kiro_crew.dashboard.handlers.secrets.KiroCrewConfig.load",
+                return_value=jira_config,
+            ),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                response = await client.get("/api/secrets")
+                assert response.status == 200
+                assert await response.json() == {"names": [], "managed": []}
+
+    @pytest.mark.asyncio
+    async def test_single_whitespace_jira_entry_is_ignored(self, tmp_path: Path) -> None:
+        app = _app()
+        jira_config = SimpleNamespace(
+            wakatime=SimpleNamespace(enabled=False),
+            dashboard=SimpleNamespace(jira_auth=[SimpleNamespace(host="   ")]),
+        )
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        with (
+            patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(tmp_path)),
+            patch(
+                "kiro_crew.dashboard.handlers.secrets.KiroCrewConfig.load",
+                return_value=jira_config,
+            ),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                response = await client.get("/api/secrets")
+                assert response.status == 200
+                assert await response.json() == {"names": [], "managed": []}
+
+    @pytest.mark.asyncio
+    async def test_config_failure_keeps_names_and_reports_managed_error(
+        self, vault_dir: Path
+    ) -> None:
+        app = _app()
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        with (
+            patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(vault_dir)),
+            patch(
+                "kiro_crew.dashboard.handlers.secrets.KiroCrewConfig.load",
+                side_effect=ValueError("broken config"),
+            ),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                response = await client.get("/api/secrets")
+                assert response.status == 200
+                assert await response.json() == {
+                    "names": ["DB_PASS", "TEST_KEY"],
+                    "managed": [],
+                    "managed_error": True,
+                }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("degraded", [{"*"}, {"dashboard"}, {"wakatime"}])
+    async def test_degraded_managed_sections_report_managed_error(
+        self, tmp_path: Path, degraded: set[str]
+    ) -> None:
+        app = _app()
+        config = SimpleNamespace(
+            degraded_sections=frozenset(degraded),
+            wakatime=SimpleNamespace(enabled=False),
+            dashboard=SimpleNamespace(jira_auth=[]),
+        )
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        with (
+            patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(tmp_path)),
+            patch(
+                "kiro_crew.dashboard.handlers.secrets.KiroCrewConfig.load",
+                return_value=config,
+            ),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                response = await client.get("/api/secrets")
+                assert response.status == 200
+                assert await response.json() == {
+                    "names": [],
+                    "managed": [],
+                    "managed_error": True,
+                }
+
+    @pytest.mark.asyncio
+    async def test_whitespace_jira_entry_uses_raw_count_for_applicability(
+        self, tmp_path: Path
+    ) -> None:
+        app = _app()
+        jira_config = SimpleNamespace(
+            wakatime=SimpleNamespace(enabled=False),
+            dashboard=SimpleNamespace(
+                jira_auth=[
+                    SimpleNamespace(host="example.com"),
+                    SimpleNamespace(host="   "),
+                ]
+            ),
+        )
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        with (
+            patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(tmp_path)),
+            patch(
+                "kiro_crew.dashboard.handlers.secrets.KiroCrewConfig.load",
+                return_value=jira_config,
+            ),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                managed = (await (await client.get("/api/secrets")).json())["managed"]
+
+        assert managed == [
+            {
+                "name": "JIRA_TOKEN_6578616D706C652E636F6D",
+                "kind": "jira_host_token",
+                "host": "example.com",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_duplicate_normalized_hosts_do_not_enable_global_fallback(
+        self, tmp_path: Path
+    ) -> None:
+        app = _app()
+        jira_config = SimpleNamespace(
+            wakatime=SimpleNamespace(enabled=True),
+            dashboard=SimpleNamespace(
+                jira_auth=[
+                    SimpleNamespace(host="Jira.Corp:443"),
+                    SimpleNamespace(host="jira.corp"),
+                ]
+            ),
+        )
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        with (
+            patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(tmp_path)),
+            patch(
+                "kiro_crew.dashboard.handlers.secrets.KiroCrewConfig.load",
+                return_value=jira_config,
+            ),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                managed = (await (await client.get("/api/secrets")).json())["managed"]
+
+        assert managed == [
+            _WAKATIME_MANAGED,
+            {
+                "name": "JIRA_TOKEN_6A6972612E636F7270",
+                "kind": "jira_host_token",
+                "host": "jira.corp",
+            },
+        ]
 
 
 class TestApiSecretsSet:
@@ -155,15 +436,45 @@ class TestApiSecretsDelete:
                 assert vault.get("TEST_KEY") is None
 
     @pytest.mark.asyncio
-    async def test_delete_nonexistent(self, vault_dir: Path) -> None:
+    async def test_deletes_secret_removes_from_list(self, vault_dir: Path) -> None:
+        """A successful DELETE removes the name from the vault; a subsequent list
+        does not include it.  Proves the membership check does not block the
+        actual deletion path."""
         app = _app()
 
         from aiohttp.test_utils import TestClient, TestServer
 
         with patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(vault_dir)):
             async with TestClient(TestServer(app)) as client:
-                resp = await client.delete("/api/secrets/MISSING")
-                assert resp.status == 200  # delete is idempotent
+                resp = await client.delete("/api/secrets/TEST_KEY")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["ok"] is True
+
+                list_resp = await client.get("/api/secrets")
+                assert list_resp.status == 200
+                names = (await list_resp.json())["names"]
+                assert "TEST_KEY" not in names
+                assert "DB_PASS" in names  # sibling entry untouched
+
+    @pytest.mark.asyncio
+    async def test_delete_nonexistent_returns_404(self, vault_dir: Path) -> None:
+        """DELETE of a name that was never stored returns 404 not_found.
+
+        Before the fix, vault.delete() was a silent no-op and the handler
+        returned 200 ok unconditionally, hiding mistyped names from the caller.
+        """
+        app = _app()
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        with patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(vault_dir)):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.delete("/api/secrets/NONEXISTENT_NAME")
+                assert resp.status == 404
+                data = await resp.json()
+                assert data["code"] == "not_found"
+                assert "error" in data
 
 
 class TestApiSecretsOwnerAuthorization:
@@ -297,17 +608,29 @@ class TestApiSecretsLogInjection:
 
     @pytest.mark.asyncio
     async def test_crlf_in_delete_name_is_escaped_in_log(
-        self, vault_dir: Path, caplog: pytest.LogCaptureFixture
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
+        """A percent-encoded CR/LF in the path segment decodes to real control
+        characters in request.match_info["name"].  The handler must escape them
+        before logging so the emitted record cannot forge extra audit lines.
+
+        The name must actually exist in the vault so the handler reaches the
+        log statement (a non-existent name returns 404 before logging).
+        """
         app = _app()
 
         from aiohttp.test_utils import TestClient, TestServer
 
-        # A percent-encoded CR/LF in the path segment decodes to real control
-        # characters in request.match_info["name"].
-        with patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(vault_dir)):
+        # Seed a vault entry whose name contains a literal CRLF.
+        injected_name = "x\r\nWARNING-forged"
+        vault = SecretVault(tmp_path)
+        vault._set_sync(injected_name, "v")
+
+        with patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(tmp_path)):
             async with TestClient(TestServer(app)) as client:
                 with caplog.at_level(logging.INFO, logger="kiro_crew.dashboard.handlers.secrets"):
+                    # aiohttp URL-encodes the path when using client.delete(url)
+                    # with a plain string, so percent-encode manually.
                     resp = await client.delete("/api/secrets/x%0d%0aWARNING-forged")
                     assert resp.status == 200
 
@@ -379,3 +702,167 @@ class TestApiSecretsSetInputValidation:
                 # Name is still trimmed, as before.
                 assert data["name"] == "PADDED"
                 assert SecretVault(empty_vault_dir).list_names() == ["PADDED"]
+
+
+class TestApiSecretsSetWhitespaceValue:
+    """POST /api/secrets rejects a value that is whitespace-only (F2 regression).
+
+    Before the fix, ``name`` was stripped before its empty-check but ``value``
+    was not — so a body like ``{"name":"K","value":"   "}`` bypassed the
+    ``if not value:`` guard (a non-empty string of spaces is truthy) and wrote
+    a blank secret to the vault.  After the fix, ``value = value.strip()`` is
+    applied before the empty-check, so the three-space value collapses to ``""``
+    and correctly hits the existing ``missing_value`` 400 path.
+    """
+
+    @pytest.mark.asyncio
+    async def test_whitespace_only_value_is_rejected(self, empty_vault_dir: Path) -> None:
+        """``{"name":"K","value":"   "}`` must return 400 missing_value."""
+        app = _app()
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        with patch(
+            "kiro_crew.dashboard.handlers.secrets.config_dir",
+            return_value=str(empty_vault_dir),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post("/api/secrets", json={"name": "K", "value": "   "})
+                assert resp.status == 400
+                data = await resp.json()
+                assert data["code"] == "missing_value"
+                # The vault must not have stored K.
+                assert SecretVault(empty_vault_dir).list_names() == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ws_value", ["   ", "\t", "\n", " \t \n "])
+    async def test_various_whitespace_variants_are_rejected(
+        self, empty_vault_dir: Path, ws_value: str
+    ) -> None:
+        """Tabs, newlines, and mixed whitespace all reduce to empty after strip."""
+        app = _app()
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        with patch(
+            "kiro_crew.dashboard.handlers.secrets.config_dir",
+            return_value=str(empty_vault_dir),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post("/api/secrets", json={"name": "K", "value": ws_value})
+                assert resp.status == 400
+                data = await resp.json()
+                assert data["code"] == "missing_value"
+                assert SecretVault(empty_vault_dir).list_names() == []
+
+    @pytest.mark.asyncio
+    async def test_normal_value_still_stores(self, empty_vault_dir: Path) -> None:
+        """Positive regression: a real value continues to be stored correctly."""
+        app = _app()
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        with patch(
+            "kiro_crew.dashboard.handlers.secrets.config_dir",
+            return_value=str(empty_vault_dir),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post("/api/secrets", json={"name": "K", "value": "real-value"})
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["ok"] is True
+                assert SecretVault(empty_vault_dir).list_names() == ["K"]
+
+    @pytest.mark.asyncio
+    async def test_padded_value_is_stored_unchanged(self, empty_vault_dir: Path) -> None:
+        """A value with real content plus surrounding whitespace is stored VERBATIM.
+
+        The emptiness check uses ``value.strip()``, but the stored value must be
+        the original, untrimmed string — a credential can legitimately carry
+        leading/trailing whitespace and trimming it would corrupt the secret.
+        """
+        app = _app()
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        padded = "  sk-live-abc  "
+        with patch(
+            "kiro_crew.dashboard.handlers.secrets.config_dir",
+            return_value=str(empty_vault_dir),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post("/api/secrets", json={"name": "K", "value": padded})
+                assert resp.status == 200
+                # The vault must hold the ORIGINAL padded value, byte-for-byte.
+                assert SecretVault(empty_vault_dir).get("K").reveal() == padded
+
+
+class TestSanitizeForLog:
+    """Unit tests for the module-private _sanitize_for_log helper.
+
+    The asserts for ESC (\\x1b), NUL (\\x00), and DEL (\\x7f) are designed to
+    FAIL on origin/main (which only escaped \\n/\\r/\\t) and PASS after the
+    full C0+DEL fix that adds the _CONTROL_CHAR_RE substitution.
+    """
+
+    def test_newline_carriage_return_tab_escaped_as_two_char(self) -> None:
+        r"""\\n, \\r, \\t map to their familiar two-character spellings."""
+        assert _sanitize_for_log("\n") == "\\n"
+        assert _sanitize_for_log("\r") == "\\r"
+        assert _sanitize_for_log("\t") == "\\t"
+        assert _sanitize_for_log("a\nb\rc\td") == "a\\nb\\rc\\td"
+
+    def test_ansi_escape_sequence_escaped(self) -> None:
+        r"""ESC (\\x1b) in an ANSI colour code becomes \\x1b; printable chars kept."""
+        # ESC [ 3 1 m X -- the ANSI red-colour prefix followed by 'X'
+        result = _sanitize_for_log("\x1b[31mX")
+        # ESC must be escaped; the printable '[31mX' must be preserved verbatim
+        assert result == "\\x1b[31mX", repr(result)
+
+    def test_nul_byte_escaped(self) -> None:
+        r"""NUL (\\x00) becomes \\x00."""
+        result = _sanitize_for_log("\x00")
+        assert result == "\\x00", repr(result)
+
+    def test_del_escaped(self) -> None:
+        r"""DEL (\\x7f) becomes \\x7f."""
+        result = _sanitize_for_log("\x7f")
+        assert result == "\\x7f", repr(result)
+
+    def test_backslash_escaped_first_no_double_transform(self) -> None:
+        r"""A literal backslash becomes \\\\ and is not re-processed."""
+        # A single backslash in the input must yield exactly two backslashes out.
+        result = _sanitize_for_log("\\")
+        assert result == "\\\\", repr(result)
+        # Backslash before n must become \\\\n (escaped backslash + literal n),
+        # not \\n (which would look like an escaped newline).
+        result2 = _sanitize_for_log("\\n")
+        assert result2 == "\\\\n", repr(result2)
+
+    def test_printable_ascii_unchanged(self) -> None:
+        """Ordinary printable text passes through unmodified."""
+        plain = "hello-WORLD_123 /path/to/key"
+        assert _sanitize_for_log(plain) == plain
+
+    def test_mixed_controls_and_printable(self) -> None:
+        r"""A string mixing printable, \\n, and an ANSI escape is fully sanitized."""
+        inp = "key\x1b[0m\nname"
+        result = _sanitize_for_log(inp)
+        assert result == "key\\x1b[0m\\nname", repr(result)
+
+    def test_c1_control_escaped(self) -> None:
+        r"""A C1 control (e.g. CSI \\x9b) is escaped, not passed to the terminal."""
+        result = _sanitize_for_log("\x9b")
+        assert result == "\\x9b", repr(result)
+
+    def test_unicode_line_separators_escaped(self) -> None:
+        r"""U+2028 / U+2029 (Unicode line/paragraph separators) are escaped.
+
+        A Unicode-aware log viewer treats these as line breaks, so they are a
+        log-injection vector just like \\n; they must not survive verbatim.
+        """
+        assert _sanitize_for_log("\u2028") == "\\u2028", repr(_sanitize_for_log("\u2028"))
+        assert _sanitize_for_log("\u2029") == "\\u2029", repr(_sanitize_for_log("\u2029"))
+        # A forged-line payload via U+2028 is neutralized.
+        result = _sanitize_for_log("ok\u2028WARNING forged")
+        assert "\u2028" not in result and "\\u2028" in result, repr(result)

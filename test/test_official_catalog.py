@@ -83,6 +83,32 @@ class TestLoadRefusals:
 
 
 class TestCache:
+    def test_interrupted_write_keeps_the_previous_cache(self, monkeypatch):
+        """A failed refresh must not expose a truncated catalog to readers."""
+        path = oc._cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        previous = doc(revision="previous")
+        replacement = doc(revision="replacement")
+        path.write_text(json.dumps(previous), encoding="utf-8")
+
+        real_write_text = type(path).write_text
+
+        def interrupted_write(self, data, *args, **kwargs):
+            if self == path:
+                real_write_text(self, data[:8], *args, **kwargs)
+                raise OSError("simulated interrupted cache write")
+            return real_write_text(self, data, *args, **kwargs)
+
+        def interrupted_atomic_write(*args, **kwargs):
+            raise OSError("simulated interrupted cache write")
+
+        monkeypatch.setattr(type(path), "write_text", interrupted_write)
+        monkeypatch.setattr(oc, "atomic_write", interrupted_atomic_write, raising=False)
+
+        oc._write_cache(replacement)
+
+        assert json.loads(path.read_text(encoding="utf-8")) == previous
+
     def test_a_second_load_does_not_refetch(self, tmp_path, monkeypatch):
         calls = []
 
@@ -162,7 +188,7 @@ class TestAnnotate:
         manifest belongs to the app.
 
         `version` is excluded on purpose and is asserted unchanged here rather
-        than in a separate test, so the line that used to overlay it cannot come
+        than in a separate test, so any line that overlays it cannot come
         back without this test noticing.
         """
         rows = self.rows()
@@ -232,6 +258,22 @@ class TestAnnotate:
         assert rows[0]["iconUrl"] == "https://apps.crew.kiro.dev/assets/icons/a.png"
         assert rows[0]["iconUrlDark"] == "https://apps.crew.kiro.dev/assets/icons/b.png"
         assert rows[0]["heroImage"] == "/app-assets/demo/hero.svg"
+
+    def test_detail_hero_and_screenshot_refs_become_loadable_urls(self):
+        """``annotate`` overlays the same two art fields as the other row
+        builders, so a seed row for a not-installed app carries its detail
+        banner and screenshots. Absent refs leave the fields unset, and an
+        unreadable screenshot member is dropped rather than emitted."""
+        rows = self.rows()
+        oc.annotate(rows, [{
+            "name": "demo-app",
+            "heroDetailRef": "assets/hero/detail.png",
+            "screenshotRefs": ["assets/s/1.png", "https://evil.example/x.png"],
+        }])
+        assert rows[0]["heroImageDetail"] == "https://apps.crew.kiro.dev/assets/hero/detail.png"
+        assert rows[0]["screenshots"] == ["https://apps.crew.kiro.dev/assets/s/1.png"]
+        assert "heroImageDetail" not in rows[1], "a row the catalog does not name is untouched"
+        assert "screenshots" not in rows[1]
 
     def test_a_url_shaped_icon_ref_is_not_applied(self):
         rows = self.rows()
@@ -664,3 +706,35 @@ class TestListCatalogRows:
             }
         ])
         assert oc.list_catalog_rows() == []
+
+    def test_detail_hero_and_screenshots_reach_the_row(self, monkeypatch):
+        """The storefront row carries ``heroImageDetail`` and
+        ``screenshots`` from the published refs, as catalog-hosted URLs the
+        detail page loads directly -- never the SSRF-gated blob proxy, which
+        403s for a not-installed catalog app."""
+        entry = self._git()
+        entry["heroDetailRef"] = "assets/hero/detail.png"
+        entry["screenshotRefs"] = ["assets/s/1.png", "assets/s/2.png"]
+        monkeypatch.setattr(oc, "load_official_catalog", lambda: [entry])
+        [row] = oc.list_catalog_rows()
+        assert row["heroImageDetail"] == "https://apps.crew.kiro.dev/assets/hero/detail.png"
+        assert row["screenshots"] == [
+            "https://apps.crew.kiro.dev/assets/s/1.png",
+            "https://apps.crew.kiro.dev/assets/s/2.png",
+        ]
+        assert "/api/apps/blob" not in row["heroImageDetail"]
+
+    def test_absent_detail_hero_and_screenshots_stay_unset(self, monkeypatch):
+        monkeypatch.setattr(oc, "load_official_catalog", lambda: [self._git()])
+        [row] = oc.list_catalog_rows()
+        assert "heroImageDetail" not in row
+        assert "screenshots" not in row
+
+    def test_an_unreadable_screenshot_ref_is_dropped(self, monkeypatch):
+        """A URL-shaped member is dropped; the readable one survives. Every
+        member unreadable would leave ``screenshots`` unset, not empty."""
+        entry = self._git()
+        entry["screenshotRefs"] = ["https://evil.example/x.png", "assets/s/ok.png"]
+        monkeypatch.setattr(oc, "load_official_catalog", lambda: [entry])
+        [row] = oc.list_catalog_rows()
+        assert row["screenshots"] == ["https://apps.crew.kiro.dev/assets/s/ok.png"]

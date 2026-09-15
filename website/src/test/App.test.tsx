@@ -1,5 +1,6 @@
 import { afterAll, describe, it, expect, vi } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
+import { MOBILE_BREAKPOINT } from '../hooks/useIsMobile'
 import { join } from 'node:path'
 import { render, screen, act, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders, createTestStore } from './helpers'
@@ -50,7 +51,6 @@ function topbarTracks(): { sides: string[]; search: string } {
 // Mock all page components to isolate routing
 vi.mock('../pages/ChatPage', () => ({ default: () => <div data-testid="chat-page">ChatPage</div> }))
 vi.mock('../pages/SystemPage', () => ({ default: () => <div data-testid="system-page">SystemPage</div> }))
-vi.mock('../pages/AgentsPage', () => ({ default: () => <div data-testid="agents-page">AgentsPage</div> }))
 vi.mock('../pages/ProjectsPage', () => ({ default: () => <div data-testid="projects-page">ProjectsPage</div> }))
 vi.mock('../pages/LogsPage', () => ({ default: () => <div data-testid="logs-page">LogsPage</div> }))
 vi.mock('../pages/KiroCrewAgentsPage', () => ({ default: () => <div data-testid="mc-agents-page">MCAgentsPage</div> }))
@@ -75,6 +75,7 @@ vi.mock('../api/client', () => ({
     chatMode: vi.fn().mockResolvedValue({}),
     listInstances: vi.fn().mockResolvedValue({ instances: [], warm_set_cap: 5 }),
     themes: vi.fn().mockResolvedValue({ themes: [] }),
+    themeDetail: vi.fn().mockResolvedValue({}),
     themeBoot: vi.fn().mockResolvedValue({
       mode: '',
       color: '',
@@ -259,7 +260,12 @@ describe('App routing', () => {
       // still shown rather than skipped along with it.
       renderWithProviders(<App />, { route: '/chat' })
 
-      const dialog = await screen.findByRole('dialog', { name: 'Privacy' })
+      // Privacy mounts only at the end of a real async chain: the import
+      // chapter's scan query resolves, an effect fires its auto-complete
+      // mutation (`api.onboardingImportState`), and `onSuccess` flips the
+      // parent's state. findBy*'s 1000ms default polls that whole chain and
+      // loses under load, so the wait names the boundary and gives it room.
+      const dialog = await screen.findByRole('dialog', { name: 'Privacy' }, { timeout: 5000 })
       expect(within(dialog).getByText('Anonymous daily heartbeat')).toBeInTheDocument()
       // Mandatory: no way past it but forward.
       expect(within(dialog).queryByRole('button', { name: /skip/i })).not.toBeInTheDocument()
@@ -284,8 +290,9 @@ describe('App routing', () => {
       const api = await freshFirstRun()
       renderWithProviders(<App />, { route: '/chat' })
 
-      // Chapter 1 (nothing to import) → Privacy → Customize.
-      const dialog = await screen.findByRole('dialog', { name: 'Privacy' })
+      // Chapter 1 (nothing to import) → Privacy → Customize. Same
+      // auto-complete mutation chain as above sits in front of this dialog.
+      const dialog = await screen.findByRole('dialog', { name: 'Privacy' }, { timeout: 5000 })
       fireEvent.click(within(dialog).getByRole('button', { name: 'Continue' }))
       expect(await screen.findByText('Pick your look')).toBeInTheDocument()
 
@@ -442,8 +449,11 @@ describe('App routing', () => {
     expect(screen.getByText('Sessions')).toBeInTheDocument()
     expect(screen.getByText('Agent Capabilities')).toBeInTheDocument()
     expect(screen.getByText('Settings')).toBeInTheDocument()
-    // The App Store now rides the Apps section header as an accent link.
-    expect(screen.getByText('Explore')).toBeInTheDocument()
+    // PR1 App Store split: the single 'Explore' entry is gone — the sidebar
+    // now carries TWO App Store rows, Discover (/apps) and Library
+    // (/apps/library).
+    expect(screen.getByText('Discover')).toBeInTheDocument()
+    expect(screen.getByText('Library')).toBeInTheDocument()
     // The bottom-pinned community row: the GitHub mark fronts a "Star us" link
     // plus a "Report issue" BUTTON (it opens the diagnostics flow rather than
     // navigating to the issue list), and the icon-only Discord link. The
@@ -479,16 +489,17 @@ describe('App routing', () => {
     expect(screen.getByRole('button', { name: /create report/i })).toBeInTheDocument()
   })
 
-  it('renders the registry-derived Artifacts and Knowledge nav items', () => {
+  it('renders the registry-derived Artifacts nav item, without a Knowledge rail item', () => {
     // Regression guard for the aaf7cfe stale-branch merge, which reverted the
     // registry-driven rail (`NAV_ITEMS = getBuiltinSurfaces().map(...)`) back
-    // to a hardcoded array that omitted Artifacts and Knowledge. Both are
-    // registered unconditionally in `surfaces/builtins.tsx`, so they must
-    // always appear in the rail. Asserting them by label catches a future
-    // hardcoded-array regression that the isolated surfaces.test.tsx cannot.
+    // to a hardcoded array that omitted Artifacts. Artifacts is registered
+    // unconditionally in `surfaces/builtins.tsx`, so it must always appear in
+    // the rail. Knowledge is the opposite pin: it deliberately has NO rail
+    // item — it lives as a tab inside Agent Capabilities and /knowledge
+    // redirects there — so a rail entry reappearing is itself a regression.
     renderWithProviders(<App />, { route: '/chat' })
     expect(screen.getByText('Artifacts')).toBeInTheDocument()
-    expect(screen.getByText('Knowledge')).toBeInTheDocument()
+    expect(screen.queryByText('Knowledge')).not.toBeInTheDocument()
   })
 
   it('does not double-render Secretary when the builtin Secretary app is enabled', async () => {
@@ -812,6 +823,54 @@ describe('App routing', () => {
     localStorage.removeItem('mc-nav')
   })
 
+  it('uses installed theme branding in the left rail and browser favicon', async () => {
+    const { api } = await import('../api/client')
+    localStorage.removeItem('mc-nav')
+    localStorage.setItem('mc-color-theme', 'custom-pearce')
+    vi.mocked(api.themes).mockResolvedValueOnce({
+      themes: [{ slug: 'pearce', name: 'Pearce CRT', emoji: 'PC', source: 'installed' }],
+    } as never)
+    vi.mocked(api.themeDetail).mockResolvedValueOnce({
+      slug: 'pearce',
+      name: 'Pearce CRT',
+      emoji: 'PC',
+      level: 1,
+      source: 'installed',
+      dark: { '--bg': '#000', '--text': '#fff', '--accent': '#fc0' },
+      light: { '--bg': '#fff', '--text': '#000', '--accent': '#840' },
+      assets: {
+        branding: {
+          botName: 'KIRO CREW',
+          logo: 'branding/logo.svg',
+          favicon: 'branding/favicon.svg',
+        },
+      },
+    } as never)
+
+    const view = renderWithProviders(<App />, { route: '/chat' })
+    try {
+      const nav = screen.getByRole('navigation', { name: 'Main navigation' })
+      const brand = within(nav).getByRole('button', { name: 'Collapse sidebar' })
+      await waitFor(() => expect(brand).toHaveTextContent('KIRO CREW'))
+      expect(brand.querySelector('img')).toHaveAttribute(
+        'src',
+        '/api/theme/pearce/assets/branding/logo.svg',
+      )
+      const favicon = document.getElementById('mc-theme-favicon') as HTMLLinkElement | null
+      expect(favicon).not.toBeNull()
+      expect(favicon).toHaveAttribute(
+        'href',
+        '/api/theme/pearce/assets/branding/favicon.svg',
+      )
+    } finally {
+      view.unmount()
+      document.getElementById('mc-theme-favicon')?.remove()
+      document.documentElement.style.removeProperty('--theme-logo')
+      localStorage.removeItem('mc-color-theme')
+      localStorage.removeItem('mc-nav')
+    }
+  })
+
   it('opens Search Everywhere from the theme-aware shadowless header trigger', () => {
     renderWithProviders(<App />, { route: '/chat' })
     const trigger = screen.getByRole('button', { name: 'Search sessions, files, and commands' })
@@ -927,6 +986,151 @@ describe('App routing', () => {
     for (const rung of ['tb-drop-metrics', 'tb-drop-usage', 'tb-drop-feedback', 'tb-narrow-only']) {
       expect(css).toMatch(new RegExp(`@container \\([^)]+\\)\\{\\s*\\.${rung}\\{`))
     }
+  })
+
+  it('shifts the collapse rungs by the pill footprint of the matching viewport base', () => {
+    // The update pill is a conditional sibling of the ladder: it never shrinks
+    // and only exists while an update does, so the rung budget has extra bases
+    // while it is mounted — and the pill's own label is viewport-gated
+    // (`hidden sm:inline`, 640px), so the shift exists ONLY where the label
+    // does: the widest shipped-locale label form at ≥640px, and NOTHING below.
+    // A phone hands the right group ≤240px routinely, so ANY shifted terminal
+    // rung there blanks the CPU/MEM/DSK and credits readouts for the whole
+    // time an update is pending (#7698); the 200–240px squeeze band with the
+    // icon-only pill degrades to the segments' nowrap leading-edge clip
+    // instead, which is the recoverable harm.
+    // Constants are measured in
+    // capture/topbar-search-variants.tsx (?update=on&updatelabel=…); the
+    // dev-only en-XA pseudolocale is excluded (nowrap backstop covers it).
+    // Re-measure and update BOTH the constants here and the index.css rungs
+    // when the pill's chrome or any locale catalog changes its widest form —
+    // the catalog-drift test below fails when that happens.
+    const css = topbarCss().replace(/\/\*[\s\S]*?\*\//g, '')
+    // Brace-balanced extraction: the ≥640px rungs live inside
+    // `@media (min-width:640px)` blocks, which nest @container blocks, so a
+    // lazy regex to the first `}` cannot delimit them.
+    const mediaBlocks: string[] = []
+    let rest = ''
+    let cursor = 0
+    const opener = /@media \(min-width:640px\)\{/g
+    let m: RegExpExecArray | null
+    while ((m = opener.exec(css)) !== null) {
+      let depth = 1
+      let i = opener.lastIndex
+      while (i < css.length && depth > 0) {
+        if (css[i] === '{') depth++
+        else if (css[i] === '}') depth--
+        i++
+      }
+      mediaBlocks.push(css.slice(opener.lastIndex, i - 1))
+      rest += css.slice(cursor, m.index)
+      cursor = i
+      opener.lastIndex = i
+    }
+    rest += css.slice(cursor)
+    const desktopCss = mediaBlocks.join('\n')
+
+    const rung = (scope: string, selector: string, hasUpdate: boolean, label: string): number => {
+      const esc = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      // Anchored to line start: without it a same-suffix rule (e.g. a scoped
+      // `.tb-has-update .tb-capsule …` line) could satisfy the base lookup and
+      // pair the shift assertion against the wrong rung.
+      const re = new RegExp(
+        `^\\s*@container \\(max-width:(\\d+)px\\)\\{ ?${hasUpdate ? '\\.tb-has-update ' : ''}${esc}\\{display:none\\}`,
+        'm'
+      )
+      const match = scope.match(re)
+      expect(match, `expected ${label} rung for ${selector}`).not.toBeNull()
+      return Number(match![1])
+    }
+    const PILL_WIDEST_LABELED = 201.7 // de downloading_percent "Wird heruntergeladen 100 %"
+    const GROUP_GAP = 6
+    const SHIFT_LABELED = Math.ceil(PILL_WIDEST_LABELED + GROUP_GAP)
+    const TERMINAL = '.tb-capsule > *:not(:first-child)'
+    // ≥640px (label visible): every rung, terminal included, shifts by the
+    // labeled footprint, inside the media gate.
+    for (const sel of ['.tb-drop-metrics', '.tb-drop-usage', '.tb-drop-feedback', TERMINAL]) {
+      expect(
+        rung(desktopCss, sel, true, '≥640 shifted') - rung(rest, sel, false, 'base'),
+        `labeled shift for ${sel}`
+      ).toBe(SHIFT_LABELED)
+    }
+    // <640px: NO `.tb-has-update` rung of any kind outside the media gate.
+    // THE regression guard for #7698: an unscoped shifted terminal rung
+    // (240px) applied on phones, where the right group is routinely ≤240px,
+    // so it blanked the CPU/MEM/DSK and credits readouts the whole time an
+    // update was pending. Below 640px the icon-only pill's footprint is
+    // absorbed by the segments' nowrap leading-edge clip and the base 200px
+    // terminal rung bounds the capsule.
+    expect(
+      rest.match(/@container \([^)]*\)\{\s*\.tb-has-update /),
+      'no tb-has-update rung may exist outside the ≥640px media gate'
+    ).toBeNull()
+    // …and the base terminal rung must still bound the phone form.
+    expect(rung(rest, TERMINAL, false, 'base')).toBeGreaterThan(0)
+    // The metric readout's icon stand-in must stay visible through the shifted
+    // band, inside the same media gate: the base rule hides it from 531px up,
+    // so the counterpart re-shows it between the base metrics rung and the
+    // shifted one.
+    const iconBand = desktopCss.match(
+      /@container \(min-width:(\d+)px\) and \(max-width:(\d+)px\)\{\s*\.tb-has-update \.tb-narrow-only\{display:(?!none)/
+    )
+    expect(iconBand, 'expected the tb-has-update .tb-narrow-only counterpart band').not.toBeNull()
+    expect(Number(iconBand![1])).toBeLessThanOrEqual(rung(rest, '.tb-drop-metrics', false, 'base') + 1)
+    expect(Number(iconBand![2])).toBe(rung(desktopCss, '.tb-drop-metrics', true, '≥640 shifted'))
+  })
+
+  it('fails when a locale catalog outgrows the measured pill budget', () => {
+    // The 201.7px constant above is a hand-measured number, so a catalog change
+    // that makes some other label the widest would leave the budget silently
+    // stale (degraded to a clean clip by the nowrap backstop, but stale).
+    // jsdom cannot measure rendered text, so the sentinel compares WIDTH UNITS:
+    // East-Asian wide/fullwidth glyphs count 2, everything else 1 — a CJK glyph
+    // renders ~2x a Latin one at this font size, so a 15-char Japanese label
+    // that would out-render the 26-char German one trips the guard instead of
+    // hiding behind a smaller .length. The range list is a BMP approximation
+    // (supplementary-plane CJK and emoji count 1, combining marks count 1
+    // each); it is a drift tripwire, not a width oracle — the real number
+    // always comes from re-measuring in the harness. The anchor is the MEASURED string
+    // itself: it must still exist, and no shipped visible label may exceed its
+    // unit width. When this fails, re-measure with
+    // capture/topbar-search-variants.tsx and update the constants + rungs.
+    const wide = /[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/
+    const unitWidth = (s: string): number =>
+      [...s].reduce((acc, ch) => acc + (wide.test(ch) ? 2 : 1), 0)
+    const localesDir = join(__dirname, '..', 'i18n', 'locales')
+    const MEASURED = 'Wird heruntergeladen 100 %'
+    const visibleKeys = ['update_available', 'update_ready', 'downloading', 'downloading_percent']
+    let measuredSeen = false
+    let localesWithPill = 0
+    for (const file of readdirSync(localesDir).filter(f => f.endsWith('.json'))) {
+      if (file === 'en-XA.json') continue // devOnly pseudolocale, excluded from the budget
+      const pill = JSON.parse(readFileSync(join(localesDir, file), 'utf8')).components?.updatePill
+      if (!pill) continue
+      localesWithPill++
+      for (const key of visibleKeys) {
+        const label = (pill[key] ?? '').replace('{{percent}}', '100')
+        if (label === MEASURED) measuredSeen = true
+        expect(
+          unitWidth(label),
+          `${file} ${key} "${label}" out-measures the widest pill label the budget was derived from — re-measure`
+        ).toBeLessThanOrEqual(unitWidth(MEASURED))
+      }
+    }
+    // Guards the sentinel itself: a renamed i18n namespace would otherwise make
+    // every lookup miss and the loop above pass vacuously.
+    expect(localesWithPill, 'expected the shipped catalogs to carry updatePill labels').toBeGreaterThanOrEqual(10)
+    expect(measuredSeen, 'the measured widest label no longer exists — re-measure the budget').toBe(true)
+  })
+
+  it('keeps the desktop form switch at or above the pill label gate', () => {
+    // The <640px rung base in index.css shifts ONLY the capsule's terminal
+    // rung, on the premise that the named readout rungs render desktop-only
+    // elements and the desktop layout never exists below the pill's own label
+    // gate (`hidden sm:inline`, 640px). That premise is this inequality; if
+    // the form switch ever drops below the gate, the 531-640px band would pair
+    // full desktop readouts with an unbudgeted icon-only pill.
+    expect(MOBILE_BREAKPOINT).toBeGreaterThanOrEqual(640)
   })
 
   it('resizes the sidebar and main body together with a quick shell transition', () => {
@@ -1127,10 +1331,14 @@ describe('App routing', () => {
         // cannot leave it queued for a later, unrelated message.
         { source: 'feature-request', maxAge: 60 },
       )
+      // sendTurn's dashboard wire passes (message, slot, agent, signal, memoryMode, steer).
       expect(api.sendChat).toHaveBeenCalledWith(
         'I’d like to request a feature!',
         'feature-slot',
         expect.any(String),
+        expect.any(AbortSignal),
+        undefined,
+        undefined,
       )
     })
     expect(api.sendChat).not.toHaveBeenCalledWith(
@@ -1236,7 +1444,12 @@ describe('TopbarMetrics widget', () => {
     sysMock.mockResolvedValueOnce({ mem_used_gb: 4.0, mem_total_gb: 0, cpu_pct: 25.0, disk_total_gb: 0, disk_free_gb: 0 } as never)
     localStorage.setItem('mc-topbar-metrics', '1')
     renderWithProviders(<App />, { route: '/chat' })
-    expect(await screen.findByText(/MEM —/)).toBeInTheDocument()
+    // The capsule paints `MEM —` / `DSK —` BEFORE the first frame lands too (the
+    // loading placeholder reuses the loaded branch's "no valid reading" glyph),
+    // so a dash is not proof the frame arrived. `CPU 25%` only exists in the
+    // loaded branch: wait for that, then read the dashes off the same frame.
+    expect(await screen.findByText(/CPU 25%/)).toBeInTheDocument()
+    expect(screen.getByText(/MEM —/)).toBeInTheDocument()
     expect(screen.getByText(/DSK —/)).toBeInTheDocument()
     sysMock.mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
     localStorage.removeItem('mc-topbar-metrics')
@@ -1255,10 +1468,12 @@ describe('TopbarMetrics widget', () => {
     sysMock.mockResolvedValueOnce({ mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
     localStorage.setItem('mc-topbar-metrics', '1')
     renderWithProviders(<App />, { route: '/chat' })
-    expect(await screen.findByText(/MEM —/)).toBeInTheDocument()
+    // Same ordering as above: `MEM —` is also the pre-frame placeholder, so the
+    // wait has to be on a reading only the loaded frame can produce.
+    expect(await screen.findByText(/CPU 25%/)).toBeInTheDocument()
+    expect(screen.getByText(/MEM —/)).toBeInTheDocument()
     // The rest of the same frame still renders — one absent probe must not
     // blank the whole capsule, let alone unmount the app.
-    expect(screen.getByText(/CPU 25%/)).toBeInTheDocument()
     expect(screen.getByText(/DSK 40%/)).toBeInTheDocument()
     sysMock.mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
     localStorage.removeItem('mc-topbar-metrics')

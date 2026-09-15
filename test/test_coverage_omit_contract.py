@@ -1,6 +1,6 @@
 """Contract: CI runs every test file, and coverage measures every test file.
 
-This used to enforce the opposite direction. ``BACKEND_DESELECTS`` in
+``BACKEND_DESELECTS`` in
 ``.github/workflows/ci.yml`` deselected eleven test files from EVERY backend pytest
 invocation, because the GitHub Actions runners deny ``unshare(CLONE_NEWNS)`` and the
 suites drive a real ``git``/``gh``/``pytest`` through ``sandboxed_spawn_argv``. Files CI
@@ -42,10 +42,12 @@ job's argv.
 from __future__ import annotations
 
 import configparser
+import functools
 import re
 from pathlib import Path
 
 import pytest
+from source_corpus import repo_files
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
@@ -172,13 +174,53 @@ def test_run_and_report_omit_lists_agree() -> None:
     assert sorted(_cfg_omit("coverage:run")) == sorted(_cfg_omit("coverage:report"))
 
 
+@functools.lru_cache(maxsize=1)
+def _all_repo_files() -> tuple[str, ...]:
+    """Every repo-relative file path (posix) the checkout holds, as git sees it.
+
+    One enumeration serves every omit pattern; the callers filter its result in
+    memory. Cached because the tree is static within a test run, and each xdist
+    worker builds its own cache.
+
+    ``source_corpus.repo_files`` and not a walk, because the match below is on
+    BASENAME: a nested worktree under ``.claude/worktrees/`` made every omit
+    pattern resolve to three files -- the real one and two stale copies -- and
+    ``test_every_omitted_test_file_carries_a_capability_guard`` only needs
+    ``any()`` of them to carry the guard. Deleting the guard from the real file
+    left that gate green. Git also gets for free the one subtlety the walk had to
+    be careful about: it excludes the ignored trees at EVERY depth while keeping
+    the tracked ``docs/build/``, which the top-level-only prune could not express.
+    """
+    return tuple(path.relative_to(REPO_ROOT).as_posix() for path in repo_files())
+
+
 def _repo_files_matching(pattern: str) -> list[Path]:
-    """Every tracked test file the omit *pattern* would exclude."""
-    tail = pattern[2:] if pattern.startswith("*/") else pattern
+    """Every tracked test file the omit *pattern* would exclude.
+
+    Every committed omit basename is a glob-free literal (enforced by
+    ``test_omit_patterns_do_not_swallow_product_code``, which requires each to be a
+    specific ``test_*.py`` name), so a basename match against the cached enumeration
+    selects the same files a basename glob would, and the unchanged ``_matches`` suffix
+    check then applies the full pattern. A basename carrying a glob metachar falls back
+    to ``fnmatch``.
+    """
+    basename = (pattern[2:] if pattern.startswith("*/") else pattern).rsplit("/", 1)[-1]
+    has_glob = any(ch in basename for ch in "*?[")
+    if has_glob:
+        import fnmatch
+
+        def _name_ok(name: str) -> bool:
+            return fnmatch.fnmatch(name, basename)
+
+    else:
+
+        def _name_ok(name: str) -> bool:
+            return name == basename
+
     return [
-        path
-        for path in REPO_ROOT.rglob(tail.rsplit("/", 1)[-1])
-        if _matches(pattern, path.relative_to(REPO_ROOT).as_posix())
+        REPO_ROOT / rel
+        for rel in _all_repo_files()
+        if _name_ok(rel.rsplit("/", 1)[-1]) and _matches(pattern, rel)
     ]
 
 
@@ -201,15 +243,36 @@ def test_every_omitted_test_file_carries_a_capability_guard() -> None:
         matched = _repo_files_matching(pattern)
         if not matched:
             unjustified.append(f"{pattern} (matches no file in the repo)")
-        elif not any(
-            _CAPABILITY_GUARD in path.read_text(encoding="utf-8") for path in matched
-        ):
+        elif not any(_CAPABILITY_GUARD in path.read_text(encoding="utf-8") for path in matched):
             unjustified.append(f"{pattern} (no {_CAPABILITY_GUARD} guard)")
     assert not unjustified, (
         f"these omit patterns exempt a test file with nothing to justify it: {unjustified}. "
         "Coverage measures what the measuring host can run: a file whose tests execute "
         "there must be measured. Drop the pattern, or make the reason visible in the file "
         f"as a {_CAPABILITY_GUARD} guard."
+    )
+
+
+def test_each_omit_pattern_resolves_to_exactly_one_file() -> None:
+    """The guard check above is existential, so its corpus has to be single-copy.
+
+    ``test_every_omitted_test_file_carries_a_capability_guard`` passes as soon as ANY
+    match carries the guard. While this module enumerated the repo by walking the
+    filesystem, a nested worktree under ``.claude/worktrees/`` made every pattern
+    resolve to three copies of its file, so removing the guard from the REAL one left
+    that gate green -- a fail-open with no red test anywhere to notice it. One match per
+    pattern is what makes the enumeration itself falsifiable.
+    """
+    ambiguous = {
+        pattern: [str(p) for p in _repo_files_matching(pattern)]
+        for pattern in _cfg_omit("coverage:run")
+        if pattern not in _FIXTURE_ESCAPES and len(_repo_files_matching(pattern)) != 1
+    }
+    assert not ambiguous, (
+        f"these omit patterns do not resolve to exactly one file: {ambiguous}. Two matches "
+        "means the guard check above can be satisfied by a copy the author is not editing "
+        "-- a second checkout under the repo root, or a genuinely ambiguous pattern that "
+        "needs more of its path spelled out."
     )
 
 

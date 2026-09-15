@@ -7,14 +7,14 @@ for that state instead: a mutable **state record** (goal, phase, next intent,
 tried approaches, artifact pointers) carrying a bounded **event tail**. The
 context window becomes a cache; the ledger is the authority.
 
-Layout (see docs/system-specs/features/session-work-ledger.md):
+Layout (see docs/system-specs/modules/session-work-ledger.md):
 
     <data_home>/ledger/<store-name>/
         slot_key        # breadcrumb: the exact ledger key this dir belongs to
         state.json      # the whole record, replaced atomically on every write
         .lock           # cross-process mutex inode (never replaced by writes)
 
-Design notes, each earned by a review finding:
+Design notes:
 
 - **One document, one atomic write.** State and its event land in the same
   ``atomic_write`` (temp file + rename), so a crash between "phase moved" and
@@ -28,8 +28,14 @@ Design notes, each earned by a review finding:
   inside :func:`_store_name` — a lossy charset fold as the identity would map
   distinct channel session keys (colon-structured) onto one ledger.
 - **Bounded lock.** The per-ledger lock acquire is a bounded poll and fails
-  closed with ``OSError`` — a wedged cross-process holder costs one refused
-  write, never an executor thread parked forever.
+  closed with ``OSError`` — a *live cross-process holder* of the flock costs
+  one refused write, not an executor thread parked on it forever. The bound
+  covers only what the deadline can reach: contention for an already-created
+  lock inode. It does NOT cover a wedged filesystem/mount — the pre-lock
+  ``mkdir``/``os.open`` are ordinary path/inode syscalls that a dead NFS mount
+  or dying disk can stall unboundedly, and no in-process deadline can
+  interrupt a stalled syscall. That mount-level failure is a distinct,
+  out-of-scope failure mode, not a bound this code promises.
 - **Size ceiling before parse.** A state file past ``_MAX_STATE_BYTES`` is
   treated as corrupt/absent rather than parsed, so a hostile or damaged file
   cannot make every nudge fire allocate its size.
@@ -83,7 +89,7 @@ _MAX_EVENT_TAIL = 20
 _MAX_STATE_BYTES = 1_000_000
 
 #: Lock acquire budget. Every in-tree critical section is a sub-millisecond
-#: read + atomic rename, so this is a ceiling against a wedged cross-process
+#: read + atomic rename, so this is a ceiling against a live cross-process
 #: holder, not a normal wait. On expiry the write FAILS CLOSED with OSError.
 _LOCK_TIMEOUT_SECS = 5.0
 _LOCK_POLL_SECS = 0.05
@@ -92,12 +98,10 @@ _STATE_FILE = "state.json"
 _KEY_FILE = "slot_key"
 _LOCK_FILE = ".lock"
 
-#: Identical fold to ``crew_chat._store_name`` — kept in lockstep so a slot
-#: key and its stores share one spelling family. Reimplemented rather than
-#: imported: ``crew_chat`` drags the whole crew orchestrator import graph into
-#: what must stay a leaf module usable from the gateway boot path. The fold
-#: shapes only the READABLE half of a directory name; identity is the digest
-#: over the exact key.
+#: Fold for the READABLE half of a store directory name (it originated as the
+#: Crew Mode store's fold and outlived that mode; ``work_ledger`` imports this
+#: copy). Kept in a leaf module usable from the gateway boot path. Identity is
+#: the digest over the exact key, never this fold.
 _STORE_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]")
 _STORE_NAME_READABLE_MAX = 80
 
@@ -143,6 +147,46 @@ def _ledger_root() -> Path:
     return data_home() / "ledger"
 
 
+_EXTENDED_LENGTH_PREFIX = "\\\\?\\"
+
+
+def _plain(path: Path) -> Path:
+    """*path* without Windows' extended-length prefix; unchanged elsewhere."""
+    text = str(path)
+    if text.startswith(_EXTENDED_LENGTH_PREFIX + "UNC\\"):
+        return Path("\\\\" + text[len(_EXTENDED_LENGTH_PREFIX) + 4 :])
+    if text.startswith(_EXTENDED_LENGTH_PREFIX):
+        return Path(text[len(_EXTENDED_LENGTH_PREFIX) :])
+    return path
+
+
+def resolved_within(base: Path, name: str) -> Path | None:
+    """``base / name`` resolved, or ``None`` when it does not stay inside *base*.
+
+    The symlink-safe containment check every ledger path goes through. Two
+    properties keep it honest under concurrency:
+
+    * The base is resolved ONCE and the child is built from the resolved base, so
+      both sides are spelled from the same ancestors.
+    * Both sides are stripped of Windows' extended-length prefix before the
+      comparison. ``Path.resolve()`` on a FILE that another thread is replacing at
+      that moment comes back as ``\\\\?\\C:\\...``: ``ntpath.realpath`` drops the
+      prefix only after re-checking the stripped spelling, and that re-check fails
+      when the file has just been swapped out. The directory, resolved separately,
+      comes back as ``C:\\...``, and ``is_relative_to`` then reads the prefix alone
+      as an escape. Four threads binding one worker at once reproduce it in about
+      four runs of ten on a short-name temp root; the CI Windows shard is one.
+
+    The root itself is not a member: a name that folds to nothing must not be
+    granted the whole store.
+    """
+    parent = _plain(base.resolve())
+    resolved = _plain((parent / name).resolve())
+    if resolved == parent or not resolved.is_relative_to(parent):
+        return None
+    return resolved
+
+
 def ledger_dir(slot_key: str) -> Path:
     """Validated per-session ledger directory for *slot_key*.
 
@@ -153,10 +197,8 @@ def ledger_dir(slot_key: str) -> Path:
     """
     if not slot_key or "\0" in slot_key or "/" in slot_key or "\\" in slot_key:
         raise ValueError(f"Invalid slot key for ledger: {slot_key!r}")
-    base = _ledger_root()
-    resolved = (base / _store_name(slot_key)).resolve()
-    parent = base.resolve()
-    if resolved == parent or not resolved.is_relative_to(parent):
+    resolved = resolved_within(_ledger_root(), _store_name(slot_key))
+    if resolved is None:
         raise ValueError(f"Path traversal blocked for slot key: {slot_key!r}")
     return resolved
 
@@ -171,28 +213,100 @@ def _clamp(value: Any, limit: int = _MAX_TEXT) -> str:
     return value[:limit]
 
 
+def require_lock_inode(fd: int, lock_path: Path) -> None:
+    """Refuse to enter a critical section on a lock inode the store does not have.
+
+    A path-based advisory lock is taken on an INODE, and a purge that removes the
+    store removes that inode. A writer that was queued on it still acquires it --
+    the kernel grants the lock on the detached file -- and would then write into
+    a directory that was deleted from under it (the ``mkdir`` a moment ago
+    recreates it), publishing a torn store into a purged key: state without a
+    breadcrumb, or a header-less item. This check, run immediately after the
+    acquire, is what makes the purge's inode deletion safe: the queued writer
+    compares the identity of the file it holds against the file now at the path
+    and REFUSES when they differ or the path is gone. The caller sees the same
+    ``OSError`` a held lock produces and retries; its next attempt opens whatever
+    is really at the path -- nothing, or a fresh store.
+
+    On Windows this check is a no-op by construction, and correctly so: a file
+    cannot be unlinked while any handle is open on it, and a queued writer HOLDS
+    a handle while it waits, so a purge running beside it either cannot remove
+    the lock file at all (the writer then acquires the same inode and rebuilds a
+    fresh store -- the ledger springs back, consistently) or removes it only when
+    no writer was queued. The OS preserves lock identity there; this check exists
+    for POSIX, where the unlink succeeds under an open handle. ``st_ino`` is
+    compared only when both sides report one, since a filesystem that reports
+    zero cannot be compared.
+    """
+    try:
+        on_disk = os.stat(lock_path)
+    except FileNotFoundError:
+        raise OSError("ledger was removed while waiting for its lock; try again") from None
+    held = os.fstat(fd)
+    if held.st_ino and on_disk.st_ino:
+        if (held.st_dev, held.st_ino) != (on_disk.st_dev, on_disk.st_ino):
+            raise OSError("ledger lock was replaced while waiting; try again")
+
+
 @contextmanager
-def _locked(dir_path: Path) -> Iterator[None]:
-    """Bounded cross-process exclusive lock over one ledger directory.
+def _locked(dir_path: Path, *, create: bool = True) -> Iterator[None]:
+    """Bounded-against-a-holder exclusive lock over one ledger directory.
 
     The lock file is a dedicated inode that writes never replace (replacing
     the locked inode would let a second writer lock the NEW inode and
     interleave). The acquire is a bounded poll over
     :func:`platform_compat.try_acquire_lock` — the repo's one non-blocking
     acquire primitive, covering POSIX and Windows alike — and FAILS CLOSED
-    with ``OSError`` rather than entering the critical section unserialized
-    or parking a worker thread on a wedged holder forever.
+    with ``OSError`` rather than entering the critical section unserialized.
+
+    Scope of the bound (be precise — the docstring must not out-promise the
+    code). ``_LOCK_TIMEOUT_SECS`` bounds ONLY the ``try_acquire_lock`` poll
+    loop below: against a *live cross-process holder* of the flock, this
+    refuses with ``OSError`` instead of waiting forever. The deadline is
+    checked between sleeps rather than during one, so the refusal lands within
+    the budget plus at most one ``_LOCK_POLL_SECS`` interval — a bound, not an
+    exact wall-clock cap.
+
+    The pre-lock ``mkdir``/``os.open`` are ordinary path/inode syscalls; on a
+    wedged filesystem (hard NFS mount, dying disk) they can stall unboundedly,
+    and NO in-process deadline can interrupt them — SIGALRM is main-thread +
+    POSIX-only (this runs on an ``asyncio.to_thread`` worker), a bounded
+    dedicated-thread offload leaks an unkillable thread and a held fd on a
+    hard hang, and ``O_NONBLOCK`` does not cover path-resolution/inode stalls
+    (only FIFO/device opens). A wedged mount is therefore explicitly OUT OF
+    SCOPE of this lock's deadline, not a bound this contextmanager promises.
+
+    The deadline is established immediately before the poll it governs and is
+    NOT hoisted above ``mkdir``/``os.open`` — hoisting would spend the budget
+    on the pre-lock syscalls and leave a near-zero retry window for genuine
+    contention, which is the inversion that must not recur.
     """
-    dir_path.mkdir(parents=True, exist_ok=True)
+    # ``create=False`` is the PURGE's form: a writer may bring a store into
+    # being by locking it, a deleter must not. With ``mkdir`` + ``O_CREAT`` a
+    # second sweep racing the first would recreate the store the first just
+    # removed -- a directory holding nothing but a lock file, with no breadcrumb,
+    # which no later purge can name -- and only then find nothing to guard. Without
+    # them the open raises ``FileNotFoundError`` for a store that is gone, and the
+    # caller skips it.
     lock_path = dir_path / _LOCK_FILE
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    if create:
+        dir_path.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    else:
+        fd = os.open(str(lock_path), os.O_RDWR)
     try:
+        # Bound only the acquire poll: set the deadline adjacent to the loop
+        # it governs, after the pre-lock syscalls (which it cannot bound).
         deadline = time.monotonic() + _LOCK_TIMEOUT_SECS
         while not try_acquire_lock(fd, exclusive=True):
             if time.monotonic() >= deadline:
                 raise OSError("ledger lock is held by another process; try again")
             time.sleep(_LOCK_POLL_SECS)
         try:
+            # The store may have been purged while this writer waited: see
+            # :func:`require_lock_inode`. Checked INSIDE the hold, so the answer
+            # cannot change between the check and the write.
+            require_lock_inode(fd, lock_path)
             yield
         finally:
             release_lock(fd)
@@ -381,11 +495,16 @@ def record(
             state["events"] = events[-_MAX_EVENTS:]
         state["last_progress_at"] = now
         state["schema"] = SCHEMA_VERSION
-        atomic_write(dir_path / _STATE_FILE, _serialize_bounded(state) + "\n", mode=0o600)
+        blob = _serialize_bounded(state, source=dir_path.name)
+        atomic_write(dir_path / _STATE_FILE, blob + "\n", mode=0o600)
+        # ``_serialize_bounded`` evicted from THIS dict, so the caller's
+        # post-write view is the document that just landed on disk. Do not
+        # serialize a copy here: that would return the pre-eviction lists
+        # while disk held the evicted ones.
         return state
 
 
-def _serialize_bounded(state: dict[str, Any]) -> str:
+def _serialize_bounded(state: dict[str, Any], source: str = "") -> str:
     """Serialize the state document, guaranteeing it fits the read ceiling.
 
     The reader treats a file past ``_MAX_STATE_BYTES`` as damage and reads it
@@ -400,72 +519,113 @@ def _serialize_bounded(state: dict[str, Any]) -> str:
     the oldest tried entries, are evicted until it fits. History ages out;
     the current state (goal/phase/next/artifacts) is never dropped and cannot
     exceed the ceiling on its own.
+
+    Every one of those evictions DISCARDS data that never reaches disk, so
+    unlike the read side there is no original file left to recover it from —
+    the loss is permanent the moment the write lands. The reader already WARNs
+    when the ceiling makes it discard a whole file; discarding history to stay
+    under that same ceiling is the same loss in a smaller quantity and is
+    reported the same way: one line per over-budget serialization, naming what
+    went and how much, and nothing at all when the document fits. The line
+    describes the document this call built, not a durable write — the caller's
+    ``atomic_write`` runs afterwards and may still fail.
+
+    Mutates *state* in place while evicting, and ``record`` returns that same
+    dict — deliberately, so a caller's post-write view is the document on
+    disk. See the note at the ``return`` in ``record``.
     """
     budget = _MAX_STATE_BYTES - 4096  # headroom so the reader's check never ties
-    while True:
-        blob = json.dumps(state, ensure_ascii=False)
-        if len(blob.encode("utf-8")) <= budget:
-            return blob
-        if state["events"]:
-            state["events"] = state["events"][1:]
-        elif state["tried"]:
-            state["tried"] = state["tried"][1:]
-        else:
-            # History is gone and the document still does not fit. The known
-            # fields are all clamped well under the budget, so the excess can
-            # only live in UNKNOWN fields carried forward by ``_coerce_state``
-            # (a newer writer's data, or a corrupt/hostile file that parsed).
-            # Preserving unknown fields is best-effort forward compatibility;
-            # preserving THE LEDGER is the contract — a document past the
-            # reader's ceiling is discarded wholesale on the next read, which
-            # loses the known state too. Drop the extras and retry once.
-            extras = [k for k in state if k not in _empty_state()]
-            if extras:
-                for k in extras:
-                    state.pop(k, None)
-                continue
-            # Unreachable with the field clamps; refuse rather than write a
-            # document the reader is guaranteed to discard.
-            raise ValueError("record too large to store")
-
-
-def purge(slot_key: str) -> None:
-    """Delete *slot_key*'s ledger directory. Best-effort, never raises.
-
-    Ledger content is disposable intermediate state — nothing reconstructs
-    from it — so this runs unconditionally on permanent session deletion.
-    A write racing the delete can at worst recreate an orphan directory that
-    the next delete sweeps; it can never touch another session's ledger, so
-    the funnel narrows the window (purge after the slot's turn is torn down)
-    instead of buying a tombstone protocol for disposable state.
-    """
+    evicted_events = 0
+    evicted_tried = 0
+    dropped_extras: list[str] = []
     try:
-        dir_path = ledger_dir(slot_key)
-    except ValueError:
-        return
-    shutil.rmtree(dir_path, ignore_errors=True)
+        while True:
+            blob = json.dumps(state, ensure_ascii=False)
+            if len(blob.encode("utf-8")) <= budget:
+                return blob
+            if state["events"]:
+                state["events"] = state["events"][1:]
+                evicted_events += 1
+            elif state["tried"]:
+                state["tried"] = state["tried"][1:]
+                evicted_tried += 1
+            else:
+                # History is gone and the document still does not fit. The known
+                # fields are all clamped well under the budget, so the excess can
+                # only live in UNKNOWN fields carried forward by ``_coerce_state``
+                # (a newer writer's data, or a corrupt/hostile file that parsed).
+                # Preserving unknown fields is best-effort forward compatibility;
+                # preserving THE LEDGER is the contract — a document past the
+                # reader's ceiling is discarded wholesale on the next read, which
+                # loses the known state too. Drop the extras and retry once.
+                extras = [k for k in state if k not in _empty_state()]
+                if extras:
+                    for k in extras:
+                        state.pop(k, None)
+                    dropped_extras.extend(extras)
+                    continue
+                # Unreachable with the field clamps; refuse rather than write a
+                # document the reader is guaranteed to discard.
+                raise ValueError("record too large to store")
+    finally:
+        # In ``finally`` so the refusal path reports too: it raises with the
+        # in-memory record already gutted, which is exactly when an operator
+        # most needs to know what this call threw away.
+        losses: list[str] = []
+        if evicted_events:
+            losses.append(f"oldest events[] evicted x{evicted_events}")
+        if evicted_tried:
+            losses.append(f"oldest tried[] evicted x{evicted_tried}")
+        if dropped_extras:
+            losses.append("unknown fields dropped: " + ", ".join(sorted(dropped_extras)))
+        if losses:
+            # Describes the DOCUMENT being serialized, not a completed write:
+            # ``atomic_write`` runs after this and can still fail (ENOSPC),
+            # leaving the previous file intact, and the refusal path above
+            # never writes at all. Either way this call's in-memory record has
+            # already lost the entries named here.
+            logger.warning(
+                "ledger state exceeded the %d-byte serialization budget%s; discarded: %s",
+                budget,
+                f" ({source})" if source else "",
+                "; ".join(losses),
+            )
 
 
-def purge_matching(exact_keys: set[str], folded_keys: set[str], fold: Any) -> int:
-    """Purge every ledger whose breadcrumb key matches a delete candidate.
+def purge_matching(exact_keys: set[str], *, guard: Any) -> int:
+    """Purge the ledgers whose breadcrumb holds one of *exact_keys*, guarded.
 
-    The delete funnel names a session by whatever spellings it has on hand
-    (history key, slot key, folded transcript spelling), but a channel
-    session's ledger is keyed by its EXACT session key — a spelling the
-    funnel may not hold once the slot is gone. This sweep closes that gap:
-    it walks the ledger root, reads each directory's ``slot_key`` breadcrumb,
-    and removes the ledger when the breadcrumb matches a candidate exactly or
-    under the caller-supplied *fold* (the transcript-filename fold, so the
-    folded history spelling the funnel does hold reaches the exact-key
-    ledger it names). The fold is used only to MATCH deletion targets, never
-    as storage identity; in the rare case two exact keys share a folded
-    spelling, both ledgers are removed — acceptable for disposable state,
-    where the alternative is one of them silently surviving its session.
+    This is an explicit best-effort maintenance API with one production caller
+    (``ledger_sweep.purge``). It matches EXACT keys only, deliberately: a
+    caller-supplied fold is exactly the one way a caller could remove a ledger
+    it never listed, so there is no fold parameter, not even a defaulted one.
+    Callers must establish that every key is safe to remove before invoking it.
 
-    Best-effort, never raises. Returns the number of ledgers removed. The
-    root holds one directory per session that ever recorded, so the walk is
-    small; a breadcrumbless directory (breadcrumb write is best-effort) is
-    still covered by the direct :func:`purge` calls the funnel makes first.
+    Every removal is locked, ordered and identity-last -- there is one spelling
+    of deletion in this module. *guard* is REQUIRED: it is called as
+    ``guard(dir_path)`` INSIDE that ledger's own :func:`_locked` hold, and the
+    store is removed only if it answers true. A caller that truly wants the match
+    alone to decide passes ``lambda _dir: True`` and says so at the call site;
+    the store does not offer a default that skips the re-decision.
+    That is what lets a caller re-read the record and stand down on one that
+    came back to life: a selection made outside the lock is a snapshot, and
+    between the snapshot and the delete a session can be resumed and write a
+    live phase into the very record the caller decided was finished. Selecting
+    under the lock is not enough on its own -- the removal has to happen in the
+    same hold, which is why the guard is a callback rather than a filter the
+    caller applies first.
+
+    The removal is ORDERED and the lock inode goes inside the hold where the OS
+    allows it: other entries first, then ``state.json`` and ``slot_key`` only
+    once every other removal succeeded (a failure never leaves a store without
+    its record or its name), then the lock file itself while the lock is still
+    held (:func:`unlink_lock_in_hold`) -- so a writer queued on that inode
+    finds the path gone when it acquires and refuses (:func:`require_lock_inode`)
+    rather than publishing into the removed store, and no later writer can be
+    handed a second inode while a first is still held. Windows refuses the
+    in-hold unlink and gets it after release instead, which is safe there
+    because it fails whenever a writer still holds a handle. A store that could
+    not be fully removed is left identifiable and is not counted as removed.
     """
     removed = 0
     try:
@@ -477,17 +637,159 @@ def purge_matching(exact_keys: set[str], folded_keys: set[str], fold: Any) -> in
         return 0
     for child in children:
         try:
-            if not child.is_dir():
+            if not child.is_dir() or is_link(child):
+                # A linked store directory names somewhere else; the delete
+                # would land there. Never followed, whatever its breadcrumb says.
                 continue
             key = (child / _KEY_FILE).read_text(encoding="utf-8").strip()
             if not key:
                 continue
-            if key in exact_keys or fold(key) in folded_keys:
-                shutil.rmtree(child, ignore_errors=True)
-                removed += 1
+            if key not in exact_keys:
+                continue
+            try:
+                lock_cm = _locked(child, create=False)
+                lock_cm.__enter__()
+            except FileNotFoundError:
+                # Removed between the listing and the lock -- by a concurrent
+                # sweep, or by the writer that owned it. Nothing to do, and
+                # nothing must be created in its place.
+                continue
+            try:
+                if not guard(child):
+                    continue
+                if not _remove_store_contents(child):
+                    # Something survived. When it was ordinary content, both
+                    # identity files were kept; when it was one of the identity
+                    # files themselves, whichever still exists is what names the
+                    # store to the next sweep. Say exactly which, so the log is
+                    # true in both cases.
+                    surviving = [n for n in (_STATE_FILE, _KEY_FILE) if (child / n).exists()]
+                    logger.warning(
+                        "ledger purge: %s not fully removed; kept: %s",
+                        child.name,
+                        ", ".join(surviving) or "(no identity file survived)",
+                    )
+                    continue
+                lock_gone = unlink_lock_in_hold(child / _LOCK_FILE)
+            finally:
+                lock_cm.__exit__(None, None, None)
+            _remove_store_shell(child, lock_gone=lock_gone)
+            removed += 1
         except Exception:
             continue
     return removed
+
+
+#: The two files that make a store a ledger and let a purge NAME it. They go
+#: last, and only when everything else is gone.
+_IDENTITY_FILES = frozenset({_STATE_FILE, _KEY_FILE})
+
+
+def _remove_store_contents(dir_path: Path) -> bool:
+    """Delete *dir_path*'s contents except the lock file. Returns whether all went.
+
+    Ordered, with the record and the breadcrumb LAST. Everything else is removed
+    first and every failure is counted -- ``rmtree(ignore_errors=True)`` would
+    report success over a subtree it silently left standing, and on Windows a
+    sharing violation on one held entry is exactly that case. ``state.json`` and
+    ``slot_key`` are unlinked only once the count is zero, so a failed removal
+    never leaves a store that has lost its record or its name: it stays a
+    ledger, stays addressable by key, and reads as damaged to the next sweep
+    rather than as a residue nothing can aim at. Call under the hold.
+    """
+    failures = 0
+
+    def _count(_fn: object, _path: object, _exc: object) -> None:
+        nonlocal failures
+        failures += 1
+
+    try:
+        children = list(dir_path.iterdir())
+    except OSError:
+        return False
+    for child in children:
+        if child.name == _LOCK_FILE or child.name in _IDENTITY_FILES:
+            continue
+        # A linked entry is unlinked as a NAME, never followed: ``is_dir`` is true
+        # through a link to a directory, and walking it would delete the target.
+        if child.is_dir() and not is_link(child):
+            shutil.rmtree(child, onerror=_count)
+        else:
+            try:
+                child.unlink()
+            except OSError:
+                failures += 1
+    if failures:
+        return False
+    for name in (_STATE_FILE, _KEY_FILE):
+        try:
+            (dir_path / name).unlink(missing_ok=True)
+        except OSError:
+            return False
+    return True
+
+
+def is_link(path: Path) -> bool:
+    """Whether *path* is a symbolic link or a Windows junction -- a name that
+    points somewhere else.
+
+    A delete primitive must never FOLLOW one: a store directory, or an ``items/``
+    inside one, that is a link would send the removal at whatever the link names,
+    and nothing about the store's own records could tell. Both stores' purges
+    refuse a linked store and a linked ``items/``, and both content walkers unlink
+    a linked entry itself rather than descending into it.
+    """
+    return path.is_symlink() or path.is_junction()
+
+
+def unlink_lock_in_hold(lock_path: Path) -> bool:
+    """Unlink *lock_path* while its lock is still HELD. Returns whether it went.
+
+    The one order that keeps lock identity stable through a purge. Unlinked
+    inside the hold, the inode a queued writer is waiting on is already detached
+    from the path by the time that writer acquires it, so its
+    :func:`require_lock_inode` check sees the path gone and refuses. Unlinked
+    AFTER release there is a window in which a queued writer acquires the old
+    inode, validates it against a path that still exists, and proceeds -- and the
+    late unlink then detaches the very inode it holds, so the next writer creates
+    a new one and the two are not serialised against each other.
+
+    POSIX permits the unlink under an open descriptor and this returns ``True``.
+    Windows refuses it and this returns ``False``; there the caller unlinks after
+    release instead, which is safe on Windows precisely because it fails whenever
+    any writer still holds a handle -- the OS keeps the identity stable, and a
+    successful late unlink proves nobody was queued.
+    """
+    try:
+        lock_path.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True
+
+
+def _remove_store_shell(dir_path: Path, *, lock_gone: bool) -> None:
+    """Remove the now-empty directory, and the lock file ONLY if the hold could not.
+
+    Call AFTER releasing. *lock_gone* is :func:`unlink_lock_in_hold`'s answer.
+    When it is true the lock path was unlinked inside the hold and MUST NOT be
+    touched again here: by now a writer that refused on the detached inode may
+    have retried, recreated the directory and taken a FRESH lock at the same path
+    -- a second unlink would detach that fresh inode under its holder, and the
+    next writer would take a third, un-serialised against the second. Only the
+    empty-directory ``rmdir`` is attempted, and it simply fails if a writer has
+    rebuilt the store. When *lock_gone* is false the OS refused the in-hold unlink
+    (Windows), and the late unlink is safe there because it fails whenever any
+    writer holds a handle.
+    """
+    if not lock_gone:
+        try:
+            (dir_path / _LOCK_FILE).unlink(missing_ok=True)
+        except OSError:
+            logger.debug("ledger purge: lock file still held; leaving it")
+    try:
+        dir_path.rmdir()
+    except OSError:
+        logger.debug("ledger purge: ledger directory not fully removed")
 
 
 #: Ceiling for the injected snapshot block. A nudge turn carries this every

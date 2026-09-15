@@ -31,7 +31,14 @@ class TestLinkToDashboardCommand:
             patch.object(handler, "is_allowed_user", return_value=True),
         ):
             result = await handler._handle_slash_command(
-                "!link-to-dashboard", slack, MagicMock(), "C1", "t1", "msg1", "t1", "U1",
+                "!link-to-dashboard",
+                slack,
+                MagicMock(),
+                "C1",
+                "t1",
+                "msg1",
+                "t1",
+                "U1",
             )
         assert result == ""
         assert any("not available" in str(c).lower() for c in slack.post_message.call_args_list)
@@ -48,7 +55,14 @@ class TestLinkToDashboardCommand:
             patch.object(handler, "is_allowed_user", return_value=True),
         ):
             result = await handler._handle_slash_command(
-                "!link-to-dashboard", slack, MagicMock(), "C1", "msg1", "msg1", "msg1", "U1",
+                "!link-to-dashboard",
+                slack,
+                MagicMock(),
+                "C1",
+                "msg1",
+                "msg1",
+                "msg1",
+                "U1",
             )
         assert result == ""
         assert any("thread" in str(c).lower() for c in slack.post_message.call_args_list)
@@ -69,7 +83,14 @@ class TestLinkToDashboardCommand:
             ),
         ):
             result = await handler._handle_slash_command(
-                "!link-to-dashboard", slack, MagicMock(), "C1", "t1", "msg1", "t1", "U1",
+                "!link-to-dashboard",
+                slack,
+                MagicMock(),
+                "C1",
+                "t1",
+                "msg1",
+                "t1",
+                "U1",
             )
         assert result == ""
         assert any("could not" in str(c).lower() for c in slack.post_message.call_args_list)
@@ -81,7 +102,14 @@ class TestLinkToDashboardCommand:
         slack = _make_slack()
         with patch.object(handler, "is_allowed_user", return_value=False):
             result = await handler._handle_slash_command(
-                "!link-to-dashboard", slack, MagicMock(), "C1", "t1", "msg1", "t1", "UBAD",
+                "!link-to-dashboard",
+                slack,
+                MagicMock(),
+                "C1",
+                "t1",
+                "msg1",
+                "t1",
+                "UBAD",
             )
         assert result == ""
         assert any("not authorized" in str(c).lower() for c in slack.post_message.call_args_list)
@@ -109,7 +137,14 @@ class TestLinkToDashboardCommand:
                 ),
             ):
                 result = await handler._handle_slash_command(
-                    "!link-to-dashboard", slack, MagicMock(), "C1", "t1", "msg1", "t1", "U1",
+                    "!link-to-dashboard",
+                    slack,
+                    MagicMock(),
+                    "C1",
+                    "t1",
+                    "msg1",
+                    "t1",
+                    "U1",
                 )
         finally:
             handler.sel = orig_sel
@@ -144,7 +179,13 @@ class TestLinkedThreadIntercept:
                 patch.object(handler, "is_allowed_user", return_value=False),
             ):
                 await handler.handle_message(
-                    slack, MagicMock(), "C1", "hello", "t1", "msg1", "UBAD",
+                    slack,
+                    MagicMock(),
+                    "C1",
+                    "hello",
+                    "t1",
+                    "msg1",
+                    "UBAD",
                 )
                 mock_sel_inst.log_tool_invocation.assert_called_once()
                 kw = mock_sel_inst.log_tool_invocation.call_args[1]
@@ -174,7 +215,13 @@ class TestLinkedThreadIntercept:
             patch("kiro_crew.dashboard.chat._run_chat", new_callable=AsyncMock) as mock_run_chat,
         ):
             await handler.handle_message(
-                slack, MagicMock(), "C1", "hello", "t1", "msg1", "U1",
+                slack,
+                MagicMock(),
+                "C1",
+                "hello",
+                "t1",
+                "msg1",
+                "U1",
             )
             slot.append.assert_called_once()
             mock_run_chat.assert_called_once()
@@ -201,14 +248,27 @@ class TestLinkedThreadIntercept:
             patch.object(handler, "_dashboard_state", ds),
             patch.object(handler, "is_allowed_user", return_value=True),
             patch("kiro_crew.dashboard.chat._run_chat", new_callable=AsyncMock) as mock_run_chat,
-            patch.object(handler, "redact_exfiltration_urls", return_value=("[REDACTED-URL]", True)),
+            patch.object(
+                handler, "redact_exfiltration_urls", return_value=("[REDACTED-URL]", True)
+            ),
             patch.object(handler, "redact_credentials", return_value=("[REDACTED]", True)),
         ):
             await handler.handle_message(
-                slack, MagicMock(), "C1", "hello http://evil.com", "t1", "msg1", "U1",
+                slack,
+                MagicMock(),
+                "C1",
+                "hello http://evil.com",
+                "t1",
+                "msg1",
+                "U1",
             )
-            # UI gets redacted text
-            slot.append.assert_called_once_with("user", "[REDACTED]", "msg msg-u")
+            # UI gets redacted text — via append_and_surface, which passes
+            # broadcast_user=True so the channel-typed row (never rendered
+            # optimistically here) still reaches open dashboard windows through
+            # append's own mid-carrying delivery.
+            slot.append.assert_called_once_with(
+                "user", "[REDACTED]", "msg msg-u", broadcast_user=True, meta=None
+            )
             # LLM gets original text
             assert mock_run_chat.call_args[0][2] == "hello http://evil.com"
 
@@ -221,7 +281,19 @@ class TestLinkedThreadIntercept:
         type(slot).running = PropertyMock(return_value=True)
         slot.key = "slot1"
         slot._queue = []
-        slot.queue_append = lambda content: (slot._queue.append({"id": "test", "content": content}) or "test")
+
+        def queue_append(content, *, meta=None, directive_user_origin, directive_channel_origin):
+            assert directive_user_origin is True
+            assert directive_channel_origin is True
+            # The linked-thread enqueue stamps the admission-time containment
+            # snapshot so the drain can re-assert it at delivery.
+            from kiro_crew.dashboard.session_control import QUEUED_CONTAINMENT_META_KEY
+
+            assert isinstance(meta, dict) and QUEUED_CONTAINMENT_META_KEY in meta
+            slot._queue.append({"id": "test", "content": content})
+            return "test"
+
+        slot.queue_append = queue_append
         ds = MagicMock()
         ds.get_linked_slot = MagicMock(return_value=slot)
         ds.broadcast_ws = MagicMock()
@@ -233,7 +305,13 @@ class TestLinkedThreadIntercept:
             patch("kiro_crew.dashboard.chat._run_chat", new_callable=AsyncMock) as mock_run_chat,
         ):
             await handler.handle_message(
-                slack, MagicMock(), "C1", "hello", "t1", "msg1", "U1",
+                slack,
+                MagicMock(),
+                "C1",
+                "hello",
+                "t1",
+                "msg1",
+                "U1",
             )
             assert len(slot._queue) == 1
             mock_run_chat.assert_not_called()
@@ -272,7 +350,13 @@ class TestTransportLinkedThreadIntercept:
             patch("kiro_crew.dashboard.chat._run_chat", new_callable=AsyncMock) as mock_run_chat,
         ):
             await transport_dispatch.handle_message_transport(
-                slack, sessions, "C1", "hello", "t1", "msg1", "U1",
+                slack,
+                sessions,
+                "C1",
+                "hello",
+                "t1",
+                "msg1",
+                "U1",
             )
             slot.append.assert_called_once()
             mock_run_chat.assert_called_once()
@@ -299,15 +383,169 @@ class TestTransportLinkedThreadIntercept:
                 patch.object(handler, "is_allowed_user", return_value=False),
             ):
                 await transport_dispatch.handle_message_transport(
-                    slack, sessions, "C1", "hello", "t1", "msg1", "UBAD",
+                    slack,
+                    sessions,
+                    "C1",
+                    "hello",
+                    "t1",
+                    "msg1",
+                    "UBAD",
                 )
                 # Denied with SEL audit; no session acquired.
                 mock_sel_inst.log_tool_invocation.assert_called_once()
                 assert mock_sel_inst.log_tool_invocation.call_args[1]["outcome"] == "denied"
                 assert any(
-                    "not authorized" in str(c).lower()
-                    for c in slack.post_message.call_args_list
+                    "not authorized" in str(c).lower() for c in slack.post_message.call_args_list
                 )
                 sessions.get_or_create.assert_not_called()
+        finally:
+            handler.sel = orig_sel
+
+
+# ── Bare `sessions` keyword fall-through in a linked thread ──
+
+
+class TestSessionsKeywordFallThrough:
+    """The bare ``sessions`` keyword must win over a linked dashboard DM, the
+    same way ``!``-bang commands fall through — otherwise the native session
+    picker is unreachable in a linked thread."""
+
+    def _linked_ds(self):
+        slot = MagicMock()
+        type(slot).running = PropertyMock(return_value=False)
+        slot.key = "slot1"
+        slot._queue = []
+        ds = MagicMock()
+        ds.get_linked_slot = MagicMock(return_value=slot)
+        ds._background_tasks = set()
+        ds.broadcast_ws = MagicMock()
+        ds.push_slots_update = MagicMock()
+        return ds, slot
+
+    @pytest.mark.asyncio
+    async def test_bare_sessions_falls_through_not_routed(self):
+        from kiro_crew.slack import handler
+
+        slack = _make_slack()
+        ds, slot = self._linked_ds()
+        with (
+            patch.object(handler, "_dashboard_state", ds),
+            patch.object(handler, "is_allowed_user", return_value=True),
+        ):
+            result = await handler.maybe_route_linked_thread(
+                "sessions", "slack:t1", "U1", "C1", slack, "t1"
+            )
+        # Falls through to normal handling: no user row appended, no queueing,
+        # no dashboard broadcast — the caller's keyword branch takes over.
+        assert result is False
+        slot.append.assert_not_called()
+        slot.queue_append.assert_not_called()
+        ds.push_slots_update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_exact_sessions_text_still_routed(self):
+        from kiro_crew.slack import handler
+
+        slack = _make_slack()
+        ds, slot = self._linked_ds()
+        with (
+            patch.object(handler, "_dashboard_state", ds),
+            patch.object(handler, "is_allowed_user", return_value=True),
+            patch("kiro_crew.dashboard.chat._run_chat", new_callable=AsyncMock),
+        ):
+            result = await handler.maybe_route_linked_thread(
+                "sessions please", "slack:t1", "U1", "C1", slack, "t1"
+            )
+        # The predicate is exact-match only: anything else keeps routing to
+        # the linked slot, pinning the narrowing.
+        assert result is True
+        slot.append.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_sessions_still_denied(self):
+        from kiro_crew.slack import handler
+
+        slack = _make_slack()
+        ds, slot = self._linked_ds()
+        mock_sel_inst = MagicMock()
+        orig_sel = handler.sel
+        handler.sel = lambda: mock_sel_inst
+        try:
+            with (
+                patch.object(handler, "_dashboard_state", ds),
+                patch.object(handler, "is_allowed_user", return_value=False),
+            ):
+                result = await handler.maybe_route_linked_thread(
+                    "sessions", "slack:t1", "UBAD", "C1", slack, "t1"
+                )
+            # The auth deny stays ahead of the keyword fall-through: an
+            # unauthorized sender gets the denial, not the session picker.
+            assert result is True
+            kw = mock_sel_inst.log_tool_invocation.call_args[1]
+            assert kw["outcome"] == "denied"
+            assert any(
+                "not authorized" in str(c).lower() for c in slack.post_message.call_args_list
+            )
+        finally:
+            handler.sel = orig_sel
+
+    @pytest.mark.asyncio
+    async def test_pinned_options_answer_sessions_still_delivered(self):
+        from kiro_crew.slack import handler
+
+        slack = _make_slack()
+        ds, slot = self._linked_ds()
+        with (
+            patch.object(handler, "_dashboard_state", ds),
+            patch.object(handler, "is_allowed_user", return_value=True),
+            patch("kiro_crew.dashboard.chat._run_chat", new_callable=AsyncMock),
+        ):
+            result = await handler.maybe_route_linked_thread(
+                "sessions",
+                "slack:t1",
+                "U1",
+                "C1",
+                slack,
+                "t1",
+                target_slot=slot,
+                route_pinned=True,
+            )
+        # A pinned OPTIONS answer whose label text is exactly "sessions" is a
+        # DELIVERY to the conversation that asked the question — it must reach
+        # the pinned slot, not be swallowed by the keyword fall-through.
+        assert result is True
+        slot.append.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_handle_message_reaches_sessions_command_when_linked(self):
+        from kiro_crew.slack import handler
+
+        slack = _make_slack()
+        ds, slot = self._linked_ds()
+        mock_sel_inst = MagicMock()
+        orig_sel = handler.sel
+        handler.sel = lambda: mock_sel_inst
+        try:
+            with (
+                patch.object(handler, "_dashboard_state", ds),
+                patch.object(handler, "is_allowed_user", return_value=True),
+                patch.object(handler, "is_owner", return_value=True),
+                patch.object(
+                    handler, "_handle_sessions_command", new_callable=AsyncMock
+                ) as mock_cmd,
+            ):
+                await handler.handle_message(
+                    slack,
+                    MagicMock(),
+                    "C1",
+                    "sessions",
+                    "t1",
+                    "msg1",
+                    "U1",
+                )
+            # End to end: the keyword wins over the linked DM — the native
+            # session picker path runs and the slot gets no user row.
+            mock_cmd.assert_awaited_once()
+            slot.append.assert_not_called()
         finally:
             handler.sel = orig_sel

@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
+from body_stream_helpers import BodyStreamPayload
 
 LINKED_KEY = "slack:1730000000.123456"
 
@@ -33,6 +34,13 @@ class _FakeSlot:
         # is also what a slot rehydrated from disk answers.
         self._active_turn_session_key = ""
         self._stop_state = "idle"
+        # Mirrors the real slot's monotonic stop-initiation counter. The real
+        # `_stop_state` setter bumps it on every idle -> active edge; this fake
+        # has a plain attribute, so the counter never moves. That is the
+        # correct model here: every consumer compares it against a value
+        # captured after the claim (or at resolver creation) within one press,
+        # and those equalities hold identically at any constant.
+        self._stop_generation = 0
         self._stop_event_id = None
         self._stop_escalated_card_id = None
         self._queue: list[dict] = []
@@ -44,6 +52,21 @@ class _FakeSlot:
         self.linked_session_key = linked
         self.messages: list[dict] = []
         self.source_links_invalidated = 0
+        #: Remote-execution binding. "local" here so these tests exercise the
+        #: LOCAL stop path; ``stop_slot_turn`` reads it to decide whether the
+        #: stop has to travel to a peer crew instead. Spelled out rather than
+        #: left absent because a missing marker would have to be defaulted with
+        #: ``getattr``, and that default would send a real slot whose binding is
+        #: half-present down the local path — the exact failure the binding
+        #: exists to prevent.
+        self.executor = "local"
+        self.instance_id = ""
+        self.remote_slot = ""
+
+    @property
+    def is_remote(self) -> bool:
+        """Mirror ``_ChatSlot.is_remote``: the WHOLE binding, or not remote."""
+        return bool(self.executor == "remote" and self.instance_id and self.remote_slot)
 
     def append(self, role, content, cls_meta):
         self.messages.append({"role": role, "content": content, "cls": cls_meta})
@@ -68,14 +91,20 @@ class _FakeState:
         return 0
 
 
-def _request(state, query=None, caller_app=""):
+def _request(state, query=None, caller_app="", raw: bytes = b""):
     app = web.Application()
     app["state"] = state
     request = MagicMock()
     request.app = app
     request.match_info = {"slot": "test-slot"}
     request.query = query or {}
-    request.json = AsyncMock(return_value={})
+    # The bounded body read consumes these instead of ``request.json``. An
+    # empty ``raw`` reads as "no body sent", which the allow_absent handlers
+    # default to an empty object.
+    request.content = BodyStreamPayload(raw)
+    request.content_length = len(raw)
+    request.can_read_body = bool(raw)
+    request.charset = None
     # The auth middleware stashes the calling app's name here; a dashboard user
     # leaves it absent, which `request.get("app", "")` reads as "".
     request.get = lambda key, default="": caller_app if key == "app" else default
@@ -441,7 +470,7 @@ class TestTheRunningTurnOwnsTheTarget:
 
     @pytest.mark.asyncio
     async def test_a_turn_that_started_on_the_link_is_still_stopped_there(self):
-        """The #2462 fix, restated on the stronger rule.
+        """A turn that started on the link is still stopped there.
 
         A channel-born slot is bound before its turn starts, so the turn's own
         identity IS the channel session — the cancel reaches it because that is
@@ -524,16 +553,18 @@ class TestTheAuthorizedSessionCannotMoveMidFlight:
         slot = _FakeSlot(app="auto-research")
         slot._queue.append({"queue_id": "q1", "content": "next"})
         state = _FakeState(slot)
-        request = _request(state, caller_app="auto-research")
-        request.content_length = 2
+        request = _request(state, caller_app="auto-research", raw=b"{}")
 
-        async def _bind_then_return_body():
-            # Stands in for the concurrent to-chat handler resuming inside this
-            # await; it only assigns the field, exactly as that handler does.
-            slot.linked_session_key = "cron:nightly-report"
-            return {}
+        class _BindingPayload(BodyStreamPayload):
+            # Stands in for the concurrent to-chat handler resuming inside the
+            # awaited body read; it only assigns the field, exactly as that
+            # handler does.
+            async def iter_chunked(self, n: int):
+                slot.linked_session_key = "cron:nightly-report"
+                async for chunk in super().iter_chunked(n):
+                    yield chunk
 
-        request.json = _bind_then_return_body
+        request.content = _BindingPayload(b"{}")
         with patch("kiro_crew.dashboard.chat_handlers.sel") as mock_sel:
             mock_sel.return_value.log_tool_invocation = MagicMock()
             mock_sel.return_value.log = MagicMock()

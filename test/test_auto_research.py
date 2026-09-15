@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import time
 from pathlib import Path
@@ -105,7 +106,7 @@ class TestValidation:
         assert r["can_start"]
 
     def test_sources_optional(self):
-        # Sources are no longer collected/required — the agent decides what to fetch.
+        # Sources are not collected or required — the agent decides what to fetch.
         r = validate_campaign({"question": "A valid research question here ok", "sources": []})
         assert r["can_start"]
 
@@ -214,7 +215,7 @@ class TestValidation:
         )
         assert not r["can_start"]
         assert any("too long" in e for e in r["errors"])
-        # And the normalizer no longer slices: it returns the trimmed input.
+        # The normalizer does not slice: it returns the trimmed input.
         assert _campaign_model({"model": f"  {long_id}  "}) == long_id
 
 
@@ -1298,6 +1299,7 @@ class TestHTTPHandlers:
             slot_key = f"research-{cid}"
             slot = SimpleNamespace(key=slot_key)
             state.get_or_create_slot.return_value = slot
+            state.get_slot.return_value = slot
             old_loop = await svc.add(slot_key=slot_key, message="old run", idle_secs=60)
             await svc.update(
                 old_loop.id,
@@ -2188,6 +2190,91 @@ class TestResearchAgentInstall:
         assert data["name"] == "kirocrew-research"
         assert "research" in data["prompt"].lower()
 
+    @staticmethod
+    def _floor_builtins() -> set[str]:
+        """The builtins whose always-on gate floor forbids a blanket grant.
+
+        Derived from the governance maps rather than hardcoding the four names,
+        so the assertion keeps holding if the template (or the map) changes.
+        """
+        from kiro_crew.platform.governance import _FLOOR_GATE_SCOPES, BUILTIN_TOOL_SCOPES
+
+        return {
+            name
+            for name, scopes in BUILTIN_TOOL_SCOPES.items()
+            if _FLOOR_GATE_SCOPES.intersection(scopes)
+        }
+
+    def _install_real(self, monkeypatch, tmp_path) -> dict:
+        """Install with the REAL build_agent_config — the fix under test lives
+        inside it, so stubbing it (as the identity test above does) would
+        bypass exactly the path under test."""
+        from kiro_crew import agent
+
+        monkeypatch.setattr(agent, "KIRO_AGENTS_DIR", tmp_path)
+        agent._install_research_agent()
+        return json.loads((tmp_path / "kirocrew-research.json").read_text(encoding="utf-8"))
+
+    def test_no_floor_scoped_builtin_is_blanket_approved(self, monkeypatch, tmp_path):
+        """The installed research spec must not auto-approve a floor builtin.
+
+        The shipped template's ``allowedTools`` starts with floor-gated
+        builtins (``fs_read``, ``code``, …). ``code`` is the consequential one:
+        auto-approved, its calls never reach ``hooks.on_tool_call``, so the
+        sensitive-path check, the write-protected-config check, the governance
+        ceiling and the SEL deny record are all skipped — for the least
+        supervised agent in the product.
+        """
+        data = self._install_real(monkeypatch, tmp_path)
+        leaked = self._floor_builtins().intersection(data.get("allowedTools", []))
+        assert not leaked, f"floor-gated builtins on the blanket auto-approve list: {leaked}"
+
+    def test_floor_builtins_stay_mounted(self, monkeypatch, tmp_path):
+        """The regression guard proving capability was not removed.
+
+        The withhold removes the BLANKET grant only: the tool stays in
+        ``tools`` (mounted), and read-only file tools still auto-approve via
+        hooks AFTER the floor runs — so a stock install gains no new prompt
+        and the unattended research loop is not handed a stall.
+        """
+        from kiro_crew import agent
+
+        data = self._install_real(monkeypatch, tmp_path)
+        shipped_tools = set(agent.get_shipped_tools()["tools"])
+        expected_mounted = self._floor_builtins().intersection(shipped_tools)
+        assert expected_mounted, "template stopped mounting floor builtins; test needs updating"
+        missing = expected_mounted - set(data.get("tools", []))
+        assert not missing, f"filter must not unmount tools, only ungrant them: {missing}"
+
+    def test_withhold_leaves_the_standard_sel_record(self, monkeypatch, tmp_path):
+        """Withholding is a permission DECISION — same event, same feed as the
+        other ``allowedTools`` writers (``mcp_auto_approve_withheld``)."""
+        from kiro_crew import agent
+
+        events: list[dict] = []
+        monkeypatch.setattr(
+            agent,
+            "sel",
+            lambda: SimpleNamespace(log_api_access=lambda **kw: events.append(kw)),
+        )
+        self._install_real(monkeypatch, tmp_path)
+        withheld = [e for e in events if e.get("operation") == "mcp_auto_approve_withheld"]
+        assert withheld, "the floor withhold must leave a SEL record"
+        # The record names what lost its grant, so an operator can explain a prompt.
+        assert any("code" in e.get("resources", "") for e in withheld)
+
+    def test_audit_failure_never_fails_the_install(self, monkeypatch, tmp_path):
+        """Best-effort audit: SEL being unavailable must not break the install."""
+        from kiro_crew import agent
+
+        def _broken_sel():
+            raise RuntimeError("SEL unavailable")
+
+        monkeypatch.setattr(agent, "sel", _broken_sel)
+        data = self._install_real(monkeypatch, tmp_path)
+        assert data["name"] == "kirocrew-research"
+        assert not self._floor_builtins().intersection(data.get("allowedTools", []))
+
 
 # --- Watchdog unresponsive grace ---
 
@@ -2396,6 +2483,68 @@ class TestWatchdogStopTombstone:
         svc.stop()
 
     @pytest.mark.asyncio
+    async def test_settlement_failure_is_logged_without_replacing_cancellation(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The watchdog reports a settlement failure it swallowed during shutdown.
+
+        The shield-and-settle discipline deliberately lets the ORIGINAL
+        cancellation win over a worker failure; the failure's only remaining
+        trace is the watchdog's log record. Pin that record so folding the
+        inline settlement loop onto ``_settle_before_cancellation`` (or any
+        later refactor of it) cannot silently drop the reporting path.
+        """
+        from kiro_crew.apps.builtins.auto_research import handlers as h
+        from kiro_crew.autonudge import AutoNudgeService
+
+        cid = "a1b2c3d4"
+        svc = AutoNudgeService(base_dir=tmp_path)
+        await svc.start()
+        await svc.add(slot_key=f"research-{cid}", message="watch", idle_secs=60)
+        monkeypatch.setattr(h, "_autonudge_instance", lambda: svc)
+        monkeypatch.setattr(
+            h,
+            "_stalled_campaign_verdict",
+            lambda _cid, _files, *, stopped_reason="": (CampaignStatus.STOPPED, None),
+        )
+
+        status_write_started = threading.Event()
+        release_status_write = threading.Event()
+
+        def _persist(_cid, _status, **_kwargs):
+            status_write_started.set()
+            assert release_status_write.wait(timeout=5)
+            raise OSError("status store unavailable")
+
+        monkeypatch.setattr(h, "update_campaign_status", _persist)
+        monkeypatch.setattr(h, "_campaign_run_is_current", lambda _cid, _started: True)
+        task = asyncio.create_task(
+            h._settle_campaign_from_watchdog(
+                cid, [], {}, {}, observed_started_at=1.0
+            )
+        )
+        assert await asyncio.to_thread(status_write_started.wait, 5)
+
+        try:
+            task.cancel()
+            release_status_write.set()
+            with caplog.at_level(logging.ERROR, logger=h.__name__):
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=5)
+
+            failure_records = [
+                r
+                for r in caplog.records
+                if "terminal settlement failed during shutdown" in r.getMessage()
+            ]
+            assert failure_records, "the swallowed settlement failure must be logged"
+            assert failure_records[0].exc_info is not None, (
+                "the log record must carry the worker failure's traceback"
+            )
+        finally:
+            svc.stop()
+
+    @pytest.mark.asyncio
     async def test_partial_terminal_persistence_still_removes_durable_loop(
         self, _isolate: Path, monkeypatch
     ):
@@ -2586,7 +2735,11 @@ class TestWatchdogStopTombstone:
 
         assert removal_attempts == h._TERMINAL_LOOP_REMOVAL_ATTEMPTS
         assert get_campaign(cid)["status"] == CampaignStatus.STOPPED
-        assert svc.get_by_slot(f"research-{cid}") is None
+        retained = svc.get_by_slot(f"research-{cid}")
+        assert retained is not None
+        assert retained.id == loop.id
+        assert retained.active is False
+        assert retained.id not in svc._timers
         assert last_counts == {}
         assert last_ts == {}
         svc.stop()
@@ -3391,6 +3544,25 @@ class TestGrillSuggestedCycles:
         assert v["suggested_max_cycles"] == 4 + (4 + 2) // 3 + 1  # == 7
 
 
+def _install_fake_pool(app, pool) -> None:
+    """Replace the grill endpoint's LLM pool BEFORE the app starts.
+
+    The production ``on_startup`` hook builds a real ``LLMPool`` (which takes a
+    live-config subscription); hooks run in registration order, so this one
+    runs after it, shuts the real pool down and installs ``pool`` while the app
+    is still mutable. Writing ``app[...]`` once the test server has started is
+    deprecated by aiohttp and left the real pool's subscription alive.
+    """
+
+    async def _swap(app_) -> None:
+        real = app_.get("auto_research_llm_pool")
+        if real is not None:
+            await real.shutdown()
+        app_["auto_research_llm_pool"] = pool
+
+    app.on_startup.append(_swap)
+
+
 class TestGrillHTTP:
     @pytest.fixture
     def app(self, tmp_path: Path):
@@ -3429,8 +3601,8 @@ class TestGrillHTTP:
             async def shutdown(self) -> None:
                 pass
 
+        _install_fake_pool(app, _FakePool())
         async with TestClient(TestServer(app)) as c:
-            app["auto_research_llm_pool"] = _FakePool()
             r = await c.post(
                 "/api/apps/auto-research/grill/expand",
                 json={
@@ -3502,8 +3674,8 @@ class TestGrillHTTP:
             async def shutdown(self) -> None:
                 pass
 
+        _install_fake_pool(app, _FakePool())
         async with TestClient(TestServer(app)) as c:
-            app["auto_research_llm_pool"] = _FakePool()
             r = await c.post(
                 "/api/apps/auto-research/grill/expand",
                 json={

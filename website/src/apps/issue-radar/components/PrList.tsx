@@ -16,6 +16,7 @@ import PrBulkBar from './PrBulkBar'
 import { providerTerms } from '../lib/links'
 
 import { i18nT } from '../../../i18n/t'
+import ErrorNotice from '../../../components/ErrorNotice'
 /** Above this many rendered rows we skip the per-card enter/layout animation
  * (same rationale as IssueList — Framer's layout pass janks on large lists). */
 const ANIM_CAP = 200
@@ -216,7 +217,7 @@ export default function PrList({ resizing = false }: { resizing?: boolean }) {
                 {files > 0 && (
                   <span
                     className="inline-flex items-center gap-1"
-                    title={`${files} file${files === 1 ? '' : 's'} changed`}
+                    title={i18nT('apps.issueRadar.components.prList.file_changed', { count: files })}
                   >
                     <FileDiff size={11} />
                     {files}
@@ -271,7 +272,8 @@ export default function PrList({ resizing = false }: { resizing?: boolean }) {
             <ListSkeleton />
           </div>
         )}
-        {pullsError && <div className="px-4 py-2 text-[14px] text-danger">{pullsError.message}</div>}
+        {/* A list read; the search box above is a filter, not a draft. */}
+        <ErrorNotice message={pullsError?.message} askAgent className="mx-4 my-2" />
         {!pullsLoading && filteredPulls.length === 0 && (
           <div className="px-4 pb-2">
             <ListEmptyState searching={Boolean(prQuery.trim())} label={terms.changeRequestPluralTitle} />

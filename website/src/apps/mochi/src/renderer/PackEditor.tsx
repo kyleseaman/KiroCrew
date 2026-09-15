@@ -21,6 +21,7 @@ import { PackInfoHeader } from './PackInfoHeader'
 import { SaveDialog } from './SaveDialog'
 import { EditorFooter } from './EditorFooter'
 import { useSaveWithDialog } from './editorHooks'
+import { useMenuKeyboard } from '../../../../hooks/useMenuKeyboard'
 
 import { api } from '../mochiApi'
 import { i18nT } from '../../../../i18n/t'
@@ -211,16 +212,64 @@ function SlotPopover({ slotKey, slots, filled, anchorRect, onSelectFile, onUseSa
 }) {
   const popoverRef = useRef<HTMLDivElement>(null)
 
-  // Close on outside click
+  // The element focused when this popover MOUNTED — the slot thumbnail, when it
+  // was opened with Enter/Space. Captured during the first render on purpose:
+  // render runs before useMenuKeyboard's focus-entry effect moves focus onto the
+  // first row, so this is the last moment the opener is still `activeElement`.
+  // `undefined` is the "not yet captured" sentinel — `activeElement` itself can
+  // in principle be null, and using null for both would re-run the capture on a
+  // later render and latch a menu ROW as the opener.
+  const opener = useRef<Element | null | undefined>(undefined)
+  if (opener.current === undefined) opener.current = document.activeElement
+
+  // The menu keyboard contract this popover's role="menu" promises: arrows walk
+  // the rows and wrap, Home/End jump to the boundaries, Tab is contained (#6231).
+  // The popover only exists while open, so `enabled` is unconditionally true.
+  useMenuKeyboard({ enabled: true, containerRef: popoverRef })
+
+  // Every EXPLICIT dismissal — Escape, or activating a row — unmounts the row
+  // that currently holds focus, so the close has to hand focus back to the
+  // opener or `activeElement` falls to <body> and the keyboard user is stranded
+  // at the top of the document. Centralised here so no command path can forget
+  // it (a bare onClose() in one row is exactly how that regresses).
+  //
+  // Deliberately NOT used by the outside-mousedown dismissal: on a pointer
+  // dismissal the browser routes focus per the click target, and yanking it to
+  // the opener would steal focus from whatever the user just clicked. Same rule
+  // as MenuBtn/#2533.
+  //
+  // Row handlers keep their existing `action(); close` ordering — the restore is
+  // only added at close time. That stays correct for Select File, whose action
+  // opens a native file dialog: the dialog takes focus after the restore, and
+  // the opener is where focus should sit once the dialog is dismissed.
+  const closeToOpener = useCallback(() => {
+    onClose()
+    ;(opener.current as HTMLElement | null)?.focus?.()
+  }, [onClose])
+
+  // Close on outside click, or on Escape.
   useEffect(() => {
     const handler = (e: MouseEvent) => {
       if (popoverRef.current && !popoverRef.current.contains(e.target as Node)) {
         onClose()
       }
     }
+    // Escape is REQUIRED here, not a nicety: the shared contract contains Tab
+    // inside the menu (#2533), so without an explicit dismissal a keyboard user
+    // who opened this popover would be TRAPPED cycling its rows. Escape plus
+    // focus-restore-to-opener mirrors MenuBtn's posture (DevFleetPage), and the
+    // restore matters because the row that holds focus is about to unmount.
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      closeToOpener()
+    }
     document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [onClose])
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', handler)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [onClose, closeToOpener])
 
   // Find other slots that have content (for "use same as" dropdown)
   const filledOthers = ALL_SLOT_KEYS.filter(
@@ -246,9 +295,16 @@ function SlotPopover({ slotKey, slots, filled, anchorRect, onSelectFile, onUseSa
     // announces the buttons with no grouping, and the repo rule (rightly)
     // blocks a div that handles clicks but names no role. The onClick only
     // contains the event so the outside-click closer does not fire.
+    //
+    // `tabIndex={-1}` makes the container programmatically focusable without
+    // adding a stop in the tab order: role="menu" declares that focus is
+    // MANAGED here (useMenuKeyboard moves it onto the first row), and the rows
+    // are the tabbable surface.
+    // eslint-disable-next-line jsx-a11y/click-events-have-key-events -- the onClick is a propagation guard, not a command; every command in this menu is a <button role="menuitem"> child and the arrow/Home/End/Tab contract lives in useMenuKeyboard, so a keydown here would swallow keys it has nothing to activate with
     <div
       ref={popoverRef}
       role="menu"
+      tabIndex={-1}
       aria-label={slotLabel(slotKey)}
       style={popStyle}
       onClick={(e) => e.stopPropagation()}
@@ -258,7 +314,7 @@ function SlotPopover({ slotKey, slots, filled, anchorRect, onSelectFile, onUseSa
         role="menuitem"
         onMouseEnter={(e) => { (e.target as HTMLElement).style.background = 'var(--bg-input)' }}
         onMouseLeave={(e) => { (e.target as HTMLElement).style.background = 'transparent' }}
-        onClick={() => { onSelectFile(); onClose() }}
+        onClick={() => { onSelectFile(); closeToOpener() }}
       >
         <FolderOpen size={13} /> {i18nT('apps.mochi.editor.select_file')}
       </button>
@@ -274,7 +330,7 @@ function SlotPopover({ slotKey, slots, filled, anchorRect, onSelectFile, onUseSa
               role="menuitem"
               onMouseEnter={(e) => { (e.target as HTMLElement).style.background = 'var(--bg-input)' }}
               onMouseLeave={(e) => { (e.target as HTMLElement).style.background = 'transparent' }}
-              onClick={() => { onUseSameAs(k); onClose() }}
+              onClick={() => { onUseSameAs(k); closeToOpener() }}
             >
               <CornerDownRight size={13} style={{ flexShrink: 0 }} /> {slotLabel(k)}
             </button>
@@ -290,7 +346,7 @@ function SlotPopover({ slotKey, slots, filled, anchorRect, onSelectFile, onUseSa
             role="menuitem"
             onMouseEnter={(e) => { (e.target as HTMLElement).style.background = 'var(--bg-input)' }}
             onMouseLeave={(e) => { (e.target as HTMLElement).style.background = 'transparent' }}
-            onClick={() => { onClear(); onClose() }}
+            onClick={() => { onClear(); closeToOpener() }}
           >
             <X size={12} style={{ marginRight: 4, verticalAlign: '-2px' }} />
             {i18nT('apps.mochi.editor.clear')}
@@ -356,8 +412,8 @@ export const PackEditor: React.FC<PackEditorProps> = ({ existingPack, onSave, on
           name: existingPack.name ?? '', author: existingPack.author ?? '',
           description: existingPack.description ?? '', flipX: false, slots: filled,
         })
-      } catch (err: any) {
-        setError(err?.message || i18nT('apps.mochi.errors.load_pack_data'))
+      } catch (err) {
+        setError((err instanceof Error ? err.message : '') || i18nT('apps.mochi.errors.load_pack_data'))
       }
     })()
     return () => { cancelled = true }
@@ -399,8 +455,8 @@ export const PackEditor: React.FC<PackEditorProps> = ({ existingPack, onSave, on
         ...prev,
         [key]: { content, filename, format },
       }))
-    } catch (err: any) {
-      setError(err?.message || i18nT('apps.mochi.errors.import_file'))
+    } catch (err) {
+      setError((err instanceof Error ? err.message : '') || i18nT('apps.mochi.errors.import_file'))
     }
     setLoadingSlot(null)
   }, [])
@@ -468,8 +524,8 @@ export const PackEditor: React.FC<PackEditorProps> = ({ existingPack, onSave, on
 
       const savedMeta: PackMeta = result?.value ?? result
       onSave(savedMeta)
-    } catch (err: any) {
-      setError(err?.message || i18nT('apps.mochi.errors.save'))
+    } catch (err) {
+      setError((err instanceof Error ? err.message : '') || i18nT('apps.mochi.errors.save'))
     }
     setSaving(false)
   }, [canSave, saving, slots, name, author, description, existingPack, onSave])

@@ -117,7 +117,7 @@ class TestChannelActivationRouting:
     async def test_group_channel_mention_mode_allows_thread_replies_with_session(self):
         """In mention mode, thread replies are processed if the bot has an active session."""
         orch = _make_orch()
-        # Simulate an existing session for this thread (bot was previously @mentioned)
+        # Simulate an existing session for this thread (bot already @mentioned in it)
         orch.sessions = MagicMock()
         # A bare MagicMock returns a truthy Mock for every accessor, so an
         # unconfigured is_busy would route this message down the mid-turn
@@ -365,8 +365,8 @@ class TestRouteMessageStop:
     async def test_stop_cancels_active_task_and_cleans_up(self):
         """!stop in _route_message cancels the asyncio task and cleans _session_tasks."""
         orch = _make_orch()
-        orch.sessions = AsyncMock()
-        orch.sessions.has_session.return_value = True
+        orch.sessions = MagicMock()
+        orch.sessions.has_session = MagicMock(return_value=True)
         orch.sessions.stop_turn = AsyncMock(return_value="soft")
         orch.sessions.enqueue = MagicMock(return_value=False)
         orch.sessions.dequeue = MagicMock(return_value=None)
@@ -410,8 +410,8 @@ class TestRouteMessageStop:
     async def test_stop_bypasses_semaphore(self):
         """!stop is handled before handle_message — never enters the semaphore path."""
         orch = _make_orch()
-        orch.sessions = AsyncMock()
-        orch.sessions.has_session.return_value = True
+        orch.sessions = MagicMock()
+        orch.sessions.has_session = MagicMock(return_value=True)
         orch.sessions.stop_turn = AsyncMock(return_value="soft")
         orch.sessions.enqueue = MagicMock(return_value=False)
         orch.sessions.dequeue = MagicMock(return_value=None)

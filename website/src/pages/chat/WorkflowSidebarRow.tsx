@@ -14,8 +14,10 @@ import { sanitizeLlmOutput } from '../../utils/sanitize'
 import WorkflowRunTree from '../../apps/workflows/WorkflowRunTree'
 import WorkflowSourcePanel from '../../apps/workflows/WorkflowSourcePanel'
 import { useRunSnapshot } from '../../apps/workflows/useRunSnapshot'
+import ErrorNotice from '../../components/ErrorNotice'
 
 import { i18nT } from '../../i18n/t'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 export interface WfRunRow {
   run_id: string
   name?: string
@@ -29,6 +31,7 @@ export interface WfRunRow {
 }
 
 const WorkflowSidebarRow = memo(function WorkflowSidebarRow({ row }: { row: WfRunRow }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [expanded, setExpanded] = useState(false)
   const { snapshot, error: snapshotError } = useRunSnapshot(row.run_id, {
     enabled: expanded,
@@ -53,7 +56,7 @@ const WorkflowSidebarRow = memo(function WorkflowSidebarRow({ row }: { row: WfRu
           ) : row.status === 'finished' ? (
             <CheckCircle size={13} className="text-green-500 shrink-0" />
           ) : (
-            <AlertCircle size={13} className="text-red-500 shrink-0" />
+            <AlertCircle size={13} className="text-danger shrink-0" />
           )}
           <Workflow size={11} className="text-accent/70 shrink-0" />
           <span className="font-medium truncate">{name}</span>
@@ -78,18 +81,26 @@ const WorkflowSidebarRow = memo(function WorkflowSidebarRow({ row }: { row: WfRu
             {lastLog}
           </div>
         )}
-        {!expanded && row.status === 'failed' && errMsg && (
-          <div className="text-[11px] text-red-500 mt-0.5 truncate">{errMsg}</div>
-        )}
       </button>
+      {/* Outside the toggle button, not inside it as the plain red line was:
+          the notice carries its own hand-off button, and a button inside a
+          button is invalid markup. askAgent on — an Activity side-panel status
+          row, nothing here is a draft. */}
+      {!expanded && row.status === 'failed' && errMsg && (
+        <div className="px-3 pb-2">
+          <ErrorNotice variant="inline" message={errMsg} askAgent testId="workflow-row-error" />
+        </div>
+      )}
 
       {expanded && (
         <div className="px-3 pb-2 pt-1 border-t border-border flex flex-col gap-2">
-          {snapshotError && (
-            <div className="text-[11px] text-red-500 border border-red-500/30 rounded p-2">
-              {i18nT('pages.chat.workflowSidebarRow.could_not_load_snapshot')} {sanitizeLlmOutput(snapshotError).slice(0, 200)}
-            </div>
-          )}
+          {/* The label is the `title` and the backend reason the `message`, so
+              the reason stays the journal lookup key for the hand-off. */}
+          <ErrorNotice
+            title={i18nT('pages.chat.workflowSidebarRow.could_not_load_snapshot')}
+            message={snapshotError ? sanitizeLlmOutput(snapshotError).slice(0, 200) : null}
+            askAgent
+          />
           <WorkflowRunTree
             events={snapshot?.events ?? []}
             status={
@@ -98,6 +109,7 @@ const WorkflowSidebarRow = memo(function WorkflowSidebarRow({ row }: { row: WfRu
             }
             result={snapshot?.result}
             error={snapshot?.error ?? row.error ?? null}
+            errorCode={snapshot?.error_code}
           />
           <WorkflowSourcePanel
             run_id={row.run_id}

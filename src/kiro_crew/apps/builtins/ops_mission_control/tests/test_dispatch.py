@@ -11,6 +11,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 class _HomeIsolated(unittest.IsolatedAsyncioTestCase):
@@ -107,11 +108,11 @@ class TestCycleSilence(_HomeIsolated):
     async def test_a_resolved_alarm_refiring_is_claimed_through_run_cycle(self):
         """The recurrence fix, asserted through the FULL cycle rather than `store.claim`.
 
-        `store.claim` learned that a terminal incident no longer owns its signal, and 408
-        unit tests passed — but `run_cycle` has its own cheap pre-filter that computed
-        `owned` from every non-stale incident, so it discarded the recurrence *before*
-        `claim` ever saw it. The app still permanently stopped responding to any failure it
-        had already handled once, and the compounding-memory fast path stayed unreachable.
+        `store.claim` knows a terminal incident does not own its signal, but `run_cycle`
+        has its own cheap pre-filter: computing `owned` from every non-stale incident
+        discards the recurrence *before* `claim` ever sees it, so the app permanently stops
+        responding to any failure it has already handled once and the compounding-memory
+        fast path is unreachable.
 
         Caught only by driving a real gateway: inject → resolve → re-inject reported
         `polled=1, claimed=0`. Two places encoded the same ownership rule and fixing one
@@ -578,15 +579,15 @@ class TestBrief(_HomeIsolated):
     async def test_brief_always_states_it_has_no_credentials(self):
         """The no-evidence brief is the case that MOST needs the warning.
 
-        Regression test for an observed live failure. The statement used to live only
-        inside the ``if claimed.evidence`` branch, so an incident with nothing gathered
-        — an unconfigured evidence source, a provider outage, a source that returned
-        empty — handed the agent an AWS alarm and no explanation. Two real sessions
-        (INV-1, INV-2) then spent their entire turn re-running ``aws … --profile …``,
-        collecting NoCredentials each time, and produced no diagnosis.
+        The statement belongs outside the ``if claimed.evidence`` branch: an incident with
+        nothing gathered — an unconfigured evidence source, a provider outage, a source
+        that returned empty — otherwise gets an AWS alarm and no explanation, and real
+        sessions (INV-1, INV-2) then spend their entire turn re-running
+        ``aws … --profile …``, collecting NoCredentials each time, and produce no
+        diagnosis.
 
-        Asserted with evidence EMPTY on purpose: with evidence present the old code
-        passed too, which is exactly why the gap survived.
+        Asserted with evidence EMPTY on purpose: a branch-scoped statement passes with
+        evidence present, which is exactly how the gap hides.
         """
         from kiro_crew.apps.builtins.ops_mission_control.backend import dispatch
 
@@ -658,7 +659,7 @@ class TestBrief(_HomeIsolated):
                 trust=TRUST_VERIFIED,
             )
         )
-        # Verified and high is no longer sufficient on its own: the entry needs a track
+        # Verified and high is not sufficient on its own: the entry needs a track
         # record too. The claim under test supplies the last use itself.
         for _ in range(ledger.MIN_USES_FOR_FAST_PATH - 1):
             ledger.record_use(entry.entry_id)
@@ -957,8 +958,8 @@ class TestPostActionVerification(_HomeIsolated):
         """`changed` gates the cron's silence, so what counts as news is load-bearing.
 
         A confirmed action is the expected outcome and announcing it would make the
-        heartbeat congratulate itself. A still-firing one means the app previously
-        reported something as applied that was not — the most newsworthy thing a cycle
+        heartbeat congratulate itself. A still-firing one means the app reported
+        something as applied that was not — the most newsworthy thing a cycle
         can find.
         """
         from kiro_crew.apps.builtins.ops_mission_control.backend.dispatch import CycleResult
@@ -1081,13 +1082,13 @@ if __name__ == "__main__":
 
 
 class TestEveryInstancePullsTheSchedule(_HomeIsolated):
-    """`rotation.yaml` travels in the ledger repo, and only the primary used to fetch it.
+    """`rotation.yaml` travels in the ledger repo, so EVERY instance has to fetch it.
 
     `sync_safely`'s only other caller is the daily hygiene pass, which is gated to the
-    primary instance. So a NON-primary instance had no code path that ever fetched the
-    schedule: it kept arming (or not) off whatever it last saw. That is the double-claim
-    the single-owner model exists to prevent, reintroduced by the transport rather than
-    by the model.
+    primary instance. Without a fetch of its own, a NON-primary instance has no code path
+    that ever reads the schedule: it keeps arming (or not) off whatever it last saw. That
+    is the double-claim the single-owner model exists to prevent, arriving through the
+    transport rather than the model.
     """
 
     async def test_the_cycle_pulls_before_it_reads_the_shift(self):
@@ -1381,3 +1382,239 @@ class TestOwnedRedeliveriesLeaveTheSpool(_HomeIsolated):
         claimed_ids = {c.incident.signal.id for c in result.claimed}
         self.assertIn("webhook:alert/2", claimed_ids)
         self.assertEqual(webhook.queue_depth(), 0)
+
+
+class TestAMaintenancePassCannotCostTheCycle(_HomeIsolated):
+    """``run_cycle`` is ordered so that a LATER fault costs no EARLIER step.
+
+    Its own comments say so at three points: the shared-repo pull is "never fatal",
+    the Slack mirror runs "after the claim, so a Slack outage can never cost us a
+    claim", and the notification bus runs after both "so a bus fault can cost
+    neither".
+
+    The strict for-update index read makes ``expire_stale_proposals`` and
+    ``sweep_stale`` RAISE on an unreadable index rather than degrade to a silent
+    no-op. Both are maintenance passes that rerun on every heartbeat, and
+    both abandon their write before touching the file — so the durable state is
+    already safe and the cycle must log and carry on. Letting them escape would
+    make one transient EACCES cost this cycle's claims, the Slack mirror, the
+    notifications and the SEL entry, which inverts the rule above. The expiry is
+    the worse of the two because it runs near the TOP of the cycle, so it would
+    cost everything below it. Found in review (Design Review, Fable 5).
+
+    The CLAIM path still RAISES out of `store.claim` -- a compare-and-set has no safe
+    degraded answer -- but `run_cycle` catches it and stops claiming, because the
+    pre-filter above the loop reads the index leniently. An unreadable index therefore
+    empties `owned`, every firing signal becomes a candidate, and the claim raises
+    BEFORE the sweep guard below it, which made that guard unreachable on any install
+    with something firing. Found in review (Design Review, Fable 5), which also noted
+    that the stub-based tests below could not have caught it -- hence the two
+    end-to-end cycle tests at the end of this class.
+    """
+
+    @staticmethod
+    def _refusing_index(*_a, **_kw):
+        raise PermissionError(13, "Permission denied")
+
+    def _index_reads_fail(self, *, only_once_claimed: bool = False):
+        """Make the index file's read fail, as a transient EACCES would.
+
+        Scoped to that one path so home resolution, the lock sidecar and the
+        per-incident logs still work -- a blanket failure would abort the cycle
+        somewhere else and the test would pass for the wrong reason.
+
+        ``only_once_claimed`` arms the fault the moment the index actually HOLDS an
+        incident, rather than after a fixed number of reads. That keeps the test
+        anchored to the state that matters -- "there is now something to lose" -- and
+        independent of how many times a cycle happens to read the file, which varies
+        with the maintenance passes and is not what either test is about.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import store
+
+        target = store.index_path()
+        real_read_text = Path.read_text
+
+        def _guarded(path_self, *args, **kwargs):
+            if Path(path_self) != target:
+                return real_read_text(path_self, *args, **kwargs)
+            if not only_once_claimed:
+                raise PermissionError(13, "Permission denied")
+            text = real_read_text(path_self, *args, **kwargs)
+            if "INV-" in text:
+                raise PermissionError(13, "Permission denied")
+            return text
+
+        return mock.patch.object(Path, "read_text", _guarded)
+
+    async def test_a_failed_proposal_expiry_does_not_cost_the_claim(self):
+        """The expiry runs before the poll, so escaping it costs the whole cycle."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import dispatch, store
+
+        self._add_source([self._signal(title="live one")])
+
+        with mock.patch.object(store, "expire_stale_proposals", self._refusing_index):
+            result = await dispatch.run_cycle()
+
+        self.assertEqual(len(result.claimed), 1, "a failed proposal expiry cost the claim")
+        self.assertEqual(result.claimed[0].incident.signal.title, "live one")
+        self.assertEqual(result.polled, 1)
+
+    async def test_a_failed_stale_sweep_does_not_cost_the_claim(self):
+        """The sweep runs immediately before the Slack mirror and the SEL entry."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import dispatch, store
+
+        self._add_source([self._signal(title="live one")])
+
+        with mock.patch.object(store, "sweep_stale", self._refusing_index):
+            result = await dispatch.run_cycle()
+
+        self.assertEqual(len(result.claimed), 1, "a failed stale sweep cost the claim")
+        self.assertEqual(result.released, [], "an abandoned sweep must release nothing")
+
+    async def test_both_failing_together_still_leaves_a_usable_cycle(self):
+        """One unreadable index fails both passes at once — the realistic case."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import dispatch, store
+
+        self._add_source([self._signal(title="live one")])
+
+        with mock.patch.object(store, "expire_stale_proposals", self._refusing_index):
+            with mock.patch.object(store, "sweep_stale", self._refusing_index):
+                result = await dispatch.run_cycle()
+
+        self.assertEqual(len(result.claimed), 1)
+        self.assertEqual(result.released, [])
+        self.assertEqual(result.skipped_reason, "", "the cycle reported itself as skipped")
+
+    # -- end-to-end: a real cycle against a real unreadable index -------------
+    #
+    # The three tests above stub `store.expire_stale_proposals` / `store.sweep_stale`
+    # directly, which proves the guards work but NOT that they are reachable. They are
+    # not, on the path that matters: the claim loop raises first. These two drive
+    # `run_cycle` with a firing candidate and a genuinely unreadable index instead.
+
+    async def test_an_unreadable_index_does_not_abort_the_whole_cycle(self):
+        """The cycle must reach its end and report, not escape as an exception.
+
+        Before the claim-loop guard this raised `PermissionError` out of `run_cycle`,
+        taking the webhook ack, the Slack pin mirror, the notification bus and the SEL
+        entry with it -- on every heartbeat for as long as the index stayed unreadable.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import dispatch
+
+        self._add_source([self._signal(native_id="alarm/one", title="one")])
+
+        # Unreadable from the pre-filter onward: the persistent case.
+        with self._index_reads_fail():
+            result = await dispatch.run_cycle()
+
+        self.assertEqual(result.polled, 1, "the cycle must still report what it polled")
+        self.assertEqual(result.claimed, [], "nothing could be claimed against a failed read")
+
+    async def test_a_claim_already_made_this_cycle_is_not_lost(self):
+        """The transient case, which is the worse one.
+
+        A signal claimed before the failure is durably on disk. If the loop escapes, that
+        incident is never mirrored to Slack, never notified and never audited -- an
+        in-flight investigation the team is never told about. The cycle must carry the
+        claims it did make through to the end.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import dispatch
+
+        self._add_source(
+            [
+                self._signal(native_id="alarm/one", title="one"),
+                self._signal(native_id="alarm/two", title="two"),
+            ]
+        )
+
+        # Armed the moment the index actually holds an incident, so the first claim
+        # genuinely lands and the second one meets the fault.
+        with self._index_reads_fail(only_once_claimed=True):
+            result = await dispatch.run_cycle()
+
+        self.assertEqual(
+            [c.incident.signal.title for c in result.claimed],
+            ["one"],
+            "the claim made before the failure was dropped from the cycle result",
+        )
+        self.assertEqual(result.polled, 2)
+
+    async def test_a_failed_verification_write_does_not_cost_the_cycle(self):
+        """The narrow race GPT named: snapshot succeeds, the write's read fails.
+
+        `verify_pending_actions` iterates the LENIENT `store.read_index()`, so a fully
+        unreadable index shows it no incidents and it never reaches the write at all. The
+        reachable window is the transient one -- the snapshot read succeeds, then
+        `update_fields`' own for-update read fails -- which is what stubbing the write to
+        raise reproduces exactly. Its `except` already tolerated the two race cases
+        (`KeyError`/`ValueError`, "pruned or raced away"); `OSError` now joins them,
+        because a store that REFUSED to publish over a failed read must not thereby become
+        the one thing that aborts a heartbeat. Found in review (GPT 5.6).
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import dispatch, store
+        from kiro_crew.apps.builtins.ops_mission_control.backend.models import (
+            MODE_ACT,
+            VERIFY_PENDING,
+        )
+
+        signal = self._signal(native_id="alarm/acted", title="acted on")
+        incident = store.claim(signal, operating_mode=MODE_ACT)
+        assert incident is not None
+        store.update_fields(
+            incident.incident_id,
+            last_action="silence",
+            last_action_at="2020-01-01T00:00:00Z",
+            verify_after="2020-01-01T00:00:00Z",
+            verification=VERIFY_PENDING,
+        )
+        self._add_source([signal])
+
+        with mock.patch.object(store, "update_fields", self._refusing_index):
+            result = await dispatch.run_cycle()
+
+        self.assertEqual(result.polled, 1, "a refused verification write aborted the cycle")
+        # The verdict was reached but could not be persisted; the next pass redoes it.
+        stored = store.get_incident(incident.incident_id)
+        assert stored is not None
+        self.assertEqual(stored.verification, VERIFY_PENDING)
+
+    async def test_a_corrupt_index_is_not_swallowed_by_the_verification_tolerance(self):
+        """Corruption must escape where an unreadable index is tolerated.
+
+        The clause above tolerates `KeyError`/`ValueError` (raced away) and `OSError`
+        (transient). `JSONDecodeError` subclasses `ValueError`, so without an explicit
+        clause it would take that tolerance by accident and a corrupt index would be
+        filed under a debug log written for a pruned incident. It must not be: an
+        unreadable index is transient and the next heartbeat retries, while a corrupt
+        one fails identically forever until a person intervenes -- so swallowing it
+        degrades the app indefinitely while the board still renders.
+
+        Stubbed for the same reason as the `OSError` sibling: `verify_pending_actions`
+        iterates the LENIENT `read_index`, which answers empty on a corrupt file, so
+        the reachable window is the transient one where the snapshot parses and the
+        write's own read meets the corruption.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import dispatch, store
+        from kiro_crew.apps.builtins.ops_mission_control.backend.models import (
+            MODE_ACT,
+            VERIFY_PENDING,
+        )
+
+        signal = self._signal(native_id="alarm/corrupt", title="corrupt case")
+        incident = store.claim(signal, operating_mode=MODE_ACT)
+        assert incident is not None
+        store.update_fields(
+            incident.incident_id,
+            last_action="silence",
+            last_action_at="2020-01-01T00:00:00Z",
+            verify_after="2020-01-01T00:00:00Z",
+            verification=VERIFY_PENDING,
+        )
+        self._add_source([signal])
+
+        def _corrupt(*_a, **_kw):
+            raise json.JSONDecodeError("Expecting value", "{ not json", 2)
+
+        with mock.patch.object(store, "update_fields", _corrupt):
+            with self.assertRaises(json.JSONDecodeError):
+                await dispatch.run_cycle()

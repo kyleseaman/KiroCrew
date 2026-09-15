@@ -2,9 +2,25 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+import sys
+from unittest.mock import MagicMock, patch
 
+import pytest
+
+from conftest import forget_env_at_teardown
+from kiro_crew import _ssl_compat
 from kiro_crew._ssl_compat import _CA_CANDIDATES, _ensure_ssl_certs
+
+
+@pytest.fixture(autouse=True)
+def _reset_ssl_bootstrap(monkeypatch):
+    """Keep tests independent and file-bootstrap cases platform-neutral."""
+    monkeypatch.setattr(_ssl_compat, "_TRUSTSTORE_INJECTED", False)
+    monkeypatch.setattr(sys, "platform", "linux")
+    # _ensure_ssl_certs() WRITES these two variables. A plain delenv(raising=False)
+    # on a key that is absent records no undo, so the value the code exports would
+    # outlive the test and pre-empt every later bootstrap on this worker.
+    forget_env_at_teardown(monkeypatch, "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE")
 
 
 class TestEnsureSslCerts:
@@ -133,6 +149,70 @@ class TestEnsureSslCerts:
         assert os.environ["SSL_CERT_FILE"] == str(fake_certifi_bundle)
         assert os.environ["REQUESTS_CA_BUNDLE"] == str(fake_certifi_bundle)
 
+    def test_win32_exports_nothing_even_when_a_bundle_is_discoverable(self, monkeypatch, tmp_path):
+        """win32 must export NEITHER variable, however findable a bundle is.
+
+        The mirror of ``test_falls_back_to_certifi_when_no_system_path_exists``:
+        identical setup, only the platform differs, opposite outcome.  Every
+        bundle discovery below the guard is made to succeed -- a candidate path
+        exists AND certifi resolves -- so this pins that the return sits ABOVE
+        the discovery block rather than merely that certifi is not reached.  A
+        future edit that moves the guard down, or adds a Windows-shaped path to
+        ``_CA_CANDIDATES``, fails here.
+
+        Why nothing may be exported: for ``rustls-native-certs``, which the
+        kiro-cli child uses, ``SSL_CERT_FILE`` REPLACES the platform store
+        rather than adding to it, and anything discovered here is a
+        public-roots-only bundle.  Exporting one therefore SUBTRACTS every
+        private CA the Windows ROOT store holds, breaking the child on any host
+        behind TLS inspection while this process -- CPython reads the variable
+        additively -- keeps working and hides it.
+        """
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+        monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising=False)
+
+        mock_paths = type("P", (), {"cafile": None, "capath": None})()
+
+        existing_candidate = tmp_path / "ca-bundle.crt"
+        existing_candidate.write_text("fake cert bundle")
+
+        fake_certifi_bundle = tmp_path / "certifi-cacert.pem"
+        fake_certifi_bundle.write_text("fake certifi bundle")
+        mock_certifi = type("M", (), {"where": staticmethod(lambda: str(fake_certifi_bundle))})()
+
+        with (
+            patch("ssl.get_default_verify_paths", return_value=mock_paths),
+            patch("kiro_crew._ssl_compat._CA_CANDIDATES", (str(existing_candidate),)),
+            patch.dict("sys.modules", {"certifi": mock_certifi}),
+        ):
+            _ensure_ssl_certs()
+
+        import os
+
+        assert os.environ.get("SSL_CERT_FILE") is None
+        assert os.environ.get("REQUESTS_CA_BUNDLE") is None
+
+    def test_win32_still_honours_an_explicit_ssl_cert_file(self, monkeypatch):
+        """An operator's own bundle outranks the win32 guard and survives it.
+
+        The guard is placed BELOW the explicit-override check on purpose:
+        exporting a public-roots bundle is what breaks the child, but an
+        operator naming their own bundle is the supported way to add a private
+        CA on a host whose store this process cannot read.  That escape hatch is
+        the current workaround for affected users, so it must not regress.
+        """
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setenv("SSL_CERT_FILE", r"C:\corp\ca-bundle.pem")
+        monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising=False)
+
+        _ensure_ssl_certs()
+
+        import os
+
+        assert os.environ["SSL_CERT_FILE"] == r"C:\corp\ca-bundle.pem"
+        assert os.environ.get("REQUESTS_CA_BUNDLE") is None
+
     def test_cafile_missing_on_disk_falls_through(self, monkeypatch, tmp_path):
         """If cafile is set but the file doesn't exist, should fall through to candidates."""
         monkeypatch.delenv("SSL_CERT_FILE", raising=False)
@@ -173,3 +253,156 @@ class TestEnsureSslCerts:
 
             importlib.reload(kiro_crew.cli)
         mock_fn.assert_called()
+
+    def test_macos_injects_system_trust(self, monkeypatch, tmp_path):
+        """macOS should delegate TLS validation to Security.framework."""
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+        inject = MagicMock()
+        mock_truststore = type("Truststore", (), {"inject_into_ssl": inject})()
+        ca_file = tmp_path / "system-ca.pem"
+        ca_file.write_text("fake cert bundle")
+        mock_paths = type("P", (), {"cafile": str(ca_file), "capath": None})()
+
+        with (
+            patch.object(_ssl_compat, "truststore", mock_truststore),
+            patch("ssl.get_default_verify_paths", return_value=mock_paths),
+        ):
+            _ensure_ssl_certs()
+
+        inject.assert_called_once_with()
+        assert _ssl_compat._TRUSTSTORE_INJECTED is True
+
+    def test_macos_explicit_bundle_wins(self, monkeypatch):
+        """An operator-supplied SSL_CERT_FILE must bypass system injection."""
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setenv("SSL_CERT_FILE", "/operator/ca.pem")
+        inject = MagicMock()
+        mock_truststore = type("Truststore", (), {"inject_into_ssl": inject})()
+
+        with patch.object(_ssl_compat, "truststore", mock_truststore):
+            _ensure_ssl_certs()
+
+        inject.assert_not_called()
+        assert _ssl_compat._TRUSTSTORE_INJECTED is False
+
+    def test_macos_injection_is_idempotent(self, monkeypatch, tmp_path):
+        """Both application entry points may call the prelude in one process."""
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+        inject = MagicMock()
+        mock_truststore = type("Truststore", (), {"inject_into_ssl": inject})()
+        ca_file = tmp_path / "system-ca.pem"
+        ca_file.write_text("fake cert bundle")
+        mock_paths = type("P", (), {"cafile": str(ca_file), "capath": None})()
+
+        with (
+            patch.object(_ssl_compat, "truststore", mock_truststore),
+            patch("ssl.get_default_verify_paths", return_value=mock_paths),
+        ):
+            _ensure_ssl_certs()
+            _ensure_ssl_certs()
+
+        inject.assert_called_once_with()
+
+    def test_macos_injection_still_exports_child_env(self, monkeypatch, tmp_path):
+        """Injection covers this process only; children still need the env vars.
+
+        MCP subprocesses (kiro-cli, Node servers) inherit ``os.environ`` and
+        cannot inherit a process-local monkey-patch, so a successful macOS
+        injection must not short-circuit the file-based export they rely on.
+        """
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+        monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising=False)
+        inject = MagicMock()
+        mock_truststore = type("Truststore", (), {"inject_into_ssl": inject})()
+
+        mock_paths = type("P", (), {"cafile": None, "capath": None})()
+        fake_certifi_bundle = tmp_path / "certifi-cacert.pem"
+        fake_certifi_bundle.write_text("fake certifi bundle")
+        mock_certifi = type("M", (), {"where": staticmethod(lambda: str(fake_certifi_bundle))})()
+
+        with (
+            patch.object(_ssl_compat, "truststore", mock_truststore),
+            patch.dict(sys.modules, {"certifi": mock_certifi}),
+            patch("ssl.get_default_verify_paths", return_value=mock_paths),
+            patch("kiro_crew._ssl_compat._CA_CANDIDATES", ("/nonexistent/a.pem",)),
+        ):
+            _ensure_ssl_certs()
+
+        import os
+
+        inject.assert_called_once_with()
+        assert os.environ["SSL_CERT_FILE"] == str(fake_certifi_bundle)
+        assert os.environ["REQUESTS_CA_BUNDLE"] == str(fake_certifi_bundle)
+
+    def test_macos_injection_failure_falls_back(self, monkeypatch, tmp_path, caplog):
+        """A system-trust failure must not prevent the prior CA bootstrap."""
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+        ca_file = tmp_path / "fallback-ca.pem"
+        ca_file.write_text("fake cert bundle")
+        mock_paths = type("P", (), {"cafile": str(ca_file), "capath": None})()
+        inject = MagicMock(side_effect=RuntimeError("unavailable"))
+        mock_truststore = type("Truststore", (), {"inject_into_ssl": inject})()
+
+        with (
+            patch.object(_ssl_compat, "truststore", mock_truststore),
+            patch("ssl.get_default_verify_paths", return_value=mock_paths),
+            caplog.at_level("WARNING", logger="kiro_crew._ssl_compat"),
+        ):
+            _ensure_ssl_certs()
+
+        inject.assert_called_once_with()
+        assert _ssl_compat._TRUSTSTORE_INJECTED is False
+        assert "falling back" in caplog.text
+
+        import os
+
+        assert os.environ.get("SSL_CERT_FILE") is None
+
+    def test_macos_missing_truststore_falls_back(self, monkeypatch, tmp_path, caplog):
+        """An absent truststore package degrades to file discovery, not a crash."""
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+        ca_file = tmp_path / "fallback-ca.pem"
+        ca_file.write_text("fake cert bundle")
+        mock_paths = type("P", (), {"cafile": str(ca_file), "capath": None})()
+
+        with (
+            patch.object(_ssl_compat, "truststore", None),
+            patch("ssl.get_default_verify_paths", return_value=mock_paths),
+            caplog.at_level("WARNING", logger="kiro_crew._ssl_compat"),
+        ):
+            _ensure_ssl_certs()
+
+        assert _ssl_compat._TRUSTSTORE_INJECTED is False
+        assert "falling back" in caplog.text
+
+    def test_gatewayd_invokes_ensure_ssl_certs(self):
+        """The separate gateway process must install process-local trust."""
+        import importlib
+
+        mock_fn = MagicMock()
+        with patch("kiro_crew._ssl_compat._ensure_ssl_certs", mock_fn):
+            import kiro_crew.mcp_gateway.gatewayd
+
+            importlib.reload(kiro_crew.mcp_gateway.gatewayd)
+        mock_fn.assert_called()
+
+    def test_context_trust_uses_openssl_ca_count(self, monkeypatch):
+        """Regular OpenSSL contexts retain the concrete CA-count check."""
+        context = MagicMock()
+        context.cert_store_stats.return_value = {"x509_ca": 1}
+
+        assert _ssl_compat._ssl_context_has_ca_trust(context) is True
+        context.cert_store_stats.assert_called_once_with()
+
+    def test_context_trust_accepts_injected_dynamic_store(self, monkeypatch):
+        """Security.framework trust is valid even though it cannot list CAs."""
+        monkeypatch.setattr(_ssl_compat, "_TRUSTSTORE_INJECTED", True)
+        context = MagicMock()
+        context.cert_store_stats.side_effect = NotImplementedError
+
+        assert _ssl_compat._ssl_context_has_ca_trust(context) is True

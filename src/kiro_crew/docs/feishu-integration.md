@@ -10,8 +10,9 @@ hostname, or open port to manage.
 
 > **Optional dependency.** The Feishu long connection is the one channel that is
 > only specified through a vendor SDK (handshake, tenant-token refresh, and
-> frame envelope), so it needs `lark-oapi`. It is **not** part of core:
-> `pip install "kirocrew[feishu]"`. Without it the gateway logs a line and skips
+> frame envelope), so it needs `lark-oapi`. It is **not** part of core, so install
+> it directly into the environment that runs the gateway:
+> `pip install 'lark-oapi>=1.4,<2'`. Without it the gateway logs a line and skips
 > the channel — nothing else is affected.
 
 ## Quick start
@@ -24,35 +25,58 @@ Lark).
    its **App ID** and **App Secret** from *Credentials & Basic Info*.
 2. **Add the bot capability** — *Add features → Bot*.
 3. **Grant permissions** — under *Permissions & Scopes*, add
-   `im:message` (receive) and `im:message:send_as_bot` (reply).
+   `im:message.p2p_msg:readonly` (receive DMs) and
+   `im:message:send_as_bot` (reply). If you enable group chats, also add
+   `im:message.group_at_msg.include_bot:readonly` (receive group messages that
+   @-mention the bot). The broader `im:message` grant does not replace the
+   explicit p2p event scope in the current Feishu console.
 4. **Use long connection** — under *Events & Callbacks*, choose
    **Long connection** (not a request URL), then subscribe to
    `im.message.receive_v1`.
 5. **Publish the app** so your tenant can install it.
 6. **Find your open_id** — the console's API Explorer, or any inbound message
    in the gateway log, shows the sender's `open_id` (it starts with `ou_`).
-7. **Save the credentials** to `~/.kiro/crew/.env`:
-   ```
-   FEISHU_APP_ID=cli_xxxxxxxxxxxx
-   FEISHU_APP_SECRET=your-app-secret
-   ```
-8. **Turn it on** in `~/.kiro/crew/config.json`:
-   ```json
-   "feishu": {
-     "enabled": true,
-     "allowed_open_ids": ["ou_xxxxxxxxxxxxxxxx"]
-   }
-   ```
-9. **Restart:**
+7. **Paste it into Settings** — open **Settings → Channels → Feishu**, put the
+   App ID and App Secret in their fields, add your `open_id` to the allow-list,
+   turn the channel on, and save. Saving writes the two secrets to
+   `~/.kiro/crew/.env` (owner-only, `0600`) and the rest to `config.json`, so
+   there is nothing left to hand-edit.
+8. **Restart:**
    ```bash
    kirocrew restart
    ```
 
-DM the bot in Feishu and it answers. If it stays quiet, look for
-`Feishu WebSocket receiver started` in the gateway log and confirm your
-`open_id` is in `allowed_open_ids`.
+DM the bot in Feishu and it answers. The panel's badge tells you where you are:
+**Needs setup** until both credentials are stored, **Not connected** once they
+are but the receiver is not running, **Connected** when it is.
 
-## Who can reach it
+<details>
+<summary>Prefer to edit the files directly?</summary>
+
+The panel is a front end over the same two files, so this is equivalent:
+
+```
+# ~/.kiro/crew/.env
+FEISHU_APP_ID=cli_xxxxxxxxxxxx
+FEISHU_APP_SECRET=your-app-secret
+```
+
+```json
+// ~/.kiro/crew/config.json
+"feishu": {
+  "enabled": true,
+  "allowed_open_ids": ["ou_xxxxxxxxxxxxxxxx"]
+}
+```
+
+Config writes from the panel are **loopback-only** — a remote or tunnelled
+dashboard session gets a read-only view, because widening who may reach the
+agent is not something a forwarded request should be able to do. On such a
+session, editing the files on the gateway's own machine is the way in.
+
+</details>
+
+## Access control
 
 Deny-by-default, in both directions:
 
@@ -93,7 +117,7 @@ Deny-by-default, in both directions:
   would reset the conversation on a message you addressed to a colleague, and
   that is not recoverable, so anything ambiguous is treated as a prompt.
 
-## Settings
+## Settings reference
 
 | Key | Default | What it does |
 | --- | --- | --- |
@@ -103,10 +127,17 @@ Deny-by-default, in both directions:
 | `feishu.allowed_group_ids` | `[]` | Which groups, when `allow_group` is on. |
 | `feishu.soft_threshold_pct` | `80` | Context % that prompts you to `/compact` or `/new`. |
 | `feishu.hard_threshold_pct` | `95` | Context % that forces a compaction. |
+| `feishu.session_folder` | `""` | Sidebar folder for sessions that start here. Empty = unfiled. |
+
+Everything above except `hard_threshold_pct` is editable in **Settings →
+Channels → Feishu**; that one is file-only, because the panel exposes the soft
+threshold as the single number worth tuning and keeps the hard ceiling as a
+safety net.
 
 Credentials come from the environment only (`FEISHU_APP_ID`,
 `FEISHU_APP_SECRET`), matching the console's own naming — they are never written
-into `config.json`.
+into `config.json`. The panel stores them in `.env` and afterwards shows only a
+masked preview: a saved secret can be **replaced or cleared, never read back**.
 
 ## Commands
 
@@ -117,7 +148,7 @@ into `config.json`.
 
 Anything else is a prompt.
 
-## What this channel can and cannot do
+## Limits
 
 Feishu v1 is deliberately single-shot: the agent's answer is buffered and sent
 as **one reply** when the turn completes, rather than streamed. There are no
@@ -132,17 +163,34 @@ Known gaps, all follow-up work rather than defects:
 - **Text only.** Non-text messages (images, files, audio) are ignored inbound.
 - **Replies only.** The bot answers an inbound message and cannot start a
   conversation, so it is not a proactive-notification target.
-- **No dashboard Settings panel yet.** Configure it in `config.json`; the other
-  channels' Settings pages are the model for the panel to come.
+- **The panel configures the channel; it does not install it.** `lark-oapi` is an
+  optional extra, and running `pip` from a dashboard action would be a new way to
+  execute code in the gateway's own environment. When the SDK is missing, Settings reports whether installation is supported for this gateway interpreter and shows its exact install command only when it is; you run that command yourself.
+- **Credentials are not verified on save.** A REST tenant-token probe would have
+  to pick a domain (`open.feishu.cn` or `open.larksuite.com`) and would report a
+  false failure for whichever tenant it guessed wrong, so the panel stores what
+  you give it. Nothing is lost: the badge tracks the receiver, and Feishu drops a
+  refused app within seconds of a restart, which turns into **Not connected**
+  with the reason attached.
 - **No auto-reconnect beyond the SDK's own.** `lark-oapi` reconnects
   internally; if it gives up, the gateway logs that the receiver is down and you
   restart.
+
+### Bot doesn’t receive direct messages
+
+- Confirm `im:message.p2p_msg:readonly` is granted. A green
+  `im:message.group_at_msg.include_bot:readonly` grant covers group @-mentions,
+  not private messages.
+- Publish a new app version after changing permissions; a draft permission does
+  not affect the installed bot.
+- Confirm `im.message.receive_v1` appears in the subscribed-event list, not only
+  that long connection is selected.
 
 ## How it fits together
 
 The channel is a thin transport over the shared messaging core — the same
 `TurnDriver` (credential redaction, tool-approval ladder, SEL audit) every other
-channel uses. See [messaging-transport.md](messaging-transport.md).
+channel uses.
 
 | File | Role |
 | --- | --- |
@@ -151,3 +199,9 @@ channel uses. See [messaging-transport.md](messaging-transport.md).
 | `feishu/renderer.py` | Buffers the turn, sends one reply |
 | `feishu/transport_dispatch.py` | Drives `TurnDriver`, handles `/new` `/compact` |
 | `feishu/gateway.py` | `maybe_start_feishu()` boot entry point |
+
+## Related docs
+
+- [Channel capabilities](channel-capabilities.md): the ten-channel matrix — streaming, buttons, uploads, reply length, approval timeout
+- [Getting Started](getting-started.md): install, first run, connecting a channel
+- [Configuration](configuration.md): the config file and environment variables

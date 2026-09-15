@@ -9,7 +9,10 @@ data home and surfaces ``internal_auth_mismatch``. Nothing names the dead path.
 
 This module walks every agent spec JSON in :func:`kiro_agents_dir_path` and
 stats every absolute ``command`` path, absolute path-like arg, and absolute
-path-like env value:
+path-like env value. Values that only LOOK like paths are screened out first —
+separator-joined lists, and the operands of flags that take an opaque identifier
+(see :data:`_IDENTIFIER_FLAGS`) — because a false "dead path" on a healthy
+install turns the whole check red and teaches operators to ignore it:
 
 * **Managed specs** (the ones ``install_agent`` / ``rebuild_agent_config`` own,
   i.e. :data:`~kiro_crew.agent_files.OWNED_KIRO_AGENT_FILES`) with dead paths are
@@ -130,7 +133,7 @@ def _sanitize_for_terminal(value: str) -> str:
     hostile spec drive the terminal (retitle the window, rewrite earlier output,
     inject a pasteable command) the moment doctor renders it. Replace every C0
     control (except tab) and the C1/DEL range with a visible ``\\xNN`` token so
-    the value is still readable but inert. ESC in particular can no longer open
+    the value is still readable but inert. ESC in particular cannot open
     a control sequence.
     """
     out: list[str] = []
@@ -174,9 +177,11 @@ def _looks_like_single_absolute_path(value: str) -> bool:
 
     Colon-joined values like ``PATH`` (``/usr/bin:/bin``) are NOT single paths
     and must not be stat-ed as one — that is the explicit false-positive to
-    avoid. The Windows list separator ``;`` is rejected for the same reason. A
-    Windows drive path (``C:\\Users\\...``) legitimately contains a colon, so
-    the colon test is scoped to the POSIX list-separator shape (see
+    avoid. The Windows list separator ``;`` is rejected for the same reason, as
+    is the comma separator that multi-value CLI flags conventionally use
+    (``--search-dirs /opt/a,/opt/b``). A Windows drive path
+    (``C:\\Users\\...``) legitimately contains a colon, so the colon test is
+    scoped to the POSIX list-separator shape (see
     :func:`_colon_scan_rejects`), leaving a bare drive-letter colon alone.
 
     Only absolute paths are considered: a bare token, a URL, a flag, or a
@@ -186,6 +191,14 @@ def _looks_like_single_absolute_path(value: str) -> bool:
         return False
     # Windows PATH-style list — never a single path.
     if ";" in value:
+        return False
+    # Comma-joined list — the separator multi-value CLI flags conventionally
+    # take. A comma is legal in a POSIX filename, so this trades a rare false
+    # negative (a real path containing a comma stops being checked) for
+    # removing a guaranteed false positive on every list-valued arg — the same
+    # blanket trade already made for ``;`` above. (``:`` is screened in scoped
+    # form instead, so a Windows drive path survives it.)
+    if "," in value:
         return False
     # POSIX PATH-style list.
     if _colon_scan_rejects(value):
@@ -229,12 +242,40 @@ _CREDENTIAL_KEY_MARKERS: tuple[str, ...] = (
     "PRIVATE",
 )
 
+#: Flags whose OPERAND is an opaque identifier, never a filesystem path.
+#: Some namespace and scope identifiers are conventionally slash-prefixed
+#: (``--scope /spaces/ns_abc123``), which makes them absolute-path-SHAPED while
+#: being unresolvable on any host by design. That is indistinguishable from a
+#: genuinely removed directory by value alone: such an operand is absolute, is a
+#: single value, and does not exist. The only signal that separates them is
+#: POSITIONAL — which flag the value is the operand of — so the skip has to read
+#: the preceding argument rather than the value.
+#:
+#: Deliberately a short, literal set rather than a heuristic. A heuristic here
+#: would trade a guaranteed false positive for an unbounded false NEGATIVE, and a
+#: dead-path check that silently stops reporting real dead paths is worse than one
+#: that over-reports.
+_IDENTIFIER_FLAGS: frozenset[str] = frozenset({"--scope", "--namespace", "--space"})
+
 _REDACTED_VALUE = "<redacted: credential-shaped key>"
 
 
 def _credential_shaped_key(key: str) -> bool:
     upper = key.upper()
     return any(marker in upper for marker in _CREDENTIAL_KEY_MARKERS)
+
+
+def _is_identifier_operand(args: list, i: int) -> bool:
+    """Whether ``args[i]`` is the operand of an identifier-taking flag.
+
+    Read BEFORE the value is tested, so the operand is never stat-ed. Deciding it
+    afterwards reaches the same report but performs the filesystem probe the
+    module docstring promises not to perform.
+    """
+    if i == 0:
+        return False
+    prev = args[i - 1]
+    return isinstance(prev, str) and prev in _IDENTIFIER_FLAGS
 
 
 def _walk_server_paths(server: str, entry: dict) -> list[DeadPath]:
@@ -250,6 +291,7 @@ def _walk_server_paths(server: str, entry: dict) -> list[DeadPath]:
         for i, arg in enumerate(args):
             if (
                 isinstance(arg, str)
+                and not _is_identifier_operand(args, i)
                 and _looks_like_single_absolute_path(arg)
                 and _path_is_dead(arg)
             ):

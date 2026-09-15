@@ -11,7 +11,7 @@
 #   cd kirocrew
 #   bash minimal_install.sh
 #
-# Prerequisites: Python 3.10+, Node.js 22+ (24 LTS recommended), npm, git
+# Prerequisites: Python 3.12+, Node.js 22+ (24 LTS recommended), npm, git
 # Optional:
 #   --voice    also install voice extras (pip install -e .[voice])
 #   ollama     for local vector memory (see step "Embeddings" below)
@@ -45,12 +45,12 @@ die() { echo "ERROR: $1" >&2; exit 1; }
 has git || die "git not found"
 
 _py=""
-for c in python3.12 python3.11 python3.10 python3; do
-    if has "$c" && "$c" -c "import sys; assert sys.version_info >= (3,10)" 2>/dev/null; then
+for c in python3.12 python3.13 python3; do
+    if has "$c" && "$c" -c "import sys; assert sys.version_info >= (3,12)" 2>/dev/null; then
         _py="$c"; break
     fi
 done
-[ -n "$_py" ] || die "Python 3.10+ not found. Install Python 3.10 or newer and re-run."
+[ -n "$_py" ] || die "Python 3.12+ not found. Install Python 3.12 or newer and re-run."
 
 has node || die "Node.js not found. Install Node.js 22+ (24 LTS recommended, https://nodejs.org) and re-run."
 has npm  || die "npm not found. Install Node.js 22+ (24 LTS recommended, https://nodejs.org) and re-run."
@@ -93,6 +93,28 @@ echo ""
 
 # ── 2. Python venv + package install (pip) ──
 _venv="$REPO_DIR/.venv"
+# Build the venv under a umask that masks group/other WRITE so bin/kirocrew
+# and its dirs are born non-group-writable -- `kirocrew service install`
+# refuses to attach its AppArmor profile to a group/world-writable launcher
+# (see the matching block in cli.sh for the full rationale). OR-ing with 022
+# only ADDS write-mask bits, so a stricter caller umask is preserved.
+_KC_PREV_UMASK="$(umask)"
+umask "$(printf '%03o' "$(( $(umask) | 022 ))")"
+# A reused venv keeps the perms it was born with: one built by an older installer
+# under a permissive umask still has a group/world-writable root or bin/, so the
+# AppArmor profile would keep refusing. Rebuild it under the tightened umask.
+if [ -d "$_venv" ] && [ -n "$(find "$_venv" "$_venv/bin" -prune \( -perm -g+w -o -perm -o+w \) -print 2>/dev/null)" ]; then
+    echo "  ↳ existing venv is group/world-writable — recreating it"
+    rm -rf "$_venv"
+fi
+# Same requires-python reuse rule as the other installers: an existing venv built
+# on a pre-3.12 interpreter cannot host the package, and the `pip install -e .`
+# below would be refused outright with "Requires-Python >=3.12", so rebuild it.
+if [ -x "$_venv/bin/python" ] \
+    && ! "$_venv/bin/python" -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
+    echo "  ↳ existing venv predates the Python 3.12 floor — recreating it"
+    rm -rf "$_venv"
+fi
 if [ ! -d "$_venv" ] || [ ! -x "$_venv/bin/python" ]; then
     echo "→ Creating virtual environment…"
     "$_py" -m venv "$_venv" || die "Failed to create venv. Try: $_py -m pip install --user virtualenv"
@@ -115,11 +137,13 @@ fi
 "$_venv/bin/python" -c "import aiohttp" 2>/dev/null \
     || die "Install succeeded but aiohttp not importable — dependencies missing"
 echo "✓ Python package installed"
+umask "$_KC_PREV_UMASK"
 echo ""
 
-# ── 3. Agent backend (claude-agent-acp) ──
-# The default agent backend is the public ACP adapter. kiro-cli is optional.
-echo "→ Checking agent backend (claude-agent-acp)…"
+# ── 3. Optional alternate agent backend (claude-agent-acp) ──
+# A fresh configuration defaults to Kiro CLI. This adapter is available only
+# after the user selects it with agent.acp_backend.
+echo "→ Checking optional agent backend (claude-agent-acp)…"
 if has claude-agent-acp; then
     echo "✓ claude-agent-acp already on PATH"
 elif has npm; then
@@ -131,6 +155,8 @@ else
     echo "⚠ npm not found — install the agent backend later:"
     echo "    npm i -g @agentclientprotocol/claude-agent-acp"
 fi
+echo "⚠ The default Kiro agent requires Kiro CLI; this installer does not install or sign in to it."
+echo "  Install it separately from https://kiro.dev/cli/ and run: kiro-cli login"
 echo ""
 
 # ── 4. Symlink CLI (no shell rc modification) ──
@@ -143,8 +169,11 @@ echo ""
 echo "👻 KiroCrew installed!"
 echo ""
 echo "  Next steps:"
-echo "    1. Run setup:    $HOME/.local/bin/kirocrew setup"
-echo "    2. Start it:     $HOME/.local/bin/kirocrew gateway"
+echo "    1. Default agent: install Kiro CLI from https://kiro.dev/cli/"
+echo "                      then run: kiro-cli login"
+echo "       (skip this if you selected another ACP backend)"
+echo "    2. Run setup:    $HOME/.local/bin/kirocrew setup"
+echo "    3. Start it:     $HOME/.local/bin/kirocrew gateway"
 echo "       (or add ~/.local/bin to PATH and just run: kirocrew gateway)"
 echo ""
 echo "  Optional — local vector memory (embeddings):"

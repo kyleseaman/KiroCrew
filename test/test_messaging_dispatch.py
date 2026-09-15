@@ -8,33 +8,53 @@ finalization itself fails.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
+
+import pytest
 
 from kiro_crew.messaging import dispatch as D
 from kiro_crew.messaging.dispatch import ChannelTurn, drive_turn
 from kiro_crew.messaging.renderer import SilentRenderer
+from kiro_crew.session_allocation import SessionClosingError
 
 
 class _Sessions:
     """Minimal stand-in that counts the calls this contract is about."""
 
-    def __init__(self, raise_on_acquire: bool = False):
+    def __init__(self, raise_on_acquire: bool = False, closing: bool = False):
         self.released = 0
         self.successes = 0
         self.failures = 0
+        self.resets = 0
         self._raise_on_acquire = raise_on_acquire
+        #: Mirrors SessionManager._closing. When set, begin_turn refuses the
+        #: dispatch exactly as the real gate does once close_all has run.
+        self.closing = closing
+        self.begin_turns = 0
 
     async def get_or_create(self, key, agent=None, channel_id=None):
         if self._raise_on_acquire:
             raise RuntimeError("cold start failed")
         return object(), False, False
 
+    def begin_turn(self, key):
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
+
     async def set_channel(self, key, channel_id):
         pass
 
     def record_success(self, key):
         self.successes += 1
+
+    async def reset(self, key):
+        self.resets += 1
 
     async def record_failure(self, key):
         self.failures += 1
@@ -68,10 +88,18 @@ class _CtxBuilder:
 
 
 class _Driver:
+    last_stop_reason = ""
+
     def __init__(self, *a, **kw):
-        pass
+        # Mirrors the real TurnDriver: the shutdown gate is supplied at
+        # construction and invoked by run(), immediately before the provider
+        # stream would open. A stand-in that swallowed it would let these tests
+        # pass while the gate was wired nowhere.
+        self._closing_gate = kw.get("closing_gate")
 
     async def run(self, message):
+        if self._closing_gate is not None:
+            self._closing_gate()
         return "the reply"
 
 
@@ -175,6 +203,234 @@ def test_the_happy_path_releases_exactly_once(monkeypatch) -> None:
     assert renderer.closed == 1
     assert sessions.released == 1
     assert sessions.successes == 1
+    # Pins that the gate is actually consulted on the normal path, so it cannot
+    # be dropped or renamed into a no-op without a test noticing.
+    assert sessions.begin_turns == 1
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/home/alice/memory.db",
+        "/Users/alice/memory.db",
+        r"C:\Users\alice\memory.db",
+    ],
+)
+def test_private_memory_refusal_hides_paths_and_credentials_before_channel_output(
+    monkeypatch, path
+):
+    from kiro_crew.memory_stores import UnknownMemoryStore
+
+    _patch_pipeline(monkeypatch)
+    secret = "ghp_" + "x" * 36
+    refuse = AsyncMock(
+        side_effect=UnknownMemoryStore(
+            f"Member memory unavailable: cannot read {path}; token={secret}. "
+            "Repair this member's memory. Global Memory V1 was not used."
+        )
+    )
+    monkeypatch.setattr(D, "session_store_for_turn", refuse)
+    sessions = _Sessions()
+    sessions.get_or_create = AsyncMock()
+    renderer = _Renderer()
+    renderer.on_text_chunk = AsyncMock()
+    renderer.on_done = AsyncMock()
+
+    asyncio.run(drive_turn(_turn(renderer), sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    renderer.on_text_chunk.assert_awaited_once()
+    visible = renderer.on_text_chunk.call_args.args[0]
+    assert "Repair this member's memory" in visible
+    assert "Global Memory V1 was not used" in visible
+    assert path not in visible and "alice" not in visible and secret not in visible
+    assert len(visible) <= 1000
+    renderer.on_done.assert_awaited_once()
+    assert renderer.closed == 1
+    sessions.get_or_create.assert_not_awaited()
+    assert sessions.released == 0
+
+
+def test_every_turn_open_site_is_gated_on_the_shutdown_state() -> None:
+    """Ratchet: the shutdown gate is wired at every site AND placed atomically.
+
+    Two halves, because either alone is satisfiable while the race stays open.
+
+    A gate at the CALL SITE is not enough, which is what the first version of
+    this change got wrong: ``TurnDriver.run`` awaits ``renderer.on_turn_start()``
+    -- a platform round-trip -- before opening the provider stream, so a restart
+    landing there still let the prompt register behind ``close_all``'s drain
+    snapshot. The only atomic placement is inside ``run()``, immediately before
+    the stream, so the gate lives there and each dispatcher passes it in.
+
+    So: every ``TurnDriver(...)`` construction must pass ``closing_gate``, and in
+    the driver no await may occur between the gate and provider stream. A
+    structured monitor may synchronously mark its claim accepted in that span;
+    because it cannot yield, shutdown still cannot take a drain snapshot there.
+    """
+    src = Path(D.__file__).resolve().parent.parent
+
+    # Half 1 -- every construction wires a gate.
+    unwired: list[str] = []
+    sites = 0
+    for path in sorted(src.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if "TurnDriver(" not in text:
+            continue
+        tree = ast.parse(text)
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "TurnDriver"
+            ):
+                continue
+            sites += 1
+            if not any(keyword.arg == "closing_gate" for keyword in node.keywords):
+                unwired.append(f"{path.relative_to(src)}:{node.lineno}")
+    assert not unwired, "TurnDriver built without a shutdown gate:\n" + "\n".join(unwired)
+    assert sites >= 4, f"expected the known TurnDriver sites, found {sites}"
+
+    # Half 2 -- the gate is atomic with the stream the driver opens.
+    driver_lines = (src / "messaging" / "driver.py").read_text(encoding="utf-8").splitlines()
+    opens = [i for i, ln in enumerate(driver_lines) if "self.provider.stream(" in ln]
+    assert opens, "could not find the provider stream in the driver"
+    for idx in opens:
+        window = driver_lines[max(0, idx - 12) : idx]
+        gates = [i for i, line in enumerate(window) if "self.closing_gate()" in line]
+        assert gates, f"messaging/driver.py:{idx + 1} opens a turn without the gate"
+        after_gate = window[gates[-1] + 1 :]
+        assert not any(
+            "await " in line for line in after_gate
+        ), f"messaging/driver.py:{idx + 1} yields between the gate and stream"
+
+
+def test_a_shutdown_between_the_claim_and_the_dispatch_never_opens_the_turn(
+    monkeypatch,
+) -> None:
+    """The lease-dispatch race gate.
+
+    ``get_or_create`` guards the CLAIM, but the turn only opens at
+    ``driver.run``, and everything between them awaits: ``set_channel``, the
+    origin/mirror bind's thread hop, ``publish_turn_identity``, and the whole
+    context build. A restart landing in that span can leave this pipeline
+    opening a turn that ``close_all`` had already taken its drain snapshot
+    without -- killed mid-flight holding its native lock, which reaches the user
+    as an empty response. The dashboard runner and the Slack handler each carry
+    this gate already; every channel on the shared pipeline had no equivalent.
+    """
+    ran: list[str] = []
+
+    class _RecordingDriver(_Driver):
+        async def run(self, message):
+            # Gate first, then record -- the real driver runs the gate
+            # immediately BEFORE the provider stream opens, so a refused turn
+            # must never reach the recording below.
+            if self._closing_gate is not None:
+                self._closing_gate()
+            ran.append(message)
+            return "the reply"
+
+    _patch_pipeline(monkeypatch)
+    monkeypatch.setattr(D, "TurnDriver", _RecordingDriver)
+    sessions = _Sessions()
+    renderer = _Renderer()
+    # The fake's get_or_create deliberately does NOT consult ``closing``, so the
+    # claim still succeeds here. That is the race being pinned: a refused CLAIM
+    # was already handled, an accepted claim whose DISPATCH races the shutdown
+    # was not.
+    sessions.closing = True
+
+    asyncio.run(drive_turn(_turn(renderer), sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    assert ran == [], "the turn must not open behind close_all's drain snapshot"
+    assert sessions.begin_turns == 1
+    # Refused is not leaked: the renderer is still finalized (so the user gets
+    # this channel's notice rather than a hanging placeholder) and the
+    # session-keyed semaphore is still given back.
+    assert renderer.closed == 1
+    assert sessions.released == 1
+    # A restart is not a session fault. Charging it to the circuit breaker via
+    # record_failure would count toward tripping a reset on a session that never
+    # misbehaved, and it is not a success either.
+    assert sessions.failures == 0
+    assert sessions.successes == 0
+
+
+def test_a_restricted_shutdown_refusal_never_spools(monkeypatch) -> None:
+    """A resolved temporary/incognito turn leaves no durable refusal record."""
+    _patch_pipeline(monkeypatch)
+    spool = AsyncMock(return_value=True)
+    monkeypatch.setattr(D, "spool_refused_turn", spool)
+    sessions = _Sessions(closing=True)
+    renderer = _Renderer()
+    turn = _turn(renderer)
+    turn.inbound_route = D.InboundRoute(conversation_id="conv", text="secret", user_id="u")
+    turn.inbound_restricted = True
+
+    asyncio.run(drive_turn(turn, sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    spool.assert_not_awaited()
+    assert sessions.released == 1
+
+
+def test_a_compaction_failed_terminal_resets_the_session(monkeypatch) -> None:
+    """A COMPACTION_FAILED terminal is synthetic — the backend abandoned the
+    turn after a failed auto-compaction and never sent end_turn, so it still
+    counts the prompt as in progress. The dispatcher must reset the session
+    or this channel's NEXT message collides with "prompt already in
+    progress" (no re-queue; the notice already reached the user)."""
+    from kiro_crew.acp.types import STOP_REASON_COMPACTION_FAILED
+
+    class _AbandonedDriver(_Driver):
+        last_stop_reason = STOP_REASON_COMPACTION_FAILED
+
+    _patch_pipeline(monkeypatch)
+    monkeypatch.setattr(D, "TurnDriver", _AbandonedDriver)
+    sessions = _Sessions()
+    renderer = _Renderer()
+
+    asyncio.run(drive_turn(_turn(renderer), sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    assert sessions.resets == 1
+    assert sessions.released == 1
+
+
+def test_a_driver_without_a_stop_reason_still_finishes_the_turn(monkeypatch) -> None:
+    """The stop-reason read is defensive, like every other attribute read on
+    this seam. ``TurnDriver`` is resolved through the module attribute, so a
+    stand-in that predates the field must mean "no synthetic completion" — not
+    an AttributeError raised at a real inbound message AFTER the turn already
+    ran and the user already got the answer."""
+
+    class _FieldlessDriver:
+        def __init__(self, *a, **kw) -> None:
+            pass
+
+        async def run(self, message: str) -> str:
+            return "the answer"
+
+    _patch_pipeline(monkeypatch)
+    monkeypatch.setattr(D, "TurnDriver", _FieldlessDriver)
+    sessions = _Sessions()
+    renderer = _Renderer()
+
+    asyncio.run(drive_turn(_turn(renderer), sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    assert sessions.resets == 0
+    assert sessions.released == 1
+
+
+def test_an_ordinary_terminal_does_not_reset_the_session(monkeypatch) -> None:
+    """The reset is scoped to the compaction-failed terminal — an ordinary
+    end_turn keeps the session alive (resetting it would pay a cold start on
+    every message)."""
+    _patch_pipeline(monkeypatch)
+    sessions = _Sessions()
+    renderer = _Renderer()
+
+    asyncio.run(drive_turn(_turn(renderer), sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    assert sessions.resets == 0
 
 
 def test_a_denied_turn_neither_renders_nor_releases(monkeypatch) -> None:
@@ -334,6 +590,50 @@ def _capture_driver_kwargs(box: list) -> type:
     return _Capturing
 
 
+# ---------------------------------------------------------------------------
+# What the pipeline forwards to the driver, and what it binds per turn.
+#
+# Both of these were asymmetries rather than missing features: the field existed
+# on the driver and the helper existed in ``link``, but the shared pipeline never
+# passed them, so every channel riding ``drive_turn`` (webex, wecom, teams,
+# weixin, imessage) silently lost a capability the forked channels had.
+# ---------------------------------------------------------------------------
+
+
+class _MirrorSessions(_Sessions):
+    """Adds the origin/mirror surface ``drive_turn`` binds through."""
+
+    def __init__(self, *, opt_out: bool = False, existing=None, raises: bool = False):
+        super().__init__()
+        self.origin_links: dict = {}
+        self.mirror_links: dict = {} if existing is None else dict(existing)
+        self._opt_out = opt_out
+        self._raises = raises
+
+    def set_origin_link(self, key, link):
+        if self._raises:
+            raise RuntimeError("session map unavailable")
+        self.origin_links[key] = link
+
+    def mirror_opt_out(self, key) -> bool:
+        return self._opt_out
+
+    def get_mirror_link(self, key):
+        return self.mirror_links.get(key)
+
+    def set_mirror_link(self, key, link, *, reason=""):
+        self.mirror_links[key] = link
+
+
+def _capture_turn_driver(box: dict) -> type:
+    class _Capturing(_Driver):
+        def __init__(self, provider, renderer, **kw):
+            box.update(kw)
+            super().__init__(provider, renderer, **kw)
+
+    return _Capturing
+
+
 def test_auto_approve_session_reaches_the_driver(monkeypatch) -> None:
     """A channel with no approve/deny buttons needs an out-of-band trust grant.
 
@@ -376,15 +676,27 @@ class _RecordingCtxBuilder:
     """Captures the kwargs the pipeline hands ``build_message``.
 
     The signature is spelled out rather than swallowed into ``**kw`` for
-    ``minimal_context``, so a pipeline that stops forwarding it fails here
-    instead of quietly falling back to the builder's own default.
+    ``minimal_context`` and ``needs_reinjection``, so a pipeline that stops
+    forwarding either fails here instead of quietly falling back to the
+    builder's own default.
     """
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
-    def build_message(self, text, is_new, session_key, *, minimal_context=False, **kw):
-        self.calls.append({"minimal_context": minimal_context, **kw})
+    def build_message(
+        self,
+        text,
+        is_new,
+        session_key,
+        *,
+        minimal_context=False,
+        needs_reinjection,
+        **kw,
+    ):
+        self.calls.append(
+            {"minimal_context": minimal_context, "needs_reinjection": needs_reinjection, **kw}
+        )
         return text, None
 
 
@@ -446,6 +758,47 @@ def test_the_default_turn_still_gets_full_context(monkeypatch) -> None:
     )
 
     assert ctx.calls[0]["minimal_context"] is False
+
+
+def test_compaction_reinjection_reaches_build_message(monkeypatch) -> None:
+    """A channel turn consumes and forwards its one-shot reinjection marker."""
+
+    class _ReinjectingSessions(_Sessions):
+        def __init__(self) -> None:
+            super().__init__()
+            self.consumed_keys: list[str] = []
+
+        def consume_needs_reinjection(self, key: str) -> bool:
+            self.consumed_keys.append(key)
+            return True
+
+    _patch_pipeline(monkeypatch)
+    sessions = _ReinjectingSessions()
+    ctx = _RecordingCtxBuilder()
+    turn = _turn(_Renderer())
+
+    asyncio.run(drive_turn(turn, sessions=sessions, ctx_builder=ctx))
+
+    assert sessions.consumed_keys == [turn.session_key]
+    assert ctx.calls[0]["needs_reinjection"] is True
+
+
+def test_missing_reinjection_consumer_keeps_turn_running(monkeypatch) -> None:
+    """A session stand-in without the new method gets the safe false default."""
+    _patch_pipeline(monkeypatch)
+    sessions = _Sessions()
+    ctx = _RecordingCtxBuilder()
+
+    asyncio.run(
+        drive_turn(
+            _turn(_Renderer()),
+            sessions=sessions,
+            ctx_builder=ctx,
+        )
+    )
+
+    assert ctx.calls[0]["needs_reinjection"] is False
+    assert sessions.successes == 1
 
 
 class _GovernanceStub:
@@ -600,3 +953,181 @@ class TestCancellationSurvivesAGovernanceDeny:
         stub = _gate(monkeypatch, permitted=True)
         assert asyncio.run(D.inbound_permitted("whatsapp", text="anything")) is True
         assert stub.asked == ["whatsapp"], "governance must be consulted first, once"
+
+
+def test_the_origin_conversation_is_recorded_and_bound(monkeypatch) -> None:
+    from kiro_crew.messaging.link import ChannelLink
+
+    _patch_pipeline(monkeypatch)
+    sessions = _MirrorSessions()
+    turn = _turn(_Renderer())
+    turn.origin_conversation = ChannelLink("weixin", channel_id="ROOM", thread_id=None)
+
+    asyncio.run(drive_turn(turn, sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    assert sessions.origin_links[turn.session_key].channel_id == "ROOM"
+    assert sessions.mirror_links[turn.session_key].channel_id == "ROOM"
+
+
+def test_a_unified_key_records_no_origin_conversation(monkeypatch) -> None:
+    """``dm_scope="unified"`` collapses every allowed user's DM into one bucket.
+
+    So "the conversation this session is read in" has no single answer: recording
+    one points the session's origin at whichever human spoke LAST, and a later
+    notice (a cron result, a subagent completion) lands in that person's chat
+    regardless of whose turn produced it. ``bind_origin_mirror`` already declines
+    for exactly this reason, so the sibling ``set_origin_link`` must not be the
+    hole that reopens it.
+    """
+    from kiro_crew.messaging.link import ChannelLink
+
+    _patch_pipeline(monkeypatch)
+    sessions = _MirrorSessions()
+    turn = _turn(_Renderer())
+    turn.session_key = "unified:agentA"
+    turn.origin_conversation = ChannelLink("webex", channel_id="ROOM_A", thread_id=None)
+
+    asyncio.run(drive_turn(turn, sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    assert sessions.origin_links == {}
+    assert sessions.mirror_links == {}
+
+
+def test_a_turn_that_omits_the_origin_conversation_binds_nothing(monkeypatch) -> None:
+    _patch_pipeline(monkeypatch)
+    sessions = _MirrorSessions()
+
+    asyncio.run(drive_turn(_turn(_Renderer()), sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    assert sessions.origin_links == {}
+    assert sessions.mirror_links == {}
+
+
+def test_the_persisted_opt_out_is_honoured(monkeypatch) -> None:
+    """An in-channel unlink has to survive the user's next message.
+
+    The bind is re-asserted every turn, so without reading the opt-out "off"
+    would last exactly until they typed again.
+    """
+    from kiro_crew.messaging.link import ChannelLink
+
+    _patch_pipeline(monkeypatch)
+    sessions = _MirrorSessions(opt_out=True)
+    turn = _turn(_Renderer())
+    turn.origin_conversation = ChannelLink("weixin", channel_id="ROOM", thread_id=None)
+
+    asyncio.run(drive_turn(turn, sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    assert sessions.mirror_links == {}
+
+
+def test_a_binding_aimed_elsewhere_is_not_repointed(monkeypatch) -> None:
+    # The dashboard can aim a session's mirror at any surface; overwriting it
+    # would silently redirect the user's replies into this conversation.
+    from kiro_crew.messaging.link import ChannelLink
+
+    _patch_pipeline(monkeypatch)
+    elsewhere = ChannelLink("discord", channel_id="99", thread_id=None)
+    sessions = _MirrorSessions(existing={"weixin:agentA:direct:userA": elsewhere})
+    turn = _turn(_Renderer())
+    turn.origin_conversation = ChannelLink("weixin", channel_id="ROOM", thread_id=None)
+
+    asyncio.run(drive_turn(turn, sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    assert sessions.mirror_links["weixin:agentA:direct:userA"] is elsewhere
+
+
+def test_a_bind_failure_does_not_drop_the_turn(monkeypatch) -> None:
+    """This is the widest call site in the codebase — five channels route here.
+
+    Losing the mirror costs a dashboard convenience; raising costs the user the
+    answer they are waiting for.
+    """
+    from kiro_crew.messaging.link import ChannelLink
+
+    _patch_pipeline(monkeypatch)
+    sessions = _MirrorSessions(raises=True)
+    turn = _turn(_Renderer())
+    turn.origin_conversation = ChannelLink("weixin", channel_id="ROOM", thread_id=None)
+
+    asyncio.run(drive_turn(turn, sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    assert sessions.successes == 1
+    assert sessions.released == 1
+
+
+class _KnownProviderSessions(_Sessions):
+    """Returns an identifiable provider, so the hook's argument can be asserted."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.provider = object()
+
+    async def get_or_create(self, key, agent=None, channel_id=None, **kw):
+        return self.provider, False, False
+
+
+def test_the_live_provider_is_handed_to_the_channel(monkeypatch) -> None:
+    """A channel that uploads local files needs the provider's own cwd as the
+    extraction root, and that is unknowable until ``get_or_create`` returns.
+
+    Reading it from the session map BEFORE the turn yields ``None`` on the first
+    message of every session generation, so the feature is silently off for
+    exactly the turn that introduces it and mysteriously on afterwards.
+    """
+    seen: list = []
+    _patch_pipeline(monkeypatch)
+    sessions = _KnownProviderSessions()
+    turn = _turn(_Renderer())
+    turn.bind_provider = seen.append
+
+    asyncio.run(drive_turn(turn, sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    assert seen == [sessions.provider]
+
+
+def test_the_hook_runs_before_the_driver(monkeypatch) -> None:
+    # Whatever it authorizes has to be in place for the turn it belongs to, not
+    # the next one.
+    order: list[str] = []
+    _patch_pipeline(monkeypatch)
+
+    class _OrderedDriver(_Driver):
+        def __init__(self, *a, **kw) -> None:
+            order.append("driver")
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(D, "TurnDriver", _OrderedDriver)
+    turn = _turn(_Renderer())
+    turn.bind_provider = lambda _p: order.append("bind")
+
+    asyncio.run(drive_turn(turn, sessions=_Sessions(), ctx_builder=_CtxBuilder()))
+
+    assert order == ["bind", "driver"]
+
+
+def test_a_failing_hook_degrades_the_feature_not_the_turn(monkeypatch) -> None:
+    # Guarded like the origin bind: what it authorizes is an enhancement, so a
+    # failure must not drop an answer the user is waiting for.
+    _patch_pipeline(monkeypatch)
+    sessions = _Sessions()
+    turn = _turn(_Renderer())
+
+    def _boom(_provider) -> None:
+        raise RuntimeError("no cwd")
+
+    turn.bind_provider = _boom
+
+    asyncio.run(drive_turn(turn, sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    assert sessions.successes == 1
+    assert sessions.released == 1
+
+
+def test_a_turn_that_omits_the_hook_still_runs(monkeypatch) -> None:
+    _patch_pipeline(monkeypatch)
+    sessions = _Sessions()
+
+    asyncio.run(drive_turn(_turn(_Renderer()), sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    assert sessions.successes == 1

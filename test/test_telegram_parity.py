@@ -3,7 +3,7 @@
 Covers what this channel gained: the commands a user can now reach from chat, the
 outbound image upload, the reasoning post, the stall marks on the live bubble, the
 reaction allow-list, the durable getUpdates cursor — and, first, the credential
-that Telegram's own markdown→HTML conversion used to REASSEMBLE after the
+that Telegram's own markdown→HTML conversion can REASSEMBLE after the
 byte-level redactor had already looked at it.
 
 The doubles come from ``test_telegram`` so there is one FakeClient, not two that
@@ -15,13 +15,15 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from test_telegram import FakeClient, _dispatcher, _dm
+from test_telegram import FakeClient, _dispatcher, _dm, _prime_live
 
+from conftest import host_abs
 from kiro_crew.messaging.outbound_files import OutboundFile
 from kiro_crew.telegram.client import (
     REACTION_EMOJI,
@@ -34,11 +36,34 @@ from kiro_crew.telegram.renderer import (
     TelegramApprovalDecider,
     TelegramRenderer,
     _display_safe,
+    _utf16_chunks,
+    _utf16_cut,
+    _utf16_len,
 )
 from kiro_crew.telegram.transport import TELEGRAM_CAPABILITIES, TelegramInboundMessage
 
 # Split so the literal never appears whole in this file.
 _AWS_KEY = "AKIA" + "IOSFODNN7EXAMPLE"
+
+#: The authorized upload root. ``authorize_upload_root`` keeps only an ABSOLUTE
+#: root (a string gate; extraction is faked below), and from Python 3.13
+#: ``ntpath.isabs("/tmp")`` is False, so the POSIX literal left uploads disabled
+#: on Windows and every "the picture must be uploaded" assertion failed there.
+_UPLOAD_ROOT = host_abs("tmp")
+
+
+@pytest.fixture(autouse=True)
+def _drop_live_config_snapshot():
+    """Leave no primed config snapshot behind for the next test.
+
+    ``_prime_live`` (and ``_dispatcher``, which calls it) publishes into the
+    process-global config watcher, so without this the last test to prime would
+    set the live config for every test after it in the same worker.
+    """
+    yield
+    from kiro_crew.config import live
+
+    live.reset_for_tests()
 
 
 def _msg(text: str, *, user: int = 1, chat: int = 1) -> TelegramInboundMessage:
@@ -223,7 +248,7 @@ class TestOutboundImages:
     @pytest.mark.asyncio
     async def test_an_image_ships_as_an_attachment_after_the_text(self) -> None:
         renderer, client = _renderer()
-        renderer.authorize_upload_root("/tmp")
+        renderer.authorize_upload_root(_UPLOAD_ROOT)
         renderer._extract_uploads = AsyncMock(  # type: ignore[method-assign]
             return_value=("Here is the chart.", [_png()])
         )
@@ -253,7 +278,7 @@ class TestOutboundImages:
     @pytest.mark.asyncio
     async def test_a_restricted_session_keeps_uploads_off(self) -> None:
         renderer, _ = _renderer(uploads_allowed=False)
-        renderer.authorize_upload_root("/tmp")
+        renderer.authorize_upload_root(_UPLOAD_ROOT)
         assert renderer._uploads_enabled() is False
 
     @pytest.mark.asyncio
@@ -261,7 +286,7 @@ class TestOutboundImages:
         self,
     ) -> None:
         renderer, client = _renderer()
-        renderer.authorize_upload_root("/tmp")
+        renderer.authorize_upload_root(_UPLOAD_ROOT)
         client.media_fails = True
         renderer._extract_uploads = AsyncMock(  # type: ignore[method-assign]
             return_value=("Here it is.", [_png()])
@@ -280,7 +305,7 @@ class TestOutboundImages:
         # Markup that hid a secret loses its formatting rather than its
         # redaction: that is the documented direction of the trade.
         renderer, client = _renderer()
-        renderer.authorize_upload_root("/tmp")
+        renderer.authorize_upload_root(_UPLOAD_ROOT)
         client.media_fails = True
         leaky = OutboundFile(
             path="/tmp/chart.png",
@@ -296,6 +321,70 @@ class TestOutboundImages:
         assert _AWS_KEY not in "".join(text for text, _ in client.sent)
 
     @pytest.mark.asyncio
+    async def test_recovery_of_many_failed_uploads_drops_no_reference(self) -> None:
+        # A truncated bubble must not keep only what fits under the cap: with
+        # enough failed images, every reference past it vanished silently.
+        renderer, client = _renderer()
+        renderer.authorize_upload_root(_UPLOAD_ROOT)
+        client.media_fails = True
+        files = [_png(f"chart-{i:03d}.png") for i in range(200)]
+        renderer._extract_uploads = AsyncMock(  # type: ignore[method-assign]
+            return_value=("Here they are.", files)
+        )
+        renderer._buf = ["Here they are."]
+        await renderer.on_done()
+        landed = "\n".join(text for text, _ in client.sent)
+        for item in files:
+            assert item.path in landed, f"recovery dropped {item.path}"
+        # Every recovery bubble stays within the channel budget, measured in
+        # Telegram's unit.
+        for text, _ in client.sent:
+            assert _utf16_len(text) <= renderer._limit()
+
+    @pytest.mark.asyncio
+    async def test_recovery_respects_telegram_utf16_budget(self) -> None:
+        # Telegram's cap counts UTF-16 code units; the old slice counted code
+        # points. An astral char costs 2 units, so emoji-dense alt text passed
+        # the slice while overflowing the real limit, and the send bounced.
+        renderer, client = _renderer()
+        renderer.authorize_upload_root(_UPLOAD_ROOT)
+        client.media_fails = True
+        dense = OutboundFile(
+            path="/tmp/chart.png",
+            data=b"\x89PNG\r\n\x1a\n",
+            alt="🚀" * 3000,
+            mime="image/png",
+        )
+        renderer._extract_uploads = AsyncMock(  # type: ignore[method-assign]
+            return_value=("Here.", [dense])
+        )
+        renderer._buf = ["Here."]
+        await renderer.on_done()
+        assert client.sent, "recovery bubbles must land"
+        for text, _ in client.sent:
+            assert _utf16_len(text) <= renderer._limit(), "bubble exceeds the API cap"
+        # Chunked, not truncated: no part of the alt text was dropped.
+        assert sum(text.count("🚀") for text, _ in client.sent) == 3000
+
+    def test_utf16_cut_floor_prevents_zero_progress(self) -> None:
+        # limit=1 with a leading astral char would otherwise cut at index 0
+        # forever; the floor of 2 guarantees any single char makes progress.
+        assert _utf16_cut("🚀abc", 1) >= 1
+        chunks = _utf16_chunks("🚀" * 5, 1)
+        assert "".join(chunks) == "🚀" * 5
+        assert all(_utf16_len(chunk) <= 2 for chunk in chunks)
+
+    def test_utf16_chunks_pack_lines_and_lose_nothing(self) -> None:
+        text = "\n".join(f"![a](/tmp/{i}.png)" for i in range(40))
+        chunks = _utf16_chunks(text, 100)
+        assert len(chunks) > 1, "must actually split for this to test packing"
+        assert all(_utf16_len(chunk) <= 100 for chunk in chunks)
+        # Newline-boundary packing: reassembled lines are exactly the input
+        # lines — nothing dropped, no line bisected.
+        lines = [line for chunk in chunks for line in chunk.split("\n")]
+        assert lines == text.split("\n")
+
+    @pytest.mark.asyncio
     async def test_a_length_rotation_holds_a_STRADDLING_reference(self) -> None:
         # The reference has to straddle the cut the splitter would actually take,
         # or the test passes with the guard removed: a reference that already sits
@@ -303,7 +392,7 @@ class TestOutboundImages:
         # _split_text hard-cuts at the render budget, so the markup is placed
         # across that offset on purpose.
         renderer, client = _renderer()
-        renderer.authorize_upload_root("/tmp")
+        renderer.authorize_upload_root(_UPLOAD_ROOT)
         ref = "![c](/tmp/chart.png)"
         cut = renderer._rendered_limit()
         renderer._buf = ["A" * (cut - 10) + ref]
@@ -319,7 +408,7 @@ class TestOutboundImages:
     @pytest.mark.asyncio
     async def test_live_frames_hide_the_markup_so_no_path_flashes(self) -> None:
         renderer, client = _renderer()
-        renderer.authorize_upload_root("/tmp")
+        renderer.authorize_upload_root(_UPLOAD_ROOT)
         renderer._last_edit = -1e9
         await renderer.on_text_chunk("Look: ![c](/tmp/secret-dir/chart.png)")
         assert "/tmp/secret-dir/chart.png" not in "".join(text for text, _ in client.sent)
@@ -331,7 +420,7 @@ class TestOutboundImages:
         # leaving it makes that transient frame the turn's FINAL text message,
         # sitting above the picture forever.
         renderer, client = _renderer()
-        renderer.authorize_upload_root("/tmp")
+        renderer.authorize_upload_root(_UPLOAD_ROOT)
         renderer._buf = ["![c](/tmp/chart.png)"]
         renderer._last_edit = -1e9
         await renderer.on_tool_call("t1", "render_chart")
@@ -347,7 +436,7 @@ class TestOutboundImages:
     @pytest.mark.asyncio
     async def test_an_extraction_failure_costs_the_picture_not_the_answer(self) -> None:
         renderer, client = _renderer()
-        renderer.authorize_upload_root("/tmp")
+        renderer.authorize_upload_root(_UPLOAD_ROOT)
         renderer._buf = ["The answer. ![c](/tmp/chart.png)"]
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(
@@ -398,7 +487,7 @@ class TestUploadRejections:
         from kiro_crew.messaging.outbound_files import ExtractResult
 
         renderer, client = _renderer()
-        renderer.authorize_upload_root("/tmp")
+        renderer.authorize_upload_root(_UPLOAD_ROOT)
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(
                 "kiro_crew.telegram.renderer.extract_local_refs_off_loop",
@@ -855,6 +944,57 @@ class TestMultipartShape:
         client._api_multipart.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_a_document_takes_sendDocument_with_its_real_name(self) -> None:
+        client = TelegramClient(token="t:1")
+        seen: list[Any] = []
+
+        async def _mp(method: str, params: dict, files: Any, **kw: Any) -> Any:
+            seen.append((method, params, list(files), kw["field_names"], kw.get("filenames")))
+            return {"message_id": 9}
+
+        client._api_multipart = _mp  # type: ignore[method-assign]
+        doc = OutboundFile(
+            path="/tmp/box/report.pdf", data=b"%PDF-1.4", alt="", mime="application/pdf"
+        )
+        mid = await client.send_document(7, doc, caption="x" * 2000, message_thread_id=3)
+        assert mid == 9
+        method, params, files, names, filenames = seen[0]
+        assert method == "sendDocument" and names == ["document"]
+        # The real filename is pinned: the multipart sanitizer is aimed at
+        # LLM-authored reference paths, and rewriting this already-gated name's
+        # extension would break the receiver's file-type association.
+        assert filenames == ["report.pdf"]
+        assert params["chat_id"] == 7 and params["message_thread_id"] == 3
+        # Caption capped at Telegram's 1024; the send stays silent (the text
+        # bubble for the same turn already pinged).
+        assert len(params["caption"]) == 1024
+        assert params["disable_notification"] is True
+        assert files == [doc]
+
+    @pytest.mark.asyncio
+    async def test_the_transport_document_verb_converts_ids_and_returns_str(self) -> None:
+        # The endpoint hands the transport a str conversation id off a
+        # ChannelLink; the Bot API wants ints. The verb owns that conversion,
+        # like send_message beside it.
+        from kiro_crew.telegram.transport import TelegramTransport
+
+        client = TelegramClient(token="t:1")
+        seen: list[Any] = []
+
+        async def _send_document(chat_id: int, document: Any, **kw: Any) -> int:
+            seen.append((chat_id, document, kw))
+            return 44
+
+        client.send_document = _send_document  # type: ignore[method-assign]
+        transport = TelegramTransport(client)
+        doc = _png("report.png")
+        mid = await transport.send_document("42", doc, caption="here", thread_id="7")
+        assert mid == "44"
+        chat_id, document, kw = seen[0]
+        assert chat_id == 42 and document is doc
+        assert kw["caption"] == "here" and kw["message_thread_id"] == 7
+
+    @pytest.mark.asyncio
     async def test_the_album_cap_bounds_one_call(self) -> None:
         client = TelegramClient(token="t:1")
         seen: list[int] = []
@@ -906,6 +1046,7 @@ class TestCommandSurface:
             ("/status", "status"),
             ("/ping", "ping"),
             ("/sessions", "sessions"),
+            ("/session launch plan", "sessions"),
             ("/title rename me", "title"),
             ("/cron list", "cron"),
             ("/crons list", "cron"),
@@ -920,7 +1061,7 @@ class TestCommandSurface:
 
     def test_the_menu_and_the_help_card_stay_one_source(self) -> None:
         names = {name for name, _ in COMMAND_SPEC}
-        assert {"agent", "status", "sessions", "cron"} <= names
+        assert {"agent", "status", "session", "cron"} <= names
         # Every row must survive the Bot API's own constraints, or Telegram
         # rejects the WHOLE array and the user loses the entire menu.
         payload = bot_command_payload()
@@ -1094,62 +1235,71 @@ class TestAgentSwitchSafety:
 
 
 class TestSessionsCommand:
+    @staticmethod
+    def _install_log(dispatcher: Any, log: Any) -> None:
+        dispatcher.conv_log = log
+        dispatcher._session_resume.conv_log = log
+        dispatcher._session_resume._controller.conv_log = log
+
     @pytest.mark.asyncio
-    async def test_the_read_is_audited_on_both_outcomes(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # Reaching into the data home and posting what it finds is an access worth
-        # a record — and the FAILURE path is the one that matters most, because an
-        # unaudited I/O error makes the attempt invisible.
-        from kiro_crew.messaging import sessions_view as sv
+    async def test_singular_alias_fuzzy_searches_and_posts_buttons(self, tmp_path: Any) -> None:
+        from kiro_crew.history import ConversationLog
 
-        seen: list[dict] = []
-        monkeypatch.setattr(
-            sv, "sel", lambda: SimpleNamespace(log_api_access=lambda **kw: seen.append(kw))
-        )
         dispatcher, client, _ = _dispatcher({1})
-        monkeypatch.setattr(sv, "_collect_recent_sessions_off_loop", AsyncMock(return_value=[]))
-        await dispatcher.handle_message(_msg("/sessions"))
-        assert seen and seen[-1]["outcome"] == "allowed"
-
-        monkeypatch.setattr(
-            sv,
-            "_collect_recent_sessions_off_loop",
-            AsyncMock(side_effect=OSError("sessions dir gone")),
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        await asyncio.to_thread(
+            log.append,
+            "dashboard:matching",
+            "user",
+            "The blue marmot owns the launch checklist",
         )
-        await dispatcher.handle_message(_msg("/sessions"))
-        assert seen[-1]["outcome"] == "error"
+        await asyncio.to_thread(log.set_title, "dashboard:matching", "General Q&A")
+        await asyncio.to_thread(log.append, "dashboard:other", "user", "Different topic")
+        await asyncio.to_thread(log.set_title, "dashboard:other", "Other session")
+        self._install_log(dispatcher, log)
+
+        await dispatcher.handle_message(_msg("/session blue marmot"))
+
+        heading, markup = client.sent[-1]
+        labels = [row[0]["text"] for row in markup["inline_keyboard"]]
+        assert "Session search" in heading
+        assert any("General Q&A" in label for label in labels)
+        assert all("Other session" not in label for label in labels)
+
+    @pytest.mark.asyncio
+    async def test_empty_history_says_so(self, tmp_path: Any) -> None:
+        from kiro_crew.history import ConversationLog
+
+        dispatcher, client, _ = _dispatcher({1})
+        self._install_log(dispatcher, ConversationLog(base_dir=tmp_path / "sessions"))
+
+        await dispatcher.handle_message(_msg("/session"))
+
+        assert client.sent[-1][0] == "No recent sessions."
+
+    @pytest.mark.asyncio
+    async def test_search_failure_is_audited_and_fails_closed(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.history import ConversationLog
+        from kiro_crew.messaging import session_resume as resume_core
+
+        dispatcher, client, _ = _dispatcher({1})
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        self._install_log(dispatcher, log)
+        seen: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            resume_core,
+            "sel",
+            lambda: SimpleNamespace(log_api_access=lambda **kw: seen.append(kw)),
+        )
+        monkeypatch.setattr(log, "search_sessions", MagicMock(side_effect=OSError("gone")))
+
+        await dispatcher.handle_message(_msg("/session launch"))
+
+        assert seen and seen[-1]["outcome"] == "error"
         assert seen[-1]["source"] == "telegram"
-        assert "Sessions unavailable" in client.sent[-1][0]
-
-    @pytest.mark.asyncio
-    async def test_an_empty_history_says_so(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        dispatcher, client, _ = _dispatcher({1})
-        monkeypatch.setattr(
-            "kiro_crew.telegram.transport_dispatch.collect_recent_sessions_audited",
-            AsyncMock(return_value=[]),
-        )
-        await dispatcher.handle_message(_msg("/sessions"))
-        assert client.sent[-1][0] == "No recent conversations."
-
-    @pytest.mark.asyncio
-    async def test_rows_are_listed_with_a_live_marker_and_redacted(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        dispatcher, client, _ = _dispatcher({1})
-        rows = [
-            {"title": f"leak {_AWS_KEY}", "agent": "kirocrew", "active": True},
-            {"title": "older thing", "agent": "researcher", "active": False},
-        ]
-        monkeypatch.setattr(
-            "kiro_crew.telegram.transport_dispatch.collect_recent_sessions_audited",
-            AsyncMock(return_value=rows),
-        )
-        await dispatcher.handle_message(_msg("/sessions"))
-        out = client.sent[-1][0]
-        assert "🟢" in out and "⚫" in out
-        assert "older thing" in out and "researcher" in out
-        assert _AWS_KEY not in out
+        assert client.sent[-1][0] == "⚠️ Recent sessions are unavailable."
 
 
 class TestAgentPicker:
@@ -1293,6 +1443,64 @@ class TestUploadGate:
         dispatcher, _, _ = _dispatcher({1})
         assert await dispatcher._uploads_restricted("telegram:kirocrew:direct:1") is False
 
+    @pytest.mark.asyncio
+    async def test_a_persisted_mode_survives_an_empty_tracker(self, tmp_path) -> None:
+        # The restart case. The privacy trackers are process-local and only an
+        # INBOUND channel message populates them, so a turn no inbound message
+        # drove — a cron, a webhook resume, a monitor/auto-nudge re-injection, an
+        # explicit file_send — reaches this gate with empty trackers even though
+        # the user's !incognito is on disk. Without the durable restore the gate
+        # reads "unrestricted" and the bytes leave the session that forbade them.
+        from kiro_crew.messaging import privacy_mode
+        from kiro_crew.messaging.upload_gate import uploads_restricted
+        from kiro_crew.session_map import SessionMap
+
+        key = "telegram:kirocrew:direct:1"
+        with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
+            sm = SessionMap()
+        # ``set_flag`` -> ``_save`` schedules a debounced ``_flush_async`` task on
+        # THIS test's loop, so the retirement has to be in a ``finally``: loop
+        # teardown would otherwise destroy it mid-write ("Task was destroyed but
+        # it is pending"), leaking a failure into whichever test runs next.
+        try:
+            sm.set_flag(key, privacy_mode.MODE_INCOGNITO, True)
+            privacy_mode.reset()  # the empty process-local view a restart leaves
+            state = SimpleNamespace(sessions=SimpleNamespace(_session_map=sm))
+
+            assert (
+                await uploads_restricted(
+                    state,
+                    key,
+                    channel_type="telegram",
+                    persisted_probe=lambda _slot: (False, None),
+                )
+                is True
+            )
+        finally:
+            await sm.aclose()
+
+    @pytest.mark.asyncio
+    async def test_an_unflagged_channel_key_stays_allowed_after_the_restore(self, tmp_path) -> None:
+        # The restore must not turn the common case into a refusal: a conversation
+        # with no durable flag is still permitted.
+        from kiro_crew.messaging import privacy_mode
+        from kiro_crew.messaging.upload_gate import uploads_restricted
+        from kiro_crew.session_map import SessionMap
+
+        privacy_mode.reset()
+        with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
+            state = SimpleNamespace(sessions=SimpleNamespace(_session_map=SessionMap()))
+
+        assert (
+            await uploads_restricted(
+                state,
+                "telegram:kirocrew:direct:1",
+                channel_type="telegram",
+                persisted_probe=lambda _slot: (False, None),
+            )
+            is False
+        )
+
     @pytest.mark.parametrize("restricted", [True, False])
     @pytest.mark.asyncio
     async def test_a_live_dashboard_slot_decides(self, restricted: bool) -> None:
@@ -1310,9 +1518,12 @@ class TestUploadGate:
 
         dispatcher, _, _ = _dispatcher({1})
         dispatcher.dashboard_state = SimpleNamespace(get_slot=lambda _name: None)
-        # Two args now: the gate takes the persisted probe as a PARAMETER rather
-        # than importing it, so `messaging` keeps its one-way dependency.
-        monkeypatch.setattr(ug, "_persisted_mode_is_restricted", lambda key, probe: True)
+        # The persisted probe is a PARAMETER rather than an import, so `messaging`
+        # keeps its one-way dependency; the third argument is the unknown-mode
+        # posture, which the upload ceiling leaves fail-closed.
+        monkeypatch.setattr(
+            ug, "_persisted_mode_is_restricted", lambda key, probe, unknown_denies=True: True
+        )
         assert await dispatcher._uploads_restricted("dashboard:ghost") is True
 
     @pytest.mark.asyncio
@@ -2081,13 +2292,14 @@ class TestSessionsIsDirectMessageOnly:
     @pytest.mark.asyncio
     async def test_a_forum_topic_is_refused_and_lists_nothing(self) -> None:
         dispatcher, client, _ = _dispatcher({1}, allow_forum=True, allowed_forum_chat_ids=[-100999])
-        with patch(
-            "kiro_crew.telegram.transport_dispatch.collect_recent_sessions_audited"
-        ) as collect:
-            await dispatcher.handle_message(_forum_msg("/sessions"))
-        # The refusal is the point, but so is not having READ the directory: a
-        # listing that was collected and then not sent still touched the data home.
-        collect.assert_not_called()
+        picker = AsyncMock()
+        dispatcher._session_resume.show_picker = picker
+
+        await dispatcher.handle_message(_forum_msg("/sessions"))
+
+        # The refusal is the point, but so is not having READ the directory: the
+        # picker owns the read and must never be called for a shared Topic.
+        picker.assert_not_awaited()
         reply = client.sent[-1][0]
         assert "direct message" in reply
         # No titles leak through the refusal itself.
@@ -2102,7 +2314,9 @@ class TestSessionsIsDirectMessageOnly:
         assert "direct message" not in reply
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("command", ["/sessions", "/cron list", "/spawn list"])
+    @pytest.mark.parametrize(
+        "command", ["/sessions", "/session launch", "/cron list", "/spawn list"]
+    )
     async def test_a_listing_needs_an_unambiguous_owner_even_in_a_dm(self, command: str) -> None:
         """A DM is the right audience; it also has to be the right PERSON.
 
@@ -2116,15 +2330,13 @@ class TestSessionsIsDirectMessageOnly:
         dispatcher, client, sessions = _dispatcher({7, 8})
         dispatcher.cron_service = MagicMock()
         dispatcher.subagent_manager = MagicMock()
+        picker = AsyncMock()
+        dispatcher._session_resume.show_picker = picker
 
-        with patch(
-            "kiro_crew.telegram.transport_dispatch.collect_recent_sessions_audited"
-        ) as collect:
-            await dispatcher.handle_message(_dm(command))
+        await dispatcher.handle_message(_dm(command))
 
-        # Refused BEFORE the listing was built, for the same reason a Topic is:
-        # a listing collected and then not sent still read the data.
-        collect.assert_not_called()
+        # Refused BEFORE any picker or host listing is built.
+        picker.assert_not_awaited()
         assert not dispatcher.cron_service.method_calls
         assert "single operator" in client.sent[-1][0]
 
@@ -2371,7 +2583,7 @@ class TestForumActivation:
 
 
 class TestSplitterConvergence:
-    """Telegram's splitter no longer fabricates fence delimiters.
+    """Telegram's splitter does not fabricate fence delimiters.
 
     The channel-local predecessor rebalanced by counting backticks
     (``ch.count("```") % 2``), which is not the fence grammar. On a
@@ -2496,11 +2708,13 @@ class TestVoiceOut:
         # every conversation the operator has not overridden.
         d, _, _ = _dispatcher({1})
         d.cfg.telegram.voice_replies = True
+        _prime_live(d.cfg)
         assert d._voice_enabled(("direct", "1")) is True
 
     def test_an_explicit_off_beats_a_configured_on(self) -> None:
         d, _, _ = _dispatcher({1})
         d.cfg.telegram.voice_replies = True
+        _prime_live(d.cfg)
         d._voice_pref[("direct", "1")] = False
         assert d._voice_enabled(("direct", "1")) is False
 
@@ -2675,7 +2889,9 @@ class TestPrivacyModes:
         logged: list = []
         d, _, _ = _dispatcher({7})
         d.conv_log = SimpleNamespace(  # type: ignore[assignment]
-            append=lambda *a, **k: logged.append(a), set_title=lambda *a, **k: None
+            append=lambda *a, **k: logged.append(a),
+            set_title=lambda *a, **k: None,
+            atomic_appends=lambda _key: nullcontext(),
         )
         key = "telegram:kirocrew:direct:7"
         d._persist_turn(key, "hello", "hi there", True, "kirocrew")
@@ -2792,8 +3008,11 @@ class TestARestrictedSessionWritesNothingAtAll:
                 if node.name not in functions:
                     continue
                 # Both shapes count: an early return (``_persist_turn``) and a
-                # guarded branch that answers the user (``_handle_title``).
-                if "is_restricted" not in ast.dump(node):
+                # guarded branch that answers the user (``_handle_title``). The
+                # dashboard-aware helper is named ``_session_restricted`` rather
+                # than ``privacy_mode.is_restricted``; both are explicit gates.
+                dump = ast.dump(node)
+                if "is_restricted" not in dump and "session_restricted" not in dump:
                     ungated.append(f"{channel}.{node.name}")
         assert not ungated, (
             "these write a durable title without checking the privacy mode, so a "
@@ -2856,7 +3075,7 @@ class TestARestrictedSessionUploadsNothing:
     async def test_a_channel_without_privacy_modes_is_unaffected(self) -> None:
         """Discord has no `/temporary`, so nothing can mark its keys.
 
-        Pinned because this rung used to answer False unconditionally: the change
+        This rung must not answer False unconditionally: the change
         must be invisible to a channel that offers no modes, or it would read as a
         behaviour change to every other channel's uploads.
         """
@@ -2924,6 +3143,7 @@ class TestAMidTurnModifierSurvivesTheQueue:
     async def test_a_queued_modifier_rides_along_and_applies_on_drain(self) -> None:
         d, client, sessions = _dispatcher({7})
         d.cfg.messaging.queue_mode = "queue"
+        _prime_live(d.cfg)
         self._busy(d)
 
         await d.handle_message(_dm("/temporary summarise this"))
@@ -2944,7 +3164,9 @@ class TestAMidTurnModifierSurvivesTheQueue:
         key = d._session_key(("direct", "7"))
         logged: list = []
         d.conv_log = SimpleNamespace(  # type: ignore[assignment]
-            append=lambda *a, **k: logged.append(a), set_title=lambda *a, **k: None
+            append=lambda *a, **k: logged.append(a),
+            set_title=lambda *a, **k: None,
+            atomic_appends=lambda _key: nullcontext(),
         )
         sessions.enqueue(key, "1", "summarise this", force=True, privacy_request="temporary")
 
@@ -3009,6 +3231,7 @@ class TestAMidTurnModifierSurvivesTheQueue:
 
         d, _, sessions = _dispatcher({7})
         d.cfg.messaging.queue_mode = "steer"
+        _prime_live(d.cfg)
         key = d._session_key(("direct", "7"))
         self._busy(d)
         steered: list[str] = []
@@ -3032,6 +3255,7 @@ class TestAMidTurnModifierSurvivesTheQueue:
 
         d, _, sessions = _dispatcher({7})
         d.cfg.messaging.queue_mode = "steer"
+        _prime_live(d.cfg)
         key = d._session_key(("direct", "7"))
         self._busy(d)
         sessions._gp = SimpleNamespace(
@@ -3232,7 +3456,13 @@ class TestPrivacyModeEnforcement:
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(privacy_mode, "hydrate", lambda s, k: seen.append(k))
             await d.handle_message(_dm("hello"))
-        assert seen == [d._session_key(("direct", "7"))]
+        # Asserted as a SET: what matters is which key is restored and that the
+        # pre-rotation one never is. The restore is idempotent and every gate that
+        # reads the process-local trackers runs it, so pinning a call count here
+        # would fail on a second gate joining the turn rather than on the key
+        # being wrong.
+        assert seen, "the inbound path must restore the durable flags"
+        assert set(seen) == {d._session_key(("direct", "7"))}
 
 
 class TestPollingLoopAck:
@@ -3432,6 +3662,7 @@ class TestFallbackTitleYieldsToAutoTitle:
         log = SimpleNamespace(
             append=lambda *a, **k: None,
             set_title=lambda key, title: titles.append((key, title)),
+            atomic_appends=lambda _key: nullcontext(),
         )
         return log, titles
 
@@ -3589,11 +3820,14 @@ class TestRotationChokepoint:
 
         d, _, _ = _dispatcher({7})
         d.cfg.messaging.idle_reset_minutes = 1
+        _prime_live(d.cfg)
         route = ("direct", "7")
         d._conv.maybe_rotate(route, time.time() - 3600, idle_minutes=1, daily_reset_hour=-1)
         logged: list[Any] = []
         d.conv_log = SimpleNamespace(  # type: ignore[assignment]
-            append=lambda *a, **k: logged.append(a), set_title=lambda *a, **k: None
+            append=lambda *a, **k: logged.append(a),
+            set_title=lambda *a, **k: None,
+            atomic_appends=lambda _key: nullcontext(),
         )
         await d.handle_message(_dm("/temporary"))
         assert privacy_mode.is_temporary(d._session_key(route))
@@ -3618,6 +3852,7 @@ class TestRotationChokepoint:
         # has to be safe to call more than once for one inbound message.
         d, _, _ = _dispatcher({7})
         d.cfg.messaging.idle_reset_minutes = 1
+        _prime_live(d.cfg)
         route = ("direct", "7")
         first = d._rotated_session_key(route)
         assert d._rotated_session_key(route) == first
@@ -3628,7 +3863,7 @@ class TestAlbumMergePreservesIdentity:
 
     An album is the head message with more photos and a joined caption, so those two
     are the only things the merge decides. Everything else is identity and has to
-    survive verbatim. The merge used to enumerate fields, which meant any field added
+    survive verbatim. The merge must not enumerate fields, or any field added
     to ``TelegramInbound`` was silently dropped: ``reply_to_user_id`` went missing
     that way, and a reply-to-the-bot album in a mention-mode forum Topic was then
     discarded by the activation gate with no trace.
@@ -3753,29 +3988,29 @@ async def _false(_channel: str) -> bool:
 
 
 class TestSessionsAuditCaller:
-    """The audit's subject is the participant, not the channel.
-
-    `caller` was the constant `"telegram"`, which is the SOURCE. With more than one
-    entry in `allowed_user_ids` — the forum case this channel now serves — a read of
-    every conversation's titles could not be attributed to anyone.
-    """
-
     @pytest.mark.asyncio
-    async def test_the_requesting_user_id_is_the_audited_caller(self) -> None:
-        from kiro_crew.telegram import transport_dispatch as td
+    async def test_the_requesting_user_id_is_the_audited_caller(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.history import ConversationLog
+        from kiro_crew.messaging import session_resume as resume_core
 
-        d, _, _ = _dispatcher({7})
-        calls: list[dict] = []
+        dispatcher, _, _ = _dispatcher({7})
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        dispatcher.conv_log = log
+        dispatcher._session_resume.conv_log = log
+        dispatcher._session_resume._controller.conv_log = log
+        calls: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            resume_core,
+            "sel",
+            lambda: SimpleNamespace(log_api_access=lambda **kw: calls.append(kw)),
+        )
 
-        async def _collect(sessions: Any, **kw: Any) -> list:
-            calls.append(kw)
-            return []
+        await dispatcher.handle_message(_dm("/session"))
 
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(td, "collect_recent_sessions_audited", _collect)
-            await d.handle_message(_dm("/sessions"))
         assert calls and calls[0]["caller"] == "7"
-        assert calls[0]["source"] == "telegram", "the source stays the channel"
+        assert calls[0]["source"] == "telegram"
 
 
 class TestHiddenLinkUrls:
@@ -3928,11 +4163,18 @@ class TestWidgetPressBypassesActivation:
     @pytest.mark.asyncio
     async def test_an_options_press_marks_its_synthetic_message(self) -> None:
         # The flag has to be SET where the synthetic message is built, or the
-        # exemption above is unreachable in production.
+        # exemption above is unreachable in production. The same handoff keeps
+        # model-authored labels out of command parsing and carries the posting
+        # session tag into the dispatcher's provenance gates.
+        from kiro_crew.messaging.renderer import session_provenance_tag
+
         d, client, _ = _dispatcher({7}, forum_activation="mention")
         d.bot_username = "kirocrewbot"
-        seen: list[Any] = []
-        d.handle_message = lambda msg, **kw: seen.append(msg) or _done_none()  # type: ignore[assignment]
+        seen: list[tuple[Any, dict[str, Any]]] = []
+        d.handle_message = (  # type: ignore[assignment]
+            lambda msg, **kw: seen.append((msg, kw)) or _done_none()
+        )
+        tag = session_provenance_tag(d._session_key(("direct", "7")))
         await d.on_callback(
             SimpleNamespace(
                 callback_query_id="q",
@@ -3940,13 +4182,16 @@ class TestWidgetPressBypassesActivation:
                 chat_id=7,
                 chat_type="private",
                 message_id=101,
-                data="opt:0",
+                data=f"opt:0:{tag}",
                 label="alpha",
                 message_thread_id=None,
             )
         )
         assert seen, "the press must re-enter the turn path"
-        assert getattr(seen[0], "from_widget", False) is True
+        msg, kwargs = seen[0]
+        assert getattr(msg, "from_widget", False) is True
+        assert kwargs["interpret_commands"] is False
+        assert kwargs["origin_tag"] == tag
 
 
 async def _done_none() -> None:
@@ -3987,7 +4232,7 @@ class TestDurableWritesUseTheRotatedKey:
         "_handle_model": False,
         "_apply_model": False,
         "_apply_agent": False,
-        "on_callback": False,
+        "_callback_session_key": False,
     }
 
     def test_every_classified_method_matches_its_side(self) -> None:
@@ -4026,7 +4271,13 @@ class TestDurableWritesUseTheRotatedKey:
             elif "_session_key(route)" in line and current:
                 consumers.add(current)
         # These resolve a key for reasons the durable/live split does not govern.
-        exempt = {"_rotated_session_key", "handle_message", "_notify_mode"}
+        exempt = {
+            "_rotated_session_key",
+            "handle_message",
+            "_notify_mode",
+            "_callback_session_key",
+            "_refused_turn_restricted",
+        }
         missing = consumers - set(self._CLASSIFIED) - exempt
         assert not missing, f"unclassified session-key consumers: {sorted(missing)}"
 
@@ -4034,6 +4285,7 @@ class TestDurableWritesUseTheRotatedKey:
     async def test_title_renames_the_session_the_next_message_will_use(self) -> None:
         d, _, _ = _dispatcher({7})
         d.cfg.messaging.idle_reset_minutes = 1
+        _prime_live(d.cfg)
         route = ("direct", "7")
         d._conv.maybe_rotate(route, time.time() - 3600, idle_minutes=1, daily_reset_hour=-1)
         titled: list[tuple[str, str]] = []

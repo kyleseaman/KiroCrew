@@ -1,9 +1,9 @@
 """Tests for dashboard cron PATCH handler's agent body-key mapping.
 
-The dashboard UI's cron editor sends `{"agent": "..."}` in the PATCH body, but
-the handler's kwargs allowlist used to only accept `"agent_id"`. That caused
-agent changes to be silently dropped: save returned 200 OK, the UI refetched,
-saw the unchanged `agent: null`, and reverted the dropdown to default.
+The dashboard UI's cron editor sends `{"agent": "..."}` in the PATCH body, so
+the handler's kwargs allowlist must accept `"agent"`. If it accepted only
+`"agent_id"`, agent changes would be silently dropped: save returns 200 OK, the
+UI refetches, sees the unchanged `agent: null`, and reverts the dropdown to default.
 
 These tests lock in the accepted-key mapping so the regression cannot return.
 """
@@ -13,6 +13,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from body_stream_helpers import attach_body
 
 from kiro_crew.dashboard.handlers import api_cron_update
 
@@ -26,7 +27,7 @@ def _make_request(body: dict, job_id: str = "abc123") -> MagicMock:
     request = MagicMock()
     request.app = {"state": mock_state}
     request.match_info = {"job_id": job_id}
-    request.json = AsyncMock(return_value=body)
+    attach_body(request, body)
     return request
 
 

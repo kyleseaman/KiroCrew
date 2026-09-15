@@ -108,6 +108,45 @@ class TestArtifactReferenceLink:
         assert ARTIFACT_ROUTE_PREFIX not in result
         assert "<mcwidget" in result
 
+    def test_save_hints_when_the_slug_was_suffixed(self) -> None:
+        # given a markdown save whose derived slug was already taken. The
+        # name-based dedup probe is scoped to chat widgets and stays silent
+        # here, so the store's report is the only signal.
+        with patch(
+            "kiro_crew.mcp_core._post",
+            return_value={
+                "slug": "run-summary-2",
+                "version": 1,
+                "name": "Run Summary",
+                "kind": "markdown",
+                "slug_collided_with": "run-summary",
+            },
+        ):
+            # when the save tool result is rendered
+            result = _call_tool_inner(
+                "artifact_save",
+                {"name": "Run Summary", "content": "# corrected", "kind": "markdown"},
+            )
+        # then it names the taken slug and the verb that versions in place
+        assert "'run-summary'" in result
+        assert "artifact_update" in result
+
+    def test_save_omits_the_hint_when_the_slug_was_free(self) -> None:
+        with patch(
+            "kiro_crew.mcp_core._post",
+            return_value={
+                "slug": "run-summary",
+                "version": 1,
+                "name": "Run Summary",
+                "kind": "markdown",
+            },
+        ):
+            result = _call_tool_inner(
+                "artifact_save",
+                {"name": "Run Summary", "content": "# notes", "kind": "markdown"},
+            )
+        assert "already taken" not in result
+
     def test_get_non_widget_emits_markdown_link(self) -> None:
         # given a fetched markdown artifact
         with patch(
@@ -469,6 +508,87 @@ class TestArtifactSave:
         assert "Saved artifact" in result
 
 
+class TestThemeContrastHint:
+    # The save/update responses attach a soft warning when the gateway's
+    # relayed ``theme_contrast_warning`` field says the persisted content
+    # hardcodes its palette. The MCP tool does NOT recompute the verdict
+    # (the request body can be stale for file-promoted saves) — it reads
+    # the relayed field, exactly like ``slug_collided_with``. Detection
+    # edge cases are unit-tested directly on the store predicate in
+    # test_artifacts.py. Warning only — the save/update always proceeds.
+
+    def test_save_hint_when_gateway_flags(self) -> None:
+        with (
+            patch("kiro_crew.mcp_core._get", return_value={"artifacts": []}),
+            patch(
+                "kiro_crew.mcp_core._post",
+                return_value={
+                    "slug": "perf",
+                    "version": 1,
+                    "kind": "widget",
+                    "theme_contrast_warning": True,
+                },
+            ),
+        ):
+            result = _call_tool_inner(
+                "artifact_save",
+                {"name": "Perf page", "content": '<div style="color:#111">hi</div>'},
+            )
+        assert "Hardcoded colors, no theme variables" in result
+        assert "var(--text,#111)" in result
+
+    def test_save_no_hint_when_gateway_silent(self) -> None:
+        # False AND absent (older gateway) must both stay silent.
+        for extra in ({"theme_contrast_warning": False}, {}):
+            with (
+                patch("kiro_crew.mcp_core._get", return_value={"artifacts": []}),
+                patch(
+                    "kiro_crew.mcp_core._post",
+                    return_value={"slug": "perf", "version": 1, "kind": "widget", **extra},
+                ),
+            ):
+                result = _call_tool_inner(
+                    "artifact_save",
+                    {"name": "Perf page", "content": "<div>hi</div>"},
+                )
+            assert "Hardcoded colors" not in result
+
+    def test_update_hint_when_gateway_flags(self) -> None:
+        with patch(
+            "kiro_crew.mcp_core._patch",
+            return_value={
+                "slug": "perf",
+                "version": 2,
+                "kind": "widget",
+                "name": "Perf",
+                "theme_contrast_warning": True,
+            },
+        ):
+            result = _call_tool_inner(
+                "artifact_update",
+                {"slug": "perf", "content": '<body style="background:#fffbe6">x</body>'},
+            )
+        assert "Hardcoded colors, no theme variables" in result
+
+    def test_update_no_hint_when_gateway_silent(self) -> None:
+        # Metadata-only updates: the gateway stamps False (nothing to lint).
+        with patch(
+            "kiro_crew.mcp_core._patch",
+            return_value={
+                "slug": "perf",
+                "version": 2,
+                "kind": "widget",
+                "name": "P2",
+                "theme_contrast_warning": False,
+            },
+        ):
+            result = _call_tool_inner(
+                "artifact_update",
+                {"slug": "perf", "name": "P2"},
+            )
+        assert "Hardcoded colors" not in result
+
+
 class TestArtifactGet:
     def test_get_current(self) -> None:
         with patch(
@@ -722,7 +842,7 @@ class TestArtifactGetCommentsFullBody:
         assert body in result
 
     def test_long_body_not_truncated(self) -> None:
-        # 500-char body — previously would be cut to 200
+        # 500-char body: the full body is preserved, not truncated to 200.
         body = "A" * 250 + " MIDDLE " + "B" * 242
         assert len(body) == 500
         with patch(
@@ -1230,14 +1350,12 @@ class TestArtifactDeleteCommentTool:
 
 
 class TestArtifactPatchUsesTheVerbHelper:
-    """The two artifact PATCH senders owe the same recovery every verb has (#4106).
+    """Both artifact PATCH senders carry the same recovery every verb has.
 
-    They were hand-rolled because ``_post`` sends POST and PATCH was needed;
-    ``mcp_core._patch`` did not exist yet. It does now, and it carries the
-    refusal->invalidate->re-resolve->replay rule that a raw ``_api_urlopen``
-    does not: a gateway that came up (or moved ports) after this tool server
-    booted is recorded only in the run marker, so the first attempt is refused
-    and every other verb recovers from that while these two did not.
+    ``mcp_core._patch`` carries the refusal->invalidate->re-resolve->replay
+    rule that a raw ``_api_urlopen`` does not: a gateway that came up (or moved
+    ports) after this tool server booted is recorded only in the run marker, so
+    the first attempt is refused and every verb must recover from that.
 
     The resolver is scripted at ``_resolve_api_port`` — the one seam the whole
     discovery chain funnels through — so these tests do not depend on how many
@@ -1306,8 +1424,8 @@ class TestArtifactPatchUsesTheVerbHelper:
 
     def test_both_senders_carry_the_caller_attribution_header(self, monkeypatch) -> None:
         """``X-Internal-Caller`` lets the gateway audit log name the component
-        that wrote (#3503). The hand-rolled requests omitted it, so an artifact
-        write was the one internal write the audit could not attribute."""
+        that wrote. Without it an artifact write is the one internal write the
+        audit cannot attribute."""
         import kiro_crew.mcp_core as mcp_core
 
         monkeypatch.setattr(mcp_core, "internal_caller", lambda: "kirocrew-artifacts")

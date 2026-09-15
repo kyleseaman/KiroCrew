@@ -129,6 +129,8 @@ class TestApiEndpoint:
         async with TestClient(TestServer(app)) as client:
             resp = await client.post("/api/chat/nav/resolve-links", data="not json")
             assert resp.status == 400
+            body = await resp.json()
+            assert body["code"] == "invalid_json"
 
     @pytest.mark.asyncio
     async def test_empty_links(self):
@@ -143,6 +145,13 @@ class TestApiEndpoint:
         async with TestClient(TestServer(app)) as client:
             resp = await client.post("/api/chat/nav/resolve-links", json={"links": []})
             assert resp.status == 400
+            body = await resp.json()
+            assert body["code"] == "links_required"
+            # A present-but-not-a-list links field refuses at the same site.
+            resp = await client.post("/api/chat/nav/resolve-links", json={"links": "x"})
+            assert resp.status == 400
+            body = await resp.json()
+            assert body["code"] == "links_required"
 
     @pytest.mark.asyncio
     async def test_success(self, monkeypatch):
@@ -206,11 +215,11 @@ class TestNormalizeLink:
         assert _normalize_link({}) == {"url": "", "context": ""}
 
     def test_non_string_url_coerced_to_empty(self):
-        # 123[:500] used to raise TypeError -> 500
+        # 123[:500] would raise TypeError -> 500
         assert _normalize_link({"url": 123, "context": "ctx"}) == {"url": "", "context": "ctx"}
 
     def test_non_string_context_coerced_to_empty(self):
-        # "".strip() on a list used to raise AttributeError -> 500
+        # "".strip() on a list would raise AttributeError -> 500
         assert _normalize_link({"url": "https://x.com", "context": ["a"]}) == {
             "url": "https://x.com",
             "context": "",
@@ -220,7 +229,7 @@ class TestNormalizeLink:
         assert _normalize_link({"url": None}) == {"url": "", "context": ""}
 
     def test_non_dict_entry_coerced_to_empty(self):
-        # link.get(...) on a str/None used to raise AttributeError -> 500
+        # link.get(...) on a str/None would raise AttributeError -> 500
         assert _normalize_link("https://x.com") == {"url": "", "context": ""}
         assert _normalize_link(None) == {"url": "", "context": ""}
 
@@ -248,7 +257,7 @@ class TestApiEndpointResilience:
         app["state"] = object()
         app.router.add_post("/api/chat/nav/resolve-links", api_chat_nav_resolve_links)
         async with TestClient(TestServer(app)) as client:
-            # Every shape that previously produced a 500.
+            # Every shape that would otherwise produce a 500.
             links = [
                 {"url": 123, "context": "x"},
                 {"url": "https://ok.com", "context": 99},
@@ -278,6 +287,8 @@ class TestApiEndpointResilience:
             for payload in ([1, 2, 3], "x", 42):
                 resp = await client.post("/api/chat/nav/resolve-links", json=payload)
                 assert resp.status == 400, f"body={payload!r} should be 400"
+                body = await resp.json()
+                assert body["code"] == "body_not_object"
 
     @pytest.mark.asyncio
     async def test_resolver_error_fails_soft_with_audit_event(self, monkeypatch):

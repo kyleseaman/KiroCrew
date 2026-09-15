@@ -231,6 +231,24 @@ class TestCollectRecentSessions:
         assert rows[0]["title"] == "ok"
         assert rows[0]["msgs"] == [{"role": "user", "content": "hi"}]
 
+    def test_skips_valid_json_lines_that_are_not_records(self, sess_dir):
+        path = sess_dir / "dashboard_non_record.jsonl"
+        path.write_text(
+            "\n".join(
+                [
+                    json.dumps({"_type": "metadata", "title": "ok"}),
+                    "null",
+                    json.dumps(["not", "a", "record"]),
+                    json.dumps({"role": "user", "content": "hi"}),
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        rows = _collect_recent_sessions(None)
+
+        assert rows[0]["msgs"] == [{"role": "user", "content": "hi"}]
+
     def test_truncates_long_message_content(self, sess_dir):
         big = "x" * 10000
         _write_jsonl(sess_dir / "dashboard_a.jsonl", title="t", messages=[("user", big)])
@@ -404,7 +422,7 @@ class TestBuildSessionsBlocks:
         assert "AKIAIOSFODNN7EXAMPLE" not in rendered
 
     def test_redacts_exfiltration_urls_in_message_content(self):
-        """Regression for review-bot security-controls comment on rev 1.
+        """Message content is redacted before it is posted to Slack.
 
         The pre-refactor inline code applied BOTH ``redact_exfiltration_urls()``
         and ``redact_credentials()`` to message content before posting to Slack.
@@ -580,9 +598,8 @@ class TestHandleSessionsCommandDelegation:
     async def test_keyword_collector_failure_emits_error_audit(
         self, tmp_path, monkeypatch
     ):
-        """Regression for review-bot security-controls. The keyword path
-        previously called the collector outside any try/except, so an
-        OSError would skip the SEL audit entirely. Locks in that the
+        """The keyword path must call the collector inside a try/except, or an
+        OSError skips the SEL audit entirely. Locks in that the
         error-outcome audit fires on collector failure, mirroring the
         slash and Home Tab error-path patterns.
         """
@@ -743,7 +760,7 @@ class TestSlashSessionsAudit:
     async def test_slash_unauthorized_denied_with_audit(
         self, tmp_path, monkeypatch
     ):
-        """Regression for review-bot security-controls / authorization rule.
+        """The slash command enforces the authorization rule.
 
         Per the deny-by-default guideline, the slash command must reject
         callers that are neither the owner nor an explicitly-allowed user,

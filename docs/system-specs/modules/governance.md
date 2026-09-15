@@ -93,15 +93,116 @@ evaluator edits.
 
 ## Loading + precedence
 
-`load_security_policy()` precedence (first present wins):
+`load_security_policy()` precedence, highest first. The centrally distributed
+document is the **authority**; every tier below it may only **tighten** it:
 
-1. `KIROCREW_SECURITY_POLICY` env path — fleet hot-override, highest.
-2. companion-bundled resource (the `amazon` edition packages it; the public core
+1. **the centrally distributed document** — fetched from `KIROCREW_POLICY_URL` or
+   from the `distribution.source` a lower tier declares, served from the
+   last-known-good cache when the endpoint is unreachable. See
+   [Central distribution](#central-distribution-distribution--policy-only).
+2. `KIROCREW_SECURITY_POLICY` env path — the local operator channel.
+3. companion-bundled resource (the `amazon` edition packages it; the public core
    passes `None`).
-3. `~/.kiro/crew/security_policy.json` — standalone operator-authored.
-4. none → `None` → editable secure-defaults (ungoverned ceiling).
+4. `~/.kiro/crew/security_policy.json` — standalone operator-authored.
+5. none → `None` → editable secure-defaults (ungoverned ceiling).
 
-The home path (step 3) is resolved through the **lazy `_policy_home_path()`
+**Tiers 2–4 are mutually exclusive** (first present wins among them) and
+collectively form the *subordinate*; tier 1 stacks above it. The composed result
+is `central ∘ subordinate` under `_intersect_ceilings`, which reuses
+`_compose_controls` — the same per-scope AND the profile layer uses (allow∩, deny∪,
+ordinal=stricter, gate=AND) — so "a lower tier cannot widen" is a property of the
+primitive rather than a rule the loader polices. A scope the subordinate governs
+and the authority does not carries through, because an ungoverned scope is
+*unrestricted* and adding a restriction to it is a tightening; a scope the
+authority governs and the subordinate omits keeps the authority's value, because a
+subordinate cannot repeal by omission. One scope inside `controls` has no compose
+archetype: the reserved sandbox boot flags (`sandbox.require_isolation`,
+`sandbox.env_scrub_prefixes`) ride as a plain mapping under `sandbox._flags`, and
+`_intersect_ceilings` merges that mapping per key — the authority's value where both
+tiers set one, the subordinate's where the authority was silent — rather than handing
+it to `_compose_controls`, which would refuse it as a type mismatch and abort boot on
+an ordinary two-tier configuration. The flags are inert (nothing reads them), so
+neither direction can widen the ceiling. Everything outside `controls` stays the
+**authority's** — identity, signature state, tier and the `updates` *commands* — so a
+subordinate document cannot relabel whose ceiling this is or supply a command the
+gateway would run unsandboxed. The two `updates` pins that are themselves restrictions
+fold instead (`_intersect_update_pins`): `updates.source` is an allowlist and
+`updates.min_version` a floor, so a subordinate that sets one the authority left empty
+narrows the ceiling and keeps it; where both set one, the authority's source stands and
+the higher floor wins. Keeping "the authority's" there would have voided a pure
+tightening — an empty source pin permits any remote, so a central document silent on
+updates plus a local source pin would have composed to "install from anywhere". Two
+things follow a declared-wins rule instead, because for them "the authority's" is only
+meaningful when the authority actually said something:
+
+- `fallback`: **authority-only**, not declared-wins. An authority that declared
+  none means an unusable profile file denies its whole surface, and a subordinate
+  supplying a fallback there would REPLACE that floor with something looser — the
+  escape hatch widened by the tier that may not widen anything. A subordinate that
+  wants a fallback asks the fleet to declare one. (Listed here because it is the
+  one out-of-`controls` field a reader expects to be declared-wins and is not.)
+- the `distribution` pins: the **highest tier that declared any** supplies them, for
+  every tier that takes part in the fold. A lower tier still cannot redirect a
+  fetch source its authority chose — that is the property the pins exist for — but
+  when no tier above it declared any there is no choice to redirect away from, and
+  the fetch source a lower tier declares is exactly the self-refresh case tier 1
+  above is defined in terms of. Taking "the authority's" unconditionally instead
+  meant an authority silent about distribution **discarded** the pins beneath it,
+  switching the central tier off and dropping every centrally supplied restriction.
+  `compose_tier_ladder` tracks the effective value as the fold proceeds and
+  re-applies it on every exit, so no path that rebuilds a ceiling can drop it.
+  An **unusable home file beneath a present authority is skipped, not raised**
+  (`_subordinate_ceiling(beneath_authority=True)`, one warning per process) --
+  unreadable, not JSON, JSON that `parse_policy` rejects, or bytes on which verifying
+  or parsing raises anything at all (the catch is total at this one boundary), one
+  path for every shape so JSON validity does not split the behaviour. The home
+  `distribution` peek that runs before the central document is known is a lookup for
+  a declared source, not a ruling on the file: a malformed block declares no source
+  and the peek moves on, leaving skip-or-fatal to `_subordinate_ceiling`, which
+  re-parses the home document only when the home tier is the one selected. The
+  authority governs unchanged, which is the fail-closed direction, whereas raising
+  -- the behaviour when the home file is the only ceiling -- would let whoever owns
+  `~/.kiro/crew` refuse boot and freeze every refresh on a fleet host.
+  "Declared" is read from the **presence** of the block, not from its values
+  (`PolicyDistribution.explicit`, set by `from_dict`, outside `__eq__`): a central
+  document that spells out `on_unavailable: fail_closed` -- the default -- has
+  expressed a choice, and a value-only test read it as silence, which let a lower
+  tier's `degrade` replace the fleet's outage disposition through the ordinary
+  two-channel split.
+
+The fold itself is **`compose_tier_ladder`**, the single implementation of
+precedence: highest present tier is the authority, and each lower one may only tighten
+it. There is deliberately no path by which a lower tier replaces the authority. A
+central refresh re-runs that same function through `compose_installed_ceiling` (see
+[The live swap](#the-live-swap-and-the-cache-it-invalidates)), so boot and refresh
+cannot drift — there is only one implementation of precedence to drift from.
+
+Each distinct composition pair is audited **once per process**
+(`security_policy_tier_intersect`, latched on the `(authority, lower)` pair in
+`_TierProcessState.tier_intersects_audited`) with the tier NAMES only — module constants this process
+authored, never a path or URL from the document, the same rule the distribution
+audit follows. Once, because `load_security_policy` runs per app callback and the
+pairs it folds do not change between calls; a row per compose was a row per
+interaction for a fact that never changed, burying the one-time env-inversion
+signal. A tier that appears later (an env document set after boot) is a new pair
+and is still recorded.
+
+**Why the env tier no longer outranks the central push.** It used to, as the
+rollback lever for a bad central document. That made the enterprise ceiling
+advisory: any account that can set an environment variable could point it at a
+permissive file and the fleet's ceiling never bound.
+
+A time-boxed local override (a dated `break_glass` grant an authority document could issue to a lower tier) was designed for this change and **withdrawn before merge**: a channel by which a local document outranks the fleet ceiling is the override this ladder exists to remove, and the reviewed design carried its own expiry-handling and cache-trust defects. Recovery from a bad central push is by re-publishing a good document at the source. The override is tracked as the follow-up issue [#9106](https://github.com/kirodotdev/KiroCrew/issues/9106), not shipped here.
+
+**The inversion announces itself once.** An upgraded fleet whose runbook still reads
+"set `KIROCREW_SECURITY_POLICY` to roll back" would otherwise learn mid-incident that the
+file now only tightens. So the first time an env document composes **beneath** the
+central authority, `_warn_env_beneath_central_once` logs a warning and writes one
+best-effort SEL row (`security_policy_env_tightens_only`, `<authority><-env`), latched by
+`_TierProcessState.env_beneath_central_warned` for the process lifetime. An env document governing alone,
+or a home document beneath an authority, is not an inversion and is not announced.
+
+The home path (step 4) is resolved through the **lazy `_policy_home_path()`
 accessor**, never a module-level `config_dir()` capture — so importing
 `platform.governance` (or `platform.admission`, whose `_policy_default_path()` /
 `_seed_marker_path()` / `_checksum_path()` follow the same pattern) never
@@ -170,6 +271,903 @@ build predating `updates` refuses to boot on a pinned policy — which inverts t
 `min_version` case, since the stale hosts a floor targets are exactly the ones
 that would stop booting. Recovery is a manual `kirocrew update`.
 
+## Central distribution (`distribution`) — policy-only
+
+`platform/policy_distribution.py` is how an enterprise IT admin owns **one**
+`security_policy.json` and every machine in the fleet follows it. Each host fetches
+the document from a central location, keeps the last-known-good copy on disk, and
+re-fetches on an interval, so a pushed change binds **without a restart, a
+redeploy, or a visit to the host**. This closes the gap the field manual named
+outright: distribution used to be entirely the customer's config-management
+tooling, with no seam on this side of it.
+
+`GovernanceCeiling.distribution` is the parsed declaration; the module is the
+engine. Like [`updates`](#update-pins-updates--policy-only) it is **not an
+archetype** — every archetype answers "is X permitted?", while a URL and an
+interval are values the core consumes — so it rides outside `controls` with no
+`SCOPE_CATALOG` row, no matcher, and no evaluator change.
+
+```json
+"distribution": {
+  "source": "https://config.corp.example/kirocrew/policy.json",
+  "refresh_interval_secs": 900,
+  "max_cache_age_secs": 86400,
+  "on_unavailable": "fail_closed"
+}
+```
+
+**Policy-only — rejected in a Level-2 profile** (`parse_profile` raises). This is a
+stronger version of the `updates` argument, not the same one: redirecting where the
+ceiling is *fetched from* is not a narrowing at all, it replaces the whole
+enforcement document, which is the widest escalation the model has.
+
+### Two source channels, and why the split
+
+| Channel | Where | For |
+|---|---|---|
+| `KIROCREW_POLICY_URL` (+ the `KIROCREW_POLICY_*` siblings) | per-machine env | The **fleet lever** — the same role `KIROCREW_SECURITY_POLICY` plays. A config-management push sets one variable; no file to place, no package to rebuild. |
+| `distribution.source` in a policy any other tier supplies | the policy document | **Self-refresh.** A fleet places one bootstrap policy once (or an edition bundles it) and that document names where its own successors come from. |
+
+The env channel wins **per setting**, so a host can be redirected to a canary
+endpoint or have its interval lengthened during an incident without editing — and
+re-signing — the published document.
+
+**No credentials in the document, and no provenance flag either.** `distribution`
+has no `headers` field on purpose: a document published to the whole fleet must not
+carry a per-machine secret, and this one is additionally copied into a local cache
+and reported on by the read-only viewer. A request credential comes from
+`KIROCREW_POLICY_HEADERS` (a JSON object) instead. There is likewise no
+`require_signature` key — a document must not be the authority on whether it has to
+be authentic, which is exactly what `_policy_trust_settings` already refuses by name
+("an attacker rewriting the policy would simply clear it"). Mandating provenance is
+`require_policy_signature` in the admission policy, which is on the keystone and
+which a fetched document cannot reach.
+
+The peek runs in the same order the tiers themselves do — the
+`KIROCREW_SECURITY_POLICY` document, then bundled, then home — so where a source may be
+declared and which declaration wins are one question rather than two. The env document
+belongs in that chain because it is tier 2, above bundled and home; its absence from the
+chain meant an operator who put `distribution.source` in the file
+`KIROCREW_SECURITY_POLICY` names got no central tier at all. That document is read once
+and handed down to the subordinate tier, so the peek and the tier cannot disagree about
+its bytes.
+
+The peek that resolves a declaration (`_declared_distribution`)
+deliberately validates **only** the `distribution` key. A policy whose other keys
+are malformed must fail at its own tier with its own message; a malformed
+`distribution` block does raise, because a fleet that mistyped where its ceiling
+comes from must not silently get none.
+
+### Availability: the cache is the whole point
+
+A ceiling a network can withhold is a ceiling a network can *remove*, so two
+failures pull in opposite directions and get opposite answers.
+
+**The endpoint is unreachable.** The cached last-known-good copy is served, and that
+is the normal answer — a host does not lose governance because a bucket had a bad
+minute. `max_cache_age_secs` is the fleet's staleness bound (0 = none); past it, and
+with no cache at all, `on_unavailable` decides:
+
+- `fail_closed` (**the default**) aborts boot. A fleet that pointed a host at a
+  central ceiling meant that ceiling to bind, so "we could not tell" must not read
+  as "run unbounded". Recovery is `KIROCREW_POLICY_ON_UNAVAILABLE=degrade` or unsetting
+  `KIROCREW_POLICY_URL`; a local policy file is not a lever here, since it only tightens
+  whatever ceiling ends up in force.
+- `degrade` falls through to the next precedence tier and records a
+  `mark_governance_incident("degraded", …)` so the dashboard indicator shows it.
+
+A cache recorded against a **different** source is ignored: serving it would let a
+retired endpoint keep governing a host that has been repointed, including a repoint
+made specifically to replace a compromised source.
+
+**A refused document is not an outage.** `on_unavailable` answers "the ceiling could
+not be REACHED"; a document this host read and REFUSED is a different question. It
+still yields to a usable cache — that is a ceiling the fleet published and this host
+verified — but with no usable cache it **raises regardless of the disposition**,
+because falling through to a lower tier would demote the host onto a policy the
+administrator superseded.
+
+**The pushed document is bad.** At boot there is nothing to fall back to, so it fails
+like any other tier. On a **live refresh it is REJECTED and the running ceiling is
+kept** — `apply_ceiling` runs `assert_policy_signature_satisfied` **and**
+`assert_profile_floor` on the **composed** candidate (the fetched document folded back
+into the tier ladder) before installing it, so a refresh can never install a ceiling
+this host would have refused to start under. That asymmetry is what stops one typo
+taking down a fleet that is already up. A refused document is **never cached**, so a
+rejection does not persist as a poisoned last-known-good after the push is corrected.
+
+### The live swap, and the cache it invalidates
+
+**A local file is never a reason for a refresh to stand down.** `KIROCREW_SECURITY_POLICY` is a subordinate tier that *tightens* the fetched ceiling, so the refresher keeps polling with one present; a poll that installs a tighter central document is composed with the local one, not blocked by it. There is no local channel that outranks the central document (see the precedence section above for the withdrawn `break_glass` design).
+
+**Validate, then publish, then install** — in that order, and the order is the point. A
+cache-only child adopts whatever the cache holds, so installing before publishing leaves a
+window where the gateway enforces the new ceiling and a freshly-spawned app backend adopts
+the retired one; publishing before validating would hand that child a document this host is
+about to refuse. `validate_ceiling` is the check split out of `apply_ceiling` so the refresh
+can prove the candidate before it writes anything.
+
+The publish is then **confirmed by reading it back**. `write_cache` is best-effort by
+design — a host that cannot write it is still governed by what it fetched — but a
+cache-only child inherits the ceiling *from that file*, so a swallowed write failure would
+leave the gateway enforcing a tighter ceiling while every app backend spawned afterwards
+adopted the looser one. A failed publish keeps the running ceiling and reports `rejected`.
+
+**A refresh recomposes the ladder; it does not install the fetched document alone.**
+`apply_ceiling` calls `compose_installed_ceiling(fetched)` first, which re-reads the
+subordinate tier and folds both rungs through the same `compose_tier_ladder` the loader
+uses. Installing the fetched rung by itself would drop every local restriction **below**
+it, so a host a fleet tightened at boot would find that tightening gone at its first successful poll
+— a ceiling that loosens itself on a timer. One composition function on both paths is
+the invariant: boot and refresh cannot diverge, because there is only one
+implementation of precedence to diverge from.
+
+The bundled tier is the one rung a recomposition cannot re-derive — only the edition
+that booted the process supplies a `bundled_loader` — so `load_security_policy`
+remembers the document it resolved in `_TierProcessState.last_bundled` and
+`compose_installed_ceiling` reads it from there. Without that, the bundled tier would silently drop out of the
+ladder at the first refresh, loosening a ceiling an edition tightened. The packaged
+resource is static for the process lifetime, so caching it is sound.
+
+`apply_ceiling` then validates that **composed** result the way boot does — so the
+floor gates judge what will actually govern rather than one rung of it — and installs
+it with `set_context(replace(current_context(), governance=…))`. Every enforcement
+chokepoint reads `current_context().governance` per decision rather than capturing
+it, so the swap binds on the next call.
+
+The validation is `assert_policy_signature_satisfied` plus
+**`assert_profile_floor`** — the ordinal half of the boot gate, split out from
+`assert_profiles_within_ceiling` so the name says which half a caller gets. The
+boot gate's extra unrecoverable-profile refusal is deliberately NOT applied here:
+it is about the profile store's state rather than about the ceiling, and honouring
+it mid-session would let one unreadable local file block every future fleet policy
+change on the host — including a tightening — which is the same global-deny
+outcome the runtime disposition above already rejects.
+
+**A `304` re-validates against the trust root.** "Unchanged" is a statement about the
+DOCUMENT, and the trust root is a separate input on its own schedule: a fleet turning on
+`require_policy_signature` or rotating a trust key makes the running ceiling untrusted
+without the endpoint publishing anything, so an unconditional `unchanged` would let it
+stand indefinitely. The cached body is re-parsed on every unchanged poll, which is cheap at
+one per interval.
+
+**A `304` re-folds the ladder too.** The digest comparison below answers only "is the
+central document the one installed"; a subordinate tier can change on its own schedule,
+and a tightening landing there between two central publishes would otherwise reach the
+running ceiling only when the central body next changed — a host looser than its own
+local file for as long as the endpoint stayed quiet. So the unchanged
+path calls `_recompose_differs`, which folds the ladder exactly as `apply_ceiling` does
+and compares the result **structurally** with the installed ceiling (`GovernanceCeiling`
+is a frozen dataclass; no second digest is kept — the installed ceiling is the record of
+the last fold). Only when they differ is `apply_ceiling` run; a genuinely unchanged poll
+keeps the installed object and its generation untouched, so nothing keyed on the
+generation is invalidated for a no-op. gatewayd's per-app-call `load_security_policy`
+never had this gap — it re-reads every tier on every call — so the fix closes the
+refresher-installed plane, the only one that could go stale.
+
+**A `304` is judged against the installed ceiling, not the cache.** The cache is
+written by other processes too (gatewayd's per-app-call reload, an app backend's
+boot, `kirocrew policy fetch`), so "the source has nothing newer than the cache"
+does not imply "this process is already running it". `refresh_now` keeps the digest
+of the document it installed and adopts the cached body when the two differ;
+without that, one `policy fetch` would cache a new revision and the poller would
+report `unchanged` forever while the gateway kept enforcing the old one. An EMPTY
+digest means this process does not know what it installed — a boot that degraded
+to ungoverned, or one whose central rung was off — and the cached body is adopted
+rather than skipped, so such a host is not left permanently below a ceiling another
+process on it had already cached. Adoption cannot loosen the ladder: the
+candidate is folded through the loader's ladder in `apply_ceiling` before it is
+validated or installed, so every local restriction below it stays in effect.
+
+One cache did have to change. `context.set_context` — routed through the single
+`_install` writer, so no install site can forget — now bumps
+`context.governance_generation()`, and `governance_profiles._ceiling_token()` folds
+that counter into the `ProfileStore` freshness key alongside the
+fallback-declared boolean. The boolean alone could not carry it: swapping one
+declared fallback for a **different** one leaves it `True` on both sides, so the
+store would keep serving profiles composed against the retired ceiling. The
+ceiling used to be boot-frozen, which is why nothing needed this before.
+
+### Transport is a seam
+
+`register_policy_fetcher(scheme, fetcher)` is append-only, mirroring
+`register_scope`/`register_matcher`. Built-ins: `https`, `file`, and `http`
+**restricted to loopback hosts** (a clear-text ceiling is substitutable in transit
+by anyone on the path; a local management relay is a legitimate shape). An edition
+that needs request signing for its own object store, or a management channel that is
+not HTTP at all, registers a fetcher at import time — exactly where the Amazon
+edition already registers its scopes — and inherits the cache, the signature
+verification, the refresh loop and every disposition unchanged.
+
+An **unknown scheme raises** rather than reading as unreachable: a typo'd `htps://`
+will never start working, so it must not quietly hand the host to the cache. A
+**conflicting registration also raises** — `register_scope`'s refusal to let a typo
+shadow a built-in matters most in the registry that decides which code fetches the
+ceiling — and there is deliberately no override flag, because the precedent has none
+either.
+
+**`http` is loopback-only, decided by `ipaddress`** rather than a set of literal
+spellings: the whole `127.0.0.0/8` block and every form of IPv6 loopback count, so
+a local management relay on `127.0.0.2` works, and a name that is not an address is
+never loopback (resolving it would make the decision depend on the network the
+check exists to distrust).
+
+Fetching follows the house pattern in `apps/official_catalog.py`: a per-call opener
+with a `_NoRedirects` handler (a 3xx that changes origin contradicts "TLS to the
+address the operator named", and the scheme guard cannot see it because it validates
+the URL we *ask* for), a `MAX_POLICY_BYTES` cap read one byte long so an over-large
+body is detected rather than truncated into a document that parses as something
+narrower than what was published, and a bounded timeout because a cold cache puts
+this on the boot path. Conditional requests (`If-None-Match` / `If-Modified-Since`,
+and an mtime validator for `file://`) mean an unchanged document costs no body; a
+`304` **restarts the cached copy's age**, since it proves those bytes are the
+published document right now.
+
+The `file://` fetcher opens **once** and judges the size on the open handle, requiring
+a regular file: stat-then-read is two trips to a path anything sharing the mount can
+replace in between, so a swapped-in oversized file would defeat the ceiling and a FIFO
+would make the read block forever — a boot that hangs rather than fails. Its validator is
+a **content digest**, not `mtime:size`, which a size-preserving replacement with a kept
+timestamp (`cp -p`, a restored backup, a deliberate `touch`) slips past — leaving the
+previous, potentially looser ceiling enforced while every poll reports "unchanged".
+
+It also **refuses a source the account Kiro Crew runs as can write — the file or any
+ancestor directory.** A distribution source
+this account can rewrite is one an agent subprocess can rewrite — it runs as the same uid —
+and the refresher would then install that ceiling without even a restart. The field manual
+already tells operators to distribute to a read-only, root-owned path; this makes it a
+precondition rather than advice, and the refusal names
+`KIROCREW_SECURITY_POLICY` as the channel designed for a local, editable policy. The
+**ancestor walk** is what makes the check mean anything: a `0444` file inside a writable
+directory is replaceable by unlink-and-recreate, so a leaf-only check would accept a forged
+read-only document. Decided from the mode bits on the already-open handle
+(`platform_compat.stat_writable_by_current_user`) plus `path_writable_by_current_user` for
+the chain. Both are POSIX-only, since Windows permissions are an ACL and the mode bits
+carry no usable answer there — and **off POSIX they answer `True`: "cannot tell" rounds to
+writable.** **Two chains are walked, the path as written and the path as resolved.** Resolving first and
+walking only the target was a gap: re-pointing a symlink needs no permission on the link and
+none on the target — it needs write on the *link's parent*, which the resolved chain never
+visits. So a root-owned, read-only document reached through a link in a directory this account
+can write is a source this account controls. A symlink's own mode bits are meaningless on Linux
+(0777 and ignored), so nothing is judged by them; what matters is the directories, and each
+chain contributes some the other does not.
+
+Each component is tested twice — against the mode bits, and against the kernel's own answer
+via `os.access(..., effective_ids=True)`. The second is the only one that sees a **POSIX
+ACL**: a named-user entry (`user:me:w` on a file owned by someone else) does not appear in
+`st_mode` at all, since the group bits show the ACL *mask* rather than that entry, so a
+mode-only check called such a source read-only. On POSIX, **ownership alone is enough**,
+without the write bit: an owner may
+`chmod` its own file, so a `0444` file this account owns is one it can make writable and
+then rewrite — the exact move the threat model describes, since the agent subprocess runs
+as the same uid. The same reasoning covers a directory in the ancestor walk (owning it
+means being able to unlink and recreate what is inside), and running as **root** makes
+everything writable whatever the mode says. Group ownership does *not* confer that power —
+only the owner and root may `chmod` — so there the write bit is still the question. The
+practical effect is that a legitimate source must be owned by a *different* account, which
+is what the field manual already tells operators (a read-only, root-owned path). There is no abstaining option for this predicate, because the caller refuses a
+writable source: a `False` would not withhold judgement, it would assert the source is
+safe and admit every Windows `file://` source unchecked, including one an agent had just
+planted. So a Windows operator loses the `file://` channel (`https://` is unaffected)
+until the DACL can actually be read. On POSIX the ids compared are the **union of the
+real and effective** uid and gid plus the supplementary list, not `os.getgroups()` alone:
+POSIX leaves it unspecified whether the effective gid appears in the supplementary list,
+so a process that reached its gid through `setegid` — or one in a container built without
+`initgroups` — has a primary group that list never mentions, and a membership test alone
+would call a group-writable source we *can* replace safe. A **loopback**
+request additionally installs an empty `ProxyHandler`: urllib has no implicit loopback
+exemption, so with `HTTP_PROXY` set a request to `127.0.0.1` is sent to the proxy in
+absolute form *with the request headers*, which would hand the fleet's credential to
+the proxy and let it answer with a substituted ceiling. A remote `https` source keeps
+the default handler, because there a corporate proxy is the intended path.
+
+### Cache layout, and why it is on the keystone
+
+`<data-home>/policy_cache/` holds `policy.json` (the document verbatim, so its
+signature still verifies) and `policy.meta.json` (`source_digest`, `fetched_at`, `etag`,
+`last_modified`, `digest`).
+
+**Malformed input is refused, not crashed on.** Two shapes a typo produces made a library
+call raise out of the very check meant to reject it. `urlsplit` raises `ValueError` on a
+malformed bracketed host (`https://[::1`), so a declared source now yields a composition error
+naming the key, and every runtime site in the engine goes through a never-raising `_split_url`
+— the redaction one matters most, because a sanitiser that crashes on a malformed source takes
+the error *report* down with it and the operator sees a traceback about URL parsing instead of
+the problem they have. `SplitResult.port` is a *lazily parsed* property, so guarding `urlsplit` does not cover it — it
+raises for a non-numeric or out-of-range port. A declared source with one is a composition error
+naming the key; the engine's own identity function falls back to the raw netloc text, since an
+identity needs stability rather than a number and two spellings of an unusable port are not a
+repoint between them. Every duration is bounded by `MAX_DURATION_SECS`
+(`threading.TIMEOUT_MAX`) on **both** channels from one constant, because that is what the
+platform can actually *wait* for: the refresher passes the interval to `Event.wait` and a fetch
+passes the timeout to a socket, and both raise `OverflowError` above it — silently killing the
+poller thread, so the host simply stops receiving policy updates. Not an invented policy limit at
+~292 years; it bounds typos rather than intentions. The environment channel needs it as much as the
+document does, since a merely *large* finite value (`1e12`) passes the finiteness screen. And
+`math.isfinite` converts its argument to a float first, so a JSON integer of 310 digits raised
+`OverflowError` inside the finiteness screen; it is asked only of
+floats now (an int has no non-finite values), and the value is stored without a `float()`
+round-trip, which would have raised three lines later.
+
+**A DECLARED source may not carry a credential.** `PolicyDistribution.from_dict` refuses
+userinfo (`https://user:pass@host/…`) and any query string in a `distribution.source` that
+comes from a *document*. This block is cached verbatim — the bytes have to be identical for
+the signature to verify — and `policy.json` is readable by an app backend, so a credential
+placed there would be published to every host and then handed to every app. It is the rule
+this module already stated (the per-machine credential travels in
+`KIROCREW_POLICY_HEADERS`, which "a published document must not" carry) made enforceable
+rather than advisory. The **environment** channel is deliberately unrestricted: that is where
+a pre-signed URL belongs, it is set by whatever provisions the host, and it never lands in
+the document.
+
+**The recorded identity is what SELECTS the document, not what authenticates the request.** The
+fragment and the basic-auth *password* are dropped — but not the username, which names the account:
+two tenants at one host and path are two different documents, and collapsing them would leave
+tenant A's possibly looser ceiling in force after a repoint to tenant B. Scheme and host are
+lowercased, and the query parameters that
+carry a *signature* are removed by name — `x-amz-*` and `x-goog-*` for SigV4 and Google's copy of
+it, plus Azure Blob's short SAS names (`sig`, `sv`, `sr`, `sp`, …) — those only when the query is
+*positively* a SAS, meaning it carries both `sig` and `sv`, since unlike the namespaced families
+these names are short enough to be somebody else's selector (`?sp=team-a` reads perfectly well as
+"policy = team-a"). A pre-signed URL is the
+documented shape for the environment channel and its signature *rotates* by design, so hashing
+the whole URL made every rotation look like a repoint: the cache was discarded as a retired
+endpoint's copy, and a host that then hit a transient outage had no last-known-good and aborted
+startup under the fail-closed default, without anyone having done anything.
+
+Every *other* query parameter stays in, because a query can also select the document.
+`?policy=team-a` and `?policy=team-b` are different sources, and collapsing them would let a
+repoint to a *stricter* policy keep serving the looser one — indefinitely on a boot-only source,
+which never re-fetches once a ceiling is established. Kept parameters are sorted, so a re-issue
+that merely reorders them is not a repoint either.
+
+A name list rather than a heuristic on the value, and deliberately small, because the two
+mistakes are not symmetric: an unknown presigning scheme stays in the identity, so a rotation
+discards the cache and costs one fetch — bounded, and visible. Wrongly dropping a
+document-selecting parameter costs a superseded ceiling staying in force.
+
+**The metadata records a DIGEST of the source, never the source.** The URL can *be* the
+credential — a pre-signed object-store link carries its signature in the query string —
+and this module's rule is that the source is emitted nowhere, so storing it made the cache
+the one place that broke that rule. It also matters concretely: the app backend reads this
+file. The field's only consumer is an equality test (the repoint rule), and an equality
+test does not need the plaintext. A cache written before this carries the plaintext under
+`source`; it is hashed on read rather than discarded, so an upgrade keeps its
+last-known-good copy and the next write replaces the file with the digest form. The `digest` is what makes the pair **provably one write**:
+two files means two writes, so overlapping writers can leave a NEW document beside OLD
+metadata — and that pair is not merely stale, because the metadata's `source` is what the
+repoint rule trusts, so a tear could hand a repointed host the retired endpoint's document
+under the new endpoint's name. A mismatch reads as no cache at all, and the caller
+fetches. Metadata written by a build without the field is still accepted, so an existing
+cache does not read as torn. Both are written through the shared
+[`atomic_write`](../../../src/kiro_crew/atomic_write.py) — never a hand-rolled temp +
+rename, which is how earlier writers here lost the Windows rename retry — and
+document-before-metadata, so a process killed mid-write leaves a consistent pair or a
+new document with old metadata, never metadata promising a document that is not
+there. `write_cache` must not run on the event loop, because `replace_with_retry`
+skips its Windows sharing-violation retry when it detects one.
+
+The digest **detects** a tear; a cross-process lock keeps one from being written in the
+first place. `write_cache` and `touch_cache` both run under `_cache_write_lock`, an
+exclusive lock on `policy_cache/policy.lock`, because two writers is the ordinary case and
+not a corner: the gateway's refresher thread polls on its interval while
+`kirocrew policy fetch --force` runs from a shell, and a forced write (new document, new
+digest) interleaving with a 304 touch (metadata only, carrying the digest read
+beforehand) persists NEW bytes against an OLD digest. Readers then discard the pair, so
+the cost is the last-known-good copy vanishing during the outage that made the refresh
+fail. **Readers are deliberately not locked** — they already revalidate the digest and
+retry, so they degrade to one transient miss, and locking them would put a boot behind a
+mutex a hung refresher holds. The lock file is opened `O_NOFOLLOW` and required to be a
+lone regular inode (the `memory.py` idiom), and a lock that cannot be taken **skips the
+write**: proceeding unlocked could destroy a good pair, while skipping preserves it.
+
+**The lock alone is not enough, because `touch_cache` reads before it locks.** Its `meta`
+argument was captured by the caller, so a forced write landing in between leaves the touch
+about to stamp the OLD digest over metadata describing NEW bytes — the same tear, reached
+by a stale read rather than an interleaved write. The metadata is therefore re-read INSIDE
+the lock and the touch is a **compare-and-swap**: skipped unless the digest and source
+still describe the document this caller validated. Skipping is right rather than merely
+safe, because the writer that got there first recorded a fresher fetch of the same source,
+so there is no age left to restart.
+
+**A refused install does not leave the rejected bytes as the last-known-good.** The
+publish is confirmed before the install, so the new document is on disk before
+`apply_ceiling` has had its say — and that step refuses for reasons the earlier
+`validate_ceiling` cannot see (a bound profile, the trust root, or a subordinate tier that moved
+between the two). `refresh_now` snapshots the prior copy and `_restore_cache` puts it back
+on any failure — **invalidating first, then writing** — carrying its original `fetched_at` so a repeatedly-failing refresh cannot
+keep resetting the staleness clock. **The rollback is itself a compare-and-swap**, on the
+document this refresh published: `apply_ceiling` sits between the publish and the failure,
+so another process can publish in that window, and rolling back over it would destroy a
+valid newer ceiling nobody asked us to touch. When the digests disagree the newer copy is
+left alone — this refresh's document is no longer the one on disk, so there is nothing of
+ours to undo.
+
+The invalidate-then-write ordering is what makes a partial failure safe. The bytes on disk
+at that moment are the ones this host just *refused*, so a restoring write that fails after
+the delete leaves the cache **absent** — a cache-only child fails closed (a disabled app,
+loudly) and the next boot re-fetches. Writing over them first and failing halfway would
+leave the rejected document as the last-known-good, which is the one outcome this exists to
+prevent. The gap is held under the lock, and the gateway's own ceiling is untouched
+throughout. A restore that fails outright is reported at ERROR with a `degraded` governance
+incident rather than a quiet warning, because `refresh_now` cannot raise (it runs on a
+background timer) and that log is the only signal the host has lost its outage fallback. When there is no prior copy to restore — the first
+refresh on a host, or a prior copy from a different source, which the repoint rule already
+says is not this source's last-known-good — the published bytes are **removed** rather than
+left in place. That is not the same trade-off as keeping a stale-but-composable copy: these
+are the bytes this host just *refused*. Kept, the next boot serves them from cache instead
+of re-fetching, so a source the administrator has since corrected does not reach the host
+until the window expires, and a cache-only child adopts the refused ceiling meanwhile. With
+no cache, boot fetches and either gets the fix or fails exactly as it would have anyway.
+
+**The publish is a compare-and-swap, and the snapshot is taken BEFORE the fetch.** A fetch
+is slow and a refresh is not the only writer: a refresher that fetched v2 over a slow link
+while `kirocrew policy fetch --force` published v3 would write v2 over v3 and then *install*
+v2 — the ceiling moving backward to a looser document, the one direction this tier must
+never move on its own. `write_cache` takes an `expect_pair` checked inside the lock — the
+`(body digest, source digest)` the caller observed, `("", "")` for no cache, `None` to
+publish unconditionally — and returns whether it published. **The pair, not the body
+alone**: identical bytes can be published for a DIFFERENT source (a repoint whose document
+did not change), and a body-only comparison would let an in-flight refresh overwrite that
+provenance with its own, which the next boot's repoint rule then discards as not belonging
+to the source it resolves. The rollback swap and the lost-swap discrimination compare the
+same pair.
+The ordering is the control: the concurrent write lands *during* the fetch, so a snapshot
+taken afterwards already includes it and the swap would pass while overwriting the newer
+document. The expectation is the raw on-disk digest, deliberately not filtered by source, so
+a legitimate repoint does not look like a lost race.
+
+**Boot takes the same swap**, with the same before-the-fetch snapshot. It is not exempt: a
+slow boot fetch of v2 racing a `kirocrew policy fetch --force` that publishes v3 would
+otherwise overwrite the cache with v2 and install it, rolling the ceiling backward on the one
+path where nothing is running yet to notice. The install is **recorded only once the publish has resolved**, because
+`central_ceiling_installed` is what the gateway flags an app backend cache-only on: recording the
+fetched bytes earlier meant a lost swap whose winner was then *rejected* left the host degraded
+while every child was told to resolve its ceiling from a cache holding the document this host had
+just refused. When the swap loses, boot must still install something and the right something is
+the **winner** — so it adopts the cache rather than the
+bytes it fetched, re-gated through the same parse, source-migration and `validate_ceiling`
+sequence **and the repoint rule**, because "another process published it" is not evidence this
+host can run under it — and that process may have been configured for a different source, which
+is exactly what a lost swap makes reachable.
+No further write: the winner is already the cache, and re-publishing it would be the overwrite
+this path exists to avoid.
+
+A publish that did not happen has two possible reasons, and `refresh_now` tells them apart
+by re-reading — which is honest, since that was the swap's own condition. A **lost swap**
+stands down and reports `unchanged`: installing what this call fetched could roll the
+ceiling backward, and the next cycle finds the cache differs from what is installed and
+adopts it, the path a 304 against a moved-ahead cache already takes. A **failed write** is
+reported like the read-back confirmation, because it is the same operator problem.
+
+The publish confirmation checks the recorded **source** as well as the bytes. A repoint
+publishing identical bytes alongside a failed metadata write would otherwise pass a
+body-only check, and it is the recorded source the next boot's repoint rule judges — so
+the refresh would report success on a document a restart then discards.
+
+A refused redirect names only the target's **scheme**, never the target. That URL comes
+from the endpoint's `Location` header, so it is neither ours to publish nor covered by
+`_redact_source` (which only knows the configured source), and a redirect to a pre-signed
+URL would otherwise carry its signature into the boot abort text and the log ring.
+
+**A boot publish that fails does not leave a looser cache behind.** `write_cache` is
+best-effort for the *gateway* — it is governed by what it just fetched either way — but a
+cache-only app backend resolves its ceiling FROM that file, so an unpublished tightening
+would leave a stale, looser document as what every child spawned afterwards adopts: the
+failure the cache-only handoff exists to prevent, reached through a swallowed write error.
+`_discard_disagreeing_cache` therefore removes a cached pair that is not the document being
+installed, so a child finds no cache and fails **closed** (a disabled app, loudly) instead
+of starting under a superseded ceiling. An agreeing pair is left alone (an equal document
+is not stale), and so is an absent one (there is nothing a child could adopt). If the stale
+pair cannot be removed either — usually the same reason the write failed — nothing can make
+the cache agree with the ceiling being adopted, and that is a boot refusal rather than
+something to log and continue past.
+
+`policy_cache` is bind-mount-hidden in **every sandbox tier** (`_STRICT_DIRS`,
+`_STANDARD_DIRS`, `_CC_DIRS`) as well as being in `security._SENSITIVE_HOME_DIRS`. Both
+are needed and they cover different things: `is_sensitive_path` gates the agent's
+in-process TOOL CALLS, but a spawned `python -c` does an OS `open()` that never routes
+through it. That distinction matters more for the cache than for the policy FILE it
+copies — on a fleet using the environment channel there is no `security_policy.json` on
+disk at all, so the cache is the only on-disk copy of the ceiling, and its metadata
+records the SOURCE the loader trusts.
+
+The app backend is the ONE spawn that gets a carve-out: it runs in cache-only mode, which
+resolves the fleet ceiling from that file and fails closed without it, so
+`apps/backend.py` passes the cache in `extra_visible_dirs` — but only when the flag is
+actually set, so an ungoverned host is unchanged. Without it the two controls contradict
+each other and every app backend on a centrally-governed host exits at boot. Reading the
+ceiling it is about to be bound by is not an escalation: the exposure the mask exists to
+prevent is the model-driven agent learning the deny patterns, and this is Kiro Crew's own
+spawn rather than a tool call.
+
+**That carve-out grants READ only where a sandbox applies, and the seal lives in `sandbox`,
+not at the call site.** `extra_visible_dirs` otherwise cancels a target's whole rule set, so a caller
+asking to read the cache would get WRITE with it — and an app backend is arbitrary
+third-party code, so with the metadata recording the source the next boot trusts, that
+would let an app pick the ceiling for every later boot on the host. Deciding it by
+directory (`sandbox._is_policy_cache_dir`, matched on the leaf so it holds for the
+`$HOME`-relative, legacy `~/.kirocrew`, and relocated spellings alike) means a future
+caller cannot re-open the hole by passing the path:
+
+- **Linux** drops it from the hidden list and puts it in `READONLY_DIRS`, which the
+  launcher binds over itself and then **remounts** `MS_RDONLY`. Both mounts are
+  load-bearing — `MS_RDONLY` is ignored on the initial `MS_BIND` — and both go through
+  `_mount_or_die`, so a seal that does not land refuses the spawn rather than silently
+  granting write. The sealing remount also **re-asserts the target's locked mount
+  flags** (`nosuid`/`nodev`/`noexec`, read off the fresh bind via `statvfs`): inside an
+  unprivileged user namespace the kernel rejects a remount that would drop a locked
+  bit, so on hosts whose `/tmp` or `/home` is mounted `nosuid,nodev` the plain
+  `MS_RDONLY` remount got EPERM and every spawn refused (#8386). Re-asserting bits
+  already in force only keeps restrictions. `test_sandbox_mount_checked.py` pins all
+  six mount sites; `test_sandbox_seal_locked_flags.py` pins the flag re-assertion.
+- **macOS** keeps the `file-write*` and `file-link` denies and drops only `file-read*`.
+
+On a host running **unconfined** — no sandbox backend, or `agent.sandbox='off'` with the
+`sandbox_allow_no_isolation` opt-in — there is no seal to apply and the argument is inert:
+the child has the whole filesystem, so the cache is one of many things it can write, and
+singling it out would neither restore the seal nor be the tightest control available. What
+bounds a forged cache there is **provenance rather than permissions**: with
+`require_policy_signature` set in the admission policy, a document nobody trusted is refused
+however it got onto disk — on the boot path, on a 304 revalidation, and in a cache-only child
+alike. That is the control to reach for on a host that cannot be sandboxed, and the spawn says
+so once: a centrally governed host whose `wrap_argv` was a no-op logs a SECURITY warning naming
+that setting.
+
+Refusing to start the app instead would protect nothing. On such a host the backend can rewrite
+`security_policy.json`, `admission_policy.json` and the SEL signing key **directly** —
+`is_sensitive_path` gates the agent's TOOL CALLS and the other file-access surfaces, not an
+arbitrary process's `open()` — so forbidding an app to *read* the ceiling while it can *replace*
+the ceiling trades a real capability for no gain. That is also why the answer here is provenance
+rather than permissions.
+
+The same `file-write*` deny applies when the cache is hidden outright, because there the
+seatbelt rule denies `file-read*` only while the Linux bind blocks both directions. It is
+scoped to this directory rather than every entry, because widening the others has its own
+blast radius (a write deny on `.aws` would break a legitimate token refresh).
+
+Those dir entries are `$HOME`-relative, so `KIROCREW_HOME` moves the cache out from under
+them — a limitation shared with the vault entries. This one directory does not inherit it:
+`sandbox._relocated_policy_cache_dirs()` additionally masks the data-home path whenever it
+differs. Compared with **`normpath`, not `realpath`**: this runs inside the launcher and
+seatbelt builders, which run on the event loop for every async spawn, and a link-resolving
+syscall on a stalled NFS home would freeze the gateway and its liveness heartbeat — the same
+reason the launcher pushes its `isdir` checks into the child. The cost is one-directional:
+where the home is a symlink (`/home/u` → `/local/home/u` is ordinary, and `config_dir()`
+resolves links internally) the spellings no longer compare equal, so a default layout reports
+as relocated and the resolved path is masked *in addition to* the `$HOME`-relative one. That
+is a redundant rule for a directory that must be masked either way, never a missing one — the
+comparison was only ever de-duplication.
+
+The sensitive-path entry is asserted by `assert_governance_paths_protected()`, and it is load-bearing for a reason the policy
+file's own entry does not cover: the metadata records the **source**, and the loader
+honours that record when deciding whether the cache is this host's last-known-good.
+An agent able to write here would not need to touch `security_policy.json` to replace
+its own ceiling — it would publish itself one, with provenance. Read matters as much
+as write: the cache is a verbatim copy of the document the trust-root entry exists to
+keep unreadable.
+
+### Refresh loop
+
+A daemon thread (`kc-policy-refresh`), started from `run_gateway` under the same
+`if not test_mode` gate as the beacon so the offline E2E gate can never make an
+outbound request, and stopped in `_shutdown` with a **0.5s** join budget — it waits
+on an `Event`, so an idling refresher wakes immediately, while one mid-fetch must not
+eat the `GRACEFUL_SHUTDOWN_SECS` budget that saves active chat slots.
+
+It **waits one full interval before its first poll**: boot has just established the
+ceiling from this same source, so an immediate re-fetch would be a redundant round
+trip on every host at startup and, across a fleet restarting together, a thundering
+herd against the admin's own endpoint. `refresh_interval_secs` is clamped up to
+`MIN_REFRESH_INTERVAL_SECS` (60) rather than rejected — refusing would brick a fleet
+over a number with a safe reading.
+
+**`refresh_interval_secs: 0` (or omitted) is boot-only, and that binds the loader path
+too.** No poller starts, which is the easy half. The subtle half is that
+`load_security_policy` is re-run *per app callback* by `mcp_gateway/app_call.py`, and
+`_fetch_window` floors a zero interval at 60 s so it never reads as "fetch on every
+call" — but a floor is still a cadence, so an operator who asked to freeze the ceiling
+for the process lifetime was getting a 60-second poller on that path, one that could
+hand an app callback a *loosened* document while the gateway kept the ceiling it booted
+on. Once the process has established a central ceiling
+(`central_ceiling_installed()`), a boot-only source is served from the cache and never
+re-fetched. Boot's own first call still fetches, because nothing is installed yet, and a
+boot that degraded without establishing a ceiling retries rather than freezing on one it
+never had. `max_cache_age_secs` is a separate bound and still applies, so this is not
+"trust bytes of any age", and `refresh_now` does not come through this path — so
+`kirocrew policy fetch` stays the operator's explicit lever in this mode.
+
+### Materialised controls, and the one hook that re-derives them
+
+A ceiling swap changes what every LIVE evaluation answers, and most governed controls are
+live evaluations: `sandbox.min_level` is re-read per spawn through `governance_floor_ordinal`,
+the governance gate runs per tool call. A few are **materialised** once, when an action is
+taken, and then outlive the decision — and for those a swap is not enough on its own.
+
+A published tailnet origin is the case that matters. The `capabilities.tailnet_origin` gate
+fires when `publish` is *called*; it is a chokepoint on the action, not a condition re-checked
+while serving. That was sound while the ceiling could only change at boot. With a live refresh
+it is not: a fleet pinning the capability off mid-flight would otherwise leave every
+already-published host serving its dashboard on the tailnet until someone restarted it, with
+the policy reporting the capability as denied the whole time.
+
+The other case is the agent config's **`allowedTools`**. It is kiro-cli's blanket
+auto-approve list, and the five writers of it consult the ceiling when they *write* — after
+which kiro-cli reads the FILE. So a ceiling that comes to deny a tool mid-flight does not
+narrow a list already on disk, and every session started afterwards keeps auto-approving what
+the fleet now forbids: the tool short-circuits inside the harness and never reaches Kiro Crew's
+own PreToolUse gate. `agent.reproject_for_ceiling_change` re-derives the file, bounded to an
+actual ceiling move by `governance_generation` — hooks run on every confirming poll, so an
+unconditional rebuild would rewrite a file kiro-cli watches every refresh interval for nothing.
+Two details make that bound safe rather than merely cheap. The baseline is seeded by
+`prime_ceiling_projection` **before the poller starts**, because the first poll can itself
+install a new ceiling and a first-call baseline would record that generation and skip the very
+rebuild it needed. And the memo advances **only after a successful rebuild**: a failure raises
+through the hook runner, which logs and moves on, so marking the generation synchronised would
+lose the retry the next poll gives and leave forbidden auto-approvals on disk for the process
+lifetime. An unseeded baseline rebuilds once rather than skipping — a redundant rewrite costs a
+file write, a skipped one costs the tighten.
+
+What no hook can do is narrow a session **already negotiated**: kiro-cli holds the grants it
+was given, and nothing reaches into a running one. That limit has the same shape as an
+already-running process keeping its own sandbox — a restart is its only answer, which is also
+why *removing* live refresh would not close it. What live refresh plus this hook does close is
+every session after the tighten, which without it stayed open indefinitely.
+
+`register_post_install_hook` is the seam. Append-only, like `register_policy_fetcher`, and
+deliberately unaware of what it calls — this module must not learn about tailnet or anything
+above it, so the gateway registers `tailnet_serve.revoke_if_governance_now_pins_off` before
+it starts the poller. Hooks run on the refresher thread wherever a poll **confirms** what governs — an install *or*
+an `unchanged` result — and best-effort: an exception is logged at ERROR **with a `degraded`
+governance incident** and the next hook still runs. The incident is what puts a control the
+installed ceiling calls for and the host is not applying onto `security_posture` and the
+dashboard, rather than leaving it in a log nobody reads.
+
+It does **not** unwind the install, and that direction is deliberate rather than lazy. Rolling
+back would restore the OLD, looser ceiling — strictly less protection than the new one with a
+single materialised control stale, since the tightened ceiling still binds every call that
+control does not pre-approve. Confirming polls rather than installs alone is what makes the
+retry automatic: they are best-effort, so a transient failure (the tailnet daemon busy for one
+cycle) would otherwise never be retried — the document does not change, every later poll
+returns `unchanged`, and the forbidden control stays materialised until someone restarts the
+host. They are cheap and idempotent for it: the tailnet one is a governance evaluation that
+returns immediately unless the capability is actually denied, and it asks twice, deliberately.
+The first is a **pure read** with no `audit_tool`, because `is_governance_pinned_off`'s own
+contract is that auditing a mere inspection appends HMAC-chained SEL rows at a multiple of the
+decisions that govern anything. Once there is something to withdraw it asks again **through the
+audited seam**, because that is the decision that does something — and an automatic revocation
+needs the record more than a human-driven one does: nobody typed it, so the SEL row is the only
+place a reviewer can see that the *fleet's policy* took this host off the tailnet. `unpublish`
+cannot supply it; withdrawal is deliberately never gated there, so it discards its own
+`audit_tool`. One extra evaluation, on the acting path only. The revocation
+itself is narrow — it acts only when governance now denies the scope *and* `serve_state`
+confirms the handler is ours, so a mapping an operator added by hand is never touched.
+
+**Boot applies the same two gates a refresh does** — the source-migration refusal and
+`validate_ceiling` — before it records or caches anything. Otherwise boot would install a
+document `refresh_now` refuses, and the refresher would then reject it on every cycle for
+the lifetime of the process, logging a rejection forever while the host ran on it. A
+refusal here is handled like a parse refusal: salvage from the cache if it can still serve,
+else raise. A document read and refused is not an availability failure, so it must not
+quietly demote the host onto a lower tier — and it is not cached, so a corrected push is not
+shadowed by a poisoned last-known-good.
+
+**A source-less declaration reaches the engine, not just the parser.** Accepting such a block
+is only half the job: `_declared_distribution` discarded it for having no `source`, so the
+settings were parsed and thrown away. `on_unavailable` is the one that bites — a fleet that
+published `degrade` silently got the `fail_closed` default and aborted startup on the first
+outage. It is retained whenever `KIROCREW_POLICY_URL` names the address the settings are for,
+and `resolve_distribution` overlays the environment onto it, which is what lets the two
+channels combine at all. With no address from either channel the tier stays inert.
+
+**Both guards defer to an environment pin.** `resolve_distribution` lets the environment win
+per setting precisely so whatever provisions the host owns the address, and two rules had to
+learn that. A `distribution` block with settings but no `source` is legitimate when
+`KIROCREW_POLICY_URL` supplies one — the ordinary split, where the fleet publishes the cadence
+and the staleness bound while the host owns the address — and rejecting it aborted boot on
+exactly the configuration the two-channel design intends. And the migration refusal below
+only fires when the document's declaration is the one that would actually take effect;
+otherwise a canary pinned elsewhere by env would refuse every document the fleet published.
+
+**An unconditional 304 is not success.** `--force` skips the conditional validators
+deliberately, so a fetcher that answers "unchanged" anyway has answered nothing — and reporting
+that as `unchanged` made `kirocrew policy fetch --force` exit 0 having established nothing, which
+is exactly what a config-management run reads as "this host took the change". The loader's own arm
+already refused it; the refresh path now does too.
+
+**A live refresh cannot migrate `distribution.source`.** A candidate document that names a
+different address is refused rather than installed, because nothing else would notice: the
+refresher re-reads the installed ceiling each cycle, so it would start polling the new
+address and the migration would look like it worked — until a restart, where the bootstrap
+declaration (the environment variable or the placed policy) still names the OLD source and
+the cache, recorded against the new one, is discarded by the repoint rule. A fleet that had
+retired the old address would then have hosts that run fine and cannot reboot, with nothing
+in between to warn them. Migrating a source is a **bootstrap** change: move
+`KIROCREW_POLICY_URL` or the placed policy's `distribution.source`, and the new address is
+durable at the next boot as well as this one. A document that repeats its own source, or
+omits the block, is not a migration and is unaffected.
+
+**A `max_cache_age_secs` the cached document declares for ITSELF is enforced too,
+tightest-wins.** The bound is as likely to be set in the published policy as in the
+bootstrap declaration — `effective_max_cache_age` already assumes so for the child it
+hands the value to — but at boot the resolved `PolicyDistribution` comes from the
+environment or a lower tier, so a fleet that set the bound only in its own document had it
+applied while the process ran and silently dropped on the next restart: exactly the
+restart-during-an-outage case the bound exists for. `_cache_is_too_old` consults both
+declarations, and `_cached_max_cache_age` reads the value straight from the cached JSON
+because this runs *before* the document has been validated — anything unreadable or not a
+positive whole number means "declares no bound of its own", leaving a malformed cache to
+be refused by the parse that follows rather than by a staleness pre-check.
+
+It also covers a label passed to code that reports it *elsewhere*, and the split between
+the two surfaces is the point. `_audit_policy_signature` puts **which** policy and **why**
+in the SEL record — which is on the keystone, so an agent cannot read it — and its
+`logger.warning` carries only the state plus a pointer to that record. Neither the label
+nor the reason is interpolated into the log line, because the log ring is served by
+`GET /api/logs` and the agent's own browser tooling can drive that; the label is whatever
+the caller was resolving (for this tier, a URL that may itself be the credential) and the
+reason names the issuer the *document* claimed. On top of that,
+`parse_distributed_policy` computes one redacted label up front and uses it for the
+signature call and for its own error text, so a URL never reaches the audit record either
+— rather than teaching the verifier about URLs.
+
+That rule covers **tracebacks, not only messages**: `logger.warning(..., exc_info=True)`
+prints the exception's own text, and a parse refusal names the source it refused — which
+for a pre-signed URL *is* the credential. So every arm here that logs a
+`PlatformCompositionError` logs `_sanitize_detail(str(exc), source)` rather than a
+traceback, and the arms that fail before a `dist` exists redact against
+`KIROCREW_POLICY_URL` instead. The test reads the FORMATTED traceback rather than
+`record.getMessage()`, because the exception text is rendered by the handler — a
+message-only assertion would pass while the log ring printed the URL.
+
+**The source URL is emitted nowhere** — not in `RefreshOutcome.detail`, which
+`kirocrew policy fetch` prints, and not in a log line either. One rule rather than a
+per-surface judgement, because the surfaces are not as separable as they look: the log
+ring is served by `GET /api/logs` and rendered in the dashboard, which the agent's own
+browser tooling can drive, so "it is only a log line" is not a boundary here. The operator
+configured the endpoint and does not need it echoed; the scheme plus the error text is
+what diagnoses a failure, and `kirocrew policy source` reports the scheme by design. `_sanitize_detail` also **substitutes the request credential by exact value**, before the
+generic pass. `security.redact` recognises credential *shapes*, and
+`KIROCREW_POLICY_HEADERS` is deliberately arbitrary — an `X-Fleet-Key` holding an opaque blob
+matches no pattern anyone can write, so pattern matching cannot reach it. What makes this
+tractable is that the value is not a pattern to us: we sent it, so we can substitute the
+string itself, which is strictly stronger than any shape rule for exactly the values at risk.
+Values shorter than 8 characters are left alone — not credentials at that length, and
+replacing a 1–3 character string would corrupt every message containing those characters.
+Longest first, so a value that is a prefix of another does not leave its remainder behind, and
+never raising, because a sanitiser that can fail is one that stops sanitising at the worst
+moment.
+
+**Every reason this module builds goes through `_sanitize_detail`, not `_redact_source`.**
+The difference matters wherever the text includes an exception: `_redact_source` knows only
+the *configured* source, while the exception is the ENDPOINT's — an error page, or a proxy
+echoing the request back, can carry the `Authorization` header into it, and
+`_sanitize_detail` runs `security.redact` over the result as well. Unified even on the arms
+that carry no endpoint text, so a later edit that adds some cannot reintroduce the gap. It is
+redacted
+as a substring (`_redact_source`) rather than by rewording each message, because the
+detail is assembled from exceptions raised all over the module and, through the fetcher
+seam, from an edition's own transport: a per-message rule is one someone has to remember.
+The **hostname alone** is redacted as well as the full URL, since plenty of transport
+errors never quote the whole thing — a TLS mismatch says "hostname 'x' doesn't match"
+and a DNS failure names the host by itself.
+
+`_sanitize_detail` wraps that in the **shared credential + exfiltration-URL chain**
+(`security.redact`), because the source is not the only thing in these messages that
+must not be published: a malformed document reaches the text through a parser error, and
+`json`'s errors quote the offending bytes — so an endpoint echoing back the request's
+`Authorization` header (its own request reflected, a proxy error page) would carry that
+credential to both surfaces. Those bytes are not ours, which is why
+`platform/policy_distribution.py` is a registered `_REDACTION_SINKS` entry rather than an
+allowlisted non-egress use.
+
+`refresh_now()` **never raises**; it returns a `RefreshOutcome` whose `status` is one
+of `not_configured` / `unchanged` / `applied` / `rejected` / `unreachable`. Named
+states rather than a boolean because the CLI, the viewer and the audit trail all need
+to tell "nothing changed" apart from "a push was refused". Only the outcomes that
+changed something or failed are audited (`log_governance_decision`, scope
+`distribution`) — auditing an unchanged poll would append one HMAC-chained row per
+interval per host for a decision that decided nothing — and the record carries the
+source's **scheme, not its URL**, because the SEL is readable through surfaces the
+agent can reach.
+
+### Signature verification is the same trust root
+
+A fetched document carries `identity.signature` and is verified exactly as a file
+tier is, against a trust key in the operator-controlled admission policy — never a
+key the fetched document supplies about itself. The opt-in is that policy's
+`require_policy_signature`, honoured here like at every other tier; this tier adds no
+flag of its own, for the reason above. It is enforced inside
+`parse_distributed_policy` as well as at the shared boot gate, so a refused document
+never reaches the cache.
+
+**Roll the build before the pin**, the same caveat `updates` carries: the parser fails
+closed on an unknown key, so a build predating `distribution` refuses to boot on a
+policy that declares one.
+
+### Operator surface
+
+`kirocrew policy source` reports the posture; `kirocrew policy fetch [--force]`
+fetches now and applies the result, exiting **non-zero** on a refusal or an
+unreachable source so it is usable as a fleet-verification step in a
+config-management run. `--force` skips the conditional validators, because a `304`
+tells an operator nothing about whether the document they just published reads
+correctly. Both inherit the `policy` command's deliberate **non-exposure as an MCP
+tool** — it surfaces governance internals the governed subject should not enumerate.
+
+`distribution_posture()` is the read-only projection, carried on
+`GET /api/governance/policy` as its `distribution` key (in **both** literals — the
+fail-safe branch needs its own, since the frontend reads the key unconditionally).
+It reports the source's **scheme and never its URL**, and every value is a number, a
+boolean, or a machine-readable enum (`error_code`, `last_refresh_status`) so no
+English ships in a JSON body. A fetcher's exception message appears nowhere: it is
+prose, and it routinely embeds the endpoint. It reads only the parsed pins, the
+on-disk cache and the refresher's in-memory record — **never the network**, because
+that GET is browser-triggerable and repolled every 30 seconds. It reads the cache's
+metadata only (`read_cache_meta`, which `stat`s the document rather than reading it),
+so an open Security tab does not re-read a document of up to `MAX_POLICY_BYTES` every
+half minute. The handler's own fail-safe returns an `error_code` rather than a bare
+`configured: false`, because the viewer renders the block on
+`configured || error_code` and a bare false would hide the row — showing the
+reassuring "no enterprise policy in effect" card on a centrally-governed host, the
+exact confusion this field exists to remove.
+
+### Bounded re-fetching, and the credential
+
+`load_security_policy` is re-run **per app callback** by `mcp_gateway/app_call.py`, so
+the tier bounds itself rather than trusting each caller's discipline: a cache younger
+than `_fetch_window` (the fleet's interval, else `MIN_REFRESH_INTERVAL_SECS`)
+short-circuits without a fetch, and `_claim_fetch_slot` records the **attempt** so a
+down endpoint is not retried by every caller. Numeric settings are additionally required
+to be **finite** on both channels: NaN parses as a JSON number and every comparison
+against it is false, so it would slip past the range and whole-number checks and raise an
+uncaught `ValueError` at `int()` instead of a validation error. `refresh_now` — the CLI and the poller —
+bypasses the window, because an operator asking for a fetch should get one.
+
+Every `KIROCREW_POLICY_*` variable is on `sandbox._AGENT_DENIED_ENV_KEYS` — not just
+the header. `KIROCREW_POLICY_HEADERS` is a live bearer credential, and with it an agent
+could read the document the keystone exists to keep it from reading on disk;
+`KIROCREW_POLICY_URL` is credential-bearing in its own right whenever the fleet uses a
+pre-signed object URL, and even unsigned it names the control plane that the SEL, the
+viewer and `RefreshOutcome.detail` all deliberately withhold.
+
+They are listed as **concrete names, not a `KIROCREW_POLICY_` prefix**, because that
+list has consumers with two different matching rules: the spawn scrubs use
+`startswith`, but `cron_script._CRON_ENV_DENY` tests exact membership and `mcp_cron`
+builds `\b`-anchored regexes from it — so a prefix entry silently matches nothing in
+either, which is how a bearer token reaches an agent-authored cron script. A test pins
+the list against `POLICY_DISTRIBUTION_ENV_VARS` (which owns the set) and separately
+drives `_clean_cron_env` to prove the exact-match consumer really drops them.
+
+`apps/backend.py` puts an app backend in **cache-only mode** (`KIROCREW_POLICY_CACHE_ONLY`)
+rather than forwarding the source at all. That resolves a real tension instead of picking
+a side: forwarding the settings would hand arbitrary third-party code the fleet's control
+plane (the header is a live token, and a pre-signed URL is itself the credential), while
+forwarding nothing would drop the child to a lower policy tier — a looser ceiling for
+exactly the code that most needs one. In cache-only mode the child needs neither, because
+the gateway has already written the last-known-good cache: the cache IS the
+administrator's ceiling, and the child adopts it with no URL, no token and no network.
+The recorded-source check is skipped in that mode, which is sound rather than a
+relaxation — there is one cache, the parent wrote it, and the parent applied the repoint
+rule when it did. Only `max_cache_age_secs` rides along, because it is the one setting
+that decides whether the cached copy is still an acceptable answer — and it is forwarded as
+the **effective** value (`effective_max_cache_age()`), not the raw environment variable,
+since a fleet is as likely to declare the bound in the published document and reading only
+the env would leave the child with no bound at all. In that mode an absent, stale or unusable cache **fails closed**, and the flag is set
+only when the gateway's own ceiling came from this tier (`central_ceiling_installed()`).
+The two go together: the flag then means "there is a fleet ceiling to inherit", so an
+absent cache is not "this host has no central policy" but "the parent had one and could
+not pass it on" — which a successful fetch with a failed cache *write* produces. Falling
+through there would start arbitrary third-party code under a local or absent ceiling on a
+governed host, silently. Gating on the predicate rather than on the variables being set is
+what keeps the converse right: a gateway that itself degraded has nothing to pass on, and
+flagging that child would refuse to start an app on a host running perfectly well.
+
+`KIROCREW_POLICY_CACHE_ONLY` is also in the tier's **entry** condition in
+`load_security_policy`: such a child has no source by design, so gating entry on one would
+skip the tier and drop it to a local ceiling — the failure cache-only mode exists to
+prevent.
+
 ## Policy authenticity (`identity.signature`)
 
 Without a signature check, a policy's integrity rests entirely on **filesystem
@@ -226,11 +1224,18 @@ raises `PlatformCompositionError` and **aborts boot** (plus a `failed_closed`
 governance-health mark), matching the module's existing fail-closed discipline for
 a wrong version, a missing `boot` object, or an unknown governed key.
 
-**All three tiers are verified — none is exempt.** When `require_policy_signature`
-is OFF (the default, and what the `amazon` edition ships), verification is advisory
-at every tier: an unsigned policy — bundled or on disk — still loads and still
-governs, so existing installs are unchanged. When it is ON, every tier must present
-a signature that verifies against a trust key, or boot aborts.
+**Every tier's document is checked; the gate judges the final ceiling.** All four
+documents — the fetched document, the env path, the companion bundle and the operator
+home file — are verified as they are read, and each parsed
+ceiling carries its own `signature_state`. Enforcement is a separate step:
+`assert_policy_signature_satisfied` runs once on the **final composed ceiling**, whose
+`signature_state` is the **authority's** (`_intersect_ceilings` keeps everything outside
+`controls` with the authority). So a subordinate that only tightens is composed in
+without its own signature having to verify; what must verify is the document that
+governs. When `require_policy_signature` is OFF (the default, and what the `amazon`
+edition ships) the verdict is advisory and an unsigned policy still governs, so existing
+installs keep working with no key to provision. When it is ON, the final ceiling must
+carry a verifying signature or boot aborts.
 
 The companion-bundled tier is **not** exempt: the plugin-admission manifest
 signature covers only the manifest fields (`name` / `publisher` / `version` /
@@ -253,9 +1258,9 @@ on the **final composed context** alongside the other governance floor gates. It
 rejects both failure shapes: a surviving ceiling whose state is not `verified`, and
 no ceiling at all.
 
-The split is what makes tier precedence work. `load_security_policy` walks
-env → companion bundle → operator home and runs more than once per boot with
-different arguments — the core calls it with no `bundled_loader`, a companion
+The split is what makes tier precedence work. `load_security_policy` composes
+central → subordinate (env / companion bundle / operator home) and runs
+more than once per boot with different arguments — the core calls it with no `bundled_loader`, a companion
 edition re-invokes it with one. A raise inside the loader fires on whichever tier
 that particular pass happened to reach, so an enterprise host with an unsigned home
 file and a correctly signed companion bundle aborted on the *lower-precedence* tier
@@ -284,7 +1289,11 @@ which parses fine — so fail-closing on a *malformed* file would catch only a c
 variant of an attack the design already concedes, while turning a non-atomic fleet
 push or a hand-edit typo into an unbootable host. Corruption there is a reliability
 event: it is logged at WARNING, plugin admission independently fails closed on the
-same file, and `kirocrew doctor` reports it.
+same file, and `kirocrew doctor` reports it. Distinct from a broken FILE: a
+well-formed trust root whose `require_policy_signature` is present but not a
+real JSON boolean (explicit `null`, `"false"`, `0`) reads fail-closed as
+opted-IN — both the enforcement gate and the key store route through the one
+strict `admission.AdmissionPolicy.from_dict` reader (#9641).
 
 
 **Threat model.** This detects **offline / at-rest tampering and substitution** of
@@ -373,9 +1382,10 @@ without re-implementing it.
 **`host` surface (in-process host actions).** A governance check that is not
 driven by a user-facing surface — app activation
 (`apps.manager._app_activation_denied`), Slack workspace admission
-(`slack.enterprise`), and non-Slack transport startup
-(`slack.gateway._channel_transport_permitted`) — runs under the `_host` sentinel
-session key, which classifies to surface `host`. Operators can bind a
+(`slack.enterprise`), non-Slack transport startup
+(`slack.gateway._channel_transport_permitted`), and the selectable-ACP-harness
+narrowing (`agent_backend_governance.narrow_selectable_backends`) — runs under
+the `_host` sentinel session key, which classifies to surface `host`. Operators can bind a
 `surface:host` profile to narrow these on top of the policy ceiling (e.g. an
 `apps` allowlist that further restricts which apps may activate, or a `channels`
 allowlist that narrows which transports may connect below what the ceiling
@@ -568,7 +1578,10 @@ four on-disk states:
   `resolve_active_scope`.
 
 **Runtime unrecoverable escalation.** `assert_profiles_within_ceiling` is the
-boot floor and runs **once**, so a governed host that hot-loads a *new*
+boot floor and runs **once** — a live ceiling swap runs
+`assert_profile_floor` instead, which is the ordinal half without this refusal
+(see [Central distribution](#central-distribution-distribution--policy-only)) — so
+a governed host that hot-loads a *new*
 unrecoverable profile after boot (no prior entry to recover a bind from) gets an
 unbound deny-all that never matches its intended surface — that surface silently
 falls to policy-only until the file is fixed. The reload makes this **loud and
@@ -675,7 +1688,37 @@ read-your-writes should add it deliberately, with its own tests.
   profile, title)` (governance, incl. the `commands` scope, and MCP titles
   `mcp__server__tool` converted to `@server/tool`) → first-party app-own MCP
   server auto-approve → read-only auto-approve →
-  user `auto_approve_tools` loop**. A governance deny wins over a user
+  user `auto_approve_tools` loop**. **Canonical MCP identity.** For a call
+  carrying BOTH trusted `_meta.kiro` fields, the gate reconstructs
+  `mcp__<mcp_server_name>__<mcp_tool_name>` once on the common path and runs the
+  deny-floor and `gate_decision` against it **in addition to** the display title
+  and raw command — never instead of them. `select_tool_title` prefers the
+  model's prose `description`, so an ordinary MCP call whose per-tool rule names
+  the real tool would otherwise miss the ceiling and reach interactive approval,
+  where a human "allow" runs a policy-denied tool. The two are not competing
+  spellings of one fact: the canonical name is the trusted, non-model-authored
+  statement of WHICH tool is invoked and is what a per-tool rule matches, while
+  the title and raw command carry the path/command/content signals that a tool
+  identity does not express. Each covers a security dimension the other cannot,
+  so a deny on EITHER denies the call: a `~/.aws/credentials` title still denies
+  behind a harmless canonical name, and a denied canonical name still denies
+  behind benign prose. **Server-only identity.** When the backend proves the
+  server but not the tool (no `_meta.kiro.toolName`, or an uncached permission
+  event), `gate_decision` is asked about `mcp__<mcp_server_name>` instead. That
+  is a complete question for this plane and only this plane: `mcp_title_to_ref`
+  maps it to `@server`, and an `@server` rule is defined to cover every tool
+  under that server, so a `deny @github` ceiling binds on a call whose tool
+  cannot be named — without it, governance sees only the model-authored title
+  and the call reaches a human who can approve a server the policy forbids. It
+  is deliberately NOT added to the deny-floor targets: that plane matches raw
+  text and operator regexes, where `mcp__<server>` is a different string from
+  the canonical identity a rule is written against rather than a broader form of
+  it. A server-only identity never satisfies auto-approval. Because this
+  enforcement is
+  on the common path, the first-party app-own auto-approve below does **not**
+  repeat it; what remains load-bearing there is the identity requirement itself
+  (an absent `mcp_tool_name` leaves the canonical name empty, so the tool cannot
+  be identified and is not auto-approved). A governance deny wins over a user
   auto-approve, and the read-only auto-approve fast-path runs strictly AFTER
   both the deny-floor and `gate_decision`, so a read-only classification can
   never re-admit a denied/governed call. **First-party app-own MCP server
@@ -740,7 +1783,12 @@ read-your-writes should add it deliberately, with its own tests.
   in `mcp_core._vet_channel_governance`; dashboard cross-surface mirror creation
   in `dashboard.chat_mirror` reuses the fail-closed
   `dashboard.chat_runner._resolve_channel_target` ladder before opaque target
-  resolution and at every outbound send boundary; the per-transport **startup** gate in
+  resolution and at every outbound send boundary (the pre-resolve call carries
+  `check_recipient=False` — its link holds the `user:<id>` configured-target
+  spelling, which a recipient predicate over conversation ids can never match —
+  and the handler re-decides recipient authorization against the resolved
+  conversation id, SEL-audited, immediately after; the `channels` governance
+  decision itself always precedes the resolve's network side effect); the per-transport **startup** gate in
   `slack.gateway._channel_transport_permitted` (a `channels` deny for a member
   keeps that transport — `slack`/`wecom`/`telegram`/`discord`/`webex` — from
   connecting at boot; resolved under `session_key=HOST_SESSION_KEY` so a
@@ -761,6 +1809,16 @@ so the call fell through to interactive approval. That row and its clamp were re
 along with the rest of the computer-use governance model — see [Computer use is NOT
 governed](#computer-use-is-not-governed-deliberately). The global `approval_mode`
 row's live clamp remains reserved (see "Still-reserved in v1").
+
+### Owner capability previews
+
+`sanitize_agent_config_governance(config, audit=False)` uses the same approval
+filter as publication without emitting withdrawal logs or SEL events. The
+nested MCP filter receives the same flag. All existing writers keep the default
+`audit=True`. Capability previews do not maintain a second governance predicate.
+Derived native permissions are updated from the filtered allowedTools list;
+custom permission policies that cannot be reconciled without changing their
+meaning are refused rather than silently retained as an alternate shortcut.
 
 ## Foreign-agent import interaction
 
@@ -882,7 +1940,7 @@ real id can equal: if the leaf is an allow-mode allowlist the sentinel is denied
 ### Channels governance-status surface (read-only) + Settings greying
 
 `GET /api/governance/channels` (`handlers_system.api_governance_channels`,
-registered in `dashboard/server.py`, behind the same dashboard token auth as the
+registered in `dashboard/routes/system.py`, behind the same dashboard token auth as the
 sibling `/api/*` GETs) returns the effective per-channel `channels` policy
 decision as a `{channel_type: bool | null}` map (`true` = permitted, `false` =
 denied by policy, `null` = governance evaluation transiently FAILED → the UI shows
@@ -984,7 +2042,7 @@ as denied (prompt refusal) rather than returning without resolving.
 ### Governance policy viewer (`GET /api/governance/policy`)
 
 `GET /api/governance/policy` (`handlers/security.build_governance_policy_snapshot`,
-registered in `dashboard/server.py`, same dashboard-token auth) returns the
+registered in `dashboard/routes/system.py`, same dashboard-token auth) returns the
 effective ceiling across ALL scopes on the **host surface**, for the read-only
 Settings → Security viewer. It iterates `SCOPE_CATALOG` (so it auto-covers any
 scope a release or the companion registers), intersects each boot-frozen POLICY
@@ -992,7 +2050,7 @@ control with the host-surface PROFILE control using the model's own
 `_compose_controls`, and reports
 `{scope, archetype, governed, source, scope_note, detail}` per scope plus
 `{version, has_policy, profile, surface, other_bound_surfaces, fallback_profiles,
-unavailable}`.
+unknown_profile_scopes, distribution, unavailable}`.
 
 **A row describes ONE surface, and must say which.** The host profile governs
 in-process host actions, so it legitimately pins capabilities the host process
@@ -1148,6 +2206,33 @@ denials leave the same forensic trail.
   `computer_use.approval` was removed with the rest of the computer-use governance
   model, so `approval_mode` is once again the only row on the `approval` scale and
   its live clamp is still the reserved half.
+- **Windows has no machine-policy managed tier today, so the central ceiling is
+  advisory against a local account.** There is no machine-scoped policy pin on
+  Windows, so `resolve_distribution`
+  ([`src/kiro_crew/platform/policy_distribution.py`](../../../src/kiro_crew/platform/policy_distribution.py))
+  lets a per-setting environment override stand: a standard user can set the
+  `KIROCREW_POLICY_URL` environment variable to a document of their own and
+  replace the whole central rung. Read the Windows guidance accordingly —
+  central distribution is the **recommended substitute, not a guarantee** that a
+  person using the laptop cannot loosen the ceiling. The intended machine-policy
+  managed tier (an `HKLM\SOFTWARE\Policies` registry rung read via `winreg`,
+  which an environment variable cannot redirect) is design-of-record, not
+  shipped; see [the central-governance-ceiling
+  RFC](../../request-for-change/rfc-central-governance-ceiling.md) for that step.
+- **macOS has no machine-policy managed tier today either, and the intended design
+  reads only a Computer-Level / device-channel managed profile as the machine
+  rung.** No managed-profile reader exists on main; see [the
+  central-governance-ceiling
+  RFC](../../request-for-change/rfc-central-governance-ceiling.md) for that step —
+  it is design-of-record, not shipped. The design calls for a managed profile to be
+  deployed at Computer Level (Jamf) or through the device channel (Intune) to be
+  read as the machine tier. A profile deployed at Jamf **User Level** or through
+  Intune's **user channel** would land at a per-user path and would **not** be read
+  as the machine tier, so once built the host would govern from a local tier
+  without raising an error — the same silent-fallback shape as the Windows
+  advisory case above. Whether a user-level profile should be deliberately
+  ignored or read as a lower-than-machine rung is an open design question tracked
+  in that RFC.
 
 > **Capability `profile-absence` semantics (deliberate deviation from spec A.4
 > rule 8).** The spec says a profile that OMITS a capability defaults it to
@@ -1163,7 +2248,9 @@ command body + the enterprise force-pin for built-in denied-command rules, see
 below), `filesystem.read` / `filesystem.write` / `folders.*` and
 `network.egress` (host gate via tool kind + args), `channels` (per-transport at
 the messaging chokepoint AND at non-Slack transport startup), `apps` (app
-activation), `sandbox.min_level` (ordinal
+activation), `agent_backend` (which ACP harness a deployment may select —
+materialised by narrowing the `acp_backends` registry at boot and on every
+runtime ceiling install, see below), `sandbox.min_level` (ordinal
 floor at `wrap_argv`), `approval_mode` (boot floor only), and every capability
 gate — `capabilities.spawn`, `capabilities.messaging`, `capabilities.cron`,
 `capabilities.memory_writes`, `capabilities.script_hooks`,
@@ -1173,9 +2260,34 @@ default on; a deny makes the tool refuse outright, and it does NOT fall back to
 the `commands` scope, so denying browsing wholesale means denying both this
 capability AND the `playwright-cli` command),
 `capabilities.publish` (artifact publish chokepoint — see below),
-`capabilities.theme_persona` / `capabilities.theme_install`, and
+`capabilities.agentcore` (opt-in agent workload identity + Gateway MCP —
+see below),
+`capabilities.theme_persona` / `capabilities.theme_install`,
+`capabilities.mobile_connect` (phone-connection methods: filters the
+`GET /api/mobile-connect/methods` listing AND is re-checked fail-closed inside
+both credential-mint endpoints — `/api/tailnet/mobile/qr` and
+`/api/auth/mobile-link` — via `mint_denied_reason`, because a filtered list is
+presentation, never the control. The mint re-check enforces TWO controls
+fail-closed: the method must exist in the active `mobile_connect` provider's
+set (an edition that removed a method disabled it — a direct POST does not
+out-rank the seam), and governance must permit it. Default-allow standalone; a `methods` ruleset
+narrows to individual method ids — `methods:tailnet_qr`, `methods:login_link`.
+The default methods deliberately use ONE spelling for id and kind
+(`tailnet_qr`, `login_link`), so a ruleset written against either binds; an
+edition contributing its own method must keep that property or document its
+ids. The built-in mint endpoints ARE the built-in methods — an edition adding
+a new method ships its own mint endpoint and frontend renderer alongside its
+descriptor. Every decision, list and mint alike, is SEL-audited through
+`vet_and_audit`. Denying everything hides the dashboard's "Connect your phone"
+entry; the method rows themselves come from the `mobile_connect` CPP seam —
+see `platform-context.md`), and
 `capabilities.telemetry` (the anonymous beacon: send gate + both write
-chokepoints — **policy layer only**, see below). Only the live `approval_mode`
+chokepoints — **policy layer only**, see below), and
+`capabilities.social_share` (the dashboard's "Share as image" entry — read
+through `GET /api/dashboard/config`, every layer honoured, every decision
+audited; see below), and `capabilities.feature_videos_download` (fetching the
+signed feature-video manifest and its media from the vendor CDN — three
+chokepoints, every layer honoured; see below). Only the live `approval_mode`
 clamp remains reserved.
 
 The `commands` scope now **doubles as the enterprise force-pin** for built-in
@@ -1213,6 +2325,48 @@ surface-agnostic Settings > Security snapshot + the builtin-toggle 409 check, so
 a rule pinned by any profile renders locked and rejects a disable rather than
 surfacing a no-op opt-out (UI success while the bound-profile gate still denies).
 Display-only union — it does not widen enforcement.
+
+`capabilities.agentcore` is a `CapabilityGate` (opt-in: `capability_default=False`,
+like `capabilities.publish` / `capabilities.messaging`). It is a catalog data row
+only — the evaluator is untouched. The inner `posture` field is policy data, not
+a second scope and not a `CapabilityGate` field (`additionalProperties: false`
+stays `enabled` + `scopes`): `workload` or `login`. An `enabled: true` document
+with a missing or unknown `posture` fails closed — the row is treated as
+disabled, or boot aborts when `boot.fail_closed`. A disabled or omitted row
+does not require `posture`.
+
+`CapabilityGate.from_dict` rejects a non-boolean `enabled` the same way
+`ScopedRuleset.mode` rejects an unknown mode: `enabled: "false"` is not
+coerced with `bool()`, and a present `enabled: null` is not treated as
+absent. The default applies only when the key is omitted. The raise is
+unconditional (including `boot.fail_closed=false`) and applies to every
+capability row, not just `agentcore` — six catalog scopes default ON, so
+a stringly-typed or null disable must not turn into a permit.
+
+The composed posture is a **policy-only** ceiling side field
+(`GovernanceCeiling.agentcore_identity_posture`, Rule 6 — same shape as Slack
+`channels.posture` and `updates`). A profile may enable or disable the
+capability (tightest-wins on `enabled`) but cannot carry `posture`,
+`gateway_url`, or `workload_name`: those keys are rejected at parse, the same
+fail-closed raise as `ScopedMap.posture` / `updates` / `fallback`.
+Enable-without-posture is the legal profile shape; it cannot turn the seam on
+alone, because an omitted policy has no stored posture. Read the composed
+value through the public helper
+`agentcore_posture(ceiling) -> "workload" | "login" | None` — do not re-parse
+raw policy JSON. The helper returns the stored posture only when the
+capability is enabled with a known value; `None` when the ceiling is missing,
+the capability is omitted, disabled, or fail-closed-disabled.
+
+`gateway_url` (https MCP URL, no credentials, no fragment, no internal
+whitespace) and `workload_name`
+(3–255 of `[A-Za-z0-9_.-]`) are the same policy-only shape. Validators live
+in `platform/agentcore_schema.py` so policy parse does not import AWS.
+Consumption ANDs three conjuncts: the `agent_identity` adapter is on,
+governance permits `capabilities.agentcore`, and `agentcore_posture(ceiling)`
+is a known value. The public `DefaultAgentIdentityProvider` is disabled, so a
+standalone host with no policy is unchanged. Later stack PRs consult this row
+at rebuild / Gateway injection; naming it here is what lets a policy pin the
+capability before those chokepoints land.
 
 `capabilities.publish` is a `CapabilityGate` (opt-in: `capability_default=False`)
 with an inner `destinations` `ScopedRuleset` (`identifier` matcher) bounding
@@ -1504,6 +2658,430 @@ switch off" (flippable) from "off because an administrator pinned it" (a config
 write returns 403), since offering a working-looking toggle for the second is the
 half-control this row exists to avoid.
 
+### Hosted feature-video media — `capabilities.feature_videos_download`
+
+Feature-intro clips are hosted, not bundled: the gateway fetches a signed manifest
+from a vendor CloudFront distribution and downloads the media it lists into
+`~/.kiro/crew/feature-videos/<release>/` (`feature_videos_manifest.py`,
+`feature_videos_cache.py`; user-facing doc `feature-videos.md`). That is outbound
+traffic to a vendor endpoint plus third-party bytes landing on disk — two things a
+managed fleet frequently may not do at all. Governed by the
+`capabilities.feature_videos_download` `SCOPE_CATALOG` capability row
+(`capability_default=True`, data-only shape — no `CONTRACT_VERSION` or evaluator
+change, mirroring the rows above).
+
+**Three chokepoints, because any one alone is a half-control.** Each manifest
+request (the fallback walk re-asks before every candidate url, so no request is
+made after a withdrawal and nothing is learned), each clip request in the download pass
+(the poster and the clip each take their own audited answer, so no media lands on
+disk after a withdrawal), and `POST /api/feature-videos/fetch-all` (refused 403
+rather than accepted into a task that would deny itself). All three are server-side,
+and that is the whole surface: the BROWSER never reaches the CDN, because the server
+never hands it a CDN url. An uncached hosted clip is not offered at all — a remote
+`src` would have the browser play bytes the sha256 pin never checked and follow
+redirects the gateway's own opener refuses — so `feature_videos.validate_asset_path`
+admits only this origin, and the ceiling has no client-side leg to govern.
+
+**Already-cached clips keep playing under a denial.** Withdrawing bytes that are
+already on disk is a separate decision this row does not make; a denied install
+offers its local entries and nothing else.
+
+**Shape: the social-share read, not the startup probes.** `vet_and_audit` on the
+pinned `dashboard:ui` surface key — never a caller-controlled header — and every
+denied decision is honoured whichever layer produced it, so a Level-2 profile bound
+to the dashboard can withdraw the fetch. The frontend reads the answer as
+`download_enabled` on `GET /api/feature-videos/status` (the settings panel) and
+`/next` (the modal), so it never guesses and never has to discover the ceiling
+through a 403. It is deliberately NOT repeated on `GET /api/dashboard/config`: that
+route is fetched on every dashboard load by every install, and an audited
+`download_denied()` there would spend a governance decision — and a SEL row — on a
+readout nobody consumes.
+
+**Fails CLOSED** (`fail_closed=True`), joining `capabilities.publish` /
+`theme_install` / `telemetry` / `tailnet_origin` / `social_share`: a wrong-DENY
+withholds an intro clip, a wrong-PERMIT makes a vendor-CDN request on a fleet that
+forbade vendor egress. An unevaluable ceiling is audited as the denial it produces.
+
+**No CSP change.** `media-src` stays `'self' blob:`. Every clip the dashboard plays
+is served from this origin — a bundled asset or a downloaded, verified one — so the
+policy needs no off-origin media host, and a header that admitted one would be
+admitting a fetch the server never offers.
+
+### "Share as image" — `capabilities.social_share`
+
+The chat's *More actions → Share as image* turns an assistant reply into a branded
+PNG card with a prefilled caption and offers to post it to X or LinkedIn
+(`website/src/pages/chat/share/`). The card is rendered and exported **in the
+browser** — copy and download never leave the machine, and there is no upload — but
+the intent buttons hand the caption text to a third-party site inside a URL. That
+makes the entry an egress path for agent output, which a managed fleet may forbid
+wholesale. Governed by the `capabilities.social_share` `SCOPE_CATALOG` capability
+row (`capability_default=True`, data-only shape — no `CONTRACT_VERSION` or evaluator
+change, mirroring the rows above).
+
+**Why the chokepoint is a read.** There is no server-side share action to refuse:
+nothing is rendered, stored or posted by the gateway. The control is the dashboard
+entry itself, and the only way the dashboard can learn the ceiling's answer is the
+endpoint it already fetches — `GET /api/dashboard/config` reports a read-only
+`social_share_enabled` (`dashboard/social_share.py`), and the frontend draws the
+menu item only when it is `true`. The entry stays hidden until the server has
+answered — the endpoint is the authority, the frontend never guesses (the same
+posture as the mobile-connect rail row). When Share was the menu's only item (a
+loaded window keeps fork/plan as row buttons), the trigger is withdrawn with it
+rather than opening an empty menu. A swap that lands while the share dialog is
+already open does **not** unmount it: the dialog stays with the user's edited
+caption in place, its four share actions are disabled, a notice names the cause and
+tells the user to copy their text now (it is not saved on close), and a plain-text
+Copy affordance — the caption plus the card's editable text, local clipboard, no
+image, no site — stays available so closing
+never means silent loss; when the clipboard refuses, the button says so and
+selects the caption for a keyboard copy rather than looking like success. The
+notice does not name who set the policy (a fleet ceiling and an operator's own
+profile pin both land here). In the Security panel's ceiling viewer the scope's row
+is labelled after the menu entry it withdraws ("Share as image", translated), so a
+user who lost the entry can connect the row to the feature. The field is dropped
+from the `PUT` body (both settings surfaces round-trip the whole `GET`), so it can
+never be written: governance, not config, owns the answer.
+
+**Shape: the mobile-connect listing, not the startup probes.** The evaluation runs
+through `vet_and_audit` on the pinned `dashboard:ui` surface key — never a
+caller-controlled header, which would let a request dodge a profile bound to the
+dashboard surface — and **every denied decision is honoured**, whichever layer
+produced it. This is a per-request dashboard question, so unlike `telemetry` and
+`tailnet_origin` (process-wide, session-less, evaluated once at boot) there is no
+policy-layer-only carve-out: a Level-2 profile narrowing the dashboard can withdraw
+the entry.
+
+**Fails CLOSED** (`fail_closed=True`), joining `capabilities.publish` /
+`theme_install` / `telemetry` / `tailnet_origin`: a wrong-DENY hides a convenience
+menu item, a wrong-PERMIT offers a "post this to a third-party site" button on a
+fleet that forbade it. An unevaluable ceiling is recorded as `denied` with a
+`fail-closed` reason.
+
+**Every decision is audited.** Each evaluation the dashboard acts on leaves a
+`governance_decision` SEL row (tool `dashboard_config_social_share`), grant and
+denial alike, through the shared seam — the read *is* the enforcement here, so it
+is not an inspection to leave unrecorded. The endpoint is not polled: the client
+fetches it on mount, focus and after its stale window, and otherwise only when the
+WS `slots` frame reports a generation change (below).
+
+**Follows a mid-session ceiling swap.** `policy_distribution.apply_ceiling` can
+replace the ceiling without a restart. The WS `slots` frame carries the process-local
+`governanceGeneration` alongside `gitlabHostsGeneration`; every dashboard-user
+socket's existing 5-second status pusher (`ws.py`, `_push_status`) compares the
+counter on each tick and asks for a coalesced slots push when it moves — no task of
+its own, and deliberately separate from the owner-only credential-refresh driver, so
+a fleet that tightened policy while only a non-owner window was open still reaches
+that window; the initial frame and the tick's baseline come from one read, so a swap
+during connection setup registers as a change. The client invalidates its cached
+`dashboardConfig` on a change (and on each connection's first frame, since the
+counter restarts with the process) — so a withdrawn entry disappears within one
+status tick rather than waiting out the cache's stale window.
+
+**And follows a profile-layer edit.** The value in that frame is
+`governance_profiles.governance_answer_generation()`, which is
+`context.governance_generation()` plus a module-private `_profile_generation()`
+bumped whenever `ProfileStore._ensure_fresh` publishes a new snapshot. The field's
+contract is unchanged — it stays an opaque, comparison-only integer, so combining two
+monotonic counters is not a change of meaning and no consumer needs to know. This
+exists because the ceiling counter alone missed Level-2 edits: a profile file
+tightening a capability is enforced on the very next decision (the authorization
+path calls `_ensure_fresh`), while the dashboard's cached answer kept the withdrawn
+entry until its 30-second stale window, focus, or an unrelated slot mutation.
+
+Detecting the edit needs the profiles directory re-stat'd, and on an idle dashboard
+nothing else would touch the store, so the watcher has to be what looks. That walk
+lives in a separate `poll_profiles_fresh()`, which the watcher offloads with
+`asyncio.to_thread`: `_dir_fingerprint` is an `iterdir` plus a `stat` per file, and
+AUTOSDE's `no-blocking-call-on-event-loop` names filesystem walks as the prohibited
+class, so a slow or large profile store must delay one socket's tick rather than
+stall chat turns and heartbeats for every session. `governance_answer_generation()`
+itself is two locked integer reads with no filesystem access, which is why the
+synchronous slots broadcast may call it inline. Measured walk cost on one host: 57us
+at 5 profile files, 107us at 15, 303us at 50, 1.12ms at 200 — small at a realistic
+count and unbounded in principle, hence offloaded rather than defended by the number.
+
+`_profile_generation()` is an OUTPUT of the profile store and must never become an
+input to it. Folding it into `_ceiling_token()` — the obvious-looking symmetry with
+the ceiling half described below — would make the store reload on every access
+forever, because `_ensure_fresh` computes its fingerprint *before* reloading and so
+would commit a pre-bump value that the next read can never match.
+
+The Security panel picks the row up automatically (`api_governance_policy` iterates
+`SCOPE_CATALOG`; its label is the humanised leaf, "Social share").
+
+### Which ACP harness a deployment may select — `agent_backend`
+
+`agent.acp_backend` chooses the harness a session runs on (kiro-cli, KAS, and
+whatever an edition registered — see [harness-parity.md](harness-parity.md)).
+Two different questions decide whether a value is usable, and keeping them apart
+is what this row is for:
+
+- **Can this build serve it?** `acp_backends.selectable_backends()` — a
+  capability fact contributed by the edition that called
+  `register_selectable_backend`. Not governable: no policy can conjure a harness
+  the build has no code for.
+- **May THIS DEPLOYMENT select it?** the `agent_backend` `SCOPE_CATALOG` row
+  (a `ScopedRuleset` on the `identifier` matcher; data-only shape — no
+  `CONTRACT_VERSION` or evaluator change, mirroring the rows above), so a managed
+  fleet can qualify one harness and bound the rest.
+
+**Members are POLICY ids, not the code's spelling** — `kiro` / `kas` / `claude`,
+translated by `acp_backends.POLICY_ID_BY_BACKEND`. `ACP_BACKEND_KIRO` is the
+empty string internally, which no identifier matcher can carry: an empty
+allow/deny entry is indistinguishable from a typo'd blank a JSON linter would
+keep. The wire vocabulary is therefore owned in one place rather than translated
+at each reader.
+
+**Additive over a floor — the semantics ruling that unblocked
+[issue #6622](https://github.com/kirodotdev/KiroCrew/issues/6622).**
+
+```json
+{"agent_backend": {"mode": "allow", "allow": ["claude"]}}
+```
+
+means **also allow claude**, not **only claude**: `kiro` stays selectable because
+`acp_backends.GOVERNANCE_FLOOR_BACKEND` is never submitted to the scope at all,
+so no rule can remove it. The exclusive reading was rejected because it can empty
+the selectable set, and an install with **no startable harness cannot be repaired
+from the dashboard** — the trust-root `security_policy.json` is the one file the
+dashboard may not write (see
+[Self-protection](#self-protection-the-keystone)). The guarantee does not rest on
+the governance caller being careful either: `apply_selectable_denials` force-keeps
+the floor even when a caller names it in `denied`. Issue #6622 remains open for
+the wider enforcement question; only the semantics is settled here.
+
+kiro-cli is the floor rather than KAS deliberately. KAS is not an independent
+harness — it is served by kiro-cli's own ACP relay
+(`acp/kas_transport.build_kas_argv`) — so a KAS floor would rest on the same
+binary while adding a second thing that can be absent. The floor has to be the
+member with the fewest preconditions of its own; revisit if KAS ever ships a
+binary of its own.
+
+**Enforced by RECOMPUTING the registry, not by a per-decision read.** This is the
+one scope here whose answer is materialised instead of resolved at each decision.
+`agent_backend_governance.narrow_selectable_backends()` iterates the BASELINE
+(`registered_backends()`), asks the scope about every non-floor member, and
+assigns `baseline - denied` whole via `apply_selectable_denials`. One call site,
+**outside** `KiroCrewConfig.load()`:
+
+| Call site | When | Why it is needed |
+|---|---|---|
+| `platform/bootstrap.py::bootstrap_context` | after `set_context`, and after every edition's `register_acp_backends` | the first session already sees the policy, and nothing an edition registers later escapes it |
+
+**When a policy change binds: the next gateway start.** `apply_ceiling` replaces
+`current_context().governance` mid-process — the poll thread reaches it through
+`refresh_now()` — and every other scope on this page picks that up on its next
+decision. This one does not, deliberately.
+
+Re-deriving the registry there would bind the new ceiling for backend SELECTION only.
+Sessions already running the now-denied harness, and providers already in the warm
+pool, keep going: nothing in this scope can retire them, because retiring live work is
+a session-lifecycle capability that does not exist yet. The operator-visible result
+would be the worst of both — the option disappears from the panel while the harness is
+still in use, which reads as "it stopped being used". A narrow promise kept beats a
+broad one that quietly holds only for new sessions, so the contract is stated plainly
+instead: the set is decided at gateway start, and editing policy takes effect on the
+next start. The dashboard panel says exactly that
+(`set_is_fixed_at_gateway_start`), and
+`test_apply_ceiling_does_not_renarrow_the_registry` pins it so the omission cannot be
+mistaken for an oversight and quietly "fixed" without the retirement half.
+
+Assigning rather than subtracting still earns its place at one call site: the recompute
+is idempotent, order-independent and reversible, so adding the runtime call site once
+retirement exists is a one-line change rather than a redesign of the primitive.
+
+**Why it cannot be a per-decision read like every other scope.** Three
+harness-parity invariants rule out each of the otherwise-obvious positions:
+
+- **H3** — the single selectability gate `resolve_selected_backend` runs inside
+  `KiroCrewConfig.load()` and must never read the platform context:
+  `current_context()`'s lazy branch loads config, so resolving a ceiling there
+  re-enters the load that called it. The gate cannot ask.
+- **H4** — selectability has exactly ONE gate. A second derivation (an
+  intersection in the dashboard handler, say) is the drift the registry replaced.
+- **H13** — the Kiro construction path gains no conditional in service of an
+  adapter, which rules out `create_provider_factory`; a test asserts no governance
+  call appears there.
+
+Narrowing the registry satisfies all three: the context is installed at both call
+sites (so no re-entrant load), the registry stays the single source, and no call
+site changes. Everything downstream inherits the narrowed answer with no code of
+its own — `resolve_selected_backend` degrades a now-denied persisted value to the
+floor with a logged reason on the next load, and the `PATCH
+/api/config/kirocrew` allowlist, `GET /api/config/schema`, `GET /api/acp-backends`
+and the provider factory all read the one derivation
+(`handlers/core.py::_selectable_acp_backends`). `bootstrap_context` additionally
+re-runs that SAME gate over the config instance it is holding — that instance was
+normalised before the narrowing — rather than adding a second gate anywhere.
+
+**`GET /api/acp-backends`** is the operator-facing view of the outcome: one
+owner-only row per backend in `ACP_BACKENDS_KNOWN`, carrying `selectable` (build
+capability ∩ this deployment's policy, from the derivation above) beside
+`installed` (is the harness on THIS machine, from `agent_sdk.probe_backends`).
+The two facts are deliberately not conflated: a policy-denied harness and an
+uninstalled
+one need different operator remedies, and the dashboard must not offer an install
+instruction for a backend an administrator pinned off.
+
+**Fails CLOSED to the floor, which is what keeps fail-closed from meaning
+bricked.** `governance_permits(..., fail_closed=True)` denies for an error raised
+inside it, and `_scope_permits` additionally denies for what that helper does not
+swallow (an absent platform context, an import failure) — so an unqualified
+harness never becomes selectable on an unreadable policy. Without the floor,
+closed and bricked would be the same state. `narrow_selectable_backends` itself
+never raises: a boot that aborts because a policy could not be evaluated is worse
+than one that starts on the floor alone, and the same holds for a runtime refresh
+whose caller keeps serving traffic either way (it leaves the registry as it was,
+plus a logged warning).
+
+**Audited in BOTH directions**, unlike the publish gate which audits denials
+only. Every decision lands a `governance_decision` SEL record through
+`log_governance_decision` with `outcome` `"allowed"` / `"denied"` — the vocabulary
+`sel.py` pins and `governance_profiles` emits, so a log query for allowed
+decisions cannot miss this scope. The full record is affordable precisely because
+the decision is materialised: it runs once per gateway start and once per pushed
+ceiling, not per panel open — and *which harnesses did this deployment admit* is
+the question an operator actually reconstructs afterwards, which a denials-only
+log cannot answer. Audit failure is swallowed: an unwritable log must not decide
+which harness starts.
+
+Every decision is bound to `HOST_SESSION_KEY` (`_host`), **not** an empty session
+key, and that is load-bearing rather than cosmetic: an empty key classifies to
+surface `unknown` and matches no profile, so a `surface:host` profile would be
+silently ignored and the harness it denies would stay selectable. It is the same
+binding app activation and the messaging host gates use — see
+[`host` surface](#profile-resolution--binding).
+
+The Security panel picks the row up automatically — `api_governance_policy`
+iterates `SCOPE_CATALOG`.
+
+### Which tool-approval modes a deployment may select — `approval_modes`
+
+The dashboard approval-mode picker offers four modes: `normal` (interactive —
+ask for every tool), `trust_reads` (auto-approve reads), `trust` (auto-approve
+the active slot), and `yolo` (auto-approve every tool everywhere). The
+`approval_modes` `SCOPE_CATALOG` row (a `ScopedRuleset` on the `identifier`
+matcher — data-only shape, no evaluator change, mirroring `agent_backend`
+above) lets a managed fleet forbid an auto-approve mode and force interactive
+approval.
+
+**Today the scope governs exactly one mode: `yolo`.**
+
+```json
+{"approval_modes": {"mode": "deny", "deny": ["yolo"]}}
+```
+
+This is distinct from the ordinal `approval_mode` scale
+(`yolo < auto < interactive`) documented under the archetypes: that clamps a
+single ceiling, whereas `approval_modes` denies a named mode.
+
+**Three modes are non-deniable, for two different reasons.** Both are declared as
+catalog DATA — `ScopeSpec(..., always_permitted=("normal", "trust", "trust_reads"))`
+— and `_parse_control` refuses any ruleset that forbids one, whether directly
+(`deny: ["trust"]`) or by an allow-list that omits it, with
+`PlatformCompositionError`. Data rather than a scope-name branch, so a second scope
+with a non-deniable member is a catalog entry and not another `if` in the loader:
+
+- **`normal` is the interactive floor.** Denying it would leave no selectable mode
+  and brick tool approval, and the trust-root `security_policy.json` is the one file
+  the dashboard may not write to repair it (see
+  [Self-protection](#self-protection-the-keystone)).
+- **`trust` and `trust_reads` are not yet governed.** Their grants are honoured by
+  consumption predicates this scope does not reach — the in-memory trusted set, and
+  the session `approval_policy` a spawned subagent inherits — spread across the
+  messaging, Slack, Telegram and subagent-admission paths. Accepting a deny for them
+  would advertise a control that does not hold, so the policy is refused **loudly at
+  parse time** instead. Governing those read paths is tracked separately.
+
+The refusal happens at parse time in both cases, because a policy that misdescribes
+the posture is worse than one that fails to load.
+
+**Enforced at every `yolo` surface**, because a mode is only actually off if every
+path that can arm it — and every path that HONOURS an existing grant — refuses:
+
+- `dashboard/chat_handlers.py::api_chat_mode` — the explicit mode switch. Refuses
+  with `403` + `mode_disabled_by_policy` **before any mutation**.
+- `safety_override` arming — `_commit_activation` and `activate_scoped`,
+  fail-closed, so YOLO stays blocked however it is armed (dashboard, Slack `!yolo`,
+  the `/yolo` slash handler, config).
+- `safety_override.is_active` / `is_scope_active` / `renew_scoped` — the consult
+  points that honour a LIVE grant. Gating only at arming left an already-armed grant
+  running to its own TTL, so an admin who denied `yolo` mid-session kept
+  auto-approving every tool for up to 24h.
+
+**A denial REVOKES the grant; it does not merely mask it.** This matters because the
+same predicate answers two different questions. `is_active` is both "may this tool
+auto-approve?" and, for every caller that asks "is there a grant to clear?", the
+liveness test — Slack's `!yolo off` is `if is_yolo_mode(): disable_yolo()`. An earlier
+revision left `_active` set and only reported `False`, so inside a denial window that
+branch reported "already off" and cleared nothing, and a later policy relaxation
+resurrected auto-approve the operator had explicitly revoked. Tearing the grant down
+makes both readings agree. The cost is that a policy which denies and then relaxes
+requires a fresh arm, which is the honest outcome anyway.
+
+The teardown runs at the moment the denying ceiling is INSTALLED, not on the next
+`is_active()` call — `safety_override.revoke_for_policy` drops the session-wide grant
+and every scoped grant, then fires `_on_expired("policy")`. That callback is the rest
+of the revocation, and it is not optional: a dashboard grant also writes
+`approval_policy="auto"` onto the slots and into the shared channel-trust mapping, and
+`subagent_manager.admission.parent_trusted` reads *that policy* rather than any flag in
+`safety_override` — so a revocation that stopped at the flag left `spawn_run`
+auto-approved. `is_active` / `is_scope_active` / `renew_scoped` keep their policy check
+as the fail-closed mask if that teardown was partial.
+
+**Every refusal is SEL-audited.** A governance denial that leaves no trace is
+indistinguishable from the request never having been made, which is exactly the
+record an operator needs after an attempted escalation. The audit is best-effort at
+each site: an SEL write failure never turns a refusal into a grant.
+
+**The verdict is PUSHED at ceiling install, never polled.** Resolving the scope walks
+the profiles dir (`iterdir` + per-file `stat`), and every consumer is on a path that
+must not do that: `status_snapshot` is emitted on the 5s WebSocket push, `is_active` is
+the predicate every transport hands to `TurnDriver` (so it runs per *tool call*), and
+arming reaches the module from the event loop through synchronous callers. So
+`approval_mode_permitted("yolo")` is resolved **once per ceiling**, by a hook
+`safety_override` registers with `platform.context.register_ceiling_install_hook`.
+`platform.context._install` is the single writer of the active context — central
+distribution (`policy_distribution.apply_ceiling`), boot, the lazy default and the test
+reset all go through it — so no ceiling escapes the hook. Every consumer
+(`yolo_policy_permits()`, and `cached_disabled_approval_modes()` on top of it) is then a
+bare attribute read: no TTL, no lock, no thread.
+
+A governance-evaluation error at install time resolves to **denied**, and a process
+that reads the verdict before any ceiling was installed resolves once through
+`current_context()` — which composes and installs the standalone default, firing the
+same hook. A host whose context refuses to compose (a governed profile whose boot did
+not run) leaves the verdict denied, which is the fail-closed direction.
+
+This replaced a pull-based cache — a 5s TTL plus a governance-generation stamp,
+refreshed on a worker thread — and the reason is worth recording. Polling a value that
+only changes on a discrete event needs a freshness key, a third
+`unknown` verdict for the window before a refresh lands, and a per-caller rule for
+collapsing that third state (approval had to fail closed on it; revocation had to *not*
+fire, or an unrelated ceiling install would destroy a live grant permanently). Each of
+those is a window in which a permit resolved under a retired ceiling is still served,
+and the windows — not the scope, the arming gate or the audits — were where every
+security finding against that design landed. Pushing removes them instead of shortening
+them.
+
+The denied set rides the shared `state.status_snapshot()` as
+`disabled_approval_modes`. The picker **hides** each denied mode rather than showing
+it disabled — a mode that cannot be chosen is simply absent, and `normal` keeps the
+list from ever being empty. The one exception is a denied mode that is STILL THE
+ACTIVE one: the trigger renders the active mode regardless, so hiding its row too
+would put a label on the button with no matching row in the menu. That row stays,
+disabled and labelled with the reason, until the user picks something else. The
+Security panel lists the scope and its deny-list automatically —
+`api_governance_policy` iterates `SCOPE_CATALOG` — so an operator can always see
+which modes a policy removed.
+
+**Not yet reached.** Auto-approval also enters through cron
+`approval_mode: "auto"`, the messaging API's approval-mode field, subagent spawn, and
+config `agent.approval_mode`. Those carry their own vocabulary and are tracked
+separately from this scope — see the reserved `approval_mode` ordinal's
+still-reserved note.
+
 ### Computer use is NOT governed (deliberately)
 
 Computer use (see [computer-use.md](computer-use.md)) has **no scope rows in
@@ -1570,7 +3148,7 @@ which are gone.)
 ## Companion (separate package, separate CR)
 
 The `amazon` companion contributes the restrictive posture as its
-**bundled `security_policy.json`** (precedence step 2) rather than as code;
+**bundled `security_policy.json`** (precedence step 3) rather than as code;
 capability providers (Midway/SigV4/tunnels) and the SharePoint redaction
 carve-out stay as code. It expects `CONTRACT_VERSION == 1` (pinned pre-launch).
 
@@ -1579,18 +3157,38 @@ carve-out stay as code. It expects `CONTRACT_VERSION == 1` (pinned pre-launch).
 - `platform/governance.py` — archetypes, catalog, loader, evaluator
   (`resolve`, `resolve_ordinal`, `gate_decision`, `assert_governance_floor`,
   `compose_profiles`, `resolve_pinned_commands` + `COMMANDS_SCOPE` force-pins,
-  `policy_signing_payload` + the `identity.signature` verification path).
+  `policy_signing_payload` + the `identity.signature` verification path), the
+  tier ladder (`TIER_CENTRAL` … `TIER_HOME`, `_intersect_ceilings`,
+  `_audit_policy_tier`), the single precedence fold `compose_tier_ladder` with its
+  refresh entry point `compose_installed_ceiling` (+ `_TierProcessState`, the
+  per-process tier state: the remembered bundled tier and the two once-per-process
+  latches).
 - `platform/admission.py` — `canonical_signing_bytes` / `hmac_signature` (shared
   by both trust roots), `require_policy_signature` / `trust_keys`, and
   `read_policy_trust_root` (the side-effect-free trust-root reader).
 - `platform/update_governance.py` — the shared update seam (`resolve_remote_url`,
   `update_blocked_reason`, `update_required`, `min_version`) called by
   `dashboard/handlers/updates.py`, `cli_server.py` and `slack/gateway.py`.
+- `platform/policy_distribution.py` — central distribution: source resolution
+  (env ∘ the policy's `distribution` block), the append-only
+  `register_policy_fetcher` transport seam, the last-known-good cache, the
+  `refresh_now` / `validate_ceiling` / `apply_ceiling` / `start_refresher`
+  live-refresh path.
 - `platform/governance_profiles.py` — `ProfileStore` (hot-reload),
   `resolve_active_scope`, `governance_permits`, `governance_floor_ordinal`,
   `GOVERNANCE_ERROR_REASON` (the eval-error marker consumers match on),
   `vet_and_audit`.
 - `security.py` — `_SENSITIVE_HOME_DIRS` keystone entries.
+- `agent_backend_governance.py` — the `agent_backend` scope: `SCOPE`,
+  `narrow_selectable_backends` (the registry recompute, plus its host-bound,
+  both-directions audit), driven from `platform/bootstrap.py::bootstrap_context`
+  and `platform/policy_distribution.py::apply_ceiling`.
+- `acp_backends.py` — the selectable registry the scope narrows:
+  `GOVERNANCE_FLOOR_BACKEND`, `POLICY_ID_BY_BACKEND`, the baseline/effective
+  split (`registered_backends` / `selectable_backends`) and
+  `apply_selectable_denials`.
+- `dashboard/handlers/acp_backend_status.py` — `GET /api/acp-backends`
+  (selectability ∩ install state, owner-only).
 - `hooks.py` — Plane A gate threading + the computer-use read-only auto-approve
   (`_cu_read_only_auto_approve`, which reads the action-class table rather than a
   governance row).
@@ -1604,7 +3202,7 @@ carve-out stay as code. It expects `CONTRACT_VERSION == 1` (pinned pre-launch).
 - `dashboard/handlers/security.py` — `GET /api/governance/policy` (posture-only
   serialization).
 - chokepoints: `sandbox.py`, `mcp_cron.py`, `subagent.py`, `mcp_core.py`,
-  `computer_use/gate.py` (`require_computer_use` fail-closed +
+  `computer_use/gate.py` (`require_computer_use` audit-only +
   `apply_observation_ceiling`).
 - `cli.py` / `cli_commands.py` — the `policy` command.
 
@@ -1612,7 +3210,12 @@ carve-out stay as code. It expects `CONTRACT_VERSION == 1` (pinned pre-launch).
 
 `test_governance_policy.py` (archetypes + loader + evaluator + E1–E13 vectors +
 extensibility + the `identity.signature` states, the opt-in fail-closed gate, and
-the `policy show` provenance reporting), `test_platform_admission.py`
+the `policy show` provenance reporting),
+`test_governance_tier_ladder.py` (the tier ladder: that the central document
+outranks every local one, that a lower tier can only tighten it, that the reserved
+sandbox boot flags compose across tiers, that an env document beneath an authority
+is announced once, and that a tier intersect is audited once per pair),
+`test_platform_admission.py`
 (`require_policy_signature` / shared signing primitives),
 `test_governance_boot.py` (compose at boot), 
 `test_governance_self_protection.py` (keystone), `test_governance_profiles.py`
@@ -1624,7 +3227,20 @@ the per-transport inbound gates), `test_governance_channels_endpoint.py`
 `test_governance_policy_viewer.py` (`/api/governance/policy` posture-only, incl.
 `test_detail_never_leaks_rule_contents` and `TestScopeAttribution` — that a
 host-profile pin is reported as surface-scoped, not install-wide),
+`test_governance_distribution.py` (the `distribution` block, the fetcher seam and
+its transport refusals, the cache and its repoint/staleness rules, the
+unavailable dispositions, the live-refresh reject-and-keep path — and the three
+controls on the cache itself — `TestAnExposedCacheIsStillReadOnly`,
+`TestTheCachePairIsWrittenUnderOneLock` and
+`TestAnUnverifiableSourceIsTreatedAsWritable`),
+`test_sandbox_mount_checked.py` (that all six launcher mounts, including the
+read-only bind and its sealing remount, refuse the spawn when they fail),
 `test_governance_updates.py` (the
 `updates` pins, the shared seam's fail-open-on-error disposition, and the
-tracked-remote resolution), and `test_computer_use_gate.py` (that the
+tracked-remote resolution), `test_agent_backend_governance.py` (the
+`agent_backend` scope: the additive-over-floor semantics, the registry recompute
+and its restore-on-loosening behaviour, the gateway-start binding contract and that
+a runtime ceiling install deliberately does not re-derive the set, the
+host-session binding, the both-directions audit, the fail-closed disposition, and
+that no second gate exists), and `test_computer_use_gate.py` (that the
 computer-use gate is audit-only and permits — see the section above).

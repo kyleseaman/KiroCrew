@@ -7,7 +7,9 @@ normalized ``LarkInbound`` frames into the async event loop via
 Outbound: ``send_reply`` wraps the sync lark-oapi REST API in
 ``run_in_executor`` so it never blocks the event loop.
 
-``lark-oapi`` is an OPTIONAL dependency (``pip install "kirocrew[feishu]"``).
+``lark-oapi`` is an OPTIONAL dependency: it ships in the ``feishu`` extra, and
+is installed on its own with ``pip install 'lark-oapi>=1.4,<2'`` (this project
+is not on an index, so ``pip install kirocrew[feishu]`` cannot resolve).
 It is imported lazily inside this module's methods so that every other module
 in the package -- including :mod:`kiro_crew.feishu.transport` and the channel
 roster in :mod:`kiro_crew.channels` -- imports cleanly on a build that does not
@@ -26,6 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
+from kiro_crew import extras
 from kiro_crew.messaging.split import split_markdown_safe
 
 logger = logging.getLogger(__name__)
@@ -34,6 +37,11 @@ logger = logging.getLogger(__name__)
 # generous for mixed CJK + ASCII content). A longer answer is SPLIT across
 # replies, never truncated — see send_reply.
 FEISHU_MAX_TEXT = 4000
+
+# Client construction is local and performs no network I/O. A bounded wait
+# prevents a broken SDK import or constructor from leaving gateway startup
+# suspended forever while preserving enough time on a loaded host.
+_WS_CLIENT_READY_TIMEOUT_SECS = 5.0
 
 # The only two chat types this channel serves. The transport gate names them
 # explicitly so an absent or future value is denied rather than falling
@@ -129,9 +137,12 @@ class LarkClient:
     ``asyncio.run_coroutine_threadsafe`` so the dispatcher never blocks.
     ``send_reply`` uses ``run_in_executor`` so it never blocks the loop.
 
-    The lark-oapi ``ws.Client`` does not expose a clean async stop; ``close()``
-    sets a flag and calls ``stop()`` -- the daemon thread exits naturally once
-    the WS is closed.
+    The official SDK stores its WebSocket event loop in a module global. The
+    gateway imports the SDK on its own running loop, so the receiver thread must
+    replace that global with a dedicated loop and construct ``ws.Client`` there
+    before calling ``start``. ``close()`` prefers a future public ``stop()``
+    method and otherwise shuts down the current 1.x SDK through its async
+    disconnect coroutine.
     """
 
     def __init__(
@@ -145,8 +156,16 @@ class LarkClient:
         self._app_secret = app_secret
         self._on_message: MessageHandler | None = on_message
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._ws_loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._closed = False
+        #: Health observer ``(connected, reason)``, set by ``maybe_start_feishu``
+        #: so the Settings badge tracks the receiver instead of guessing from
+        #: "the channel was enabled at boot". Assigned after construction to
+        #: avoid a client<->transport cycle; see ``_notify_state``.
+        self.on_state_change: Callable[[bool, str], None] | None = None
+        self._healthy: bool | None = None
+        self._healthy_reason = ""
 
         # Build the sync REST client once; it is thread-safe for outbound calls.
         try:
@@ -163,7 +182,7 @@ class LarkClient:
         except ImportError as exc:
             raise ImportError(
                 "lark-oapi is required for the Feishu channel. "
-                "Install it with: pip install lark-oapi"
+                f"Install it with: {extras.install_hint('feishu')}"
             ) from exc
 
         # Dedicated executor for the blocking REST replies. The default
@@ -235,13 +254,16 @@ class LarkClient:
         """Sync P2ImMessageReceiveV1 handler injected into the WS dispatcher."""
         event = getattr(data, "event", None)
         if event is None:
+            logger.info("Feishu inbound dropped: frame has no event")
             return
         message = getattr(event, "message", None)
         if message is None:
+            logger.info("Feishu inbound dropped: event has no message")
             return
 
         msg_id: str = message.message_id or ""
         if not msg_id:
+            logger.info("Feishu inbound dropped: message has no message_id")
             return
 
         # NOTE: redelivery dedup deliberately does NOT happen here. Everything
@@ -253,19 +275,33 @@ class LarkClient:
         # after authorization instead.
 
         # Only handle plain-text messages for now.
-        if (message.message_type or "") != "text":
+        message_type = message.message_type or ""
+        if message_type != "text":
+            logger.info(
+                "Feishu inbound dropped: unsupported message_type=%r (message_id=%s)",
+                message_type,
+                msg_id,
+            )
             return
 
         sender = getattr(event, "sender", None)
         sid = getattr(sender, "sender_id", None) if sender else None
         open_id: str = (getattr(sid, "open_id", None) or "") if sid else ""
         if not open_id:
+            logger.info(
+                "Feishu inbound dropped: sender has no open_id (message_id=%s)",
+                msg_id,
+            )
             return
 
         try:
             content = json.loads(message.content or "{}")
             raw_text: str = content.get("text", "").strip()
         except Exception:
+            logger.info(
+                "Feishu inbound dropped: message content is not valid JSON (message_id=%s)",
+                msg_id,
+            )
             return
 
         # Feishu sends mentions as opaque placeholders (``@_user_1``) with the
@@ -276,6 +312,11 @@ class LarkClient:
         # which is what keeps a bare "@bot" from driving an empty turn.
         mention_free = _AT_RE.sub("", raw_text).strip()
         if not mention_free:
+            logger.info(
+                "Feishu inbound dropped: message body is mention-only "
+                "(no instruction) (message_id=%s)",
+                msg_id,
+            )
             return
         # NOT ``mention_free``: that deletes every placeholder, which would read
         # "@bot /new @alice" as the bare command "/new" and reset the
@@ -283,6 +324,10 @@ class LarkClient:
         command_body = _command_body(raw_text)
         text = _resolve_mentions(raw_text, getattr(message, "mentions", None)).strip()
         if not text:
+            logger.info(
+                "Feishu inbound dropped: resolved text is empty (message_id=%s)",
+                msg_id,
+            )
             return
 
         inbound = LarkInbound(
@@ -317,51 +362,145 @@ class LarkClient:
             .register_p2_im_message_receive_v1(self._handle_receive_v1)
             .build()
         )
-        ws = lark.ws.Client(
-            self._app_id,
-            self._app_secret,
-            event_handler=handler_builder,
-            log_level=lark.LogLevel.WARNING,
-        )
-        self._ws_client = ws
+        ws_loop = asyncio.new_event_loop()
+        self._ws_loop = ws_loop
+        client_ready = threading.Event()
+        startup_errors: list[BaseException] = []
 
         def _run() -> None:
-            # lark-oapi's ws.Client owns its own auto-reconnect, so this call
-            # blocks for the life of the channel. Both exits still get a log
-            # line: a RETURN means lark gave up reconnecting, which would
-            # otherwise kill the receiver in total silence.
+            # lark-oapi binds both its module-global loop and constructor-time
+            # helpers (including ExpiringCache) to the current event loop. The
+            # client therefore has to be constructed here, after this thread
+            # owns its loop; moving only ws.start() leaves SDK state split
+            # across the gateway and receiver loops.
             try:
-                ws.start()
-            except Exception:
+                try:
+                    asyncio.set_event_loop(ws_loop)
+                    from lark_oapi.ws import client as lark_ws_client  # noqa: PLC0415
+
+                    lark_ws_client.loop = ws_loop
+                    ws = lark.ws.Client(
+                        self._app_id,
+                        self._app_secret,
+                        event_handler=handler_builder,
+                        log_level=lark.LogLevel.WARNING,
+                    )
+                    self._ws_client = ws
+                except BaseException as exc:
+                    startup_errors.append(exc)
+                    if not self._closed:
+                        logger.exception("Feishu WS client initialization failed")
+                        self._notify_state(False, f"receiver stopped: {type(exc).__name__}")
+                    return
+                finally:
+                    client_ready.set()
+
+                try:
+                    ws.start()
+                except Exception as exc:
+                    if not self._closed:
+                        logger.exception("Feishu WS loop raised; receiver is down")
+                        self._notify_state(False, f"receiver stopped: {type(exc).__name__}")
+                    return
                 if not self._closed:
-                    logger.exception("Feishu WS loop raised; receiver is down")
-                return
-            if not self._closed:
-                logger.error(
-                    "Feishu WS loop returned without a close() -- receiver is "
-                    "down and will not reconnect; restart the gateway."
-                )
+                    logger.error(
+                        "Feishu WS loop returned without a close() -- receiver is "
+                        "down and will not reconnect; restart the gateway."
+                    )
+                    self._notify_state(
+                        False,
+                        "receiver stopped (check the app id/secret and that the app "
+                        "has the im:message events subscribed)",
+                    )
+            finally:
+                client_ready.set()
+                self._ws_loop = None
+                pending = asyncio.all_tasks(ws_loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    ws_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                ws_loop.close()
 
         self._thread = threading.Thread(target=_run, daemon=True, name="feishu-ws")
         self._thread.start()
+        ready = await asyncio.to_thread(client_ready.wait, _WS_CLIENT_READY_TIMEOUT_SECS)
+        if not ready:
+            self._closed = True
+            self._executor.shutdown(wait=False)
+            try:
+                ws_loop.call_soon_threadsafe(ws_loop.stop)
+            except RuntimeError:
+                pass
+            raise RuntimeError("Feishu WebSocket client initialization timed out")
+        if startup_errors:
+            self._executor.shutdown(wait=False)
+            startup_error = startup_errors[0]
+            raise RuntimeError("Feishu WebSocket client initialization failed") from startup_error
+
+        # Healthy on launch, then corrected by _run's exit. start() proves the
+        # thread is up, not that Feishu accepted the app -- but a refused app
+        # ends the thread within seconds, so the badge self-corrects rather than
+        # sitting on an optimistic claim indefinitely.
+        self._notify_state(True, "")
         logger.info("Feishu WebSocket receiver started (app_id=%s)", self._app_id)
 
+    def _notify_state(self, connected: bool, error: str) -> None:
+        """Publish a health transition to the dashboard badge.
+
+        Deduped on the transition (mirrors ``TeamsClient._notify_state``): a
+        repeated identical report must not overwrite the FIRST reason with the
+        same later one. The first call always publishes, because the initial
+        state is unknown rather than healthy.
+        """
+        if self._healthy is connected and error == self._healthy_reason:
+            return
+        self._healthy = connected
+        self._healthy_reason = error
+        if self.on_state_change is not None:
+            try:
+                self.on_state_change(connected, error)
+            except Exception:
+                logger.debug("Feishu on_state_change observer raised", exc_info=True)
+
     async def close(self) -> None:
-        """Signal shutdown; the daemon thread exits once the WS closes."""
+        """Signal shutdown and release the SDK-owned receiver loop."""
         self._closed = True
         ws = self._ws_client
         if ws is not None:
-            # ws.stop() is lark-oapi's SYNCHRONOUS shutdown — it closes the
-            # socket and can block on a wedged peer. Called directly it would
-            # run on the gateway event loop, and the caller's asyncio.wait_for
-            # could not rescue it: a timeout only fires at an await point, so a
-            # hung peer would freeze every task on the loop rather than just
-            # this shutdown. Offloading keeps the await interruptible; a leaked
-            # worker thread is survivable, a frozen loop is not.
-            try:
-                await asyncio.get_running_loop().run_in_executor(self._executor, ws.stop)
-            except Exception:
-                logger.debug("Feishu WS stop failed", exc_info=True)
+            stop = getattr(ws, "stop", None)
+            if callable(stop):
+                # A future SDK may expose a synchronous stop. Keep it off the
+                # gateway loop because a wedged peer would otherwise freeze all
+                # tasks and make the caller's timeout ineffective.
+                try:
+                    await asyncio.get_running_loop().run_in_executor(self._executor, stop)
+                except Exception:
+                    logger.debug("Feishu WS stop failed", exc_info=True)
+            else:
+                ws_loop = self._ws_loop
+                if ws_loop is not None and not ws_loop.is_closed():
+                    # lark-oapi 1.x exposes only the private async disconnect
+                    # used by its own reconnect path. Disable reconnect before
+                    # closing, then stop the loop that blocks in start().
+                    if hasattr(ws, "_auto_reconnect"):
+                        ws._auto_reconnect = False
+                    disconnect = getattr(ws, "_disconnect", None)
+                    if callable(disconnect) and ws_loop.is_running():
+                        future = asyncio.run_coroutine_threadsafe(disconnect(), ws_loop)
+                        try:
+                            await asyncio.wrap_future(future)
+                        except Exception:
+                            logger.debug("Feishu WS disconnect failed", exc_info=True)
+                    try:
+                        ws_loop.call_soon_threadsafe(ws_loop.stop)
+                    except RuntimeError:
+                        # The disconnect may make a future SDK return from
+                        # start() and close the loop before this signal lands.
+                        pass
         # Do not wait: an in-flight REST reply must not hold up shutdown.
         self._executor.shutdown(wait=False)
+        # An intentional shutdown is still "not connected" — with no reason,
+        # because nothing failed.
+        self._notify_state(False, "")
         logger.info("Feishu client closed")

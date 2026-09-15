@@ -39,9 +39,12 @@ import fnmatch
 import hmac
 import json
 import logging
+import math
 import os
 import re
-from dataclasses import dataclass, field
+import threading
+import urllib.parse
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import (
     Callable,
@@ -59,22 +62,62 @@ from kiro_crew.config.paths import config_dir
 from kiro_crew.platform.admission import (
     canonical_signing_bytes,
     hmac_signature,
-    policy_trust_root_path,
     read_policy_trust_root,
 )
 from kiro_crew.platform.context import PlatformCompositionError
 from kiro_crew.platform.governance_health import mark_governance_incident
+from kiro_crew.platform.tool_paths import (
+    TARGET_PATH_KEYS,
+    edit_target_candidates,
+    is_edit_call,
+    target_paths,
+)
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
 
-# Where the enterprise security policy is read from.  Env wins so a managed
-# fleet can point at a root-owned / read-only location without a package
-# rebuild; the home file is the standalone operator's authoring location.  The
-# companion-bundled resource (precedence step 2) is resolved separately by the
+# Where the local security policy tiers are read from.  Both sit BENEATH the
+# centrally distributed document and may only tighten it (``compose_tier_ladder``);
+# the env file is the first subordinate, the home file the standalone operator's
+# authoring location.  The companion-bundled resource is resolved separately by the
 # caller that knows the active edition (see ``load_security_policy``).
 _POLICY_ENV = "KIROCREW_SECURITY_POLICY"
 _POLICY_HOME_LEAF = "security_policy.json"
+
+# Names for the precedence tiers.  Set by the loader on the ceiling each tier
+# produces and written into SEL audit records (``_audit_policy_tier``); strings
+# rather than an enum because a SEL record is text.
+TIER_CENTRAL = "central"  # the fetched, centrally distributed document
+TIER_ENV = "env"  # KIROCREW_SECURITY_POLICY
+TIER_BUNDLED = "bundled"  # the companion edition's packaged resource
+TIER_HOME = "home"  # ~/.kiro/crew/security_policy.json
+
+
+# Duplicated from ``policy_distribution.POLICY_URL_ENV`` on purpose.  This module
+# is the trust root and must not import the fetch engine at module load — that
+# would pull urllib onto every import of the governance evaluator, and the engine
+# imports back from here.  Naming the variable is not a behaviour, so the copy has
+# nothing to drift into; ``test_governance_distribution.py`` pins them equal.
+#: Ceiling on any ``distribution`` duration, in seconds. ``threading.TIMEOUT_MAX`` is what the
+#: platform can wait for, and both consumers of these values hit it: ``Event.wait`` in the
+#: refresher and the socket timeout in a fetch each raise OverflowError above it. ~292 years, so
+#: it bounds typos rather than intentions.
+MAX_DURATION_SECS = threading.TIMEOUT_MAX
+
+_POLICY_DISTRIBUTION_URL_ENV = "KIROCREW_POLICY_URL"
+#: Named here only so the declared-source refusal can point at it; the engine owns it.
+_POLICY_DISTRIBUTION_HEADERS_ENV = "KIROCREW_POLICY_HEADERS"
+
+# Duplicated from ``policy_distribution.CACHE_DIR_LEAF`` for the same reason, and
+# pinned equal by the same test.  Named here because
+# ``assert_governance_paths_protected`` is a BOOT check that must not import the
+# fetch engine to know what it is asserting.
+_POLICY_CACHE_LEAF = "policy_cache"
+
+# Also duplicated from ``policy_distribution``, and pinned by the same test.  Named
+# here because the tier's ENTRY condition has to know about cache-only mode: such a
+# child is deliberately given no source, so a source-only gate would skip the tier.
+_POLICY_DISTRIBUTION_CACHE_ONLY_ENV = "KIROCREW_POLICY_CACHE_ONLY"
 
 
 def _policy_home_path() -> Path:
@@ -156,8 +199,8 @@ def _match_path(item: str, pattern: str) -> bool:
     and avoids one trap:
 
     * a ``..`` traversal cannot satisfy an ALLOW-mode prefix:
-      ``/home/u/ws/../.bashrc`` normalizes to ``/home/u/.bashrc`` and no longer
-      fnmatches ``/home/u/ws/**`` (without this ``*`` spans the ``..`` and the
+      ``/home/u/ws/../.bashrc`` normalizes to ``/home/u/.bashrc`` and does not
+      fnmatch ``/home/u/ws/**`` (without this ``*`` spans the ``..`` and the
       write is wrongly PERMITTED though the OS resolves it outside the allow-list);
     * an agent-supplied RELATIVE item is anchored to an absolute form, so it can
       still match an absolute DENY glob (``../../etc/passwd`` cannot dodge
@@ -440,9 +483,57 @@ _KIND_READ = "read"
 _KIND_EDIT = "edit"
 _KIND_FETCH = "fetch"
 
+# The accepted path spellings are OWNED by the shared low-level walk
+# (``kiro_crew.platform.tool_paths.TARGET_PATH_KEYS``) so the governance
+# intersection plane and the hooks sensitive-path keystone can never drift on
+# which keys count as a target. Aliased here under the historic name for local
+# readers; do NOT redefine the tuple.
+_PATH_ARG_KEYS = TARGET_PATH_KEYS
+
+# Synthetic, never-permittable item emitted for a filesystem scope when the
+# bounded path walk TRUNCATED (see the truncation branch in
+# ``classify_tool_args``).  It is deliberately not a real path: it contains a NUL
+# byte and glob metacharacters, so no operator allow-list pattern
+# (``allow: ['~/project/**']``) or literal can ever match it, while a deny-mode
+# ceiling that governs the scope still binds on it.  The marker text names why it
+# exists so a denial audit is self-explanatory.
+_TRUNCATED_SCAN_ITEM = "\x00<governance:path-scan-truncated-unverifiable>"
+
+#: Same never-permittable construction, for a file-EDIT whose diff content block
+#: names a path that is still RELATIVE after ``~``/env expansion.  Such a path
+#: resolves against the gateway process CWD, not the agent workspace, so no
+#: allow-mode confinement can be verified against it.  Emitting the marker means
+#: an operator ceiling that governs ``filesystem.write`` DENIES the unverifiable
+#: edit, while an ungoverned scope still permits (standalone default preserved).
+_UNANCHORED_TARGET_ITEM = "\x00<governance:edit-target-unanchored-unverifiable>"
+
+
+def _tool_arg_paths(raw_params: Mapping[str, object]) -> Tuple[Tuple[str, ...], bool]:
+    """Return every distinct, non-empty path carried under a supported alias,
+    at ANY nesting depth, plus whether the bounded scan was TRUNCATED.
+
+    Tool backends use all three spellings, sometimes in the same payload, and a
+    batch-shaped tool buries its real targets inside an array argument (e.g.
+    ``{"operations": [{"mode": "Line", "path": …}]}``).  Every value must be
+    governed at every depth: choosing the first truthy alias would let a benign
+    ``path`` mask a sensitive ``filePath`` (and a truthy non-string value could
+    mask every later alias entirely), and reading only the TOP level would let a
+    nested path escape the operator ceiling entirely — the reported bypass.
+
+    Delegates to the shared, iterative, bounded walk so the extraction is
+    IDENTICAL to the hooks keystone's (single source of truth).  The second
+    element is the walk's ``truncated`` flag: the caller must not treat a
+    truncated scan as "no governed target present" — see the truncation branch in
+    :func:`classify_tool_args`.
+    """
+    found = target_paths(raw_params)
+    return tuple(found), found.truncated
+
 
 def classify_tool_args(
-    tool_kind: str, raw_params: Optional[Mapping[str, object]]
+    tool_kind: str,
+    raw_params: Optional[Mapping[str, object]],
+    diff_path: str = "",
 ) -> Tuple[Tuple[str, str], ...]:
     """Map a tool's semantic ``kind`` + real arguments to ``(scope, item)`` pairs.
 
@@ -452,8 +543,18 @@ def classify_tool_args(
     authoritative signal.  Used by the gate to enforce the path/host scopes that a
     title cannot carry:
 
-    * ``kind == "edit"`` with a ``path`` → ``("filesystem.write", "<path>")``.
-    * ``kind == "read"`` with a ``path`` → ``("filesystem.read", "<path>")``
+    * ``kind == "edit"`` → ``("filesystem.write", "<path>")`` for every path in
+      the edit's judged target set: the UNION of the params' path spellings and
+      *diff_path*, the path the tool call's diff content block named
+      (:func:`kiro_crew.platform.tool_paths.edit_target_candidates`, the same
+      single source the hooks edit gate consumes).  A backend may stream trusted
+      params that carry no path key and name the file only in that block, so
+      classifying the params alone would hand an ALLOW-mode ``filesystem.write``
+      confinement a pathless edit — the write it exists to confine would never
+      be asked.  A *diff_path* still relative after ``~``/env expansion emits
+      ``_UNANCHORED_TARGET_ITEM`` (see below) instead of a path.
+    * ``kind == "read"`` with a path argument →
+      ``("filesystem.read", "<path>")``
       (redundant with the ``Reading`` title path, harmless — both must permit).
     * ``kind == "fetch"`` with a ``url`` → ``("network.egress", "<host>")`` —
       the host is extracted from the URL so the ``host`` matcher applies.
@@ -462,26 +563,104 @@ def classify_tool_args(
     ACP backends omit it, so it arrives ``""``).**  When the kind is not one of
     the known fs/fetch kinds, we infer from the param SHAPE so an edit/fetch is
     still governed: a ``url``/``uri`` (and no shell ``command``) → egress; a
-    ``path``/``file_path`` (and no shell ``command``) → BOTH read and write
+    ``path``/``file_path``/``filePath`` (and no shell ``command``) → BOTH read and write
     (we cannot tell read from write without the kind, so we apply both ceilings —
     an ungoverned one permits, so this only tightens and never misroutes a shell
     command, which carries ``command`` and is governed by the ``commands`` scope).
 
     Returns an empty tuple when the params carry no governed item (an ungoverned
     scope permits, so this only ever tightens).
+
+    **Truncated scan (open-question-2 policy on this permit-by-default plane).**
+    The shared path walk is bounded (``_TARGET_PATH_MAX_PATHS`` /
+    ``_TARGET_PATH_MAX_NODES``); a payload padded past those caps returns a
+    ``truncated`` result whose path list may be INCOMPLETE.  On this plane a
+    truncated scan that yielded no path must NOT silently reach the caller's
+    permit-by-default ``if not pairs`` branch — that is exactly the fail-open the
+    reported bypass exploits (bury the governed path past 10_000 nodes to escape
+    the operator ceiling).  The keystone in ``hooks`` fails SAFE by hard-denying
+    any truncated scan, but this plane is permit-by-default and must NOT
+    blanket-deny an UNGOVERNED standalone host that happens to send a huge
+    payload.  So we thread the needle (issue option (c)): on truncation we emit
+    the filesystem scope(s) the ``tool_kind`` implies against a synthetic,
+    never-permittable item (``_TRUNCATED_SCAN_ITEM``).  Result: an operator
+    ceiling that governs that filesystem scope DENIES the unverifiable call
+    (closing the fail-open), while an ungoverned scope still permits it (the
+    standalone default is preserved, and no unrelated scope is touched).  The
+    truncation is auditable via the synthetic item text in the denial reason.
+    Rejected alternatives: (a) permit as before = keep the fail-open; (b) deny the
+    whole call unconditionally = over-blocks ungoverned hosts and every unrelated
+    scope.
+
+    **Unanchored diff path — the same needle, threaded the same way.**  A
+    relative diff-block path resolves against the process CWD, so its membership
+    in an allow-list cannot be established; ``edit_target_candidates`` withholds
+    it and sets ``unanchored``, and this plane emits
+    ``("filesystem.write", _UNANCHORED_TARGET_ITEM)``: a governed
+    ``filesystem.write`` scope denies the unverifiable edit, an ungoverned one
+    permits.  (The hooks edit gate additionally hard-denies the unanchored shape
+    outright for its callers — this marker is the governance plane's own
+    fail-safe reading, not the primary deny.)
+
+    Precise semantics of the marker against the two ruleset modes (both correct):
+    a PREFIX-BOUNDED ALLOW-mode ceiling (``allow: ['~/workspace/**']`` — confine
+    to a workspace, the exact profile the reported bypass targets) does NOT match
+    the synthetic item, so the truncated call is DENIED — the fail-open is closed.
+    (A CATCH-ALL ALLOW pattern — ``**`` / ``/**`` / ``*`` — does match the marker
+    because fnmatch ``*`` crosses separators, so it permits the truncated scan;
+    that is not a bypass, since such a ceiling confines nothing and is
+    unconstrained anyway.)  A DENY-mode
+    ceiling that blocks only specific paths (``deny: ['~/secrets/**']``) permits
+    the marker, because a targeted deny is not a general confinement and a partial
+    scan cannot prove the buried path hit that one pattern; the always-on,
+    resolved ``is_sensitive_path`` keystone in ``hooks`` (which hard-denies ANY
+    truncated scan) remains the authoritative guard for the sensitive tiers there.
     """
-    if not raw_params or not isinstance(raw_params, Mapping):
+    params = raw_params if raw_params and isinstance(raw_params, Mapping) else None
+    if is_edit_call(tool_kind, diff_path):
+        # The edit's judged target set is the params∪diff-block union, from the
+        # same helper both edit gates consume — a diff-only edit (params carry
+        # no path key, or no params at all) is classified by the diff block's
+        # path rather than reaching an ALLOW-mode confinement pathless. The
+        # route is ``is_edit_call``: a diff content block is write-plane
+        # evidence whatever the spec-optional ``kind`` field says, so a
+        # kindless (or mislabelled) call carrying one is classified here too.
+        candidates = edit_target_candidates(params, diff_path)
+        edit_pairs: list = [("filesystem.write", path) for path in candidates]
+        if candidates.truncated:
+            edit_pairs.append(("filesystem.write", _TRUNCATED_SCAN_ITEM))
+        if candidates.unanchored:
+            edit_pairs.append(("filesystem.write", _UNANCHORED_TARGET_ITEM))
+        if tool_kind != _KIND_EDIT:
+            # A kindless call routed here by its diff block also keeps the
+            # read pairs the shape-inference fallback applies to kindless
+            # paths — additive only, so no call loses a pair.
+            for path in candidates:
+                edit_pairs.append(("filesystem.read", path))
+        # ADDITIVE for every other classified dimension too: routing a call
+        # here because its frame carried a diff block must never DROP a pair
+        # the pre-route classification would have emitted. A call that also
+        # carries a ``url`` param keeps its ``network.egress`` pair, so a
+        # governed egress ceiling still binds it (a fetch-kind or kindless
+        # call cannot shed egress governance by arriving with a diff block).
+        if params is not None:
+            edit_url = params.get("url") or params.get("uri")
+            if isinstance(edit_url, str) and edit_url:
+                edit_host = _url_host(edit_url)
+                if edit_host:
+                    edit_pairs.append(("network.egress", edit_host))
+        return tuple(edit_pairs)
+    if params is None:
         return ()
     pairs: list = []
-    path = raw_params.get("path") or raw_params.get("file_path")
-    url = raw_params.get("url") or raw_params.get("uri")
-    has_command = bool(raw_params.get("command"))  # a shell tool → commands scope
-    if tool_kind == _KIND_EDIT:
-        if isinstance(path, str) and path:
-            pairs.append(("filesystem.write", path))
-    elif tool_kind == _KIND_READ:
-        if isinstance(path, str) and path:
+    paths, paths_truncated = _tool_arg_paths(params)
+    url = params.get("url") or params.get("uri")
+    has_command = bool(params.get("command"))  # a shell tool → commands scope
+    if tool_kind == _KIND_READ:
+        for path in paths:
             pairs.append(("filesystem.read", path))
+        if paths_truncated:
+            pairs.append(("filesystem.read", _TRUNCATED_SCAN_ITEM))
     elif tool_kind == _KIND_FETCH:
         if isinstance(url, str) and url:
             host = _url_host(url)
@@ -494,11 +673,17 @@ def classify_tool_args(
             host = _url_host(url)
             if host:
                 pairs.append(("network.egress", host))
-        if isinstance(path, str) and path:
+        for path in paths:
             # Can't distinguish read from write without the kind → apply both
             # ceilings (tightest-wins; an ungoverned scope permits).
             pairs.append(("filesystem.read", path))
             pairs.append(("filesystem.write", path))
+        if paths_truncated:
+            # Unknown kind → we cannot tell read from write, so a truncated scan
+            # must consult BOTH filesystem ceilings against the never-permittable
+            # marker (see the truncated-scan policy in the docstring).
+            pairs.append(("filesystem.read", _TRUNCATED_SCAN_ITEM))
+            pairs.append(("filesystem.write", _TRUNCATED_SCAN_ITEM))
     return tuple(pairs)
 
 
@@ -625,6 +810,12 @@ class Decision:
     reason: str
     rule: str = ""  # rule1-allow | rule1-deny | rule2-intersect | ordinal | gate | default
     layer: str = ""  # policy | profile | both | default
+    # The governed item this outcome is ABOUT. One gate query can carry several
+    # identities for a single call (a prose title plus a trusted tool name plus an
+    # MCP reference), so a denial has to say WHICH one it denied or the audit
+    # record names the wrong subject. Empty when the caller asked about one item
+    # and already knows it.
+    item: str = ""
 
 
 # A control that can answer "is this item permitted?" for ONE level.  Both
@@ -725,20 +916,30 @@ class _AndRuleset:
     """The AND of two rulesets; ``permits`` requires both to permit.
 
     Used when :meth:`ScopedRuleset.compose` cannot flatten to a single ruleset.
+    The halves are named ``outer`` / ``inner`` rather than ceiling/profile: a
+    fold of three or more tiers nests one ``_AndRuleset`` inside another, so a
+    half may itself be a composed pair (another policy tier), not the profile.
+    The two-party denial labels keep the ``policy:`` / ``profile:`` prefixes
+    and layers; a denial from a NESTED inner pair propagates that pair's own
+    layer and label instead of being stamped ``profile``.
     Deliberately NOT a ``ScopedRuleset`` subclass — it satisfies
     :class:`RulesetLike` structurally, so the evaluator stays shape-agnostic.
     """
 
-    ceiling: RulesetLike
-    profile: RulesetLike
+    outer: RulesetLike
+    inner: RulesetLike
 
     def permits(self, item: str) -> Decision:
-        c = self.ceiling.permits(item)
-        if not c.permitted:
-            return Decision(False, f"policy: {c.reason}", rule="rule2-intersect", layer="policy")
-        p = self.profile.permits(item)
-        if not p.permitted:
-            return Decision(False, f"profile: {p.reason}", rule="rule2-intersect", layer="profile")
+        o = self.outer.permits(item)
+        if not o.permitted:
+            return Decision(False, f"policy: {o.reason}", rule="rule2-intersect", layer="policy")
+        i = self.inner.permits(item)
+        if not i.permitted:
+            if isinstance(self.inner, _AndRuleset):
+                # A nested pair is another policy tier, not the profile — its
+                # decision already carries the right prefix and layer.
+                return Decision(False, i.reason, rule="rule2-intersect", layer=i.layer)
+            return Decision(False, f"profile: {i.reason}", rule="rule2-intersect", layer="profile")
         return Decision(True, "permitted by both levels", rule="rule2-intersect", layer="both")
 
 
@@ -822,9 +1023,17 @@ class CapabilityGate:
             for k, v in raw_scopes.items()
             if isinstance(v, dict)
         }
-        enabled = d.get("enabled")
+        if "enabled" not in d:
+            enabled_flag = default_enabled
+        else:
+            enabled = d["enabled"]
+            if not isinstance(enabled, bool):
+                raise PlatformCompositionError(
+                    f"CapabilityGate.enabled must be a boolean, got {enabled!r}"
+                )
+            enabled_flag = enabled
         return CapabilityGate(
-            enabled=bool(enabled) if enabled is not None else default_enabled,
+            enabled=enabled_flag,
             scopes=scopes,
         )
 
@@ -899,7 +1108,14 @@ class ScopedMap:
     def compose(self, narrower: "ScopedMap") -> "ScopedMap":
         # members intersect; posture is policy-only so the ceiling's wins.
         base = self.members
-        composed = base.compose(narrower.members) if isinstance(base, ScopedRuleset) else base
+        if isinstance(base, ScopedRuleset):
+            composed: RulesetLike = base.compose(narrower.members)
+        else:
+            # An earlier fold already produced an ``_AndRuleset``; wrap it the
+            # same way the sibling composers (``CapabilityGate.compose``,
+            # ``_compose_controls``) do, so a third — and any later — tier's
+            # narrowing is honoured instead of being silently dropped.
+            composed = _AndRuleset(base, narrower.members)
         return ScopedMap(members=composed, posture=self.posture)
 
     def permits_member(self, member: str) -> Decision:
@@ -940,6 +1156,12 @@ class ScopeSpec:
     capability_default: bool = False  # see the CAPABILITY-DEFAULT CONTRACT note below
     # for CapabilityGate: scope-name -> matcher for its inner ScopedRulesets
     scope_matchers: Mapping[str, str] = field(default_factory=dict)
+    # Identifiers this scope may never forbid, checked at PARSE time so a policy
+    # that removes the floor is refused instead of booting into a state with no
+    # usable option. Data rather than a scope-name branch in the parser: the
+    # loader's contract is that registering a scope needs no loader edit, and a
+    # second scope with a floor should be a catalog entry, not another `if`.
+    always_permitted: tuple[str, ...] = ()
 
 
 # ── CAPABILITY-DEFAULT CONTRACT (read before touching any capability_default) ──
@@ -966,8 +1188,8 @@ class ScopeSpec:
 # validate`` reports a partially-governed ``capabilities`` block so the gap is
 # visible instead of implied.
 #
-# Verified 2026-08-11 by executing parse_policy + resolve; several comments below
-# previously described the absent-key case and were wrong.
+# The absent-key semantics below are verified by executing parse_policy + resolve,
+# not inferred from the comments.
 
 # Built-in catalog.
 #
@@ -982,6 +1204,28 @@ class ScopeSpec:
 # fails closed — the asymmetry is documented on ``_parse_controls``.)
 SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     "tools": ScopeSpec(RULESET, matcher="identifier"),
+    # Dashboard tool-approval modes. Today this scope governs exactly ONE mode:
+    # ``yolo`` (auto-approve every tool everywhere), e.g.
+    # ``{"approval_modes": {"mode": "deny", "deny": ["yolo"]}}``. An absent scope
+    # permits every mode (unchanged behavior).
+    #
+    # ``always_permitted`` carries the three modes this scope may not forbid, for two
+    # DIFFERENT reasons, both enforced at parse time so a policy author is told
+    # rather than left with a control that silently does not hold:
+    #
+    # * ``normal`` is the interactive floor. Denying it would leave no selectable
+    #   mode and brick tool approval, and the trust-root ``security_policy.json`` is
+    #   the one file the dashboard may not rewrite to repair itself.
+    # * ``trust`` and ``trust_reads`` are NOT YET GOVERNED. Their grants are honoured
+    #   by consumption predicates this scope does not reach — the in-memory trusted
+    #   set, and the session ``approval_policy`` a spawned subagent inherits — so
+    #   accepting a deny for them would advertise enforcement that does not exist.
+    #   Governing those read paths is tracked separately.
+    "approval_modes": ScopeSpec(
+        RULESET,
+        matcher="identifier",
+        always_permitted=("normal", "trust", "trust_reads"),
+    ),
     "mcp": ScopeSpec(RULESET, matcher="mcp"),
     "apps": ScopeSpec(RULESET, matcher="identifier"),
     "commands": ScopeSpec(RULESET, matcher="command"),
@@ -1005,6 +1249,34 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     # by kiro_crew.safety_override at the activation seam, against the HOST
     # profile and fail-closed.
     "yolo_duration": ScopeSpec(RULESET, matcher="identifier"),
+    # Which ACP harness a deployment may select (``agent.acp_backend``).
+    #
+    # Distinct from the selectable-backend REGISTRY in ``kiro_crew.acp_backends``:
+    # that answers "what can this BUILD serve", which is a capability fact and is
+    # not governable. This row answers "what may THIS DEPLOYMENT select", so a
+    # managed fleet can qualify one harness and bound the rest.
+    #
+    # ADDITIVE over a floor -- the semantics the selectable-backend design settled on:
+    #   {"agent_backend": {"mode": "allow", "allow": ["claude"]}}
+    # means "ALSO allow claude", not "only claude" — ``kiro`` stays selectable
+    # because ``acp_backends.GOVERNANCE_FLOOR_BACKEND`` is never submitted to this
+    # scope at all. The alternative reading (exclusive) can empty the set, and an
+    # install with no startable harness cannot be recovered from the dashboard,
+    # since the trust-root policy is the one file it may not write.
+    #
+    # Members are POLICY ids, not the code's spelling: ``kiro`` / ``kas`` /
+    # ``claude`` (see ``acp_backends.POLICY_ID_BY_BACKEND``) — the kiro backend is
+    # the empty string internally, which no identifier matcher can carry.
+    #
+    # Consulted by ``kiro_crew.agent_backend_governance`` at exactly ONE place: it
+    # recomputes the ``acp_backends`` registry, from ``bootstrap_context`` at boot and
+    # from ``policy_distribution.apply_ceiling`` on every runtime ceiling install.
+    # Deliberately NOT consulted at provider construction — harness-parity H13 forbids
+    # the Kiro construction path gaining a conditional in service of an adapter, and a
+    # test asserts ``create_provider_factory`` contains no governance call. The
+    # existing single gate ``resolve_selected_backend`` reads the narrowed registry, so
+    # it degrades a denied persisted value with no second check.
+    "agent_backend": ScopeSpec(RULESET, matcher="identifier"),
     # Capabilities (registered defaults — see the CAPABILITY-DEFAULT CONTRACT above):
     "capabilities.spawn": ScopeSpec(
         CAPABILITY, capability_default=True, scope_matchers={"agents": "identifier"}
@@ -1021,6 +1293,13 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     "capabilities.script_hooks": ScopeSpec(CAPABILITY, capability_default=False),
     "capabilities.cron": ScopeSpec(CAPABILITY, capability_default=False),
     "capabilities.messaging": ScopeSpec(CAPABILITY, capability_default=False),
+    # Agent workload identity + Gateway MCP (opt-in, like messaging/publish).
+    # Inner ``posture`` is policy data (``workload`` | ``login``), not a second
+    # scope and not an evaluator input. An ``enabled: true`` document with a
+    # missing or unknown posture fails closed — treated as disabled, or
+    # boot-abort when ``boot.fail_closed``. Data row only; CONTRACT_VERSION
+    # and the evaluator are untouched.
+    "capabilities.agentcore": ScopeSpec(CAPABILITY, capability_default=False),
     # Publishing an artifact's bytes to an external destination is an
     # exfil/external-side-effect surface (like messaging), so it is opt-in
     # (capability_default=False): a policy that names ``publish`` while omitting
@@ -1124,6 +1403,71 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     # Data row only — CONTRACT_VERSION and the evaluator are untouched (mirrors
     # telemetry).
     "capabilities.tailnet_origin": ScopeSpec(CAPABILITY, capability_default=True),
+    # "Connect your phone": minting a live mobile session credential (tailnet QR
+    # or one-time login link) is an auth-surface widening an enterprise POLICY
+    # must be able to close wholesale or narrow per method. The ``methods``
+    # ruleset binds on the MobileConnectMethod ids the CPP seam contributes
+    # (mirrors capabilities.publish's ``destinations``); WHO implements a method
+    # is the orthogonal MobileConnectProvider seam — this gate only decides
+    # WHETHER + WHICH. Default True: naming the row without ``enabled`` keeps
+    # the personal-install pair working; a governing policy can pin it off.
+    # Enforced fail-closed at the methods listing AND at each mint endpoint
+    # (the filtered list is presentation, never the control). Data row only —
+    # CONTRACT_VERSION and the evaluator are untouched (mirrors publish).
+    "capabilities.mobile_connect": ScopeSpec(
+        CAPABILITY, capability_default=True, scope_matchers={"methods": "identifier"}
+    ),
+    # "Share as image": the dashboard turns an assistant reply into a branded
+    # PNG card and offers a prefilled post to X / LinkedIn. The card itself is
+    # rendered and exported in the browser (no upload — copy / download stay
+    # local), but the intent buttons hand the reply's caption text to a
+    # third-party site in a URL, so the feature is an egress path for agent
+    # output that a managed fleet may forbid wholesale. There is no server-side
+    # share action to refuse; the control is the dashboard entry, and the
+    # dashboard learns whether to draw it from ``GET /api/dashboard/config``
+    # (``social_share_enabled``), which resolves this row server-side so the
+    # frontend never guesses. Default True: naming the row without ``enabled``
+    # keeps the entry for the standalone user; a governing ceiling — policy or
+    # a profile bound to the dashboard surface — withdraws it
+    # (``dashboard/social_share.py``: evaluated on the pinned ``dashboard:ui``
+    # surface through ``vet_and_audit``, fail-closed, mirroring the
+    # mobile_connect listing). Data row only — CONTRACT_VERSION and the
+    # evaluator are untouched.
+    "capabilities.social_share": ScopeSpec(CAPABILITY, capability_default=True),
+    # Hosted feature-video clips: the gateway fetches a signed manifest from a
+    # vendor CDN and then downloads media from it into the data home
+    # (``feature_videos_manifest`` / ``feature_videos_cache``). That is outbound
+    # traffic to a vendor endpoint plus third-party bytes landing on disk, which a
+    # managed fleet frequently may not do at all — so this row sits in the egress
+    # family with ``capabilities.telemetry`` and ``capabilities.publish`` rather
+    # than with the advisory probes, and is enforced FAIL-CLOSED: an unevaluable
+    # ceiling denies.
+    #
+    # Default True: naming the row without ``enabled`` keeps the documented
+    # behaviour for the standalone user, who additionally has the
+    # ``dashboard.feature_videos_enabled`` kill switch and a URL override. (An
+    # unnamed row is ungoverned and permitted regardless of this default — see the
+    # CAPABILITY-DEFAULT CONTRACT above.) An enterprise that wants no vendor fetch
+    # says so, and unlike the config switches this row is read from the trust-root
+    # ``security_policy.json``, which the agent cannot REWRITE from any surface:
+    # its file tools refuse the path (``security._SENSITIVE_HOME_DIRS``, the
+    # read+write fence, so those tools cannot read it either) and the OS sandbox
+    # mounts the keystone read-only in every mode. A shell READ of it is permitted
+    # by design (see ``security/paths.py``) — the ceiling is not a secret, it is a
+    # bound — and ``kirocrew policy show`` prints the same posture summary.
+    # Consulted at THREE chokepoints, because any one alone is a half-control:
+    #   * the manifest fetch — no request is made, so nothing is learned;
+    #   * each clip request in the download pass — no media lands on disk;
+    #   * ``POST /api/feature-videos/fetch-all`` — refused 403 rather than
+    #     accepted into a task that would deny itself.
+    # All three are server-side, and that is the whole surface: the browser is
+    # never handed a CDN url (an uncached hosted clip is not offered at all), so
+    # there is no client-side fetch for the ceiling to miss.
+    # Already-cached clips keep playing under a denial: withdrawing bytes already
+    # on disk is a separate decision this row does not make.
+    # Data row only — CONTRACT_VERSION and the evaluator are untouched (mirrors
+    # social_share).
+    "capabilities.feature_videos_download": ScopeSpec(CAPABILITY, capability_default=True),
 }
 
 
@@ -1321,6 +1665,328 @@ def active_update_pins() -> UpdatePins:
     return pins if isinstance(pins, UpdatePins) else UpdatePins()
 
 
+# ``distribution.on_unavailable`` dispositions.  Two values, because there are only
+# two questions: may this host run when the central ceiling cannot be established,
+# and may it run on a cache older than the fleet's staleness bound.
+UNAVAILABLE_FAIL_CLOSED = "fail_closed"  # abort boot / refuse the stale cache
+UNAVAILABLE_DEGRADE = "degrade"  # fall through to the next tier / serve stale + audit
+_UNAVAILABLE_DISPOSITIONS = frozenset({UNAVAILABLE_FAIL_CLOSED, UNAVAILABLE_DEGRADE})
+
+#: Floor on ``refresh_interval_secs``.  A central endpoint serves the whole fleet,
+#: so a typo'd `1` would turn every host into a polling loop against the admin's
+#: own control plane.  A value below this is raised to it (with a warning) rather
+#: than rejected: refusing would brick a fleet over a number that has a safe
+#: reading, which is the opposite of what a distribution channel is for.
+MIN_REFRESH_INTERVAL_SECS = 60
+
+#: Default per-request timeout when the policy names none.  Bounded because this
+#: runs on the boot path on a cold cache: an endpoint that accepts a connection
+#: and never answers must not hang startup indefinitely.
+DEFAULT_FETCH_TIMEOUT_SECS = 10.0
+
+#: Hard ceiling on a fetched document.  A hostile or misconfigured endpoint must
+#: not be able to OOM boot by answering with an unbounded body.
+MAX_POLICY_BYTES = 1 << 20  # 1 MiB
+
+
+@dataclass(frozen=True)
+class PolicyDistribution:
+    """Policy-only central-distribution pins: WHERE the ceiling itself comes from.
+
+    This is how an enterprise IT admin owns one document and has every machine in
+    the fleet follow it: the admin publishes ``security_policy.json`` to a central
+    location, and each host fetches it, caches the last-known-good copy, and
+    re-fetches on an interval so a pushed change lands without a restart or a
+    redeploy.  ``kiro_crew.platform.policy_distribution`` is the engine; this
+    dataclass is only the parsed declaration.
+
+    **Not a governed scope**, for the same reason :class:`UpdatePins` is not: every
+    archetype answers "is X permitted?", while a URL and an interval are *values
+    the core consumes*.  So it rides outside ``controls`` — no ``SCOPE_CATALOG``
+    row, no matcher, no evaluator change.
+
+    **Policy-only: rejected in a Level-2 profile** (see :func:`parse_profile`).  A
+    profile is narrow-only and there is no narrower version of pointing somewhere
+    else.  A per-app profile that could redirect where the ceiling is fetched from
+    would not be a narrowing — it would be a total replacement of the enforcement
+    document, which is the widest escalation in this model.
+
+    **Provenance is not configured here either.**  There is no
+    ``require_signature`` key: a document must not be the authority on whether it has
+    to be authentic, which is the reason ``_policy_trust_settings`` already gives for
+    keeping the flag out of ``security_policy.json`` — "an attacker rewriting the
+    policy would simply clear it".  Mandating a verified signature is
+    ``require_policy_signature`` in the operator-controlled admission policy, which is
+    on the keystone and which a fetched document cannot reach; this tier honours it
+    like every other tier.
+
+    **No credentials live here.**  ``headers`` is deliberately absent: a document
+    published to the whole fleet must not carry a per-machine secret, and this one
+    is additionally copied into a local cache and reported on by the read-only
+    policy viewer.  A request credential is per-machine configuration and comes
+    from the ``KIROCREW_POLICY_HEADERS`` environment variable instead — the same
+    channel that already carries ``KIROCREW_SECURITY_POLICY``.
+    """
+
+    #: The URL the ceiling is fetched from.  Empty = no central distribution (the
+    #: default, so an existing policy is byte-identical in behaviour).  The scheme
+    #: must be one a fetcher is registered for; the built-ins are ``https``,
+    #: ``file``, and ``http`` restricted to loopback hosts.
+    source: str = ""
+    #: Seconds between background re-fetches.  0 = fetch at boot only, which is
+    #: still centrally-managed but not "on the fly".  Raised to
+    #: :data:`MIN_REFRESH_INTERVAL_SECS` when set lower.
+    refresh_interval_secs: int = 0
+    #: Per-request timeout.  0 = :data:`DEFAULT_FETCH_TIMEOUT_SECS`.
+    timeout_secs: float = 0.0
+    #: How old the cached copy may be before it stops being an acceptable answer.
+    #: 0 = no bound (a reachable-once host keeps running forever on that copy).
+    #: A positive value is the fleet's staleness ceiling: past it, the disposition
+    #: below decides whether the host refuses to run or runs and reports.
+    max_cache_age_secs: int = 0
+    #: What to do when the central ceiling cannot be established — a cold cache and
+    #: an unreachable source, or a cache past ``max_cache_age_secs``.
+    #: :data:`UNAVAILABLE_FAIL_CLOSED` (the default) refuses; a fleet that pointed
+    #: a host at a central ceiling meant that ceiling to bind, so "we could not
+    #: tell" must not read as "run unbounded".  :data:`UNAVAILABLE_DEGRADE` falls
+    #: through to the next precedence tier instead, recording a governance
+    #: incident — for a fleet that would rather have a working host it can see is
+    #: degraded than a host that will not start.
+    on_unavailable: str = UNAVAILABLE_FAIL_CLOSED
+    #: Was a ``distribution`` block present in the document at all?  Set by
+    #: :meth:`from_dict`; excluded from equality so a block that spells out the
+    #: defaults still compares equal to the defaults and a ceiling that composes
+    #: alone is still returned as the same object.  Read through :attr:`declared`.
+    explicit: bool = field(default=False, compare=False, repr=False)
+
+    @property
+    def enabled(self) -> bool:
+        """Is central distribution configured at all?"""
+        return bool(self.source)
+
+    @property
+    def declared(self) -> bool:
+        """Did the tier that produced this value express distribution AT ALL?
+
+        Distinct from :attr:`enabled`, which asks only whether a source is set.  A
+        block that pins the cadence and names no address still declares that the tier
+        which carried it owns the channel, and :func:`compose_tier_ladder` needs that
+        question: a lower tier may supply the pins only when NO tier above it declared
+        any, so "declared something" and "declared a source" are different questions.
+
+        A block that is PRESENT counts as declared even when every value it names is
+        the default: a central document that spells out ``on_unavailable: fail_closed``
+        has expressed a choice, and reading it as "no choice" would let a lower tier's
+        ``degrade`` replace it -- the loosening this ladder exists to refuse.  The
+        value comparison stays as a second route so a field added to this dataclass
+        later is covered without editing a hand-maintained list.
+        """
+        return self.explicit or self != PolicyDistribution()
+
+    def effective_timeout(self) -> float:
+        return self.timeout_secs if self.timeout_secs > 0 else DEFAULT_FETCH_TIMEOUT_SECS
+
+    def effective_refresh_interval(self) -> int:
+        """The refresh interval actually used, clamped to the polling floor."""
+        if self.refresh_interval_secs <= 0:
+            return 0
+        return max(self.refresh_interval_secs, MIN_REFRESH_INTERVAL_SECS)
+
+    def cache_too_old(self, age_secs: float) -> bool:
+        """Has a cached copy of *age_secs* exceeded the fleet's staleness bound?
+
+        A negative age (a clock that moved backwards between the write and the
+        read) reads as fresh rather than as infinitely stale: a host must not
+        refuse to boot because NTP stepped its clock.
+        """
+        if self.max_cache_age_secs <= 0:
+            return False
+        return age_secs > self.max_cache_age_secs
+
+    @staticmethod
+    def from_dict(d: Mapping[str, object]) -> "PolicyDistribution":
+        _reject_unknown_keys(
+            d,
+            {
+                "source",
+                "refresh_interval_secs",
+                "timeout_secs",
+                "max_cache_age_secs",
+                "on_unavailable",
+            },
+            "distribution",
+        )
+        raw_source = d.get("source")
+        if raw_source is not None and not isinstance(raw_source, str):
+            # `str(raw or "")` would coerce `"source": false` to "", silently
+            # DISABLING central distribution on a policy that plainly meant to
+            # configure it. Fail closed instead, exactly as ``updates`` does.
+            raise PlatformCompositionError("distribution.source must be a string")
+        source = str(raw_source or "").strip()
+        # A DECLARED source may not carry a credential, and the two shapes that do are
+        # userinfo and a query string. This block ends up in the policy cache VERBATIM --
+        # the document has to be byte-identical for its signature to verify -- and that
+        # file is readable by an app backend, which is arbitrary third-party code. So a
+        # `https://user:pass@host/p.json` or a pre-signed `?X-Amz-Signature=...` placed
+        # here would be published to every host and then handed to every app.
+        #
+        # This is the rule the module docstring already states -- the per-machine request
+        # credential travels in `KIROCREW_POLICY_HEADERS`, which "a published document must
+        # not" carry -- made enforceable rather than advisory. The ENVIRONMENT channel is
+        # deliberately unrestricted: that is where a pre-signed URL belongs, it is set by
+        # whatever provisions the host, and it never lands in the document.
+        if source:
+            try:
+                parsed = urllib.parse.urlsplit(source)
+            except ValueError as exc:
+                # ``urlsplit`` raises on a malformed bracketed host ("https://[::1"), and a
+                # policy is CONFIGURATION: an operator who mistyped the address must get a
+                # composition error naming the key, not an uncaught ValueError traceback out
+                # of boot. Refusing here also keeps a source that cannot be parsed from
+                # reaching the engine at all.
+                raise PlatformCompositionError(
+                    f"distribution.source is not a parseable URL: {exc}"
+                ) from exc
+            # ``.port`` is a LAZILY parsed property, so the ``urlsplit`` guard above does not
+            # cover it: it raises for a non-numeric or out-of-range port. A policy is
+            # configuration, so that is a composition error naming the key, not a traceback.
+            try:
+                parsed.port
+            except ValueError as exc:
+                raise PlatformCompositionError(
+                    f"distribution.source has an unusable port: {exc}"
+                ) from exc
+            offending = "userinfo" if (parsed.username or parsed.password) else ""
+            if not offending and parsed.query:
+                offending = "a query string"
+            if offending:
+                raise PlatformCompositionError(
+                    f"distribution.source carries {offending}, which a published policy "
+                    "must not: this document is cached verbatim and is readable by app "
+                    f"backends. Put the address in {_POLICY_DISTRIBUTION_URL_ENV} and any "
+                    f"credential in {_POLICY_DISTRIBUTION_HEADERS_ENV}, which stay "
+                    "per-machine."
+                )
+
+        numbers: dict[str, float] = {}
+        for key, allow_float in (
+            ("refresh_interval_secs", False),
+            ("timeout_secs", True),
+            ("max_cache_age_secs", False),
+        ):
+            raw = d.get(key)
+            if raw is None:
+                numbers[key] = 0.0
+                continue
+            # bool is an int subclass, and `"refresh_interval_secs": true` would
+            # otherwise parse as 1 second — a fleet-wide poll storm from a typo.
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                raise PlatformCompositionError(f"distribution.{key} must be a number")
+            # NaN and infinity parse as JSON numbers in Python's decoder, and every
+            # comparison below is FALSE for NaN — so it would slip past the range and
+            # whole-number checks and then raise an uncaught ValueError at int().
+            #
+            # Only a FLOAT is asked: ``math.isfinite`` converts its argument to a float
+            # first, so a JSON integer of 310 digits — which is a perfectly ordinary thing
+            # for a typo to produce — raises OverflowError inside the very check meant to
+            # reject it. An int has no non-finite values to screen for, and the range check
+            # below handles it exactly.
+            if isinstance(raw, float) and not math.isfinite(raw):
+                raise PlatformCompositionError(f"distribution.{key} must be a finite number")
+            if raw < 0:
+                raise PlatformCompositionError(f"distribution.{key} must not be negative")
+            if not allow_float and raw != int(raw):
+                raise PlatformCompositionError(f"distribution.{key} must be a whole number")
+            # Bounded by ``threading.TIMEOUT_MAX``, which is what the platform can actually
+            # WAIT for: the refresher passes the interval to ``Event.wait`` and the fetch
+            # passes the timeout to a socket, and both raise OverflowError above it —
+            # silently killing the poller thread, so the host simply stops receiving policy
+            # updates. Not an invented policy limit: it is ~292 years, so no duration anyone
+            # means comes near it, and every value that does is a typo.
+            if raw > MAX_DURATION_SECS:
+                raise PlatformCompositionError(
+                    f"distribution.{key} must not exceed {int(MAX_DURATION_SECS)} seconds "
+                    "(the longest interval this platform can wait for)"
+                )
+            # Stored WITHOUT a float round-trip, for the same reason ``isfinite`` is not
+            # asked of an int: ``float()`` on a 310-digit integer raises OverflowError, and
+            # doing that here would move the crash three lines down rather than fix it.
+            # Every consumer either takes ``int()`` of this or accepts a float, and an int
+            # satisfies both.
+            numbers[key] = raw
+
+        raw_disposition = d.get("on_unavailable")
+        if raw_disposition is None:
+            disposition = UNAVAILABLE_FAIL_CLOSED
+        elif not isinstance(raw_disposition, str):
+            raise PlatformCompositionError("distribution.on_unavailable must be a string")
+        else:
+            disposition = raw_disposition.strip()
+            if disposition not in _UNAVAILABLE_DISPOSITIONS:
+                raise PlatformCompositionError(
+                    f"distribution.on_unavailable {raw_disposition!r} must be one of "
+                    f"{sorted(_UNAVAILABLE_DISPOSITIONS)}"
+                )
+
+        if (
+            not source
+            and not os.environ.get(_POLICY_DISTRIBUTION_URL_ENV, "").strip()
+            and any(
+                (
+                    numbers["refresh_interval_secs"],
+                    numbers["timeout_secs"],
+                    numbers["max_cache_age_secs"],
+                    raw_disposition is not None,
+                )
+            )
+        ):
+            # A block that tunes a fetch it never configures is a policy whose
+            # author believed central distribution was on. Silently ignoring it is
+            # how a fleet ends up ungoverned while its policy file reads as managed.
+            #
+            # Unless the ENVIRONMENT supplies the source, which is the ordinary split:
+            # whatever provisions the host owns the address (and any credential in it),
+            # while the fleet publishes the cadence and the staleness bound in the
+            # document. Such a block is not inert at all, and refusing it here aborted
+            # boot on exactly the configuration the two-channel design intends.
+            raise PlatformCompositionError(
+                "distribution declares settings but no 'source'; central policy "
+                f"distribution would be inert (fail-closed). Set 'source', or "
+                f"{_POLICY_DISTRIBUTION_URL_ENV} if the address is per-machine."
+            )
+
+        return PolicyDistribution(
+            source=source,
+            refresh_interval_secs=int(numbers["refresh_interval_secs"]),
+            timeout_secs=numbers["timeout_secs"],
+            max_cache_age_secs=int(numbers["max_cache_age_secs"]),
+            on_unavailable=disposition,
+            # Any key at all is a declaration, default-valued or not; the caller
+            # passes ``{}`` for an absent block, which stays undeclared.
+            explicit=bool(d),
+        )
+
+
+def active_policy_distribution() -> PolicyDistribution:
+    """The installed ceiling's distribution pins — empty when ungoverned.
+
+    The single read point so the refresher, the CLI and the policy viewer cannot
+    drift.  Returns an unconfigured value on any error, and deliberately reads the
+    INSTALLED context rather than resolving one: this is called from a background
+    refresh thread, where composing a context as a side effect of asking "where do
+    I fetch from" would be a boot-order surprise.
+    """
+    try:
+        from kiro_crew.platform.context import installed_context
+
+        ctx = installed_context()
+        pins = getattr(ctx.governance, "distribution", None) if ctx is not None else None
+    except Exception:
+        logger.debug("policy distribution pins unavailable", exc_info=True)
+        return PolicyDistribution()
+    return pins if isinstance(pins, PolicyDistribution) else PolicyDistribution()
+
+
 @dataclass(frozen=True)
 class GovernanceCeiling:
     """Level 1 — the enterprise security ceiling, frozen at boot.
@@ -1343,6 +2009,10 @@ class GovernanceCeiling:
     signature_state: str = "unchecked"
     # Policy-only update pins (outside ``controls`` — see UpdatePins).
     updates: UpdatePins = field(default_factory=UpdatePins)
+    # Policy-only central-distribution pins (outside ``controls`` — see
+    # PolicyDistribution). Where THIS document is fetched from, so an enterprise
+    # admin owns one file and the fleet follows it.
+    distribution: PolicyDistribution = field(default_factory=PolicyDistribution)
     # Optional operator-declared fallback profile (policy top-level ``fallback``).
     # When a per-surface profile FILE is unusable (unreadable, unparseable, or a
     # broken ``extends``), the loader substitutes THIS profile instead of the
@@ -1351,6 +2021,27 @@ class GovernanceCeiling:
     # fallback is still intersected with this ceiling, so it can only ever narrow
     # it — it trades strict fail-closed for keeping the unlisted planes available.
     fallback_profile: "Optional[Profile]" = None
+    # Policy-only composed posture for ``capabilities.agentcore``
+    # (``workload`` | ``login``). Not a CapabilityGate field — that type stays
+    # ``enabled`` + ``scopes``. Read through :func:`agentcore_posture`, which
+    # returns ``None`` when the capability is off, omitted, or fail-closed
+    # disabled. A profile cannot compose a different posture onto this field
+    # (policy-wins).
+    agentcore_identity_posture: Optional[str] = None
+    # Policy-only Gateway MCP URL (``capabilities.agentcore.gateway_url``).
+    # Empty when omitted or the capability is off. Not a CapabilityGate field.
+    # A profile cannot carry this key. Read through
+    # :func:`agentcore_gateway_url`.
+    agentcore_gateway_url: str = ""
+    # Policy-only workload identity name (``capabilities.agentcore.workload_name``).
+    # Empty when omitted — runtime then uses env or a later default. A profile
+    # cannot carry this key. Read through :func:`agentcore_workload_name`.
+    agentcore_workload_name: str = ""
+    # Which precedence tier produced this ceiling (one of the ``TIER_*`` names, or
+    # "" for a ceiling parsed outside the loader).  Its one consumer is the tier
+    # audit in ``compose_tier_ladder``, which names authority and subordinate in the
+    # SEL when two tiers compose; nothing displays it to an operator yet.
+    tier: str = ""
 
     def get(self, scope: str) -> Optional[object]:
         return self.controls.get(scope)
@@ -1471,6 +2162,173 @@ def _command_deny_patterns(control: object) -> Tuple[str, ...]:
     return ()
 
 
+_AGENTCORE_SCOPE = "capabilities.agentcore"
+_AGENTCORE_POSTURES = frozenset({"workload", "login"})
+_AGENTCORE_POLICY_ONLY = frozenset({"posture", "gateway_url", "workload_name"})
+
+
+def _capability_raw_for_gate(
+    scope: str, raw: Mapping[str, object], *, is_policy: bool
+) -> Mapping[str, object]:
+    """Drop inner policy data that is not a CapabilityGate field.
+
+    ``capabilities.agentcore.posture``, ``gateway_url``, and
+    ``workload_name`` are policy data, not a second scope and not an
+    evaluator input. Strip them on a policy document so
+    ``CapabilityGate.from_dict`` stays ``additionalProperties: false``.
+    A profile (or policy fallback body) that carries either key is
+    rejected — Rule 6, same fail-closed raise as ``ScopedMap.posture``.
+    """
+    if scope != _AGENTCORE_SCOPE:
+        return raw
+    extra = _AGENTCORE_POLICY_ONLY.intersection(raw)
+    if not extra:
+        return raw
+    if not is_policy:
+        name = "posture" if "posture" in extra else next(iter(extra))
+        raise PlatformCompositionError(
+            f"capabilities.agentcore.{name} is policy-only; not allowed on a profile"
+        )
+    return {key: value for key, value in raw.items() if key not in _AGENTCORE_POLICY_ONLY}
+
+
+def _apply_agentcore_posture(
+    data: Mapping[str, object],
+    controls: Dict[str, object],
+    boot: "BootControls",
+) -> Optional[str]:
+    """Validate agentcore posture and return the value to persist on the ceiling.
+
+    Missing or unknown ``posture`` with ``enabled: true`` aborts when
+    ``boot.fail_closed``; otherwise the row is treated as disabled. Disabled
+    (or unnamed) rows do not require a posture and yield ``None``.
+    """
+    raw_caps = data.get("capabilities")
+    if not isinstance(raw_caps, dict):
+        return None
+    raw = raw_caps.get("agentcore")
+    if not isinstance(raw, dict):
+        return None
+    control = controls.get(_AGENTCORE_SCOPE)
+    if not isinstance(control, CapabilityGate) or not control.enabled:
+        return None
+    posture = raw.get("posture")
+    if isinstance(posture, str) and posture in _AGENTCORE_POSTURES:
+        return posture
+    reason = (
+        f"capabilities.agentcore is enabled but posture is {posture!r}; "
+        "expected 'workload' or 'login'"
+    )
+    if boot.fail_closed:
+        raise PlatformCompositionError(reason)
+    controls[_AGENTCORE_SCOPE] = CapabilityGate(enabled=False, scopes=control.scopes)
+    return None
+
+
+def agentcore_posture(ceiling: Optional[GovernanceCeiling]) -> Optional[str]:
+    """Return the policy posture if ``capabilities.agentcore`` is enabled.
+
+    ``\"workload\"`` or ``\"login\"`` when the ceiling enables the capability
+    with a known posture. ``None`` when there is no ceiling, the capability is
+    omitted, disabled, or fail-closed-disabled. The single reader later work
+    must use — do not re-parse raw policy JSON for this field.
+    """
+    if ceiling is None:
+        return None
+    stored = ceiling.agentcore_identity_posture
+    if stored not in _AGENTCORE_POSTURES:
+        return None
+    control = ceiling.controls.get(_AGENTCORE_SCOPE)
+    if not isinstance(control, CapabilityGate) or not control.enabled:
+        return None
+    return stored
+
+
+def _apply_agentcore_gateway_url(
+    data: Mapping[str, object],
+    controls: Dict[str, object],
+    boot: "BootControls",
+) -> str:
+    """Validate and return the policy Gateway URL, or empty.
+
+    Missing / empty is legal (the crew may still name a posture and add
+    the URL later). A present but unusable value aborts when
+    ``boot.fail_closed``; otherwise it is ignored.
+    """
+    from kiro_crew.platform.agentcore_schema import normalize_agentcore_gateway_url
+
+    raw_caps = data.get("capabilities")
+    if not isinstance(raw_caps, dict):
+        return ""
+    raw = raw_caps.get("agentcore")
+    if not isinstance(raw, dict):
+        return ""
+    control = controls.get(_AGENTCORE_SCOPE)
+    if not isinstance(control, CapabilityGate) or not control.enabled:
+        return ""
+    value = raw.get("gateway_url")
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str):
+        reason = "capabilities.agentcore.gateway_url must be a string"
+        if boot.fail_closed:
+            raise PlatformCompositionError(reason)
+        return ""
+    try:
+        return normalize_agentcore_gateway_url(value)
+    except ValueError as exc:
+        if boot.fail_closed:
+            raise PlatformCompositionError(str(exc)) from exc
+        return ""
+
+
+def agentcore_gateway_url(ceiling: Optional[GovernanceCeiling]) -> str:
+    """Return the policy Gateway URL if ``capabilities.agentcore`` is enabled."""
+    if ceiling is None or agentcore_posture(ceiling) is None:
+        return ""
+    return str(ceiling.agentcore_gateway_url or "")
+
+
+def _apply_agentcore_workload_name(
+    data: Mapping[str, object],
+    controls: Dict[str, object],
+    boot: "BootControls",
+) -> str:
+    """Validate and return the policy workload name, or empty."""
+    from kiro_crew.platform.agentcore_schema import normalize_agentcore_workload_name
+
+    raw_caps = data.get("capabilities")
+    if not isinstance(raw_caps, dict):
+        return ""
+    raw = raw_caps.get("agentcore")
+    if not isinstance(raw, dict):
+        return ""
+    control = controls.get(_AGENTCORE_SCOPE)
+    if not isinstance(control, CapabilityGate) or not control.enabled:
+        return ""
+    value = raw.get("workload_name")
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str):
+        reason = "capabilities.agentcore.workload_name must be a string"
+        if boot.fail_closed:
+            raise PlatformCompositionError(reason)
+        return ""
+    try:
+        return normalize_agentcore_workload_name(value)
+    except ValueError as exc:
+        if boot.fail_closed:
+            raise PlatformCompositionError(str(exc)) from exc
+        return ""
+
+
+def agentcore_workload_name(ceiling: Optional[GovernanceCeiling]) -> str:
+    """Return the policy workload name if ``capabilities.agentcore`` is enabled."""
+    if ceiling is None or agentcore_posture(ceiling) is None:
+        return ""
+    return str(ceiling.agentcore_workload_name or "")
+
+
 def _parse_control(scope: str, spec: ScopeSpec, raw: object, *, is_policy: bool) -> object:
     """Parse one raw JSON control value into its archetype, per the catalog."""
     if not isinstance(raw, dict):
@@ -1478,7 +2336,30 @@ def _parse_control(scope: str, spec: ScopeSpec, raw: object, *, is_policy: bool)
             return OrdinalControl(scale=spec.ordinal_scale, value=raw)
         raise PlatformCompositionError(f"scope {scope!r} must be an object")
     if spec.kind == RULESET:
-        return ScopedRuleset.from_dict(raw, matcher=spec.matcher)
+        ruleset = ScopedRuleset.from_dict(raw, matcher=spec.matcher)
+        for floor in spec.always_permitted:
+            # An ``always_permitted`` identifier is one this scope may not forbid.
+            # Two reasons qualify, and the catalog entry says which applies: the
+            # scope cannot FUNCTION without it (``approval_modes``' ``normal``, the
+            # interactive floor -- denying it would brick tool approval), or its
+            # enforcement is NOT IMPLEMENTED yet, so accepting a deny would
+            # advertise a control that does not hold. Either way, refuse at parse
+            # time rather than boot into a state the policy misdescribes -- and
+            # refuse HERE because the trust-root ``security_policy.json`` is the one
+            # file the dashboard may not rewrite to repair itself.
+            #
+            # An ALLOW-list that merely omits the floor denies it just as
+            # effectively, which is why this asks the resolved ruleset rather than
+            # inspecting the deny list.
+            if not ruleset.permits(floor).permitted:
+                raise PlatformCompositionError(
+                    f"scope {scope!r} must not forbid {floor!r} - it is not deniable "
+                    f"in this scope, either because the scope cannot function "
+                    f"without it or because its enforcement is not implemented yet; "
+                    f"a deny is refused rather than accepted and left unenforced. "
+                    f"Omit it from 'deny', or include it in 'allow'"
+                )
+        return ruleset
     if spec.kind == ORDINAL:
         # Accept {"value": ...} / {"min_level": ...} / {"mode": ...}; a bare
         # string value is handled above.
@@ -1487,8 +2368,9 @@ def _parse_control(scope: str, spec: ScopeSpec, raw: object, *, is_policy: bool)
             raise PlatformCompositionError(f"ordinal scope {scope!r} needs a string value")
         return OrdinalControl(scale=spec.ordinal_scale, value=value)
     if spec.kind == CAPABILITY:
+        gate_raw: Mapping[str, object] = _capability_raw_for_gate(scope, raw, is_policy=is_policy)
         return CapabilityGate.from_dict(
-            raw, default_enabled=spec.capability_default, scope_matchers=spec.scope_matchers
+            gate_raw, default_enabled=spec.capability_default, scope_matchers=spec.scope_matchers
         )
     if spec.kind == SCOPEDMAP:
         return ScopedMap.from_dict(raw, allow_posture=is_policy)
@@ -1498,7 +2380,18 @@ def _parse_control(scope: str, spec: ScopeSpec, raw: object, *, is_policy: bool)
 # Structural (non-governed) keys consumed by parse_policy/parse_profile, not as
 # governed scopes.
 _STRUCTURAL_KEYS = frozenset(
-    {"version", "boot", "identity", "name", "bind", "extends", "description", "updates", "fallback"}
+    {
+        "version",
+        "boot",
+        "identity",
+        "name",
+        "bind",
+        "extends",
+        "description",
+        "updates",
+        "distribution",
+        "fallback",
+    }
 )
 
 
@@ -1512,6 +2405,29 @@ _KEY_OPEN_NAMESPACES = frozenset({"capabilities"})
 # ``sandbox`` carries the ordinal ``min_level`` plus non-governed boot flags
 # (require_isolation, env_scrub_prefixes) kept raw under a reserved scope.
 _SANDBOX_FLAGS_SCOPE = "sandbox._flags"
+
+# The EXHAUSTIVE set of non-governed ``sandbox`` boot flags that may ride raw
+# under ``_SANDBOX_FLAGS_SCOPE``.  Anything else under ``sandbox`` fails closed
+# like every other fixed-child namespace (filesystem, folders, network).
+#
+# Why an allowlist rather than blanket tolerance: ``sandbox.min_level`` is the
+# ordinal floor with the widest blast radius in the catalog, and the reserved
+# scope is WRITE-ONLY — nothing reads it back.  Blanket tolerance therefore
+# turned a one-character typo into silent total loss of the floor:
+# ``{"sandbox": {"min_levl": "strict"}}`` parsed clean, reported OK from
+# ``kirocrew policy validate``, rendered as a governed scope in
+# ``kirocrew policy show``, and left ``sandbox.min_level`` absent — so
+# ``sandbox._governance_sandbox_floor()`` read "ungoverned" and clamped nothing.
+# Green validation with zero enforcement is precisely the failure class this
+# model exists to prevent, so an unrecognized child must be loud.
+#
+# Why not reject EVERY non-``min_level`` child: these two names are documented
+# in-code above as reserved, and a deployed policy may already carry one.
+# Rejecting them would abort boot on a policy that parses today, converting a
+# diagnostic gap into an availability regression.  Keeping the two known names
+# accepted costs nothing (they are inert either way) and confines the new
+# strictness to names nobody has been told are valid.
+_SANDBOX_RESERVED_FLAGS = frozenset({"require_isolation", "env_scrub_prefixes"})
 
 # Scope aliases: the provider doc names the profile's path scopes ``folders.read``/
 # ``folders.write`` but the policy names them ``filesystem.read``/``.write`` (App.
@@ -1677,8 +2593,11 @@ def _parse_controls(
                 dotted = f"{key}.{sub}"
                 if dotted in SCOPE_CATALOG:
                     take(dotted, sub_raw)
-                elif key == "sandbox":
-                    # Non-governed boot flags ride raw under a reserved scope.
+                elif key == "sandbox" and sub in _SANDBOX_RESERVED_FLAGS:
+                    # A KNOWN non-governed boot flag rides raw under a reserved
+                    # scope.  The membership test is what keeps a typo'd
+                    # ``min_level`` from being swallowed here instead of
+                    # reaching the fail-closed raise below.
                     controls.setdefault(_SANDBOX_FLAGS_SCOPE, {})  # type: ignore[arg-type]
                     controls[_SANDBOX_FLAGS_SCOPE][sub] = sub_raw  # type: ignore[index]
                 else:
@@ -1691,6 +2610,34 @@ def _parse_controls(
 # ──────────────────────────────────────────────────────────────────────────
 # Loader
 # ──────────────────────────────────────────────────────────────────────────
+def _coerce_boot_flag(
+    boot_raw: Mapping[str, object], key: str, *, default: bool, closed: bool
+) -> bool:
+    """Strict read of one ``boot`` gate flag.
+
+    A real boolean is honoured and an absent key takes the documented
+    default. Anything else (including explicit null) is warned about and
+    read in the fail-closed direction: a bare ``bool()`` would read a
+    ``"false"`` string as true, which is the fail-open direction.
+    """
+    if key not in boot_raw:
+        return default
+    value = boot_raw[key]
+    if isinstance(value, bool):
+        return value
+    # Log the TYPE, never the value: a mis-typed flag can carry a secret
+    # (a credential pasted into the policy), and this warning lands in the
+    # persistent gateway log. The key names the misconfiguration; the type
+    # is all an operator needs to fix it.
+    logger.warning(
+        "security policy boot flag %r must be a boolean, got %s — reading fail-closed as %s",
+        key,
+        type(value).__name__,
+        closed,
+    )
+    return closed
+
+
 def parse_policy(
     data: Mapping[str, object], *, signature_state: str = SIGNATURE_UNCHECKED
 ) -> GovernanceCeiling:
@@ -1714,17 +2661,23 @@ def parse_policy(
     if not isinstance(boot_raw, dict):
         raise PlatformCompositionError("security policy requires a 'boot' object")
     boot = BootControls(
-        require_sandbox=bool(boot_raw.get("require_sandbox", True)),
-        allow_terminal=bool(boot_raw.get("allow_terminal", False)),
-        fail_closed=bool(boot_raw.get("fail_closed", True)),
+        require_sandbox=_coerce_boot_flag(boot_raw, "require_sandbox", default=True, closed=True),
+        allow_terminal=_coerce_boot_flag(boot_raw, "allow_terminal", default=False, closed=False),
+        fail_closed=_coerce_boot_flag(boot_raw, "fail_closed", default=True, closed=True),
     )
     controls = _parse_controls(data, is_policy=True)
+    composed_posture = _apply_agentcore_posture(data, controls, boot)
+    composed_gateway_url = _apply_agentcore_gateway_url(data, controls, boot)
+    composed_workload_name = _apply_agentcore_workload_name(data, controls, boot)
     identity = data.get("identity") or {}
     issuer = str(identity.get("issuer", "")) if isinstance(identity, dict) else ""
     signature = str(identity.get("signature", "")) if isinstance(identity, dict) else ""
     raw_updates = data.get("updates")
     if raw_updates is not None and not isinstance(raw_updates, dict):
         raise PlatformCompositionError("security policy 'updates' must be an object")
+    raw_distribution = data.get("distribution")
+    if raw_distribution is not None and not isinstance(raw_distribution, dict):
+        raise PlatformCompositionError("security policy 'distribution' must be an object")
     # Optional operator-declared fallback profile (see GovernanceCeiling.fallback_profile).
     # Parsed as a narrow-only PROFILE (is_policy=False): resolve() intersects it with
     # this ceiling like any per-surface profile when a profile FILE is unusable, so it
@@ -1761,7 +2714,11 @@ def parse_policy(
         identity_signature=signature,
         signature_state=signature_state,
         updates=UpdatePins.from_dict(raw_updates or {}),
+        distribution=PolicyDistribution.from_dict(raw_distribution or {}),
         fallback_profile=fallback_profile,
+        agentcore_identity_posture=composed_posture,
+        agentcore_gateway_url=composed_gateway_url,
+        agentcore_workload_name=composed_workload_name,
     )
 
 
@@ -1789,6 +2746,18 @@ def parse_profile(data: Mapping[str, object]) -> Profile:
         raise PlatformCompositionError(
             "profiles may not set 'updates' — update pins are policy-only "
             "(a profile redirecting the update source would be privilege escalation)"
+        )
+    # ``distribution`` is POLICY-ONLY for a stronger version of the same reason,
+    # and it is in _STRUCTURAL_KEYS for the same mechanical one (so _parse_controls
+    # skips it rather than failing as an unknown scope, which would make a
+    # profile's copy silently inert). Redirecting where the CEILING is fetched from
+    # is not a narrowing at all — it replaces the whole enforcement document, so a
+    # profile that could do it would be the widest escalation in this model.
+    if "distribution" in data:
+        raise PlatformCompositionError(
+            "profiles may not set 'distribution' — central policy distribution is "
+            "policy-only (a profile redirecting where the ceiling is fetched from "
+            "would replace the enforcement document, not narrow it)"
         )
     # ``fallback`` is POLICY-ONLY for the same reason ``updates`` is. It is in
     # _STRUCTURAL_KEYS (so parse_policy's _parse_controls skips it rather than
@@ -1909,7 +2878,15 @@ def _policy_signature_state(
     # fallback: a tampered policy would yield an UNGOVERNED host even with
     # ``require_policy_signature`` on, inverting the flag. Encoding both sides
     # keeps every malformed signature an ordinary UNVERIFIED verdict.
-    if hmac.compare_digest(expected.encode("utf-8"), signature.encode("utf-8")):
+    #
+    # ``surrogatepass`` for the same reason: ``json.loads`` accepts a lone surrogate
+    # (``"\udc80"``) and a strict ``encode`` raises UnicodeEncodeError -- a ValueError,
+    # not a composition error, with the same ungoverned outcome. The ladder verifies a
+    # user-owned home file BENEATH the central document on every load, so without this
+    # one byte in that file would take the fleet ceiling out of the process.
+    if hmac.compare_digest(
+        expected.encode("utf-8"), signature.encode("utf-8", errors="surrogatepass")
+    ):
         return SIGNATURE_VERIFIED, f"issuer {issuer!r}"
     return SIGNATURE_UNVERIFIED, f"signature does not match trust key for issuer {issuer!r}"
 
@@ -1954,24 +2931,31 @@ def _policy_trust_settings() -> Tuple[bool, Dict[str, str]]:
 def _policy_signature_required() -> bool:
     """True when the admission policy explicitly opted in.
 
-    A trust root that is absent, unreadable, or not a JSON object reads as **no
-    opt-in**, and that is deliberate rather than a gap.  An attacker who can write
-    ``admission_policy.json`` is explicitly out of this feature's threat model (see
-    the threat-model note in ``docs/system-specs/modules/governance.md``) — such a
-    process would simply set the flag to ``false``, which is well-formed JSON, so
-    fail-closing on a *malformed* file only catches a clumsy version of an attack
-    the design already concedes.  What a corrupt trust root actually indicates in
-    practice is a non-atomic fleet push or a hand-edit typo — a reliability event —
-    and the useful response to that is to log loudly and behave predictably, which
-    ``read_policy_trust_root`` already does.  ``kirocrew doctor`` surfaces it.
+    Routed through :func:`_policy_trust_settings` — and thus
+    ``admission.AdmissionPolicy.from_dict`` and its strict ``_coerce_flag``
+    reader — so the opt-in flag and the ``trust_keys`` the verifier consults
+    are read by ONE parser.  Two independent readers of the same field is how
+    a well-formed trust root carrying ``"require_policy_signature": null``
+    can log a fail-closed warning on one path while the enforcement path
+    silently reads the gate as off: with the shared reader, a flag that is
+    present but not a real JSON boolean reads fail-closed as opted-IN.
+
+    A trust root that is absent, unreadable, or not a JSON object still reads
+    as **no opt-in**, and that is deliberate rather than a gap.  An attacker
+    who can write ``admission_policy.json`` is explicitly out of this
+    feature's threat model (see the threat-model note in
+    ``docs/system-specs/modules/governance.md``) — such a process would simply
+    set the flag to ``false``, which is well-formed JSON, so fail-closing on a
+    *malformed* file only catches a clumsy version of an attack the design
+    already concedes.  What a corrupt trust root actually indicates in
+    practice is a non-atomic fleet push or a hand-edit typo — a reliability
+    event — and the useful response to that is to log loudly and behave
+    predictably, which ``read_policy_trust_root`` already does.  ``kirocrew
+    doctor`` surfaces it.
 
     Never raises.
     """
-    try:
-        data = json.loads(policy_trust_root_path().read_text(encoding="utf-8"))
-    except Exception:
-        return False
-    return bool(isinstance(data, dict) and data.get("require_policy_signature", False))
+    return _policy_trust_settings()[0]
 
 
 def _audit_policy_signature(state: str, detail: str, path_label: str) -> None:
@@ -1994,16 +2978,24 @@ def _audit_policy_signature(state: str, detail: str, path_label: str) -> None:
             operation="security_policy_signature",
             outcome=state,
             source="startup",
+            # WHICH policy and WHY both live here rather than in the log line below.
+            resources=path_label,
             error=detail,
         )
     except Exception:
         logger.debug("policy signature SEL emit unavailable", exc_info=True)
     if state == SIGNATURE_UNVERIFIED:
+        # Neither the label nor the reason is interpolated. Both carry text this process
+        # did not author — the label is whatever the caller was resolving (for the fetch
+        # tier a URL that may itself be a credential) and the reason names the issuer the
+        # DOCUMENT claimed — and the log ring is served by ``GET /api/logs``, which the
+        # agent's own browser tooling can drive. The SEL record above is on the keystone
+        # and is not reachable that way, so it is where an audit reason belongs; this line
+        # exists so the state is visible in an operator's console.
         logger.warning(
-            "security policy at %s carries an UNVERIFIED signature (%s); "
-            "treating the ceiling as unauthenticated",
-            path_label,
-            detail,
+            "the security policy carries an UNVERIFIED signature; treating the ceiling as "
+            "unauthenticated. The security_policy_signature audit record names which "
+            "policy and why."
         )
 
 
@@ -2037,102 +3029,696 @@ def _mark_policy_signature_incident(detail: str) -> None:
         logger.debug("governance health mark unavailable", exc_info=True)
 
 
+@dataclass
+class _TierProcessState:
+    """Every per-process value the tier ladder keeps, in ONE place.
+
+    ``load_security_policy`` is not called once per process -- ``mcp_gateway.app_call``
+    re-runs it on every app callback -- so anything that must happen once, or be
+    remembered across a central refresh, lives here rather than being recomputed.
+    Held in one dataclass rather than separate module globals so a test resets them
+    together (:func:`reset_process_state`, mirroring
+    ``policy_distribution.reset_process_state``): a fixture that resets some of them
+    and forgets one is how ``last_bundled`` leaked between tests.
+
+    ``last_bundled`` -- the companion edition's bundled document from the last load
+    that resolved one. A refresh has no ``bundled_loader`` of its own, and without
+    this the bundled rung would drop out of the ladder at the first poll, loosening a
+    ceiling an edition tightened. The packaged resource is static for the process.
+
+    ``home_unreadable_warned`` -- the one-time warning that an unusable home file
+    (unreadable, or one ``parse_policy`` rejects) beneath a present authority was
+    skipped has fired. Once, because the fold runs on
+    every refresh poll and a warning per poll would be a warning per interval.
+
+    ``env_beneath_central_warned`` -- the one-time warning that
+    ``KIROCREW_SECURITY_POLICY`` only tightens has fired. A runbook may still describe
+    it as a rollback lever that outranks the central document; the first compose of
+    the env-beneath-central shape says otherwise, once.
+
+    ``tier_intersects_audited`` -- the ``(authority, lower)`` pairs already recorded.
+    The pairs are fixed for the process unless a tier appears or disappears, so a row
+    per compose was a row per interaction, burying the one-time signal above.
+
+    ``last_composed`` -- the fold now IN EFFECT: what :func:`load_security_policy`
+    returned at boot, or what :func:`policy_distribution.apply_ceiling` installed on a
+    refresh (recorded after ``set_context``, never for a fold that failed
+    validation).  It is the comparison basis for the 304 re-fold
+    (``policy_distribution._recompose_differs``): "did another tier move" is a
+    question about the fold, and the fold is the only object this module can vouch
+    for.  ``current_context().governance`` is NOT that object -- whatever installed it
+    (``bootstrap``, the companion's ``compose``, a caller that ``replace()``-tags a
+    field) may have made it structurally unequal to the fold while meaning the same
+    ceiling, and a compare against it would re-install on every quiet poll and bump
+    the governance generation each time.  Read it through
+    :func:`last_composed_ceiling`.
+    """
+
+    last_bundled: Optional[Mapping[str, object]] = None
+    env_beneath_central_warned: bool = False
+    home_unreadable_warned: bool = False
+    tier_intersects_audited: "set[Tuple[str, str]]" = field(default_factory=set)
+    last_composed: Optional["GovernanceCeiling"] = None
+
+
+_process_state = _TierProcessState()
+
+
+def reset_process_state() -> None:
+    """Clear every per-process value the tier ladder keeps.  Test helper."""
+    global _process_state
+    _process_state = _TierProcessState()
+
+
+def last_composed_ceiling() -> Optional["GovernanceCeiling"]:
+    """The last fold that actually LANDED, or ``None`` before the first one.
+
+    "Landed" is the load-bearing word: :func:`load_security_policy` records its
+    result (a boot whose fold fails the floor gates aborts the process, so that record
+    cannot outlive a rejection), and :func:`policy_distribution.apply_ceiling` records
+    only after ``set_context`` returns. :func:`compose_installed_ceiling` itself records
+    nothing, because its caller may reject the fold.  See ``_TierProcessState``.
+    """
+    return _process_state.last_composed
+
+
+def record_composed_ceiling(ceiling: "GovernanceCeiling") -> None:
+    """Record *ceiling* as the fold now in effect.  Installer-only; see above."""
+    _process_state.last_composed = ceiling
+
+
+def _intersect_ceilings(
+    authority: GovernanceCeiling, subordinate: GovernanceCeiling
+) -> GovernanceCeiling:
+    """Narrow *authority* by *subordinate* -- the subordinate can only tighten.
+
+    Reuses :func:`_compose_controls`, the same per-scope AND the profile layer
+    uses (allow∩, deny∪, ordinal=stricter, gate=AND), so "cannot widen" is a
+    property of the primitive rather than a rule this function has to police.
+
+    A scope the subordinate governs and the authority does not carries through:
+    an ungoverned scope is *unrestricted*, so adding a restriction to it is a
+    tightening, not an escape.  A scope the authority governs and the subordinate
+    does not keeps the authority's value, because a subordinate cannot repeal by
+    omission.
+
+    Everything outside ``controls`` stays the AUTHORITY's -- identity, signature
+    state, tier, distribution pins and the update *commands* -- except the two update
+    pins that are themselves restrictions, which fold (:func:`_intersect_update_pins`).
+    (The distribution pins are additionally re-applied by :func:`compose_tier_ladder`,
+    which owns the one case this function cannot see: an authority that declared no
+    pins at all, where keeping "the authority's" would discard the pins of the tier
+    beneath it rather than preserve a choice.  Within a single intersection the rule
+    below still holds.)
+    A subordinate document must not be able to relabel whose ceiling this is, relax
+    an update pin, redirect where the next document is fetched from, or widen its
+    own escape hatch.
+
+    Every field outside ``controls`` falls into one of three classes, and the class
+    decides its precedence rule.  Get the class wrong and a lower tier widens the
+    ceiling through a side door ``_compose_controls`` never sees -- or, the mirror
+    failure, a lower tier's restriction is silently voided:
+
+    * **A restriction that folds** -- ``updates.source`` (an allowlist; empty permits
+      any remote) and ``updates.min_version`` (a floor; empty is none).  A subordinate
+      supplying one where the authority left it empty NARROWS the ceiling, so it is
+      kept; where both set one, the authority's source stands and the higher floor
+      wins.  Keeping "the authority's" here would discard a pure tightening and let
+      code install from a source the local operator forbade.
+    * **Absence means "no choice expressed"** -- ``distribution`` pins.  Nothing above
+      chose, so a lower tier supplying one redirects nothing; ``compose_tier_ladder``
+      lets the first declared value through.
+    * **Absence means the fail-closed floor** -- ``fallback_profile``, ``tier``,
+      identity, signature state, and the update *commands* (``check_command``,
+      ``apply_command``, ``platform_commands``: a command runs unsandboxed as the
+      gateway, so a lower tier supplying one is an escalation, not a restriction).
+      Authority-only, never ``authority.x or subordinate.x``.  For
+      ``fallback_profile`` specifically: an authority that declared none means an
+      unusable profile file denies its whole surface, and a subordinate supplying a
+      looser fallback would REPLACE that floor -- the escape hatch widened by the
+      tier that is not allowed to widen anything.  A subordinate that wants a
+      fallback asks the fleet to declare one.
+
+    A new out-of-``controls`` field must be placed in one of the classes here before
+    it is composed; copying a neighbour's rule is how the wrong class ships.
+    """
+    merged: Dict[str, object] = dict(authority.controls)
+    for scope, sub_control in subordinate.controls.items():
+        existing = merged.get(scope)
+        if existing is None:
+            merged[scope] = sub_control
+            continue
+        if scope == _SANDBOX_FLAGS_SCOPE:
+            # The reserved sandbox boot flags ride as a plain ``dict`` with no
+            # compose archetype, and ``_compose_controls`` refuses a ``dict`` as a
+            # type mismatch -- so two tiers that each carry a documented flag would
+            # abort boot here.  They are inert (nothing reads them; see
+            # ``_SANDBOX_RESERVED_FLAGS``), so no direction widens the ceiling: the
+            # authority's value wins per key, and a key it left unset is taken from
+            # the subordinate, the "no choice expressed" class.
+            merged[scope] = {**sub_control, **existing}  # type: ignore[dict-item]
+            continue
+        merged[scope] = _compose_controls(existing, sub_control)
+    boot = BootControls(
+        require_sandbox=authority.boot.require_sandbox or subordinate.boot.require_sandbox,
+        allow_terminal=authority.boot.allow_terminal and subordinate.boot.allow_terminal,
+        fail_closed=authority.boot.fail_closed or subordinate.boot.fail_closed,
+    )
+    # ``fallback_profile`` is deliberately NOT listed: ``replace(authority, ...)``
+    # keeps the authority's, which is the fail-closed-floor class above.
+    return replace(
+        authority,
+        boot=boot,
+        controls=merged,
+        updates=_intersect_update_pins(authority.updates, subordinate.updates),
+    )
+
+
+def _intersect_update_pins(authority: UpdatePins, subordinate: UpdatePins) -> UpdatePins:
+    """Fold the two update pins that are restrictions; keep the commands the authority's.
+
+    ``source`` is an allowlist and ``min_version`` a floor, so a subordinate that sets
+    one the authority left empty tightens the ceiling and must not be discarded.  Two
+    source globs have no expressible intersection, so where both are set the
+    authority's stands (the subordinate cannot loosen it; its own narrowing is not
+    applied).  Two floors intersect as the higher one; an unparseable floor imposes
+    none (:meth:`UpdatePins.meets_min_version`), so it yields to a parseable one.
+    """
+    source = authority.source or subordinate.source
+    min_version = authority.min_version
+    if not authority.min_version:
+        min_version = subordinate.min_version
+    elif subordinate.min_version:
+        upper = _version_tuple(authority.min_version)
+        lower = _version_tuple(subordinate.min_version)
+        if not upper:
+            min_version = subordinate.min_version
+        elif lower:
+            width = max(len(upper), len(lower))
+            if lower + (0,) * (width - len(lower)) > upper + (0,) * (width - len(upper)):
+                min_version = subordinate.min_version
+    return replace(authority, source=source, min_version=min_version)
+
+
+def _audit_policy_tier(operation: str, authority_tier: str, lower_tier: str) -> None:
+    """Audit a tier composition.  Best-effort, never fatal.
+
+    Only tier NAMES are recorded -- module constants this process authored, never
+    a path or URL from the document, following the same rule the distribution
+    audit follows: the SEL is readable through agent-reachable surfaces and a
+    document's own source may itself be credential-bearing.
+
+    Tightening is not a privilege escalation, so its record is a side-effect rather
+    than a precondition: making it fatal would let one unwritable SEL file refuse
+    boot on every governed host in a fleet -- a self-inflicted outage far wider than
+    the evidence gap it would close. (A record that GATES an action belongs to a path
+    where a local document outranks the fleet ceiling; no such path exists in this
+    ladder.)
+    """
+    try:
+        sel().log_api_access(
+            caller="_host",
+            operation=operation,
+            outcome="allowed",
+            source="startup",
+            resources=f"{authority_tier}<-{lower_tier}",
+            error="",
+        )
+    except Exception:
+        logger.debug("policy tier SEL emit unavailable", exc_info=True)
+
+
+def _warn_home_unreadable_beneath_authority_once(home_path: Path, error: Exception) -> None:
+    """Say once per process that an unusable home file was skipped beneath a higher tier.
+
+    Unusable covers every shape ``_subordinate_ceiling`` skips: a read error, a JSON
+    error, and a document ``parse_policy`` rejects -- and the ``distribution`` peek in
+    :func:`load_security_policy` that moves on from a malformed home block. The
+    governing tier (central, env or bundled) is unchanged, so nothing loosened; but a
+    local operator who meant that file to tighten the ceiling, or to name where the
+    ceiling lives, must be able to see that it did not.
+
+    Only the path and the exception CLASS are logged. This line is served by
+    ``GET /api/logs``, and a ``PolicyDistribution.from_dict`` error quotes the declared
+    source URL, which :func:`_audit_policy_tier` and :func:`_audit_policy_signature`
+    deliberately keep off agent-reachable surfaces because a source URL may itself be a
+    credential. The full error still reaches the operator through the fatal path when
+    the home file is the only ceiling.
+    """
+    if _process_state.home_unreadable_warned:
+        return
+    _process_state.home_unreadable_warned = True
+    logger.warning(
+        "security policy at %s is unusable (%s); skipped, the governing tier is "
+        "unchanged. Fix or remove the file for a local tightening to apply.",
+        home_path,
+        type(error).__name__,
+    )
+
+
+def _warn_env_beneath_central_once(authority_tier: str) -> None:
+    """Say once per process that the env document now only TIGHTENS the fleet ceiling.
+
+    The precedence inversion this change ships is silent at the point it bites: a fleet
+    whose runbook set ``KIROCREW_SECURITY_POLICY`` to roll back a bad central push finds
+    the file demoted to tighten-only with no signal, mid-incident. This is the one shape
+    where an upgraded operator's mental model is wrong, so the first time it composes
+    the host says so -- a log line and a best-effort SEL row of the same shape as
+    the tier-intersect record. Once, because the shape is stable for the process
+    lifetime and a warning per compose would be a warning per refresh.
+    """
+    if _process_state.env_beneath_central_warned:
+        return
+    _process_state.env_beneath_central_warned = True
+    logger.warning(
+        "KIROCREW_SECURITY_POLICY is composed BENEATH the %s security policy and can "
+        "only tighten it. It no longer overrides the fleet document; to recover from a "
+        "bad central push, republish a good document at the source.",
+        authority_tier,
+    )
+    _audit_policy_tier("security_policy_env_tightens_only", authority_tier, TIER_ENV)
+
+
+def _audit_tier_intersect_once(authority_tier: str, lower_tier: str) -> None:
+    """Record a tier intersection the first time that PAIR composes in this process.
+
+    Keyed on the pair rather than a single process-wide flag so a tier that appears
+    later (an env document set after boot, a central document that arrives on the
+    first successful poll) is still recorded once, while the flagship shape --
+    central + home present, recomposed on every app callback -- writes one row, not
+    one per interaction. See ``_TierProcessState.tier_intersects_audited``.
+    """
+    pair = (authority_tier, lower_tier)
+    if pair in _process_state.tier_intersects_audited:
+        return
+    _process_state.tier_intersects_audited.add(pair)
+    _audit_policy_tier("security_policy_tier_intersect", authority_tier, lower_tier)
+
+
+def compose_tier_ladder(
+    *tiers: Optional[GovernanceCeiling],
+) -> Optional[GovernanceCeiling]:
+    """Fold present tiers, highest first, into one ceiling.
+
+    The single implementation of precedence.  The highest present tier is the
+    authority; each lower one may only tighten it (:func:`_intersect_ceilings`).
+    There is deliberately NO path by which a lower tier replaces the authority: a
+    time-boxed rollback grant is deliberately absent (tracked as a follow-up issue,
+    see the enterprise governance guide), because a channel that lets a local document
+    outrank the fleet ceiling is the override this ladder exists to remove, however it
+    is dated.
+
+    Extracted so that boot and a live central refresh cannot drift: a refresh that
+    installed the fetched document alone would silently drop every local restriction
+    below it.
+    """
+    present = [tier for tier in tiers if tier is not None]
+    if not present:
+        return None
+    ceiling = present[0]
+    # The distribution pins ride OUTSIDE ``controls`` (they are values the core
+    # consumes, not a governed scope), so they are not carried by the per-scope
+    # compose the rest of this fold uses -- every path that REBUILDS a ceiling has
+    # to preserve them explicitly or the host silently loses the channel it fetches
+    # the ceiling from.  One path did: an authority that declared no distribution
+    # discarded the pins of the tier beneath it, which switches the central tier off
+    # and drops every centrally supplied restriction -- the looser-ceiling failure
+    # this ladder exists to prevent.  Tracking the value HERE, once, as the fold
+    # proceeds is what makes preserving it structural rather than a rule each
+    # ``return`` has to remember.
+    #
+    # Precedence is unchanged: a tier can only supply pins when NO tier above it
+    # declared any, so a lower document still cannot redirect a fetch source its
+    # authority chose.  When nothing above expressed a choice there is no choice to
+    # redirect away from -- the "absence means no choice" class in
+    # :func:`_intersect_ceilings`.
+    distribution = ceiling.distribution
+    for lower in present[1:]:
+        if not distribution.declared and lower.distribution.declared:
+            distribution = lower.distribution
+        if lower.tier == TIER_ENV and ceiling.tier == TIER_CENTRAL:
+            _warn_env_beneath_central_once(ceiling.tier)
+        _audit_tier_intersect_once(ceiling.tier, lower.tier)
+        ceiling = _intersect_ceilings(ceiling, lower)
+    if distribution != ceiling.distribution:
+        # Only when the fold actually moved them, so a ceiling that composes alone
+        # is returned as the same object: callers assert that identity to prove a
+        # single document was installed untouched.
+        return replace(ceiling, distribution=distribution)
+    return ceiling
+
+
+def _subordinate_ceiling(
+    bundled: Optional[Mapping[str, object]],
+    home_data: Optional[Dict[str, object]],
+    home_error: Optional[Exception],
+    home_path: Path,
+    env_data: Optional[Dict[str, object]] = None,
+    env_path: Optional[Path] = None,
+    *,
+    beneath_authority: bool = False,
+) -> Optional[GovernanceCeiling]:
+    """Tiers 2-4, first present wins: env -> bundled -> home.
+
+    Mutually exclusive by design, and collectively the *subordinate*: whichever one
+    is present may only tighten whatever authority sits above it.
+
+    *beneath_authority* says a central document is present above this fold. A home
+    file that cannot be USED -- unreadable, not JSON, JSON that ``parse_policy``
+    rejects, or bytes on which verifying or parsing raises anything at all -- is
+    then reported and treated as ABSENT rather than raised: the
+    authority still governs, which is the fail-closed direction, and a raise would
+    hand whoever owns ``~/.kiro/crew`` a lever that refuses boot and freezes every
+    refresh on a fleet host -- an availability lever, not a tightening. One path
+    for every shape of unusable, so JSON validity does not split the behaviour.
+    With no authority the home file is the only ceiling, so its error stays fatal.
+
+    *env_data* / *env_path* let a caller that ALREADY read the env document hand it
+    over instead of having this function read the file a second time -- which matters
+    because :func:`load_security_policy` has to peek that document's ``distribution``
+    block before the central tier runs, and two reads could disagree.  Omitting them
+    does not opt the tier out: the read then happens here instead, so
+    a caller that does not care about the declaration keeps the env tier for free.
+    """
+    if env_data is None and env_path is None:
+        env_data, env_path = _read_env_policy()
+    if env_data is not None and env_path is not None:
+        env_state = _verify_policy_signature(env_data, source=str(env_path))
+        return replace(parse_policy(env_data, signature_state=env_state), tier=TIER_ENV)
+    if bundled is not None:
+        # The bundled tier is NOT exempt from a fleet that opted into
+        # require_policy_signature. The plugin-admission manifest signature covers
+        # only name/publisher/version/capabilities
+        # (admission.PluginManifest.signing_payload), NOT the packaged
+        # security_policy.json bytes, so "covered by admission" did not in fact
+        # protect the resource -- a tampered bundled policy would have loaded
+        # unchecked.
+        bundled_state = _verify_policy_signature(bundled, source="companion-bundled resource")
+        return replace(parse_policy(bundled, signature_state=bundled_state), tier=TIER_BUNDLED)
+    if home_error is not None:
+        if beneath_authority:
+            _warn_home_unreadable_beneath_authority_once(home_path, home_error)
+            return None
+        raise PlatformCompositionError(
+            f"security policy at {home_path} is unreadable: {home_error}"
+        ) from home_error
+    if home_data is not None:
+        try:
+            home_state = _verify_policy_signature(home_data, source=str(home_path))
+            parsed = parse_policy(home_data, signature_state=home_state)
+        except Exception as exc:
+            # Valid JSON the schema refuses (a stale ``version``, an unknown key) is
+            # the same lever as an unreadable file, reached one step later -- and so
+            # is anything ELSE these two calls raise on user-owned bytes. The catch is
+            # total on purpose: this is the one boundary where a document a standard
+            # user controls meets the fleet ceiling, and an exception class nobody
+            # anticipated (the lone-surrogate UnicodeEncodeError was one) must land
+            # on the same skip-and-warn path, not escape the loader as ungoverned.
+            if beneath_authority:
+                _warn_home_unreadable_beneath_authority_once(home_path, exc)
+                return None
+            raise
+        return replace(parsed, tier=TIER_HOME)
+    return None
+
+
+def _read_env_policy() -> Tuple[Optional[Dict[str, object]], Optional[Path]]:
+    """Read the env tier eagerly, for the central tier's declaration peek.
+
+    Returns ``(None, None)`` when ``KIROCREW_SECURITY_POLICY`` is unset.  Unlike the
+    home tier the error is RAISED here rather than captured and re-raised further
+    down: the env tier outranks bundled and home, so there is no lower tier whose own
+    failure could have taken precedence over it, and hoisting the read only moves the
+    refusal earlier than the central fetch -- a fleet that pointed this variable at a
+    file it cannot read is misconfigured whether or not the poll would have answered.
+    The message is the one this path has always produced.
+    """
+    raw_env = os.environ.get(_POLICY_ENV, "").strip()
+    if not raw_env:
+        return None, None
+    env_path = Path(raw_env)
+    try:
+        return _read_json_file(env_path), env_path
+    except Exception as exc:  # fail-closed: a fleet pointed here on purpose.
+        raise PlatformCompositionError(
+            f"security policy at {env_path} (from {_POLICY_ENV}) is unreadable: {exc}"
+        ) from exc
+
+
+def _read_home_policy() -> Tuple[Optional[Dict[str, object]], Optional[Exception], Path]:
+    """Read the home tier eagerly, capturing rather than raising its error.
+
+    The CENTRAL tier needs to see whether a lower tier declares a ``distribution``
+    source, so the read has to happen before it -- but an unreadable home file must
+    still raise at its OWN point in precedence, further down, with its own message.
+    """
+    home_path = _policy_home_path()
+    if not home_path.exists():
+        return None, None, home_path
+    try:
+        return _read_json_file(home_path), None, home_path
+    except Exception as exc:
+        return None, exc, home_path
+
+
+def compose_installed_ceiling(central: GovernanceCeiling) -> GovernanceCeiling:
+    """Re-apply the tier ladder around a freshly fetched *central* document.
+
+    A central refresh replaces exactly one rung of the ladder.  Installing the
+    fetched document by itself would drop every local restriction BELOW it, so a host
+    tightened at boot would find that tightening silently gone at the first
+    successful poll -- a ceiling that loosens itself on a timer.  This routes a
+    refresh through the same :func:`compose_tier_ladder` boot uses, so the two cannot
+    diverge.
+
+    Returns *central* unchanged when no other tier is present.
+    """
+    home_data, home_error, home_path = _read_home_policy()
+    subordinate = _subordinate_ceiling(
+        _process_state.last_bundled,
+        home_data,
+        home_error,
+        home_path,
+        beneath_authority=True,
+    )
+    # Tagged here exactly as boot tags it: ``parse_distributed_policy`` returns an
+    # untiered ceiling, and an untagged authority makes ``compose_tier_ladder``'s
+    # ``ceiling.tier == TIER_CENTRAL`` guard False -- so a host that reached the fleet
+    # document only on a later poll never got the env-tightens-only warning, and its
+    # intersect row read ``""<-env``.
+    if central.tier != TIER_CENTRAL:
+        central = replace(central, tier=TIER_CENTRAL)
+    composed = compose_tier_ladder(central, subordinate)
+    # compose_tier_ladder only returns None when every argument was None, and
+    # ``central`` never is; the fallback keeps the signature honest for mypy.
+    #
+    # Deliberately NOT recorded as ``last_composed`` here: this is a pure fold, and the
+    # caller may go on to REJECT it (``apply_ceiling`` validates the fold before it
+    # installs). Recording a rejected fold would make the next 304 poll compare
+    # against it, read "nothing moved", and skip -- so a tightening that failed
+    # validation once would never install after the operator fixed the document.
+    # ``record_composed_ceiling`` is called by the installer, after ``set_context``
+    # succeeds.
+    return composed if composed is not None else central
+
+
 def load_security_policy(
     *, bundled_loader: Optional[Callable[[], Optional[Mapping[str, object]]]] = None
 ) -> Optional[GovernanceCeiling]:
-    """Load the enterprise security policy, or ``None`` for editable defaults.
+    """Load the enterprise security ceiling, or ``None`` for editable defaults.
 
-    Precedence (first present wins):
+    Precedence, highest first.  The top tier is the AUTHORITY; every tier below it
+    may only **tighten** it:
 
-    1. ``KIROCREW_SECURITY_POLICY`` env path — fleet hot-override, highest.
-    2. ``bundled_loader()`` — the companion-bundled resource, supplied by the
-       caller when the active edition is ``amazon`` (Phase 9 packages it via
-       ``importlib.resources``).  The public core passes ``None`` here.
-    3. ``~/.kiro/crew/security_policy.json`` — standalone operator-authored.
-    4. None → editable secure-defaults (standalone, ungoverned ceiling).
+    1. the **centrally distributed document** — fetched from ``KIROCREW_POLICY_URL``
+       or from the ``distribution.source`` a lower tier declares, served from the
+       last-known-good cache when the endpoint is unreachable.  See
+       :mod:`kiro_crew.platform.policy_distribution`.
+    2. ``KIROCREW_SECURITY_POLICY`` env path — local operator channel.
+    3. ``bundled_loader()`` — the companion-bundled resource, supplied by the
+       caller that knows the active edition.  The public core passes ``None``.
+    4. ``~/.kiro/crew/security_policy.json`` — standalone operator-authored.
+    5. None → editable secure-defaults (standalone, ungoverned ceiling).
 
-    A **present-but-unreadable / invalid** policy at the env or home path raises
-    ``PlatformCompositionError`` (fail-closed to strictest), mirroring
-    ``admission.load_admission_policy`` — a fleet that meant to enforce something
-    must never silently fall open.  The bundled loader is trusted (same author,
-    covered by the admission signature) so its parse errors also raise.
+    **Tiers 2–4 are mutually exclusive** (first present wins among them) and
+    collectively form the *subordinate*; the central tier stacks above them.  The
+    result is ``central ∘ subordinate`` under :func:`_intersect_ceilings`, so a local
+    document can add restrictions but never remove one.
 
-    **Signature verification (``identity.signature``).**  The two FILE tiers (1
-    and 3) carry a detached signature over the canonical document
-    (:func:`policy_signing_payload`), verified against a trust key the
-    *operator-controlled admission policy* holds — never a key the security policy
-    supplies about itself.  The verdict is recorded on
-    ``GovernanceCeiling.signature_state`` and is **advisory by default**: an
-    unsigned or unverifiable policy still loads and still governs, so every
-    existing standalone install and every existing policy file keeps working
-    byte-for-byte unchanged.  Setting ``require_policy_signature`` in the
-    admission policy makes it mandatory, and a failure then raises
-    ``PlatformCompositionError`` (boot aborts) like every other fail-closed check
-    in this module.
+    **Why the env tier sits beneath the central push.**  An env tier that outranks
+    the fleet document is a rollback lever, and a rollback lever makes the enterprise
+    ceiling advisory: any account that can set an environment variable could point it
+    at a permissive file and the fleet's ceiling would never bind.  There is no local
+    rollback lever in this ladder: recovery from a bad central push is by
+    re-publishing a good document at the source, and a local, time-boxed override is
+    tracked as a follow-up issue (see the enterprise governance guide) rather than
+    provided here.
 
-    **All three tiers are verified — none is exempt.**  The plugin-admission
-    manifest signature covers only the manifest fields (name / publisher /
-    version / capabilities — ``admission.PluginManifest.signing_payload``), NOT
-    the bytes of the packaged ``security_policy.json``, so "covered by admission"
-    never actually protected the bundled resource: a tampered bundled policy would
-    have loaded unchecked.  So the bundled tier passes ``signable=True`` like the
-    file tiers.  When ``require_policy_signature`` is OFF (the default, and what
-    the ``amazon`` edition ships) verification is advisory at every tier and an
-    unsigned bundled policy still loads — so existing installs are unchanged; when
-    it is ON, an edition signs its bundled policy like any other governed tier.
-    A **missing** policy does not satisfy the requirement either: with a genuine
-    opt-in and no policy at any tier, boot aborts rather than running ungoverned.
+    A **present-but-unreadable / invalid** policy at the env path, or at the home
+    path when it is the only ceiling, raises ``PlatformCompositionError``
+    (fail-closed to strictest), mirroring ``admission.load_admission_policy`` — a
+    fleet that meant to enforce something must never silently fall open.  Beneath a
+    central document the home file is the one exception: it is skipped with a
+    once-per-process warning and the authority governs unchanged
+    (:func:`_subordinate_ceiling`), because raising there would let whoever owns
+    ``~/.kiro/crew`` refuse boot and freeze every refresh on a fleet host while the
+    ceiling itself is unaffected.
+
+    **Signature verification (``identity.signature``).**  Every tier's document is
+    checked as it is read, so every ``GovernanceCeiling`` carries its own verdict.
+    The verdict is recorded on ``GovernanceCeiling.signature_state`` and is
+    **advisory by default**, so existing installs and policy files keep working
+    unchanged.  ``require_policy_signature`` in the admission policy makes a verified
+    signature mandatory.  Enforcement lives in
+    :func:`assert_policy_signature_satisfied`, which runs once on the FINAL composed
+    ceiling — this function is called more than once per boot with different
+    arguments, so a tier the final ceiling never came from must not be able to abort
+    boot.
     """
-    raw_env = os.environ.get(_POLICY_ENV, "").strip()
-    if raw_env:
-        path = Path(raw_env)
-        try:
-            data = _read_json_file(path)
-        except Exception as exc:  # fail-closed: a fleet pointed here on purpose.
-            raise PlatformCompositionError(
-                f"security policy at {path} (from {_POLICY_ENV}) is unreadable: {exc}"
-            ) from exc
-        state = _verify_policy_signature(data, source=str(path))
-        return parse_policy(data, signature_state=state)
+    # Resolved BEFORE the central tier because the fetch source may be declared by
+    # a lower tier's ``distribution`` block, and the peek follows the same
+    # precedence the tiers themselves do. The bundled resource is resolved even when
+    # the env tier is set: the env tier does not short-circuit the central one, so
+    # its declaration still has to be seen.
+    bundled = bundled_loader() if bundled_loader is not None else None
+    if bundled is not None:
+        # Remembered so a later central refresh can still see this tier; see
+        # ``_TierProcessState.last_bundled``.
+        _process_state.last_bundled = bundled
 
-    if bundled_loader is not None:
-        bundled = bundled_loader()
-        if bundled is not None:
-            # The bundled tier is NOT exempt from a fleet that opted into
-            # require_policy_signature. The plugin-admission manifest signature
-            # covers only name/publisher/version/capabilities
-            # (admission.PluginManifest.signing_payload), NOT the packaged
-            # security_policy.json bytes, so "covered by admission" did not in
-            # fact protect the resource — a tampered bundled policy would have
-            # loaded unchecked. When require is OFF this is advisory exactly like
-            # the file tiers (an unsigned bundled policy still loads), so the
-            # standalone/default and the Amazon edition (which sets no require)
-            # are unaffected; when require is ON the edition must sign its
-            # bundled policy like any other governed tier.
-            state = _verify_policy_signature(bundled, source="companion-bundled resource")
-            return parse_policy(bundled, signature_state=state)
+    home_data, home_error, home_path = _read_home_policy()
+    # Read BEFORE the central tier for the same reason the home tier is: the peek
+    # below has to see this document's ``distribution`` block. Read once and passed
+    # down to ``_subordinate_ceiling`` so the tier and the peek cannot see different
+    # bytes.
+    env_data, env_path = _read_env_policy()
 
-    home_path = _policy_home_path()
-    if home_path.exists():
-        try:
-            data = _read_json_file(home_path)
-        except Exception as exc:
-            raise PlatformCompositionError(
-                f"security policy at {home_path} is unreadable: {exc}"
-            ) from exc
-        state = _verify_policy_signature(data, source=str(home_path))
-        return parse_policy(data, signature_state=state)
-
-    # No policy at env, bundled, OR home tier → ungoverned (editable defaults).
+    # Tier 1 — the centrally distributed ceiling. Returns None when distribution is
+    # not configured, or when it is configured, could not be established, and the
+    # policy chose to degrade; raises under the fail-closed default. Fully inert —
+    # not even an import — when nothing declares a source.
+    # ``_POLICY_DISTRIBUTION_CACHE_ONLY_ENV`` is in this condition because a
+    # cache-only child (an app backend) is given NO source by design — the tier is
+    # what reads the cache the gateway wrote, so gating entry on a source would skip
+    # it and drop that child to a local or absent ceiling: exactly the looser-ceiling
+    # failure cache-only mode exists to prevent.
     #
-    # This function deliberately does NOT refuse boot here, because it cannot tell
-    # whether it is the LAST word on the question. ``load_security_policy()`` is
-    # called more than once per boot with different arguments: the core calls it
-    # with NO bundled_loader first (``bootstrap.build_default_context``) and a
-    # companion edition re-invokes it WITH its loader afterwards. "No policy at any
-    # tier" is therefore only decidable once composition has finished, so the
-    # fail-closed refusal lives in :func:`assert_policy_signature_satisfied`, which
-    # boot calls on the FINAL context alongside the other governance floor gates.
+    # The variable IS user-settable, and the cache directory IS user-writable, so a
+    # local account can set it and plant a document. Two things bound what that buys,
+    # and a reviewer proposing to gate the flag on something else should weigh them:
+    # (1) the planted document is verified exactly as a fetched one is, so under
+    # ``require_policy_signature`` it is refused; (2) it is the same power the account
+    # already has through KIROCREW_POLICY_URL, which every tier honours by design.
+    # Activating cache-only through a parent-authenticated channel rather than the
+    # environment is tracked as a follow-up; it is a new IPC contract, not a change to
+    # this ladder.
+    central: Optional[GovernanceCeiling] = None
+    # The peek follows the SAME order the tiers do, which is why the env document is
+    # in the chain: it is the tier directly beneath central, above bundled and home.
+    # Leaving it out meant an env-declared ``distribution.source`` was silently
+    # ignored and the central tier never loaded from it.
+    declared = _declared_distribution(env_data) or _declared_distribution(bundled)
+    # The home peek is a LOOKUP for a declared source, not a ruling on the home file:
+    # a malformed home ``distribution`` block declares no source, so the peek moves on.
+    # Whether that file is then skipped or fatal is decided once, by
+    # ``_subordinate_ceiling`` -- which re-parses the same document only if the home
+    # tier is the one selected, after the central tier is known and after env and
+    # bundled have had precedence. Ruling here as well would refuse boot on a host
+    # that env or central would have governed with the home file ignored. Moving on
+    # is not silent, though: when env or bundled then governs with no central, this
+    # is the only place the skipped block is ever seen, and a fleet that mistyped
+    # where its ceiling lives must find out from a log line, not from nothing. Same
+    # once-per-process warning as the skip in ``_subordinate_ceiling`` (it latches, so
+    # a home file that is then also skipped there warns once, not twice).
+    if declared is None:
+        try:
+            declared = _declared_distribution(home_data)
+        except PlatformCompositionError as exc:
+            _warn_home_unreadable_beneath_authority_once(home_path, exc)
+    if (
+        declared is not None
+        or os.environ.get(_POLICY_DISTRIBUTION_URL_ENV, "").strip()
+        or os.environ.get(_POLICY_DISTRIBUTION_CACHE_ONLY_ENV, "").strip()
+    ):
+        from kiro_crew.platform.policy_distribution import load_distributed_policy
+
+        distributed = load_distributed_policy(declared)
+        if distributed is not None:
+            central = replace(distributed, tier=TIER_CENTRAL)
+
+    # Tiers 2–4 — the subordinate, first present wins.
+    subordinate = _subordinate_ceiling(
+        bundled,
+        home_data,
+        home_error,
+        home_path,
+        env_data,
+        env_path,
+        beneath_authority=central is not None,
+    )
+
+    composed = compose_tier_ladder(central, subordinate)
+    # Recorded even when None: a host with no policy at any tier has no fold for a
+    # refresh to compare against, and a refresh cannot run there anyway.
+    _process_state.last_composed = composed
+    if composed is None:
+        # No policy at any tier → ungoverned (editable defaults).
+        #
+        # This function deliberately does NOT refuse boot here, because it cannot tell
+        # whether it is the LAST word on the question. ``load_security_policy()`` is
+        # called more than once per boot with different arguments: the core calls it
+        # with NO bundled_loader first (``bootstrap.build_default_context``) and a
+        # companion edition re-invokes it WITH its loader afterwards. "No policy at any
+        # tier" is therefore only decidable once composition has finished, so the
+        # fail-closed refusal lives in :func:`assert_policy_signature_satisfied`, which
+        # boot calls on the FINAL context alongside the other governance floor gates.
+        return None
+    return composed
+
+
+def _declared_distribution(
+    data: Optional[Mapping[str, object]],
+) -> Optional[PolicyDistribution]:
+    """Peek a lower tier's ``distribution`` block, for the central tier's source.
+
+    Returns ``None`` when *data* is absent, or declares no source AND the environment
+    supplies none either — so the central tier stays completely inert, not even imported,
+    on every install that does not use it.
+
+    The environment half of that condition is load-bearing, not defensive. A block with
+    settings and no ``source`` is legitimate when ``KIROCREW_POLICY_URL`` supplies the
+    address: that is the ordinary two-channel split, where whatever provisions the host owns
+    the address while the fleet publishes the cadence, the staleness bound and — the one
+    that bites — ``on_unavailable``. Discarding such a declaration parsed it and then threw
+    it away, so a fleet that had chosen ``degrade`` silently got the ``fail_closed`` default
+    and aborted startup on the first outage. ``resolve_distribution`` overlays the
+    environment onto whatever is returned here, so returning the settings is what lets the
+    two channels combine at all.
+
+    Deliberately does **not** validate the rest of the document.  This is a peek at
+    one key, ahead of the tier that will parse the whole thing: a policy whose
+    OTHER keys are malformed must still fail at its own tier with its own message,
+    not here with a confusing one about distribution.  A malformed ``distribution``
+    block itself does raise, because that block is what this function exists to
+    read and a fleet that mistyped where its ceiling comes from must not silently
+    get no central distribution at all.
+    """
+    if not isinstance(data, Mapping):
+        return None
+    raw = data.get("distribution")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise PlatformCompositionError("security policy 'distribution' must be an object")
+    declared = PolicyDistribution.from_dict(raw)
+    if declared.enabled:
+        return declared
+    # Source-less, so only worth carrying when the environment names the address the
+    # settings are for. ``from_dict`` already refuses a block with settings and no source
+    # from either channel, which is the case that means "the author believed distribution
+    # was on"; anything left here is an empty block, which is inert by any reading.
+    if os.environ.get(_POLICY_DISTRIBUTION_URL_ENV, "").strip():
+        return declared
     return None
 
 
@@ -2150,8 +3736,8 @@ def assert_policy_signature_satisfied(ceiling: Optional[GovernanceCeiling]) -> N
       ceiling whatsoever, the exact failure the flag exists to prevent.
 
     Enforcing here rather than in the loader is what makes tier precedence work.
-    ``load_security_policy`` walks env → companion bundle → operator home and runs
-    more than once per boot with different arguments (the core with no
+    ``load_security_policy`` folds the central document over env → companion bundle →
+    operator home and runs more than once per boot with different arguments (the core with no
     ``bundled_loader``, an edition with one).  A raise inside it fires on whichever
     tier that particular pass happened to reach: the core's loader-less pass falls
     through to an unsigned HOME file and would abort even when the edition's later
@@ -2171,7 +3757,7 @@ def assert_policy_signature_satisfied(ceiling: Optional[GovernanceCeiling]) -> N
         _mark_policy_signature_incident("no-policy:require_policy_signature set")
         raise PlatformCompositionError(
             "require_policy_signature is set in the admission policy but no "
-            "security policy is present at any tier (env, bundled, or home); "
+            "security policy is present at any tier (central, env, bundled, or home); "
             "boot is refused (fail-closed) rather than running ungoverned. "
             "Install a signed security_policy.json, or clear "
             "require_policy_signature to return to advisory verification."
@@ -2279,6 +3865,9 @@ def gate_decision(
     *,
     tool_kind: str = "",
     raw_params: Optional[Mapping[str, object]] = None,
+    diff_path: str = "",
+    mcp_ref: str = "",
+    extra_titles: Tuple[str, ...] = (),
 ) -> Decision:
     """Resolve a PreToolUse gate title against the governance ceiling ∩ profile.
 
@@ -2287,13 +3876,50 @@ def gate_decision(
     event carries them), the real arguments are ALSO classified
     (:func:`classify_tool_args`) so path/host scopes the title cannot carry —
     ``filesystem.write`` (edit path), ``network.egress`` (fetch host) — are
-    enforced at the same gate.  A title/args pair the gate does not govern is
-    permitted here — an ungoverned scope permits.  When BOTH levels are
-    ungoverned the result permits (the standalone default), so a host with no
-    policy + no profile behaves exactly as today.
+    enforced at the same gate.  ``diff_path`` is the path the tool call's diff
+    content block named (``event.diff_path``); for an edit it joins the
+    classified ``filesystem.write`` target set, so a diff-only edit does not
+    reach an ALLOW-mode confinement pathless.  A title/args pair the gate does
+    not govern is permitted here — an ungoverned scope permits.  When BOTH
+    levels are ungoverned the result permits (the standalone default), so a
+    host with no policy + no profile behaves exactly as today.
+
+    ``mcp_ref`` supplies an ALREADY-canonical ``@server`` / ``@server/tool``
+    reference for a caller that holds the server and tool as separate trusted
+    fields; it is checked in the ``mcp`` scope alongside anything the title maps
+    to.  Taking the reference directly is what makes such a call exact: the
+    ``mcp__<server>__<tool>`` title form is read by splitting on the LAST ``__``,
+    so it cannot represent a tool name containing ``__``, and a caller holding
+    the untangled fields must not be made to encode them into a form that loses
+    the distinction.
+
+    ``extra_titles`` carries any further NON-model-authored names the caller holds
+    for the SAME call (the trusted ``_meta.kiro.toolName`` beside a prose display
+    title). They belong in this one call rather than a second one: a separate call
+    re-resolves the active profile, so a hot reload between the two could answer
+    each question from a different snapshot and permit a tool that both complete
+    profiles deny. Empty entries are ignored.
     """
     pairs = list(classify_tool_title(tool_title))
-    pairs.extend(classify_tool_args(tool_kind, raw_params))
+    # Additional NON-model-authored titles the caller holds for the same call --
+    # e.g. the trusted ``_meta.kiro.toolName`` beside an LLM-authored display
+    # title. They are classified here, in ONE decision, rather than asked as
+    # separate calls: each separate call would resolve the active profile again,
+    # so a profile hot-reloaded mid-call could serve a DIFFERENT snapshot to each
+    # question and a tool denied by both complete profiles could be permitted by
+    # every individual lookup. One snapshot, every target, deny if any denies.
+    # Empty entries are skipped: an empty title classifies to the unprefixed
+    # scopes as a real queryable item (``('tools', '')``), not a no-op, so it
+    # could match a rule it has nothing to do with.
+    for extra in extra_titles:
+        if extra:
+            pairs.extend(classify_tool_title(extra))
+    pairs.extend(classify_tool_args(tool_kind, raw_params, diff_path))
+    if mcp_ref:
+        pairs.append(("mcp", mcp_ref))
+    # Order-preserving dedupe -- a caller whose title already equals its trusted
+    # identity must not pay the same resolve twice.
+    pairs = list(dict.fromkeys(pairs))
     if not pairs:
         return Decision(True, "title not name-gate-governed", rule="default")
     # Deny if ANY governed scope the title/args map to denies it (the unprefixed
@@ -2302,7 +3928,10 @@ def gate_decision(
     for scope, item in pairs:
         decision = resolve(ceiling, profile, scope, item)
         if not decision.permitted:
-            return decision
+            # Name the identity that actually denied: with several targets in one
+            # query the caller cannot infer it, and an audit naming the prose
+            # title instead of the trusted tool name is a misleading record.
+            return replace(decision, item=item)
     return Decision(True, "permitted by all mapped scopes", rule="rule2-intersect")
 
 
@@ -2523,7 +4152,9 @@ def may_skip_gate(ref: str, ceiling: Optional[GovernanceCeiling]) -> bool:
         return False
 
 
-def strip_ungoverned_auto_approve(servers: Mapping[str, object]) -> Dict[str, object]:
+def strip_ungoverned_auto_approve(
+    servers: Mapping[str, object], *, audit: bool = True
+) -> Dict[str, object]:
     """Return ``servers`` with a ceiling-governed ``autoApprove`` removed.
 
     ``autoApprove`` is the OTHER route to the exemption ``allowedTools`` grants,
@@ -2555,6 +4186,9 @@ def strip_ungoverned_auto_approve(servers: Mapping[str, object]) -> Dict[str, ob
             continue
         trimmed = dict(spec)
         trimmed.pop("autoApprove", None)
+        if not audit:
+            out[name] = trimmed
+            continue
         logger.info(
             "Dropped autoApprove from MCP server %s: the governance ceiling "
             "constrains it, so its tools go through the approval gate",
@@ -2622,7 +4256,9 @@ def may_skip_gate_now(ref: str) -> bool:
     return True
 
 
-def sanitize_agent_config_governance(config: MutableMapping[str, object]) -> None:
+def sanitize_agent_config_governance(
+    config: MutableMapping[str, object], *, audit: bool = True
+) -> None:
     """In-place: strip ceiling-governed auto-approve grants from a full agent
     config about to be written to ``kirocrew.json``.
 
@@ -2635,6 +4271,10 @@ def sanitize_agent_config_governance(config: MutableMapping[str, object]) -> Non
     through them restored the very bypass the per-ref writers close. Every
     whole-config writer MUST call this immediately before it persists, so no
     future writer can reopen the surface.
+
+    ``audit=False`` is for a pure owner preview: filtering is identical, but
+    no withdrawal log or SEL event is emitted. Publication keeps the default
+    ``audit=True`` and therefore retains its existing audit contract.
 
     Drops non-string and ceiling-governed ``allowedTools`` entries (same rule and
     fail-closed semantics as ``may_skip_gate_now``) and removes ``autoApprove``
@@ -2650,7 +4290,7 @@ def sanitize_agent_config_governance(config: MutableMapping[str, object]) -> Non
                 continue  # non-string junk is not a valid ref — drop silently
             (kept if may_skip_gate_now(ref) else withheld).append(ref)
         config["allowedTools"] = kept
-        if withheld:
+        if withheld and audit:
             # Withholding a grant is a permission DECISION — every other
             # allowedTools writer emits this event, so a silent drop here would
             # be the one withhold path with no audit trail. Best-effort.
@@ -2669,7 +4309,7 @@ def sanitize_agent_config_governance(config: MutableMapping[str, object]) -> Non
                 logger.debug("SEL audit unavailable for config sanitize", exc_info=True)
     servers = config.get("mcpServers")
     if isinstance(servers, dict):
-        config["mcpServers"] = strip_ungoverned_auto_approve(servers)
+        config["mcpServers"] = strip_ungoverned_auto_approve(servers, audit=audit)
 
 
 def resolve_ordinal(
@@ -2752,6 +4392,13 @@ def assert_governance_paths_protected() -> None:
         # Denied-command opt-out ceiling — the agent must not be able to write
         # its own deny opt-out state (would let it disable the deny gate).
         ".kiro/crew/denied_commands.json",
+        # The centrally-distributed ceiling's cache. On this list for the same
+        # reason as the policy itself and then one more: the cached metadata records
+        # the source the copy came from, and the loader trusts that record when
+        # deciding whether the cache is this host's last-known-good. An agent that
+        # could write here would not need to touch ``security_policy.json`` to
+        # replace its own ceiling — it would publish itself one, with provenance.
+        f".kiro/crew/{_POLICY_CACHE_LEAF}",
     )
     sensitive = set(security._SENSITIVE_HOME_DIRS)  # noqa: SLF001 — boot integrity check
     missing = [p for p in required if p not in sensitive]
@@ -2820,6 +4467,13 @@ __all__ = [
     "BootControls",
     "UpdatePins",
     "active_update_pins",
+    "PolicyDistribution",
+    "active_policy_distribution",
+    "UNAVAILABLE_FAIL_CLOSED",
+    "UNAVAILABLE_DEGRADE",
+    "MIN_REFRESH_INTERVAL_SECS",
+    "DEFAULT_FETCH_TIMEOUT_SECS",
+    "MAX_POLICY_BYTES",
     "Profile",
     "Bind",
     "POLICY_VERSION",
@@ -2850,6 +4504,8 @@ __all__ = [
     "parse_policy",
     "parse_profile",
     "load_security_policy",
+    "compose_installed_ceiling",
+    "reset_process_state",
     "resolve",
     "resolve_pinned_commands",
     "resolve_ordinal",

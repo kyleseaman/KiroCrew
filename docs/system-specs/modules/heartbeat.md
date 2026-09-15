@@ -7,7 +7,9 @@ The heartbeat service (`kiro_crew/heartbeat.py`) runs periodic background tasks 
 ## Responsibilities
 
 1. **Task processing** — reads `~/.kiro/crew/workspace/HEARTBEAT.md`, sends non-empty tasks to the agent
-2. **FTS index rebuild** — every 15 ticks (~15 min at default interval)
+2. **FTS index rebuild** — every `_FTS_REBUILD_TICKS` ticks (~15 min at the default interval)
+3. **Daily retention prune** — every `_PRUNE_TICKS` ticks (~24h at the default interval): `prune_history(keep_days=memory.history_max_days)` plus `sel().prune()`. Both run on the maintenance executor, never on the event loop, and a failed SEL prune increments the `kirocrew.sel.prune_failed.count` counter rather than aborting the beat.
+4. **Idle-session consolidation** — `HistoryConsolidator.check_idle_sessions()` on **every** tick, not on a multiple
 
 ## HEARTBEAT.md Format
 
@@ -44,7 +46,7 @@ Progress: 3/5 files processed. HEARTBEAT_KEEP
 - `_should_keep(result)` checks for the sentinel (case-insensitive)
 - `None` return (legacy) treated as complete (removed)
 - Sentinel stripped from display text before posting
-- Deliver tags (`<!-- deliver:channel_id -->`) preserved on retention
+- Deliver tags (`<!-- deliver:slack:<channel_id> -->`) preserved on retention
 
 ## Concurrency
 
@@ -121,6 +123,8 @@ Heartbeat is unattended — there is no human to click an approval button. Tool 
 
 The heartbeat-scoped hooks drop the user's `auto_approve_tools` so the allowlist is the **sole approval authority** — `llm_helpers._resolve_permission` would otherwise consult the hooks BEFORE the `_heartbeat_approval` callback, and a user config like `auto_approve_tools=["*"]` would auto-approve any tool, bypassing `HEARTBEAT_SAFE_TOOLS` entirely. The user's `auto_deny_tools` IS preserved (denies can only narrow what runs in heartbeat, never widen).
 
+A hook `TOOL_AUTO_APPROVE` that DOES fire in `_resolve_permission` (the read-only tier survives the heartbeat scoping; cron and autonudge turns run with the user's full hooks) is honoured for a **shell** command only after the name-grant check confirms each program name still resolves to the program it appears to name; a refusal downgrades to the caller's approver — `_heartbeat_approval` (exact-match allowlist) or the interactive card — never a hard block, audited as `outcome=auto_approve_declined` with `reason=name_grant`. On Windows the check declines every name-based shell grant, so unattended cron/autonudge/heartbeat turns there fall to their approver for shell tools the read-only tier used to auto-approve. The check runs UNCONDITIONALLY; a refusal on a caller with no interactive approver rejects the tool (deny-by-default) rather than falling through to the caller-less auto-approve — an unattended turn is exactly where a shadowed name would otherwise run unwatched.
+
 The allowlist is name-based and exact-match only — no verb / heuristic fallback. Heartbeat polls untrusted external content (CR comments, ticket bodies) where prompt-injection could try to widen approval via a clever read-shaped tool name (`get_all_credentials`, `list_env_secrets`, etc.). Strict enforcement is auditable and cannot be widened that way; this is deny-by-default per the security-controls guideline.
 
 The allowlist is curated for read-only / observation tools — local file reads (`Read`, `Grep`, `Glob`), `WorkspaceSearch`, and side-effect-free KiroCrew-core reads (`learn_list`, `cron_list`, `spawn_list`, `spawn_status`, `artifact_list`, `artifact_get`, `artifact_versions`, `local_knowledge_search`). (The enterprise-internal read APIs — internal code/knowledge search, code-review/ticketing/pipeline/deploy/on-call reads, `recall` — were removed from the public fork's allowlist; an internal companion re-adds them out of band.) Write tools (`send_message`, `file_send`, `cron_add`, `Edit`, `Write`, shell `execute`/`run`) are not in the list and are rejected.
@@ -133,6 +137,8 @@ When a legitimate new read tool needs to run in heartbeat, operators observe SEL
 |----------|-------|----------|
 | `_DEFAULT_INTERVAL` | 60 | `heartbeat.py` |
 | `_FTS_REBUILD_TICKS` | 15 | `heartbeat.py` |
+| `_PRUNE_TICKS` | 1440 | `heartbeat.py` |
+| `_KEEP_SENTINEL` | `HEARTBEAT_KEEP` | `heartbeat.py` |
 | `HEARTBEAT_TASK_TIMEOUT_SECS` | 1800 | `heartbeat.py` |
 | `HEARTBEAT_FILE` | `HEARTBEAT.md` | `heartbeat.py` |
 | `HEARTBEAT_KEY` | `_hb` | `session.py` |
@@ -159,9 +165,28 @@ Tasks can specify a delivery target via HTML comment tags:
 
 | Mode | Syntax | Behavior |
 |------|--------|----------|
-| Slack DM (default) | _(no tag)_ | Posts result to owner's Slack DM |
-| Dashboard slot | `<!-- deliver:prompt:dashboard:<slot> -->` | Injects result into a specific dashboard chat slot (e.g., `chat-0`, `chat-3`) |
-| Channel | `<!-- deliver:<channel_id> -->` | Posts to a specific Slack channel |
+| Default | _(no tag)_ | Routed per `heartbeat.default_deliver`: `slack` (default) = owner's Slack DM + dashboard bell; `dashboard` = new dashboard slot + bell only |
+| Dashboard prompt | `<!-- deliver:prompt:dashboard:<slot> -->` | Injects result as a *user* prompt into a specific dashboard chat slot (e.g., `chat-0`, `chat-3`), triggering an agent turn |
+| Dashboard slot | `<!-- deliver:dashboard:<slot> -->` | Appends result to a specific dashboard chat slot + bell (no agent turn) |
+| Dashboard | `<!-- deliver:dashboard -->` | Appends result to a new dashboard chat slot + bell |
+| Slack DM | `<!-- deliver:slack -->` | Posts result to owner's Slack DM only (no bell) |
+| Channel | `<!-- deliver:slack:<channel_id> -->` | Posts result as a new message in that Slack channel + bell, if the channel is allowed (see below). A report long enough to split posts its first part top-level and threads the rest under it |
+| Thread | `<!-- deliver:slack:<channel_id>:<thread_ts> -->` | Replies in that Slack thread + bell, if the channel is allowed (see below) |
+| Silent | `<!-- deliver:silent -->` | Logs only |
+
+A `slack:` tag with an empty channel id (`<!-- deliver:slack: -->`) falls back to the
+owner's DM: posting to channel `""` would raise inside the swallowed Slack error
+handler and lose the report.
+
+The deliver tag is agent-writable — `config/prompt.md` tells the agent to append
+HEARTBEAT.md entries itself, and HEARTBEAT.md is not a fenced path — so the channel
+id on a `slack:<channel_id>` tag is untrusted input. Both channel forms therefore
+require the id to be a well-formed Slack channel id (`validation.CHANNEL_ID_RE`, so
+a `U…` member id is refused rather than resolved to an IM) AND to be either in
+`slack.tracking_channels` or the owner's own DM channel — the same allowlist
+`api_send_message` states in its 403, because an unattended post reaches a NEW
+audience. A refused target is SEL-logged `heartbeat_channel_deliver` /
+`outcome=denied` and falls back to the owner DM, so the report is never lost.
 
 ### Dashboard Delivery (`prompt:dashboard:<slot>`)
 

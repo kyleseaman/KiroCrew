@@ -96,32 +96,93 @@ const EXTERNALLY_MANAGED_MARKER = "EXTERNALLY-MANAGED";
 const EXTERNALLY_MANAGED_MAX_BYTES = 8192;
 const MANAGED_BY_MAX_CHARS = 128;
 const UPDATE_COMMAND_MAX_CHARS = 512;
+const CHECK_COMMAND_MAX_CHARS = 512;
 
 /**
  * Is this install's update lifecycle owned by an external package manager?
  *
  * Lookup order: the `KIROCREW_EXTERNALLY_MANAGED` env var (a path to a marker
  * file, or any other non-empty value to mark the install managed with no
- * metadata — the test-harness seam, mirroring `KIROCREW_UPDATE_FEED`), then
- * `<resourcesPath>/EXTERNALLY-MANAGED`. I/O-bearing and fully injectable, like
- * resolveLinuxInstall above.
+ * metadata — the test-harness seam, mirroring `KIROCREW_UPDATE_FEED`, and
+ * honored ONLY on an unpackaged build: in a packaged app one env var in the
+ * launch environment would otherwise name the file whose body we execute), then
+ * the BAKED marker `<app code>/EXTERNALLY-MANAGED` (inside app.asar, next to
+ * this file — placed there at build time by `packaging/build-desktop.sh` when
+ * `KIROCREW_MANAGED_INSTALL_MARKER` names one; read on a PACKAGED build only,
+ * since in a dev checkout that directory is writable source), then the LOOSE marker
+ * `<resourcesPath>/EXTERNALLY-MANAGED` a repackager drops beside the app.
+ * I/O-bearing and fully injectable, like resolveLinuxInstall above.
  *
- * The marker body is optional JSON `{managedBy, updateCommand}`: `managedBy`
- * names the owning system for the About panel, `updateCommand` is the command
- * the panel offers to copy. Every degenerate marker — empty, unparsable,
+ * The two on-disk shapes differ in WHO put the file there, which is what its
+ * authority rests on. The loose marker is a post-build affordance for a distro
+ * packager, so it is gated on provenance (below). The baked marker is part of
+ * the application's own code: it ships in the same archive as main.js and this
+ * module, so anyone positioned to rewrite it is already positioned to rewrite
+ * the code that reads it, and no ownership probe can add anything to that. It
+ * is therefore trusted as code is trusted — on every platform, Windows
+ * included — and it outranks a loose marker when both exist, because a
+ * build-time declaration by the edition that produced the binary is a stronger
+ * statement than a file dropped next to it afterwards. On macOS the baked
+ * marker is additionally sealed by codesign for free.
+ *
+ * The marker body is optional JSON `{managedBy, updateCommand, checkCommand}`:
+ * `managedBy` names the owning system for the About panel, `updateCommand` is
+ * the command the panel offers to copy AND (when the managed auto-update path
+ * is active) the command run to apply an update, and `checkCommand` is the
+ * optional command run to discover whether an update is available. Every
+ * degenerate marker — empty, unparsable,
  * over-cap, a directory, a symlink, a dangling symlink — still means MANAGED:
  * an operator who dropped SOMETHING at that name gets the safe behavior
  * (updater off) even when the metadata is wrong, never a silent fallback to
  * self-updating. Entries are `lstat`ed and only regular files are read, so a
  * symlink can never route this startup-path read into a FIFO or device.
  *
+ * INTEGRITY (loose marker only): the metadata is only parsed when neither the
+ * marker nor its directory is OWNED by this euid or writable by group/other (see
+ * canRewriteMarker) — `updateCommand`/`checkCommand` are SHELLED, so a marker
+ * anything running as this user could rewrite is a marker that names arbitrary
+ * code to run. A rewritable marker still means MANAGED, just with no metadata:
+ * the same degenerate shape as an empty body, which leaves the updater off and
+ * nothing to execute. Windows always takes that answer for a loose marker (no
+ * POSIX owner to read); a baked marker is not probed on any platform.
+ *
  * @param {object} [o]
  * @param {object} [o.env=process.env]
  * @param {string} [o.resourcesPath=process.resourcesPath]
- * @returns {{managedBy:string, updateCommand:string}|null} null when not managed
+ * @param {boolean} [o.isPackaged]  packaged app? gates the env-var seam off
+ * @param {(p:string)=>boolean} [o.probeMarkerRewritable=canRewriteMarker]
+ * @param {string} [o.bakedMarkerPath]  where the in-code marker lives; defaults
+ *   to `EXTERNALLY-MANAGED` beside this module (inside app.asar when packaged)
+ * @returns {{managedBy:string, updateCommand:string, checkCommand:string}|null} null when not managed
  */
-function readExternallyManaged({ env = process.env, resourcesPath = process.resourcesPath } = {}) {
+function readExternallyManaged({
+  env = process.env,
+  resourcesPath = process.resourcesPath,
+  // Is this a PACKAGED app? Only the env-var seam consults it, and only to
+  // refuse. Resolved lazily so the module still loads outside Electron: a
+  // runtime with no `electron.app` is by definition not the packaged desktop
+  // app, which is exactly when the harness seam is allowed.
+  isPackaged = (() => {
+    try {
+      const electronApp = require("electron").app;
+      return !!(electronApp && electronApp.isPackaged);
+    } catch {
+      return false;
+    }
+  })(),
+  // Marker-integrity probe, injected for the same reason as the other probes in
+  // this module: assertable without a real read-only install directory.
+  probeMarkerRewritable = canRewriteMarker,
+  // The in-code marker. `__dirname` is inside app.asar in a packaged build
+  // (Electron's fs shim reads through the archive), and the module directory
+  // in a dev checkout, where the file simply does not exist.
+  bakedMarkerPath = require("path").join(__dirname, EXTERNALLY_MANAGED_MARKER),
+} = {}) {
   let raw = null;
+  let markerPath = "";
+  // Which shape was found. Only a LOOSE marker is subject to the provenance
+  // probe below; a baked one is code (see the doc comment).
+  let loose = false;
   try {
     const fs = require("fs");
     const path = require("path");
@@ -141,22 +202,49 @@ function readExternallyManaged({ env = process.env, resourcesPath = process.reso
         return "";
       }
     };
-    const override = (env && env.KIROCREW_EXTERNALLY_MANAGED) || "";
+    // The env seam is a DEV/TEST affordance. In a packaged app the launch
+    // environment (shell profile, launchd plist, .desktop file) is writable by
+    // the user, so honoring it there would let one env var choose the file whose
+    // body this process shells.
+    const override = (!isPackaged && env && env.KIROCREW_EXTERNALLY_MANAGED) || "";
     if (override) {
       // A value that names a marker file reads it; any other non-empty value
       // (including a dangling path) marks the install managed with no metadata.
+      // Treated like a loose marker: the harness is exercising that path.
+      markerPath = override;
+      loose = true;
       raw = readMarkerAt(override);
       if (raw === null) raw = "";
     } else {
-      raw = readMarkerAt(path.join(resourcesPath || "", EXTERNALLY_MANAGED_MARKER));
-      if (raw === null) return null;
+      // Baked first: a build-time declaration outranks a file dropped later.
+      // PACKAGED builds only. The baked path is `__dirname/EXTERNALLY-MANAGED`,
+      // and in a dev checkout `__dirname` is a plain writable source directory,
+      // not an archive: a file there has none of the provenance the trust rests
+      // on, and the managed lane below arms its launch timer before the
+      // dev-disable gate. An unpackaged run reads no baked marker; the env seam
+      // above is the harness's route.
+      markerPath = isPackaged && bakedMarkerPath ? bakedMarkerPath : "";
+      raw = markerPath ? readMarkerAt(markerPath) : null;
+      if (raw === null) {
+        markerPath = path.join(resourcesPath || "", EXTERNALLY_MANAGED_MARKER);
+        loose = true;
+        raw = readMarkerAt(markerPath);
+        if (raw === null) return null;
+      }
     }
   } catch {
     // fs itself unavailable (non-node runtime): nothing to read, not managed.
     return null;
   }
+  // Integrity gate: a LOOSE marker this process could rewrite carries no
+  // authority, so it is read as a bare marker (managed, no metadata).
+  // Deliberately BEFORE the parse, so no attacker-chosen string reaches the
+  // fields at all. A baked marker skips the probe: it is code, and its
+  // provenance is the application's own.
+  if (raw && loose && probeMarkerRewritable(markerPath)) raw = "";
   let managedBy = "";
   let updateCommand = "";
+  let checkCommand = "";
   try {
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === "object") {
@@ -166,11 +254,83 @@ function readExternallyManaged({ env = process.env, resourcesPath = process.reso
       if (typeof parsed.updateCommand === "string") {
         updateCommand = parsed.updateCommand.trim().slice(0, UPDATE_COMMAND_MAX_CHARS);
       }
+      if (typeof parsed.checkCommand === "string") {
+        checkCommand = parsed.checkCommand.trim().slice(0, CHECK_COMMAND_MAX_CHARS);
+      }
     }
   } catch {
     // Presence alone is the signal; a bare marker means managed, no metadata.
   }
-  return { managedBy, updateCommand };
+  return { managedBy, updateCommand, checkCommand };
+}
+
+// Can THIS process rewrite the externally-managed marker?
+//
+// The marker's `updateCommand`/`checkCommand` are handed to a shell, so the
+// marker's integrity is the whole boundary between "the packager that owns this
+// install told us how to update" and "anything that can write one file told us
+// what to run". A marker we can rewrite is one a prompt-injected agent shell
+// running as this user can rewrite, so its metadata is refused.
+//
+// The question is OWNERSHIP, not the current mode bits. `access(W_OK)` answers
+// "can I write this right now", and a POSIX owner can always `chmod +w` back —
+// so on exactly the user-owned installs this exists to defend (Homebrew,
+// `pip --user`, ~/Applications) an attacker would plant the marker, `chmod 0400`
+// it, and be handed the trusted verdict. Provenance is what the metadata's
+// authority rests on, so provenance is what is probed:
+//
+//   - a file or directory OWNED by this euid is rewritable (chmod is ours),
+//   - a group- or world-writable one is rewritable by whoever else holds it, and
+//   - one the KERNEL says we can write is rewritable however that was granted.
+//
+// The third arm is not redundant with the second: POSIX mode bits do not model
+// ACLs, so a root-owned 0755 directory carrying a macOS `chmod +a` (or Linux
+// setfacl) entry for this user is writable while every mode bit reads safe.
+// access(W_OK) is the only check that sees that grant.
+//
+// Both the marker and its directory are checked, because either one controls the
+// content: a writable directory allows replacing the file outright, and a file
+// we own is rewritable even inside a directory we do not.
+//
+// Fail-CLOSED — the OPPOSITE direction to isBundleContainerWritable below. There
+// a probe that cannot run must not disable updates; here a marker whose
+// provenance cannot be established must not be executed. The cost of the safe
+// answer is only "no metadata", which is the historical bare-marker behavior.
+// Windows takes that answer UNCONDITIONALLY and by declaration: it has no POSIX
+// owner to read, and `access(W_OK)` there does not model ACLs, so there is no
+// honest verdict to give. A Windows install therefore never honors a LOOSE
+// marker's commands; a packager that needs them there bakes the marker into the
+// app at build time, where this probe does not apply (see readExternallyManaged
+// and docs/build/desktop-app.md).
+function canRewriteMarker(markerPath) {
+  try {
+    const fs = require("fs");
+    const path = require("path");
+    // No POSIX ownership to read: declared fail-closed (see note above).
+    if (process.platform === "win32" || typeof process.geteuid !== "function") return true;
+    const euid = process.geteuid();
+    // root owns everything and can chmod anything, so nothing is un-rewritable.
+    if (euid === 0) return true;
+    for (const target of [markerPath, path.dirname(markerPath)]) {
+      let st;
+      try {
+        st = fs.lstatSync(target);
+      } catch {
+        return true; // cannot establish provenance
+      }
+      if (st.uid === euid) return true;          // ours: chmod +w is ours too
+      if ((st.mode & 0o022) !== 0) return true;  // group- or world-writable
+      try {
+        fs.accessSync(target, fs.constants.W_OK);
+        return true;                             // ACL-granted write
+      } catch {
+        // Not writable by any grant the kernel knows about.
+      }
+    }
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 // Can the AppImage replace itself, i.e. is the directory HOLDING the image
@@ -337,6 +497,97 @@ function resolveChannel(stamped, preference) {
 }
 
 /**
+ * Is `candidate` a STRICTLY NEWER version than `current`? Returns null when the
+ * comparison cannot be made (either string unparseable, or semver unavailable).
+ *
+ * Uses electron-updater's own bundled `semver` so the ordering matches the
+ * library's, and understands the prerelease stamps this app ships
+ * (`0.3.0-insider.13`, `0.1.2-nightly.<ts>`). `require`d inline — like the
+ * `fs`/`child_process` requires elsewhere in this module — so the pure helper
+ * stays loadable outside an Electron runtime; a stubbed/absent semver yields
+ * null (fail-open) rather than throwing.
+ *
+ * @param {string} candidate
+ * @param {string} current
+ * @returns {boolean|null}
+ */
+function isNewerVersion(candidate, current) {
+  if (!candidate || !current) return null;
+  let semver;
+  try {
+    semver = require("semver");
+  } catch {
+    return null;
+  }
+  const a = semver.valid(candidate) || semver.valid(semver.coerce(candidate));
+  const b = semver.valid(current) || semver.valid(semver.coerce(current));
+  if (!a || !b) return null;
+  try {
+    return semver.gt(a, b);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Should a discovered version drive the AUTOMATIC update path — the background
+ * download and the "update found" nudge?
+ *
+ * - YES for a genuine upgrade (candidate strictly newer than the running build).
+ * - YES for ANY version when the FOLLOWED channel differs from the build's own
+ *   DEFAULT (no-preference) channel: that is a deliberate channel switch — the
+ *   user's stored preference has actively moved this install off the lane it
+ *   would otherwise follow — where landing on an older build of the chosen
+ *   channel is the intended, user-initiated outcome `allowDowngrade=true` exists
+ *   for.
+ * - NO for a same-channel version that is NOT newer than the running build.
+ *   That is a build running AHEAD of what its own channel has published
+ *   (locally-built or prerelease bytes ahead of the feed): from that channel's
+ *   point of view there is nothing to install, so electron-updater's
+ *   difference-based `update-available` (which fires for any version ≠ running,
+ *   because allowDowngrade=true) would otherwise nag a DOWNGRADE. This is the
+ *   bug this guard closes.
+ *
+ * **Why the switch signal is the DEFAULT lane, not the byte stamp.** A promoted
+ * stable release ships the soaked insider candidate's exact bytes, so its
+ * version keeps the insider stamp (`0.3.0-insider.13`) and `channelForVersion`
+ * reports `insider` for a build that is, in fact, a stable install following the
+ * stable feed with no deliberate switch. Keying the exemption on that raw stamp
+ * (`followed=stable !== stamped=insider`) therefore fired for the ENTIRE
+ * promoted-stable population — and for any prerelease-stamped build running ahead
+ * of stable (`0.5.0-insider.20`) — re-opening the exact downgrade nag this guard
+ * removes. So the comparison uses `defaultChannel = resolveChannel(stamped, "")`
+ * (the lane with no preference, which folds promoted-insider bytes to stable),
+ * and the exemption fires only when the FOLLOWED channel differs from THAT — i.e.
+ * an explicit preference actually moved the install to a non-default lane.
+ *
+ * `allowDowngrade` stays true, so a real channel switch and any EXPLICIT user
+ * download still roll the version; only the unsolicited auto-path is suppressed.
+ *
+ * Fail-open: an unrankable comparison (isNewerVersion → null) is treated as
+ * offerable, so a version we cannot compare is never silently hidden.
+ *
+ * TRADE-OFF (deliberate, not accidental): a same-channel version RETRACTION —
+ * the feed intentionally repointed to an older build — also reads as "not
+ * newer, same channel" and is therefore no longer auto-applied. The client
+ * cannot tell a retraction from an ahead-of-feed dev build by version alone, and
+ * silently DOWNGRADING a user on the next restart is the more dangerous default,
+ * so the safe direction is to not auto-act. A deliberate `retracted` feed flag
+ * could re-enable that path explicitly in future.
+ *
+ * @param {{candidate:string, current:string, followedChannel:string, defaultChannel:(string|null)}} o
+ * @returns {boolean}
+ */
+function shouldAutoOffer({ candidate, current, followedChannel, defaultChannel }) {
+  if (followedChannel && defaultChannel && followedChannel !== defaultChannel) {
+    return true;
+  }
+  const newer = isNewerVersion(candidate, current);
+  if (newer === null) return true;
+  return newer;
+}
+
+/**
  * Build the per-channel feed DIRECTORY url for the generic provider. Pure +
  * testable.
  *
@@ -384,10 +635,9 @@ function buildFeedBase({ base, channel, variant = "" }) {
  * over the top is the supported recovery and is non-destructive: user data lives
  * in the KiroCrew home directory, never inside the app bundle.
  *
- * Computed HERE rather than in the renderer because the renderer has no
- * trustworthy platform: getInfo()'s `platform` field is a display string that
- * main.js does not currently supply, so it reports its "darwin-arm64" default on
- * every OS. osPlatform is the real one.
+ * Computed HERE rather than in the renderer because the display-oriented
+ * getInfo().platform value is not the updater's routing authority. osPlatform
+ * and osArch are the native values used to select a published artifact.
  *
  * Paths are the documented mutable "latest" aliases (max-age=300).
  *
@@ -437,9 +687,20 @@ function manualDownloadUrl(channel, osPlatform, osArch = process.arch, linuxForm
  * made deliberately — so they are set in one audited place rather than
  * scattered:
  *
- * - autoDownload=false        consent-first UX: discovery must never download.
- *                             The default (true) would download megabytes on a
- *                             background check with no user action.
+ * - autoDownload=false        electron-updater must never fetch from INSIDE
+ *                             checkForUpdates. This is not the same question as
+ *                             "may an update download without a click": that is
+ *                             a policy read per discovery from
+ *                             getAutoDownloadPreference(), and when it is on the
+ *                             "update-available" handler calls startDownload()
+ *                             itself. Keeping the library flag false is what
+ *                             makes every download — automatic or consented —
+ *                             pass through that one guarded function, so the
+ *                             preference can actually turn it off and the
+ *                             re-entrancy guards apply to both callers.
+ *                             It also keeps discovery cheap on macOS: see the
+ *                             autoInstallOnAppQuit note below for why staging,
+ *                             not fetching, is the dangerous step there.
  * - autoInstallOnAppQuit=false FALSE ON EVERY PLATFORM, for two different
  *                             reasons -- electron-updater gives this one flag
  *                             two unrelated meanings:
@@ -559,11 +820,12 @@ function classifyError(err) {
  * @param {typeof import("electron").Notification} deps.Notification
  * @param {() => string} deps.getFlavor        - returns "beta" | "stable"
  * @param {() => Promise<void>} deps.stopGateway - graceful, awaitable gateway stop
- * @param {string} [deps.platform]             - display arch, e.g. "darwin-arm64"
  * @param {string} [deps.osPlatform]           - process.platform override (tests)
  * @param {string} [deps.osArch]               - process.arch override (tests). Picks the
  *   per-arch Linux AppImage for the manual-reinstall link; darwin ignores it
  *   (the DMG is universal).
+ * @param {string} [deps.platform]             - display platform override (tests);
+ *   defaults to `${osPlatform}-${osArch}`
  * @param {string} [deps.resourcesPath]        - process.resourcesPath override
  *   (tests). Used only to classify where the bundle runs FROM, so a
  *   translocated / read-only-volume install can be refused an update lane.
@@ -588,6 +850,17 @@ function initAutoUpdate(deps) {
     Notification,
     getFlavor,
     getChannelPreference = () => "",
+    // Whether discovery may proceed straight to a download without a click.
+    // Read FRESH per event, like getChannelPreference, so toggling it in
+    // Settings takes effect on the next check with no re-init.
+    //
+    // Defaults to FALSE, and that is deliberate: the module's fallback must be
+    // the consent path, so a host that forgets to wire this loses the
+    // convenience rather than silently downloading behind the user. The PRODUCT
+    // default (on) lives in main.js where the preference store does, and
+    // test/update-ipc-registration.test.js pins that wiring so it cannot
+    // disappear unnoticed.
+    getAutoDownloadPreference = () => false,
     notifyUpdateFound = null,
     stopGateway,
     // Host hook: an install is now in flight, so a gateway that stops answering
@@ -599,9 +872,9 @@ function initAutoUpdate(deps) {
     // without this the user is left in a live app whose dashboard is dead until
     // they relaunch by hand. main.js re-arms recovery and respawns the gateway.
     onInstallFailed = null,
-    platform = "darwin-arm64",
     osPlatform = process.platform,
     osArch = process.arch,
+    platform = `${osPlatform}-${osArch}`,
     resourcesPath = process.resourcesPath,
     probeBundleWritable = isBundleContainerWritable,
     // Linux install shape + its AppImage writability probe, injected for the
@@ -653,6 +926,43 @@ function initAutoUpdate(deps) {
   // back out so the renderer can replay it on mount, which keeps the boot path
   // untouched (the renderer already requests the info payload).
   let lastEmittedState = null;
+  // The version the FOLLOWED channel's feed last reported, and the channel it was
+  // reported FOR. Recorded because promotion never re-stamps: the stable feed's
+  // current release is literally `0.4.1-insider.1`, so `channelForVersion` cannot
+  // tell a promoted-stable install from an insider one, and every surface that
+  // asked the version string "which lane am I on" answered `insider` for the whole
+  // promoted-stable population. The feed's own answer is the only honest input, so
+  // it is kept for the display layer.
+  let laneVersion = null;
+  let laneChannel = null;
+  /**
+   * The lane pair, or UNKNOWN. Reported as unknown unless the recorded version
+   * was read for the channel this install follows RIGHT NOW: a switch makes the
+   * old lane's answer describe a lane nobody is on, and `update:set-channel`
+   * returns `getInfo()` synchronously while its re-check is still in flight, so a
+   * read-time comparison is what closes that window rather than clearing state on
+   * an ordering assumption. Concretely, without it: flip insider -> stable on an
+   * up-to-date insider build while the follow-up check cannot reach the feed
+   * (offline), and a retained `runningAheadOfLane: false` tells the panel these
+   * bytes ARE the stable release — folding the chip to a version that does not
+   * exist and suppressing the prerelease ask, i.e. the very bug this pair exists
+   * to fix. `null` means no usable answer and must never read as "ahead".
+   */
+  function laneSnapshot() {
+    if (!laneVersion || laneChannel !== currentChannel()) {
+      return { laneVersion: "", runningAheadOfLane: null };
+    }
+    return { laneVersion, runningAheadOfLane: isNewerVersion(app.getVersion(), laneVersion) };
+  }
+  /** Record what the lane just answered, attributed to the lane that answered. */
+  function recordLaneVersion(version) {
+    if (!version) return;
+    laneVersion = version;
+    // The channel the FETCH was configured for, not a live read: the preference
+    // can flip while a check is in flight, and attributing that answer to the new
+    // lane is the same mis-pairing `shouldAutoOffer` avoids with `feedChannel`.
+    laneChannel = feedChannel || currentChannel();
+  }
   // Single channel resolver used for the feed AND everything reported to
   // the UI. Read the preference FRESH on every call: configureFeed() runs
   // per check, so a Settings channel switch takes effect on the next check
@@ -663,7 +973,27 @@ function initAutoUpdate(deps) {
   }
   function emit(state, extra = {}) {
     if (!uiDriven) return;
-    const payload = { state, channel: currentChannel(), version: app.getVersion(), ...extra };
+    const payload = {
+      state,
+      channel: currentChannel(),
+      version: app.getVersion(),
+      // The renderer cannot infer the real updater handoff from getInfo().platform:
+      // packaged Linux variants and older bundles make that display field an
+      // unreliable capability signal. Carry the handoff contract with every
+      // lifecycle event so both ready surfaces can set the right expectation.
+      // Externally managed Windows installs run the marker's update command
+      // and relaunch directly; they never hand off to our NSIS installer.
+      installHandoff: osPlatform === "win32" && !managed
+        ? "windows-installer"
+        : "automatic-relaunch",
+      // Display inputs for the version chip and the prerelease note (see
+      // laneSnapshot). Carried on every lifecycle payload as well as getInfo()
+      // so a renderer driven by pushes alone never falls back to the
+      // stamp-based guess this pair replaces -- and so a renderer that mounted
+      // before the latest check does not keep rendering that older answer.
+      ...laneSnapshot(),
+      ...extra,
+    };
     // Remembered even when the push below throws: a renderer that missed the
     // push is exactly the one the getInfo() replay exists to catch up.
     lastEmittedState = payload;
@@ -691,6 +1021,20 @@ function initAutoUpdate(deps) {
       stampedChannel: stamped,
       channelSwitchable: !managed && (stamped === "insider" || stamped === "stable"),
       channelPreference: getChannelPreference() || "",
+      // What the FOLLOWED channel publishes, and whether these bytes are ahead
+      // of it — i.e. that lane never shipped this build, so the install is not
+      // on it. Both come from the feed rather than from `stampedChannel`, which
+      // a promoted stable release makes unusable for the question (its bytes
+      // keep the soaked candidate's insider stamp). "" / null until a check has
+      // completed FOR THE CHANNEL THIS INSTALL FOLLOWS (see laneSnapshot).
+      ...laneSnapshot(),
+      // Current auto-download policy, so About renders the toggle from the
+      // value the updater will actually act on rather than from its own copy
+      // of the store. Read through the same guard as the event path: a
+      // throwing reader reports "off", matching what would happen on discovery.
+      autoDownload: (() => {
+        try { return !!getAutoDownloadPreference(); } catch { return false; }
+      })(),
       // Externally-managed metadata, both empty on a self-updating install.
       managedBy: managed ? managed.managedBy || "" : "",
       updateCommand: managed ? managed.updateCommand || "" : "",
@@ -711,8 +1055,392 @@ function initAutoUpdate(deps) {
   // override, so it wins over every runtime detection below — the updater is
   // never armed and the feed is never contacted.
   if (managed) {
-    log.info(`[update] externally managed${managed.managedBy ? ` by ${managed.managedBy}` : ""} — auto-update disabled`);
-    return { check: () => {}, download: async () => {}, install: async () => {}, getInfo, disabled: "externally-managed" };
+    // A BARE marker (present, but no updateCommand) means "someone else owns
+    // updates and gave us nothing to run": keep the historical no-op behavior.
+    if (!managed.updateCommand) {
+      log.info(`[update] externally managed${managed.managedBy ? ` by ${managed.managedBy}` : ""} — auto-update disabled`);
+      return { check: () => {}, download: async () => {}, install: async () => {}, getInfo, disabled: "externally-managed" };
+    }
+
+    // MANAGED AUTO-UPDATE (marker-driven): the marker carries the very
+    // commands that own this install's lifecycle, so instead of arming
+    // electron-updater or contacting the feed (which would fight the external
+    // manager), we discover and apply updates by SHELLING the marker's own
+    // commands.
+    //
+    // TRUST / HARDENING: reaching here means the marker's metadata already
+    // passed the provenance test in readExternallyManaged — either it is BAKED
+    // into the application's own code (the same archive as this module, so no
+    // write primitive reaches it that does not already reach main.js), or it is
+    // a LOOSE marker that neither this euid owns nor group/other can write, so
+    // it is a genuine packager artifact rather than a file a prompt-injected
+    // agent shell could have planted. That test is
+    // what makes the commands trustworthy at all; the hardening below is about
+    // the ENVIRONMENT they run in, not about the command string (see
+    // runManagedCommand) — a narrowed system-only PATH so a planted shim on the
+    // user's PATH cannot shadow a command, a CONSTRUCTED environment so nothing
+    // the shell reads as code is inherited at all, cwd="/" (never the app or an
+    // inherited dir), a
+    // timeout, and bounded retained output. The
+    // command still runs through a shell, so the writer MUST name absolute
+    // binaries (a bare name will not resolve under the narrowed PATH); we NEVER
+    // interpolate untrusted input. Platform-agnostic: the same path serves
+    // macOS/Windows/Linux.
+    log.info(`[update] externally managed${managed.managedBy ? ` by ${managed.managedBy}` : ""} — managed auto-update (self-contained commands)`);
+
+    let foundVersion = null; // last version discovered by the checkCommand, awaiting apply
+    let managedQuitArmed = false; // is a before-quit auto-apply handler installed?
+    let managedInstalling = false; // an apply is in progress — pause the poll
+
+    // Mirror emitError's renderer contract (emitError itself is defined further
+    // down, after this early return, so it is out of scope here): a failure
+    // WITH ITS PHASE so the card can distinguish check from install failures.
+    const emitManagedError = (phase, err) => {
+      const { code, detail, httpStatus } = classifyError(err);
+      log.error(`[update] managed ${phase} failed (${code})`, err);
+      emit("error", {
+        phase,
+        code,
+        message: detail,
+        ...(httpStatus === undefined ? {} : { httpStatus }),
+      });
+    };
+
+    // Bound retained output so a chatty command cannot exhaust memory (we keep
+    // DRAINING both streams either way), and cap how long an apply / check runs.
+    const MANAGED_OUTPUT_CAP = 64 * 1024;
+    const MANAGED_APPLY_TIMEOUT_MS = 30 * 60 * 1000; // 30 min ceiling for an apply
+    const MANAGED_CHECK_TIMEOUT_MS = 45 * 1000; // a check must not hang the UI
+    const MANAGED_VERSION_CAP = 128; // a version string is short; cap like the sibling
+    // A narrowed, non-user-writable PATH: an agent-writable entry on the user's
+    // own PATH cannot shadow a command. The marker's commands must name ABSOLUTE
+    // binaries (a bare name will not resolve here) — mirrors CommandProvider.
+    const managedPath = () =>
+      process.platform === "win32"
+        ? [
+            `${process.env.SystemRoot || "C:\\Windows"}\\System32`,
+            process.env.SystemRoot || "C:\\Windows",
+          ].join(";")
+        : "/usr/bin:/bin:/usr/sbin:/sbin";
+    // The interpreter the marker command runs under. On Windows `shell: true`
+    // would read `process.env.ComSpec` -- user-level, and therefore settable by
+    // the same agent this whole construction defends against -- so the system
+    // cmd.exe is named by PATH instead, anchored on the SystemRoot that
+    // managedPath() already trusts. On POSIX Node resolves /bin/sh by path, so
+    // `true` is already pinned.
+    const managedShell = () =>
+      process.platform === "win32"
+        ? `${process.env.SystemRoot || "C:\\Windows"}\\System32\\cmd.exe`
+        : true;
+    // The child's environment is CONSTRUCTED, not filtered.
+    //
+    // `shell: true` means a shell interprets the command, and a shell reads its
+    // environment as code: the loader family (LD_*/DYLD_*), the interpreter
+    // family (PYTHON*, NODE_OPTIONS), the startup files (BASH_ENV, ENV), the
+    // tracing pair (SHELLOPTS plus a command-substituting PS4), word splitting
+    // (IFS), and exported shell FUNCTIONS (BASH_FUNC_* — a function shadows a
+    // command name outright, beating managedPath() rather than evading it).
+    // That namespace is open-ended and differs by shell and by version, so no
+    // denylist over it is provably complete; successive review rounds just find
+    // the next name.
+    //
+    // Naming what the child DOES get inverts that: anything absent from this
+    // list is gone by construction, so every present and future injection
+    // variable is already handled and there is no enumeration to keep current.
+    // The list carries what a packager's own updater plausibly needs — locale,
+    // temp dir, proxy — and nothing a shell or an interpreter treats as code. A
+    // packager needing more sets it inside its own command, which is the one
+    // place that requirement is visible to whoever wrote it.
+    //
+    // HOME is deliberately NOT here. It is not shell-interpreted, but it is a
+    // path an interpreter reads code from: Python derives its user-site
+    // directory from HOME, so a planted ~/.local/lib/pythonX/site-packages/
+    // sitecustomize.py executes on every `python` start. Passing HOME would
+    // re-open the startup-injection class for any marker command that happens to
+    // be a Python program, which is the class this whole construction closes.
+    const MANAGED_ENV_PASSTHROUGH = [
+      "USER", "LOGNAME", "TZ", "TMPDIR",
+      "LANG", "LC_ALL", "LC_CTYPE",
+      "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+      "http_proxy", "https_proxy", "no_proxy",
+    ];
+    // cmd.exe cannot start without these, so the win32 lane mirrors
+    // managedPath()'s win32 branch rather than handing it a shell it cannot run.
+    // COMSPEC is deliberately NOT inherited: the shell is pinned by
+    // managedShell(). (cmd.exe sets COMSPEC to its own path once it starts, so
+    // whatever the child sees IS the pinned shell -- what matters is that the
+    // app's inherited value never reaches it.)
+    const MANAGED_ENV_PASSTHROUGH_WIN32 = [
+      "SystemRoot", "SystemDrive", "windir",
+      "PATHEXT", "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+    ];
+    const managedEnv = () => {
+      // PYTHONNOUSERSITE is SET, not merely withheld: HOME is excluded above
+      // because Python derives its user-site directory from it, but on Windows
+      // the same directory derives from APPDATA -- which cmd.exe-era tooling
+      // needs and so IS passed through. Rather than reason per platform about
+      // which variable leads to `site-packages`, tell the interpreter directly
+      // that no user site exists. Harmless to every non-Python command.
+      // KIROCREW_MANAGED_ARGV0 is DERIVED, not inherited: process.execPath is
+      // the running executable's absolute path from the kernel command line,
+      // never read from process.env. It is the one fact a relaunch-verifying
+      // wrapper needs (which binary launched the app it is about to replace)
+      // and the only way to get it, since no app environment variable reaches
+      // the command by design.
+      const e = {
+        PATH: managedPath(),
+        PYTHONNOUSERSITE: "1",
+        KIROCREW_MANAGED_ARGV0: process.execPath,
+      };
+      const keys = process.platform === "win32"
+        ? [...MANAGED_ENV_PASSTHROUGH, ...MANAGED_ENV_PASSTHROUGH_WIN32]
+        : MANAGED_ENV_PASSTHROUGH;
+      for (const k of keys) {
+        if (process.env[k] !== undefined) e[k] = process.env[k];
+      }
+      return e;
+    };
+
+    // Run a marker command through the platform shell, resolving to
+    // {code, out} (combined stdout+stderr, capped). Never rejects: spawn errors
+    // and timeouts resolve with a non-zero code so callers treat them uniformly.
+    // Hardened like the Python CommandProvider: narrowed PATH, cwd="/", a
+    // timeout, and bounded retained output.
+    const runManagedCommand = (command, { timeout } = {}) => new Promise((resolve) => {
+      const cp = require("child_process");
+      let out = "";        // combined stdout+stderr, for logging an apply
+      let outStdout = "";  // stdout ONLY, for deriving the check's version
+      let settled = false;
+      // `failed` marks that the command could not be RUN to completion (spawn
+      // error or timeout kill), as distinct from running and exiting non-zero.
+      // The check path treats these differently: a run that exits non-zero is
+      // "no update", but a command that could not run at all is an error.
+      const done = (code, failed) => {
+        if (!settled) {
+          settled = true;
+          resolve({ code: typeof code === "number" ? code : 1, out, stdout: outStdout, failed: !!failed });
+        }
+      };
+      // Keep consuming BOTH streams (so the pipe never blocks the child) but
+      // stop RETAINING once capped. stdout is captured separately because the
+      // version is derived from stdout ONLY — a warning printed to stderr must
+      // never be mistaken for the version.
+      const capped = (s) => (s.length > MANAGED_OUTPUT_CAP ? s.slice(0, MANAGED_OUTPUT_CAP) : s);
+      const onStdout = (d) => {
+        const s = d.toString();
+        if (out.length < MANAGED_OUTPUT_CAP) out = capped(out + s);
+        if (outStdout.length < MANAGED_OUTPUT_CAP) outStdout = capped(outStdout + s);
+      };
+      const onStderr = (d) => {
+        if (out.length < MANAGED_OUTPUT_CAP) out = capped(out + d.toString());
+      };
+      let child;
+      try {
+        // `command` is NOT user input: it is operator-controlled text from the
+        // EXTERNALLY-MANAGED marker, and execution is hardened (narrowed system
+        // PATH, cwd="/", bounded output, timeout). See the trust note above.
+        //
+        // The SHELL is pinned, not discovered. `shell: true` on Windows resolves
+        // the interpreter from `process.env.ComSpec`, a user-level variable the
+        // same agent that managedEnv() defends against can set -- so the trusted
+        // command would run under an attacker-chosen shell before its first
+        // token was parsed. managedShell() names the system cmd.exe by path
+        // (the same SystemRoot anchor managedPath() already relies on) and the
+        // app's COMSPEC is not inherited -- cmd.exe sets its own to the pinned
+        // path, so nothing the child re-reads names another shell. POSIX keeps
+        // `shell: true`: Node resolves /bin/sh by path there, not from the env.
+        // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process
+        child = cp.spawn(command, { // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process
+          shell: managedShell(),
+          cwd: "/",
+          env: managedEnv(),
+          ...(timeout ? { timeout } : {}),
+        });
+      } catch (err) {
+        log.error("[update] managed command spawn threw", err);
+        return done(1, true);
+      }
+      if (child.stdout) child.stdout.on("data", onStdout);
+      if (child.stderr) child.stderr.on("data", onStderr);
+      child.on("error", (err) => { log.error("[update] managed command error", err); done(1, true); });
+      // A timeout kill closes with a null exit code and a signal; treat that as
+      // "could not run", not as a non-zero exit.
+      child.on("close", (code, signal) => done(code, code === null && signal != null));
+    });
+
+    // The command run to APPLY an update, on quit and on explicit install.
+    // Bounded by a ceiling timeout so a wedged package manager cannot hang quit.
+    const runUpdateCommand = () => runManagedCommand(managed.updateCommand, { timeout: MANAGED_APPLY_TIMEOUT_MS });
+
+    // Fresh-read the auto-download preference; a throwing reader fails toward
+    // NOT auto-installing (same direction as the feed path's deferred handler).
+    const autoDownloadOn = () => {
+      try { return !!getAutoDownloadPreference(); } catch (err) {
+        log.error("[update] getAutoDownloadPreference threw — treating as off", err);
+        return false;
+      }
+    };
+
+    // Auto-on-restart: apply the discovered update on the next natural quit.
+    // Mirrors deferredInstallOnQuit — pref is re-read FRESH at quit time so a
+    // toggle-off between discovery and quit is honored.
+    const managedInstallOnQuit = (event) => {
+      // Nothing pending (a later check cleared it, or it was already applied):
+      // let the quit proceed normally — never relaunch into a withdrawn update.
+      if (!foundVersion) {
+        log.info("[update] managed quit handler fired with no pending update — not applying");
+        return;
+      }
+      let stillOn = false;
+      try { stillOn = !!getAutoDownloadPreference(); } catch (err) {
+        log.error("[update] getAutoDownloadPreference threw on quit — not installing", err);
+      }
+      if (!stillOn) {
+        log.info("[update] managed auto-download off at quit — not applying on quit");
+        return;
+      }
+      event.preventDefault();
+      (async () => {
+        managedInstalling = true;
+        emit("installing", { version: foundVersion });
+        try { if (onInstallDispatched) onInstallDispatched(); } catch { /* advisory */ }
+        try { if (stopGateway) await stopGateway(); } catch (err) {
+          log.error("[update] managed stop on quit errored", err);
+        }
+        log.info("[update] managed deferred install on quit — running update command");
+        const { code } = await runUpdateCommand();
+        if (code === 0) {
+          app.relaunch();
+        } else {
+          // The apply failed; the user asked to quit, so honor that and exit
+          // WITHOUT relaunching into a version that did not install.
+          log.error(`[update] managed deferred install failed (exit ${code}) — quitting without relaunch`);
+          try { if (onInstallFailed) onInstallFailed(); } catch { /* advisory */ }
+        }
+        app.exit(0);
+      })();
+    };
+
+    // Undo a quit-time auto-apply armed by an earlier check and forget the
+    // discovered version. Called when a later check finds nothing pending, so a
+    // normal quit does not relaunch into an update the external manager already
+    // applied or withdrew — the feed path clears its deferred state for the
+    // same reason.
+    const disarmManagedQuit = () => {
+      foundVersion = null;
+      if (managedQuitArmed) {
+        app.removeListener("before-quit", managedInstallOnQuit);
+        managedQuitArmed = false;
+      }
+    };
+
+    async function managedCheck() {
+      emit("checking");
+      if (!managed.checkCommand) {
+        // The marker says how to APPLY an update but gives no way to DISCOVER
+        // one. This is a check error, NOT a green "up to date": a silent
+        // "latest" would hide every future update for this install forever.
+        log.info("[update] managed: no checkCommand — cannot check for updates");
+        emitManagedError("check", new Error("this managed install has no checkCommand"));
+        return;
+      }
+      const { code, stdout, failed } = await runManagedCommand(managed.checkCommand, {
+        timeout: MANAGED_CHECK_TIMEOUT_MS,
+      });
+      if (failed) {
+        // Could not RUN the command (spawn error or timeout) — an error, not
+        // "up to date". Mirrors the sibling CommandProvider, which returns an
+        // error verdict for a check it could not execute.
+        log.error("[update] managed check could not run");
+        emitManagedError("check", new Error("managed check command failed to run"));
+        return;
+      }
+      if (code !== 0) {
+        // Ran and exited non-zero: no update available (sibling contract). Undo
+        // any quit-time auto-apply armed by an earlier check that DID find one,
+        // so a normal quit does not relaunch into a withdrawn/applied update.
+        log.info(`[update] managed check: up to date (code=${code})`);
+        disarmManagedQuit();
+        emit("not-available");
+        return;
+      }
+      // Sibling contract: exit 0 and stdout IS the version (trimmed, capped).
+      // Derived from stdout ONLY so a stderr warning is never read as a version.
+      const version = stdout.trim().slice(0, MANAGED_VERSION_CAP);
+      if (!version) {
+        // Exit 0 that prints NO version is a broken command, not an available
+        // update: treating it as available would relaunch to the SAME version
+        // forever. Fail the check rather than report "latest".
+        log.error("[update] managed check: exit 0 but printed no version");
+        emitManagedError("check", new Error("managed check command produced no version"));
+        return;
+      }
+      foundVersion = version;
+      log.info(`[update] managed check: update available -> ${version}`);
+      emit("found", { version });
+      // Auto-on-restart: if the user allows auto-download, arm a one-shot
+      // before-quit handler that applies on the natural quit.
+      if (autoDownloadOn() && !managedQuitArmed) {
+        managedQuitArmed = true;
+        app.once("before-quit", managedInstallOnQuit);
+      }
+    }
+
+    async function managedDownload() {
+      // Managed download+apply is ONE step (the updateCommand). "download" just
+      // lights the UI Install action; it never applies. Discover first if the
+      // UI raced the check.
+      if (!foundVersion) {
+        await managedCheck();
+      }
+      if (foundVersion) {
+        emit("downloaded", { version: foundVersion });
+      }
+    }
+
+    async function managedInstall() {
+      managedInstalling = true;
+      emit("installing", { version: foundVersion });
+      try { if (onInstallDispatched) onInstallDispatched(); } catch { /* advisory */ }
+      try { if (stopGateway) await stopGateway(); } catch (err) {
+        log.error("[update] managed stop before install errored", err);
+      }
+      const { code } = await runUpdateCommand();
+      if (code === 0) {
+        log.info("[update] managed install succeeded — relaunching");
+        app.relaunch();
+        app.exit(0);
+        return;
+      }
+      log.error(`[update] managed install failed (exit ${code})`);
+      try { if (onInstallFailed) onInstallFailed(); } catch { /* advisory */ }
+      emitManagedError("install", new Error(`managed update command exited ${code}`));
+    }
+
+    // Auto-check on launch and on the same interval as the feed path, so a
+    // managed install DISCOVERS updates without the user clicking Check
+    // (auto-update is on by default). Background checks only discover — an
+    // apply still requires the auto-download preference or an explicit install.
+    // The poll skips windows where an apply is already in flight, and both
+    // timers are unref'd so they never hold the process open (Electron quit,
+    // tests).
+    const managedLaunchTimer = setTimeout(() => {
+      managedCheck().catch((err) => log.error("[update] managed launch check threw", err));
+    }, LAUNCH_CHECK_DELAY_MS);
+    const managedPollTimer = setInterval(() => {
+      if (!managedInstalling) {
+        managedCheck().catch((err) => log.error("[update] managed poll check threw", err));
+      }
+    }, CHECK_INTERVAL_MS);
+    if (typeof managedLaunchTimer.unref === "function") managedLaunchTimer.unref();
+    if (typeof managedPollTimer.unref === "function") managedPollTimer.unref();
+
+    return {
+      check: () => managedCheck(),
+      download: () => managedDownload(),
+      install: () => managedInstall(),
+      getInfo,
+    };
   }
   // Updating requires an installed, signed bundle (macOS code signature
   // validation is mandatory for Squirrel.Mac; Linux AppImage needs the
@@ -802,10 +1530,27 @@ function initAutoUpdate(deps) {
   let downloading = false;
   let stagedVersion = null; // version electron-updater has downloaded + staged
   let stagedNotes = "";
+  // Was the staged build fetched by the auto-download policy rather than asked
+  // for? It decides whether turning the preference OFF also disarms the
+  // install-on-quit: a stage the user never requested must not land on a user
+  // who has just declined auto-updates, while a stage they explicitly
+  // downloaded stays armed because the preference is not what put it there.
+  let stagedWasAutomatic = false;
+  // Set when startDownload() is entered from the discovery handler, and read by
+  // the update-downloaded handler -- the event carries no provenance of its own.
+  let downloadWasAutomatic = false;
   let foundVersion = null; // last version surfaced to the user, awaiting consent
   let installing = false;
   let quitHandled = false;
   let checking = false;
+  // The channel the LAST configureFeed() pointed the updater at. Captured at
+  // check time because the update-available handler's direction gate must
+  // compare the candidate against the channel its FEED was configured for, not
+  // against a live currentChannel() read: the preference can flip mid-flight
+  // (an in-flight stable check, then the user picks insider), and re-reading it
+  // in the handler would treat a stable-feed downgrade as a deliberate insider
+  // switch and stage it. Null until the first configureFeed().
+  let feedChannel = null;
 
   /**
    * Version of the update currently being fetched/held -- NOT the running
@@ -847,6 +1592,10 @@ function initAutoUpdate(deps) {
 
   function configureFeed() {
     const channel = currentChannel();
+    // Record the channel this check's feed is configured for, so the
+    // update-available handler compares the candidate against THIS lane rather
+    // than a currentChannel() that may have changed since (see feedChannel).
+    feedChannel = channel;
     // A package install reads its channel file from a per-format subdirectory,
     // so the two Linux formats never overwrite each other's metadata.
     const url = buildFeedBase({ base: feedBase, channel, variant: linux.format });
@@ -904,10 +1653,21 @@ function initAutoUpdate(deps) {
   }
 
   /**
-   * Explicit user consent: download the version last surfaced by safeCheck.
-   * Never called automatically — this is the whole point of autoDownload=false.
+   * Download the version last surfaced by safeCheck.
+   *
+   * Reached two ways: the user's explicit Download action, and — when
+   * getAutoDownloadPreference() is on — automatically from the
+   * "update-available" handler. Both enter here rather than through
+   * electron-updater's own autoDownload flag, which stays false: routing every
+   * download through one guarded function is what keeps the decision
+   * inspectable, cancellable by preference, and identical on all platforms.
+   *
+   * Every early return below is load-bearing for the automatic caller, which
+   * fires on a 4-hourly timer and can therefore re-enter: an in-flight download
+   * is not restarted, an already-staged version is not re-fetched, and a call
+   * with nothing discovered discovers instead of blind-downloading.
    */
-  async function startDownload() {
+  async function startDownload({ automatic = false } = {}) {
     if (downloading) { emit("downloading", { version: pendingVersion() }); return; }
     if (updateReady && stagedVersion) {
       emit("downloaded", { version: stagedVersion, notes: stagedNotes });
@@ -920,8 +1680,9 @@ function initAutoUpdate(deps) {
       await safeCheck();
       return;
     }
-    log.info(`[update] user consented — downloading ${foundVersion}`);
+    log.info(`[update] downloading ${foundVersion}`);
     downloading = true;
+    downloadWasAutomatic = automatic;
     emit("downloading", { version: pendingVersion() });
     try {
       await autoUpdater.downloadUpdate();
@@ -985,16 +1746,28 @@ function initAutoUpdate(deps) {
 
   // isForceRunAfter=true so the user lands back in the app after the swap.
   //
-  // isSilent is platform-dependent, and on Windows it decides whether this is an
-  // automatic update at all. NsisUpdater passes /S only when isSilent, and the
-  // installer is assisted (nsis.oneClick=false), so isSilent=false shows the
-  // full NSIS wizard: the app would quit and then sit waiting for the user to
-  // click through a setup dialog, which is not the silent swap macOS and Linux
-  // perform. macOS and Linux have no installer UI to suppress, and passing
-  // isSilent there would change which relaunch flag BaseUpdater honours, so the
-  // flag is set only for win32.
+  // Windows deliberately uses isSilent=false. The assisted NSIS installer has
+  // update-only hooks in build/installer.nsh that skip every decision page,
+  // leave the native extraction progress visible, then relaunch and close on
+  // completion. Passing /S hid that only useful feedback for several minutes,
+  // making a healthy update look exactly like a crash. The installer also
+  // converts /S back to this visible update mode for clients released before
+  // this change, so the first upgrade into the fix is covered too.
+  function notifyWindowsInstallHandoff() {
+    if (osPlatform !== "win32") return;
+    try {
+      new Notification({
+        title: "Installing Kiro Crew update",
+        // Timing and automatic relaunch stay on the installer window that they
+        // explain. The toast carries only the unique recovery instruction.
+        body: "If Kiro Crew doesn’t reopen after the installer finishes, open it from the Start menu.",
+      }).show();
+    } catch { /* notifications optional */ }
+  }
+
   function quitAndInstall() {
-    autoUpdater.quitAndInstall(osPlatform === "win32", true);
+    notifyWindowsInstallHandoff();
+    autoUpdater.quitAndInstall(false, true);
   }
 
   async function applyUpdateAndRestart() {
@@ -1061,7 +1834,7 @@ function initAutoUpdate(deps) {
       installing = false;
       try { if (onInstallFailed) onInstallFailed(); } catch { /* advisory */ }
       // Use the install-error renderer contract, NOT a bare found/not-available:
-      // the user just clicked Restart & Update and is watching an install
+      // the user just clicked Install Update & Restart App and is watching an install
       // surface -- a silent state swap reads as an unexplained cancel. The
       // error/install shape has an existing renderer contract (the About
       // card, and the in-place overlay failure state) that says the install
@@ -1088,6 +1861,33 @@ function initAutoUpdate(deps) {
   // preventDefault, stop the gateway, then quitAndInstall.
   function deferredInstallOnQuit(event) {
     if (quitHandled || !updateReady) return;
+    // The opt-out has to govern the update the user opted out BECAUSE OF.
+    // Without this, the nudge says "downloading, will install on your next
+    // quit", the user follows it to the toggle and switches it off, and the
+    // stage lands anyway — the one outcome the toggle promises will not happen.
+    // Only an AUTOMATIC stage is dropped: one the user downloaded on purpose
+    // stays armed, because the preference is not what put it there.
+    //
+    // The bytes are kept either way. This disarms the install, it does not
+    // discard the stage, so an explicit Install still applies it immediately
+    // with nothing to re-download.
+    if (stagedWasAutomatic) {
+      let stillAuto = false;
+      try {
+        stillAuto = !!getAutoDownloadPreference();
+      } catch (err) {
+        // Unreadable preference: treat as opted OUT here. This is the same
+        // fail-toward-consent direction as the discovery path, and on this path
+        // it is the one that cannot surprise anyone -- the app quits as asked
+        // and the stage is still there to install later.
+        log.error("[update] getAutoDownloadPreference threw on quit — not installing", err);
+      }
+      if (!stillAuto) {
+        log.info(`[update] auto-download off — leaving ${stagedVersion} staged instead of `
+          + "installing on quit");
+        return;
+      }
+    }
     quitHandled = true;
     event.preventDefault();
     (async () => {
@@ -1126,16 +1926,19 @@ function initAutoUpdate(deps) {
   }
 
   async function promptInstall(versionName, notes) {
+    const handoffDetail = osPlatform === "win32"
+      ? "Installing can take several minutes. Kiro Crew will close, show Windows installation progress, and reopen automatically."
+      : "Installing can take several minutes. Kiro Crew will close and reopen automatically when the update is complete.";
     const { response } = await dialog.showMessageBox({
       type: "info",
-      buttons: ["Restart & Update", "Later"],
+      buttons: ["Install Update & Restart App", "Later"],
       defaultId: 0,
       cancelId: 1,
       title: "Kiro Crew update ready",
       message: `Kiro Crew ${versionName || ""} is ready to install.`.trim(),
       detail:
         (notes || "").slice(0, 500) +
-        "\n\nKiro Crew will stop the local gateway, install the update, and relaunch.",
+        `\n\n${handoffDetail}`,
     });
     if (response === 0) {
       await applyUpdateAndRestart();
@@ -1191,6 +1994,11 @@ function initAutoUpdate(deps) {
   autoUpdater.on("update-not-available", () => {
     downloading = false;
     foundVersion = null;
+    // The feed's gate is DIFFERENCE-based (allowDowngrade=true), so "not
+    // available" means the followed lane publishes exactly the running version:
+    // record that, which is what makes the lane pair a definite not-ahead
+    // instead of an unknown for the whole up-to-date population.
+    recordLaneVersion(app.getVersion());
     // Clear the STAGED state too, not just the found state. The feed reporting
     // "no update" while something is staged is exactly the retraction path
     // (a feed repointed to the running version) and the channel-switch-back
@@ -1209,10 +2017,64 @@ function initAutoUpdate(deps) {
     log.info("[update] up to date");
     emit("not-available");
   });
-  // CONSENT GATE: with autoDownload=false this fires on DISCOVERY, before any
-  // bytes move. Surface what was found and wait for an explicit download().
+  // DISCOVERY, before any bytes move. electron-updater's autoDownload stays
+  // false so it never fetches inside checkForUpdates; whether a download
+  // follows is OUR decision, made here from the preference, so the automatic
+  // and the consent paths share one guarded entry point (startDownload).
   autoUpdater.on("update-available", (info) => {
     foundVersion = (info && info.version) || null;
+    // What the followed lane publishes, recorded BEFORE the direction gate
+    // below can null `foundVersion` out. The suppressed case is precisely the
+    // one the display layer needs it for: an insider build whose preference was
+    // flipped to stable reaches here with the stable lane's OLDER release, is
+    // (correctly) not auto-offered, and must still be able to say "stable
+    // publishes 0.4.1; you are running bytes it never shipped" instead of
+    // folding its version to a stable release that does not exist.
+    recordLaneVersion(foundVersion);
+    // Direction gate — the fix for the "update to an OLDER version" nag.
+    // electron-updater fires this for ANY feed version that DIFFERS from the
+    // running one, because allowDowngrade=true — so on a build running ahead of
+    // its channel's published latest it reports a DOWNGRADE as available. When
+    // this is a same-channel version that is not newer, suppress the automatic
+    // path entirely: discard any stage armed for it, report up to date, and do
+    // NOT download or nag. A deliberate channel switch (followed !== default
+    // lane) is exempt, and explicit user downloads are unaffected.
+    if (
+      foundVersion &&
+      !shouldAutoOffer({
+        candidate: foundVersion,
+        current: app.getVersion(),
+        // The channel THIS candidate's feed was configured for, captured at
+        // check time (feedChannel), NOT a live currentChannel() read. If the
+        // preference flipped while this check was in flight, a live read would
+        // pair the new channel with the OLD feed's candidate and wrongly treat
+        // a stale-feed downgrade as a deliberate switch. Falls back to a live
+        // read only before the first configureFeed() has run.
+        followedChannel: feedChannel || currentChannel(),
+        // The lane this build follows with NO preference. Folds a promoted
+        // stable build's insider-stamped bytes back to stable, so only an
+        // explicit preference that MOVES the install off its default lane reads
+        // as a deliberate channel switch (see shouldAutoOffer).
+        defaultChannel: resolveChannel(channelForVersion(app.getVersion()), ""),
+      })
+    ) {
+      log.info(
+        `[update] feed offers ${foundVersion} but running ${app.getVersion()} is not older `
+          + "on the same channel — treating as up to date (suppressing downgrade nag)",
+      );
+      if (updateReady || stagedVersion) {
+        // A downgrade staged before this guard existed (or by a race) must not
+        // survive to install on the next quit.
+        updateReady = false;
+        stagedVersion = null;
+        stagedNotes = "";
+        quitHandled = false;
+        app.removeListener("before-quit", deferredInstallOnQuit);
+      }
+      foundVersion = null;
+      emit("not-available");
+      return;
+    }
     // A stage is only useful if it is still the latest thing on the feed.
     // Because the RUNNING version never changes mid-session, the updater
     // reports "available" for the staged version too — so the comparison
@@ -1223,7 +2085,7 @@ function initAutoUpdate(deps) {
         emit("downloaded", { version: stagedVersion, notes: stagedNotes });
         return;
       }
-      // Superseded: drop the stale stage so consent re-downloads the NEWEST
+      // Superseded: drop the stale stage so the next download takes the NEWEST
       // build rather than installing an already-old one.
       log.info(`[update] staged ${stagedVersion} superseded by ${foundVersion} — discarding stage`);
       updateReady = false;
@@ -1231,18 +2093,33 @@ function initAutoUpdate(deps) {
       stagedNotes = "";
       app.removeListener("before-quit", deferredInstallOnQuit);
     }
-    log.info(`[update] found ${foundVersion} (running ${app.getVersion()}) — awaiting user consent`);
-    // Nudge hook: main.js shows a native notification pointing at
-    // Settings > About (deduped there, once per version). Discovery-only —
-    // download/install still require the explicit consent actions.
+    let autoDownload = false;
+    try {
+      autoDownload = !!getAutoDownloadPreference();
+    } catch (err) {
+      // A throwing preference reader must not cost the user the discovery
+      // nudge, and it must not be read as consent either — fall back to the
+      // consent path, which is the safe half.
+      log.error("[update] getAutoDownloadPreference threw — treating as off", err);
+    }
+    log.info(`[update] found ${foundVersion} (running ${app.getVersion()}) — `
+      + (autoDownload ? "auto-downloading" : "awaiting user consent"));
+    // Nudge hook: main.js shows a native notification (deduped there, once per
+    // version). Its copy differs by mode, so pass the mode rather than letting
+    // main.js re-read the preference and risk disagreeing with this decision.
     if (typeof notifyUpdateFound === "function") {
-      try { notifyUpdateFound(foundVersion); } catch (err) { log.error("[update] notifyUpdateFound threw", err); }
+      try { notifyUpdateFound(foundVersion, { autoDownload }); } catch (err) { log.error("[update] notifyUpdateFound threw", err); }
     }
     emit("found", {
       version: foundVersion,
       notes: notesFrom(info),
       pubDate: (info && info.releaseDate) || "",
     });
+    // AFTER the "found" emit: the renderer must see the version it is about to
+    // download, and startDownload() emits "downloading" over the top of it.
+    // Fire-and-forget — startDownload owns its own error reporting, and this
+    // handler is a synchronous event listener that cannot await.
+    if (autoDownload) void startDownload({ automatic: true });
   });
   autoUpdater.on("download-progress", (p) => {
     // New capability vs. the hand-rolled updater: real progress, so the card
@@ -1258,6 +2135,7 @@ function initAutoUpdate(deps) {
     downloading = false;
     stagedVersion = (info && info.version) || null;
     stagedNotes = notesFrom(info);
+    stagedWasAutomatic = downloadWasAutomatic;
     log.info(`[update] downloaded ${stagedVersion} — ${uiDriven ? "notifying UI" : "prompting"}`);
     emit("downloaded", { version: stagedVersion || app.getVersion(), notes: stagedNotes });
     if (uiDriven) {
@@ -1311,12 +2189,15 @@ module.exports = {
   channelForFlavor,
   channelForVersion,
   resolveChannel,
+  isNewerVersion,
+  shouldAutoOffer,
   buildFeedBase,
   configureUpdater,
   classifyError,
   manualDownloadUrl,
   resolveLinuxInstall,
   readExternallyManaged,
+  canRewriteMarker,
   DEFAULT_FEED_BASE,
   DOWNLOAD_BASE,
   SUPPORTED_PLATFORMS,

@@ -44,6 +44,7 @@ import pytest
 
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.cron import CronJob, CronStoreBusy
+from kiro_crew.dashboard import chat_persistence
 from kiro_crew.slack import gateway as gw
 
 # ─── Helpers ─────────────────────────────────────────────────────────────
@@ -184,7 +185,7 @@ async def _cron_cb(
     with ExitStack() as stack:
         for patcher in (
             patch.object(gw.CronService, "create", AsyncMock(side_effect=_create)),
-            # No executor patch: the fire-time gate no longer resolves a pool from
+            # No executor patch: the fire-time gate does not resolve a pool from
             # this module -- it goes through run_in_cron_gate_pool, which owns its
             # own bounded pool. `vet_job_at_fire_time` is still patched below, so the
             # gate submits a trivial callable and returns immediately.
@@ -272,6 +273,20 @@ class TestCronCommandMode:
             assert await cb(job) is None
         # The guard must not consume the marker — the in-flight run owns it.
         assert job.id in orch._running_script_ids
+
+    @pytest.mark.asyncio
+    async def test_closed_gateway_admission_defers_command(self):
+        orch = _make_orchestrator()
+        orch.sessions = SimpleNamespace(admission_closed=True)
+        job = _job(command="echo hi")
+
+        async with _cron_cb(orch, command_result={"status": "ok", "output": "hi"}) as cb:
+            assert await cb(job) is None
+
+        assert job.id not in orch._running_script_ids
+        assert job.last_status == "error"
+        assert job.last_error == "gateway admission is closed"
+        assert job.run_never_started is True
 
     @pytest.mark.asyncio
     async def test_fire_time_denial_keeps_job_and_audits(self):
@@ -366,6 +381,20 @@ class TestCronCommandMode:
 
 class TestCronScriptMode:
     """``_cron_callback``'s ``job.script`` arm and its dispositions."""
+
+    @pytest.mark.asyncio
+    async def test_closed_gateway_admission_defers_script(self):
+        orch = _make_orchestrator()
+        orch.sessions = SimpleNamespace(admission_closed=True)
+        job = _job(script="probes.py:check")
+
+        async with _cron_cb(orch, script_result={"status": "ok"}) as cb:
+            assert await cb(job) is None
+
+        assert job.id not in orch._running_script_ids
+        assert job.last_status == "error"
+        assert job.last_error == "gateway admission is closed"
+        assert job.run_never_started is True
 
     @pytest.mark.asyncio
     async def test_fire_time_denial_keeps_job(self):
@@ -1132,11 +1161,45 @@ class TestDeliverScriptResult:
         orch.dashboard_state = _mock_dashboard_state()
         job = _job(script="probes.py:check", session_key="dashboard:chat-gone")
         result = {"status": "report", "message": "orphaned"}
-        with patch.object(gw, "_rehydrate_slot_from_history", MagicMock(return_value=None)):
+        with patch.object(gw, "rehydrate_slot_from_history_async", AsyncMock(return_value=None)):
             async with _cron_cb(orch, script_result=result) as cb:
                 assert await cb(job) == "orphaned"
         orch.dashboard_state.notify.assert_called_once()
         assert orch.dashboard_state.notify.call_args[0][2] == "orphaned"
+
+    @pytest.mark.asyncio
+    async def test_rehydration_reads_the_transcript_off_the_loop(self):
+        """A slot-miss must not parse the transcript on the event loop.
+
+        The sync ``_rehydrate_slot_from_history`` used here reads and
+        JSON-parsed the whole transcript inline (100-300 ms on a large store),
+        stalling every other session's frames. The async form hoists that read
+        into a worker thread, where ``get_running_loop()`` raises -- which is
+        what this asserts, rather than trusting the call's name.
+        """
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        orch.dashboard_state.conversation_log = MagicMock()
+        threads: list[bool] = []
+
+        def _prefetch(*_a: Any, **_kw: Any) -> tuple[Any, ...]:
+            try:
+                asyncio.get_running_loop()
+                threads.append(True)  # on the loop -- the defect
+            except RuntimeError:
+                threads.append(False)  # in a worker thread -- correct
+            return ({}, True, None, {}, None)
+
+        job = _job(script="probes.py:check", session_key="dashboard:chat-cold")
+        result = {"status": "report", "message": "cold session"}
+        with patch.object(chat_persistence, "_prefetch_rehydrate_inputs", _prefetch):
+            async with _cron_cb(orch, script_result=result) as cb:
+                assert await cb(job) == "cold session"
+        assert threads, (
+            "the off-loop prefetch never ran: either the read is happening inline "
+            "on the loop again (the #7408 defect) or this seam moved"
+        )
+        assert threads == [False], f"transcript read ran on the event loop: {threads}"
 
     @pytest.mark.asyncio
     async def test_report_without_session_key_notifies(self):
@@ -1172,7 +1235,12 @@ class TestDeliverScriptResult:
         result = {"status": "done", "message": "all clear"}
         async with _cron_cb(orch, svc=svc, sel_obj=_blind_sel(), script_result=result) as cb:
             assert await cb(job) == "all clear"
-        svc.remove_job_async.assert_awaited_once_with(job.id)
+        svc.remove_job_async.assert_awaited_once_with(
+            job.id,
+            actor="cron",
+            source="cron",
+            one_shot_path="cron_gateway",
+        )
 
     @pytest.mark.asyncio
     async def test_done_defers_removal_when_store_is_busy(self):
@@ -1432,7 +1500,12 @@ def _message_arm_sessions() -> MagicMock:
 def _channel_transport() -> MagicMock:
     """A MessagingTransport double whose only job is to record outbound sends."""
     transport = MagicMock()
-    transport.capabilities = MagicMock(max_message_chars=4096)
+    # ``max_message_bytes=0`` explicitly: a bare MagicMock attribute is a child
+    # OBJECT, not a number, so ``chunk_for_transport`` cannot compare it and the
+    # send never happens. 0 = not byte-capped, which is the character path these
+    # tests are about (Webex is the byte-capped one). Same reason the fakes in
+    # test_cross_surface_mirror.py and test_chat_runner_coverage.py declare it.
+    transport.capabilities = MagicMock(max_message_chars=4096, max_message_bytes=0)
     transport.send_message = AsyncMock(return_value="m1")
     transport.resolve_configured_target = AsyncMock(return_value=None)
     return transport
@@ -1552,7 +1625,7 @@ class TestCronChannelDelivery:
 
     @pytest.mark.asyncio
     async def test_identical_second_run_is_suppressed_on_the_channel(self):
-        """Regression for the spam this fixes: run two, deliver one.
+        """An identical second run is suppressed: run two, deliver one.
 
         With the anchor left unadvanced on this path, ``last_posted_hash`` stayed
         ``""`` forever and every tick re-posted the same text — while Slack posted

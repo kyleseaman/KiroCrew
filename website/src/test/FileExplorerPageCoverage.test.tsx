@@ -54,9 +54,17 @@ vi.mock('../components/MarkdownRenderer', async () => {
 
 vi.mock('../utils/clipboard', () => ({ copyToClipboard: vi.fn() }))
 
+// FileViewer's overflow gates Open/Reveal on directLocal (the browser is on the
+// gateway machine). Mock it true so the reveal-menu tests can see those items;
+// the remote-hidden case is covered in FilePathMenu.test.tsx.
+vi.mock('../hooks/useBranding', () => ({
+  useBranding: () => ({ botName: 'Kiro Crew', avatar: '/logo.png', directLocal: true }),
+}))
+
 import { fileExplorerApi } from '../apps/file-explorer/api'
 import { api } from '../api/client'
 import { copyToClipboard } from '../utils/clipboard'
+import { i18nT } from '../i18n/t'
 import { STORAGE_KEY } from '../apps/file-explorer/constants'
 import FileExplorerPage from '../apps/file-explorer/FileExplorerPage'
 import type { TreeEntry, FileMeta, GitInfo } from '../apps/file-explorer/types'
@@ -368,29 +376,41 @@ describe('FileExplorerPage reveal', () => {
     await ready()
     await openFromTree('notes.txt')
     await pickFromOverflow('Show in file manager')
-    expect(reveal).toHaveBeenCalledExactlyOnceWith('/home/user/notes.txt')
+    expect(reveal).toHaveBeenCalledExactlyOnceWith('/home/user/notes.txt', 'reveal')
   })
 
-  it('explains the clipboard fallback when the host has no desktop', async () => {
-    // `api.revealPath` has already copied the path by the time it answers with
-    // `copy`; without the notice the click would look like it did nothing.
-    spyReveal({ ok: true, copy: '/home/user/notes.txt' })
+  it('does not alert locally when the mocked backend resolves with a copy fallback', async () => {
+    // The copy-fallback confirmation is centralized in api.revealPath itself
+    // (client.ts), right next to its copyToClipboard call, so this call site
+    // must not also alert — that would double-notify once the real client
+    // resolves.
+    const reveal = spyReveal({ ok: true, copy: '/home/user/notes.txt' })
     const alerted = captureAlert()
     renderPage()
     await ready()
     await openFromTree('notes.txt')
     await pickFromOverflow('Show in file manager')
-    await waitFor(() => expect(alerted).toHaveBeenCalledWith('Path copied to clipboard (no desktop available)'))
+    await waitFor(() => expect(reveal).toHaveBeenCalled())
+    expect(alerted).not.toHaveBeenCalled()
   })
 
-  it("surfaces a refusal with the server's own message", async () => {
+  it('surfaces a refusal with the shared i18n failure message', async () => {
+    // The overflow funnels reveal failures through the shared FilePathMenu path,
+    // which shows a neutral catalog string rather than leaking the raw server
+    // message per surface.
     spyReveal(new Error('access denied'))
     const alerted = captureAlert()
     renderPage()
     await ready()
     await openFromTree('notes.txt')
     await pickFromOverflow('Show in file manager')
-    await waitFor(() => expect(alerted).toHaveBeenCalledWith('access denied'))
+    // In place under the viewer bar through the shared ErrorNotice — no
+    // blocking dialog, and the raw server prose never reaches it.
+    const notice = await screen.findByTestId('file-viewer-reveal-error')
+    expect(notice).toHaveAttribute('role', 'alert')
+    expect(notice).toHaveTextContent(i18nT('components.filePathMenu.reveal_failed'))
+    expect(notice).not.toHaveTextContent('access denied')
+    expect(alerted).not.toHaveBeenCalled()
   })
 
   /** Publish a gateway platform into the cache the prerequisite gate owns. */
@@ -846,5 +866,35 @@ describe('FileExplorerPage backend banner', () => {
     // Cached data keeps the page initialized, so the banner is reachable.
     await waitFor(() => expect(screen.getByText(/Backend not reachable/)).toBeInTheDocument())
     expect(screen.getByText(/connection refused/)).toBeInTheDocument()
+  })
+
+  it('surfaces a folder-open (tree) failure instead of a silent blank pane', async () => {
+    const { qc } = renderPage()
+    await ready()
+    // A refresh of an already-listed folder fails (e.g. it became unreadable).
+    // React Query keeps the last good data, so the tree stays put — but the
+    // banner must appear so the failure is not silent.
+    vi.mocked(fileExplorerApi.tree).mockRejectedValue(new Error('path not allowed'))
+    await act(async () => {
+      await qc.refetchQueries({ queryKey: ['file-explorer', 'tree'] }).catch(() => {})
+    })
+    await waitFor(() => expect(screen.getByText(/Cannot open this folder/)).toBeInTheDocument())
+    expect(screen.getByText(/path not allowed/)).toBeInTheDocument()
+  })
+
+  it('shows an empty state, not a perpetual skeleton, when a folder fails to load with no prior data', async () => {
+    // First load of the folder errors (no cached entries to fall back on): a
+    // symlink resolving outside the allow-list makes /api/tree 403 from the
+    // start. The pane must resolve to an empty state rather than a loading
+    // skeleton that never completes.
+    vi.mocked(fileExplorerApi.tree).mockRejectedValue(new Error('path not allowed'))
+    renderPage()
+    // Not ready() — that waits for .mc-fe-tree, which never appears on a first-
+    // load error. The banner and the empty state are the terminal render.
+    await waitFor(() => expect(screen.getByText(/Cannot open this folder/)).toBeInTheDocument())
+    expect(screen.getByText(/This folder is unavailable/)).toBeInTheDocument()
+    expect(document.querySelector('.mc-fe-tree')).not.toBeInTheDocument()
+    // A recovery action sits beside the empty state so the user is not stuck.
+    expect(screen.getByText(/Go to parent folder/)).toBeInTheDocument()
   })
 })

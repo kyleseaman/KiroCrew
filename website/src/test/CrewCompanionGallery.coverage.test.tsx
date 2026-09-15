@@ -17,7 +17,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup, act, within } from '@testing-library/react'
 
-import type { PackMeta } from '../apps/crew-companion/appearanceTypes'
+import type { PackMeta } from '../lib/appearancePacks/types'
 
 // ── Bridge double ──────────────────────────────────────────────────────────
 
@@ -532,7 +532,7 @@ describe('deleting a pack', () => {
     await openDetail('Boba')
     fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
 
-    expect(confirmSpy).toHaveBeenCalledWith('Delete appearance pack "Boba"? This cannot be undone.')
+    expect(confirmSpy).toHaveBeenCalledWith('Delete appearance pack “Boba”? This cannot be undone.')
     expect(api.galleryDelete).not.toHaveBeenCalled()
     expect(screen.getByRole('dialog')).toBeInTheDocument()
   })

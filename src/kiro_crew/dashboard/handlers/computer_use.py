@@ -581,7 +581,7 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
             error="app tokens may not write the computer-use keystone",
         )
         return web.json_response(
-            {"error": "dashboard user required"},
+            {"error": "dashboard user required", "code": "dashboard_user_required"},
             status=403,
         )
 
@@ -589,10 +589,13 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         _audit(request, operation=OP_CONFIG_SAVE, outcome="denied", resources="invalid_json")
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
         _audit(request, operation=OP_CONFIG_SAVE, outcome="denied", resources="body_not_object")
-        return web.json_response({"error": "request body must be a JSON object"}, status=400)
+        return web.json_response(
+            {"error": "request body must be a JSON object", "code": "body_not_object"},
+            status=400,
+        )
 
     # ── Validate EVERYTHING before writing anything ──
     state_patch: dict[str, Any] = {}
@@ -601,7 +604,10 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
             _audit(
                 request, operation=OP_CONFIG_SAVE, outcome="denied", resources="enabled=bad_type"
             )
-            return web.json_response({"error": "enabled must be a boolean"}, status=400)
+            return web.json_response(
+                {"error": "enabled must be a boolean", "code": "invalid_field_type"},
+                status=400,
+            )
         state_patch[STATE_KEY_ENABLED] = body["enabled"]
     for key in _APP_LIST_KEYS:
         if key not in body:
@@ -614,7 +620,8 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
                     "error": (
                         f"{key} must be a list of at most {MAX_APP_PATTERNS} strings, "
                         f"each at most {MAX_APP_PATTERN_LEN} characters"
-                    )
+                    ),
+                    "code": "invalid_app_patterns",
                 },
                 status=400,
             )
@@ -629,11 +636,18 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
         # explicitly — a JSON ``true`` must not become the integer 1 for a budget.
         if isinstance(value, bool) or not isinstance(value, int):
             _audit(request, operation=OP_CONFIG_SAVE, outcome="denied", resources=f"{key}=bad_type")
-            return web.json_response({"error": f"{key} must be an integer"}, status=400)
+            return web.json_response(
+                {"error": f"{key} must be an integer", "code": "invalid_field_type"},
+                status=400,
+            )
         if value < low or value > high:
             _audit(request, operation=OP_CONFIG_SAVE, outcome="denied", resources=f"{key}={value}")
             return web.json_response(
-                {"error": f"{key} must be between {low} and {high}"}, status=400
+                {
+                    "error": f"{key} must be between {low} and {high}",
+                    "code": "value_out_of_range",
+                },
+                status=400,
             )
         limits_patch[key] = value
     for key in _BOOL_KEYS:
@@ -641,12 +655,18 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
             continue
         if not isinstance(body[key], bool):
             _audit(request, operation=OP_CONFIG_SAVE, outcome="denied", resources=f"{key}=bad_type")
-            return web.json_response({"error": f"{key} must be a boolean"}, status=400)
+            return web.json_response(
+                {"error": f"{key} must be a boolean", "code": "invalid_field_type"},
+                status=400,
+            )
         limits_patch[key] = body[key]
 
     if not state_patch and not limits_patch:
         _audit(request, operation=OP_CONFIG_SAVE, outcome="denied", resources="empty_patch")
-        return web.json_response({"error": "no known computer-use fields in body"}, status=400)
+        return web.json_response(
+            {"error": "no known computer-use fields in body", "code": "no_known_fields"},
+            status=400,
+        )
 
     # No governance step here, deliberately: the computer-use governance model
     # (and the 409 it would have returned) does not exist. The write boundary
@@ -695,7 +715,9 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
                 error=str(exc),
             )
             logger.error("refusing computer-use mutation: %s", exc)
-            return web.json_response({"error": ERR_STATE_CORRUPT}, status=500)
+            return web.json_response(
+                {"error": ERR_STATE_CORRUPT, "code": "config_corrupt"}, status=500
+            )
         except OSError as exc:
             _audit(
                 request,
@@ -705,7 +727,13 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
                 error=str(exc),
             )
             logger.error("computer-use settings write failed: %s", exc)
-            return web.json_response({"error": "failed to write computer-use settings"}, status=500)
+            return web.json_response(
+                {
+                    "error": "failed to write computer-use settings",
+                    "code": "config_write_failed",
+                },
+                status=500,
+            )
 
     # Audit the DECISION, not the payload: the enable is the security-relevant
     # bit, and the app patterns can name applications the operator would rather
@@ -733,10 +761,9 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
         # (``agent._computer_use_spec_gate``): while it is off the server is not in
         # ``mcpServers`` at all, so no backend is spawned. A reset alone would
         # therefore restart every session into the SAME spec that omits the server
-        # — the tools would not appear until the next gateway start, which is a
-        # regression in the one path that has to work. Rebuilding here keeps the
-        # user-visible contract ("enable, sessions restart, tools are there")
-        # exactly as it was.
+        # — the tools would not appear until the next gateway start. Rebuilding
+        # here holds the user-visible contract: enable, sessions restart, tools
+        # are there.
         #
         # UNDER THE CONFIG LOCK, reacquired: the rebuild READS the keystone and
         # WRITES the spec, so leaving it outside would let two overlapping PUTs
@@ -749,8 +776,8 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
         # so this cannot self-deadlock.
         #
         # A rebuild failure must not fail the SAVE: the write already landed and
-        # was audited. The fallback is the pre-existing behaviour — the tool
-        # surface appears on the next gateway start.
+        # was audited. The fallback is the un-rebuilt spec — the tool surface
+        # appears on the next gateway start.
         #
         # The import is function-local and must STAY function-local, which is not
         # a style choice: it makes the name resolve at CALL time, so
@@ -773,8 +800,8 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
             sessions_reset = await _reset_all_sessions(request)
         except Exception:
             # The write already landed and was audited; a restart failure must not
-            # report the SAVE as failed. Worst case is the pre-existing behaviour:
-            # the new tool surface appears on the next cold session.
+            # report the SAVE as failed. Worst case: the new tool surface appears
+            # on the next cold session.
             logger.exception("computer-use enable saved, but session reset failed")
 
     payload = await _full_payload()
@@ -825,11 +852,16 @@ async def api_computer_use_invoke(request: web.Request) -> web.Response:
     shim) still get 4xx.
 
     The identity fields are not an authorization claim this handler trusts: the
-    ``session_key`` is resolved STRICTLY on the shim side (``KIROCREW_SESSION_KEY``,
-    else ``KIROCREW_HOST_PID`` + the HMAC sidecar), which refuses an unresolvable
-    key before it reaches the wire. Passing them in the body is how the gateway
-    learns which surface is calling — it is the AUDIT identity, not a permit; the
-    trust comes from the local-secret handshake plus that strict resolution.
+    ``session_key`` is resolved STRICTLY on the shim side (the gateway-injected
+    caller block, else ``KIROCREW_SESSION_KEY``, else ``KIROCREW_HOST_PID`` + the
+    HMAC sidecar). An unresolvable key is NOT refused there: the shim substitutes
+    its ``unresolved:<pid>[#<nonce>]`` placeholder in the body and sends no
+    ``X-Session-Key`` header at all, so the middleware's kernel peer check has no
+    claim to verify and the call proceeds unnamed (``mcp_computer._declares_identity``).
+    Passing them in the body is how the gateway learns which surface is calling; it
+    is the AUDIT identity and the ``SnapshotIndex`` namespace, not a permit. The
+    trust comes from the local-secret handshake plus the peer check on any key
+    that IS declared.
 
     ``approval_recorded`` is passed as ``False`` and does not change any outcome:
     nothing reads it. It is not minted from the request body, because a body field
@@ -857,21 +889,31 @@ async def api_computer_use_invoke(request: web.Request) -> web.Response:
             resources=request.path,
             error="internal secret required",
         )
-        return web.json_response({"error": "forbidden"}, status=403)
+        return web.json_response(
+            {"error": "forbidden", "code": "internal_secret_required"}, status=403
+        )
 
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
-        return web.json_response({"error": "request body must be a JSON object"}, status=400)
+        return web.json_response(
+            {"error": "request body must be a JSON object", "code": "body_not_object"},
+            status=400,
+        )
 
     tool = body.get("tool")
     if not isinstance(tool, str) or not tool:
-        return web.json_response({"error": "tool must be a non-empty string"}, status=400)
+        return web.json_response(
+            {"error": "tool must be a non-empty string", "code": "tool_required"},
+            status=400,
+        )
     args = body.get("args") or {}
     if not isinstance(args, dict):
-        return web.json_response({"error": "args must be a JSON object"}, status=400)
+        return web.json_response(
+            {"error": "args must be a JSON object", "code": "invalid_args"}, status=400
+        )
     session_key = body.get("session_key")
     agent = body.get("agent")
     app = body.get("app")
@@ -986,7 +1028,7 @@ async def api_computer_use_frame(request: web.Request) -> web.Response:
             resources="non-loopback",
             error="loopback only",
         )
-        return web.json_response({"error": "loopback only"}, status=403)
+        return web.json_response({"error": "loopback only", "code": "loopback_only"}, status=403)
 
     # And the machine grant, for exactly the reason ``api_computer_use_invoke``
     # re-asserts it: being listed in ``_STRICT_INTERNAL_API_PATHS`` does NOT prove
@@ -1005,18 +1047,20 @@ async def api_computer_use_frame(request: web.Request) -> web.Response:
             resources=request.path,
             error="internal secret required",
         )
-        return web.json_response({"error": "forbidden"}, status=403)
+        return web.json_response(
+            {"error": "forbidden", "code": "internal_secret_required"}, status=403
+        )
 
     try:
         body = await request.json()
     except Exception:
         _audit(request, operation=OP_FRAME, outcome="invalid_input", resources="invalid-json")
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
 
     payload = build_frame_payload(body if isinstance(body, dict) else {})
     if payload is None:
         _audit(request, operation=OP_FRAME, outcome="invalid_input", resources="no-frame-data")
-        return web.json_response({"error": "no frame data"}, status=400)
+        return web.json_response({"error": "no frame data", "code": "no_frame_data"}, status=400)
 
     state = request.app["state"]
     delivered = await state.deliver_ws_owners(COMPUTER_USE_FRAME_EVENT, payload)

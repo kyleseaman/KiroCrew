@@ -24,9 +24,9 @@ that marker away, so the runner's check is now structural
 coupling guard below fails if a future reformat re-breaks it.
 
 Both handle sites also pass the session's advertised model ids, so the
-entitlement discriminator added by #1550 (``_model_is_unentitled``) actually
-fires on this path. #1550 wired only the ``AcpClient`` sites, and this handle
-is the path every dashboard chat takes.
+entitlement discriminator (``_model_is_unentitled``) fires on this path — the
+path every dashboard chat takes, not only the ``AcpClient`` sites where the
+discriminator is also wired.
 """
 
 import asyncio
@@ -57,8 +57,8 @@ _PROMPT_BUSY = {
 }
 
 # kiro-cli >= 2.16 rewording of the capacity rejection, which names NO model.
-# The exact frame from a live cron failure (gateway.log 2026-08-12 02:57), with
-# the request id value swapped. Before its own pattern existed this fell
+# A representative capacity-rejection frame, with the request id value
+# swapped. Before its own pattern existed this fell
 # through to the unknown-shape branch and classified TERMINAL, so unattended
 # callers failed fast on a momentary blip instead of retrying.
 _MODEL_TEMP_UNAVAILABLE = {
@@ -69,6 +69,15 @@ _MODEL_TEMP_UNAVAILABLE = {
         "'/model' to select a different model and try again. (request_id: "
         "863ae6fe-de1d-4149-b3ff-6ee02d8d58a2)"
     ),
+}
+
+# A structural "Improperly formed request" rejection. The backend
+# passes this string through verbatim; before FEAT-001 it fell through to the
+# unknown-shape branch (raw passthrough) with an incidental terminal verdict.
+_MALFORMED_REQUEST = {
+    "code": -32603,
+    "message": "Internal error",
+    "data": "Improperly formed request. (request_id: 863ae6fe-de1d-4149-b3ff-6ee02d8d58a2)",
 }
 
 
@@ -141,6 +150,24 @@ class TestNoRawDictInUserFacingError:
         assert "still processing a previous request" in str(exc)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_prompt_busy_guidance_names_no_unknown_command(self, driver):
+        """The busy branch must not name `!restart` either.
+
+        Same defect class as the malformed-request branch, in the same
+        surface-blind formatter: `!restart` is a Slack-only bang alias, it is
+        owner-gated even there, and it restarts the GATEWAY rather than the
+        session -- so on every other surface it is an inert instruction. It was
+        also unnecessary, because the handlers reset and re-queue on
+        AcpPromptBusy on their own. Asserted as an absence, and paired with a
+        positive check that the recovery advice survived.
+        """
+        msg = str(await driver(_PROMPT_BUSY))
+
+        assert "!restart" not in msg
+        assert "clears on its own" in msg
+
+    @pytest.mark.asyncio
     async def test_unknown_shape_still_preserved(self):
         """An unrecognised frame must not be swallowed — the raw shape is kept."""
         msg = str(await _raise_via_wait({"code": -32602, "message": "Invalid params"}))
@@ -150,8 +177,8 @@ class TestNoRawDictInUserFacingError:
 class TestEntitlementReachesTheHandlePath:
     """The shared-runtime path must feed the entitlement discriminator too.
 
-    #1550 added ``_model_is_unentitled`` and wired it into the three
-    ``AcpClient`` raise sites. ``AcpSessionHandle`` is the path every dashboard
+    ``_model_is_unentitled`` is wired into the three ``AcpClient`` raise sites,
+    but ``AcpSessionHandle`` is the path every dashboard
     chat actually takes, so without passing its advertised ids the entitlement
     split stays inert exactly where users hit it: a free-tier rejection would
     still read as a capacity blip and still burn the retry ladder.
@@ -198,7 +225,7 @@ class TestNamelessCapacityWording:
     """kiro-cli >= 2.16's nameless capacity rejection must stay retryable.
 
     The rewording dropped the model name from "The model 'X' is not
-    available", so ``_RE_MODEL_UNAVAILABLE`` no longer matches and the error
+    available", so ``_RE_MODEL_UNAVAILABLE`` does not match and the error
     fell through to the unknown-shape branch: passthrough text (fine) with a
     TERMINAL verdict (not fine). A cron hit exactly this during a backend
     capacity blip — the run before and after both succeeded — and failed
@@ -297,8 +324,8 @@ class TestTransientMarkerCoupling:
     still fall back to substring matching against ``_TRANSIENT_MARKERS``, whose
     entries quote ``_format_acp_error``'s prose verbatim. Rewording a branch
     without updating that tuple makes a retryable failure look terminal — which
-    is exactly what #1550 did when it changed "on Bedrock" to "on the backend"
-    and left the marker behind.
+    is exactly the hazard when a reword changes "on Bedrock" to "on the backend"
+    and leaves the marker behind.
 
     Scope note: this pins the OUTCOME (formatted transients classify), not any
     single marker. The capacity branch is matched twice over — by
@@ -326,7 +353,7 @@ class TestTransientMarkerCoupling:
         """The terminal sibling branch must NOT match a retry marker.
 
         A marker that caught the unentitled text would resurrect the pointless
-        retry loop #1550 removed, via the string-fallback path.
+        retry loop the entitlement split removed, via the string-fallback path.
         """
         from kiro_crew.acp.client import _format_acp_error
         from kiro_crew.llm_helpers import is_transient_backend_error
@@ -334,3 +361,223 @@ class TestTransientMarkerCoupling:
         formatted = _format_acp_error(_MODEL_UNAVAILABLE, ["claude-sonnet-4-5"])
         assert "does not have access" in formatted
         assert not is_transient_backend_error(formatted)
+
+    def test_rejected_auto_sentinel_does_not_recommend_auto(self):
+        """A partition that does not serve ``auto`` must not be told to set it.
+
+        The generic wording ends with "set agent.model to 'auto'"; when the
+        rejected id IS ``auto`` that advice sends the user in a circle. The
+        message has to route them to the picker AND the default-model setting,
+        and must never suggest the value that just failed.
+        """
+        from kiro_crew.acp.client import _format_acp_error
+
+        error = dict(
+            _MODEL_UNAVAILABLE, data=_MODEL_UNAVAILABLE["data"].replace("claude-opus-4.8", "auto")
+        )
+        served = ["gpt-5.6-sol", "deepseek-3.2", "glm-5"]
+        formatted = _format_acp_error(error, served)
+        assert "does not have access to model 'auto'" in formatted
+        # State only what the served list proves: on this account. A regional
+        # partition and a plan/tier exclusion produce identical evidence.
+        assert "not available on your account" in formatted
+        assert "region" not in formatted
+        assert "set agent.model to 'auto'" not in formatted
+        assert "Settings → Chat" in formatted
+        assert "model picker" in formatted
+        for m in served:
+            assert m in formatted
+        assert "Retrying will not help" in formatted
+        # Headless surfaces (CLI, subagents, channels) have no picker or Settings
+        # page: the config.json spelling of the default is named too.
+        assert "agent.model in ~/.kiro/crew/config.json" in formatted
+        # The generic (pinned-model) branch on the SAME auto-less partition must
+        # not recommend 'auto' either -- that would re-open the circle.
+        generic = _format_acp_error(_MODEL_UNAVAILABLE, served)
+        assert "set agent.model to 'auto'" not in generic
+        assert "model picker" in generic
+        assert "Settings → Chat" in generic
+        # Where 'auto' IS served, the generic branch still offers it as the escape.
+        generic_auto = _format_acp_error(_MODEL_UNAVAILABLE, served + ["auto"])
+        assert "set agent.model to 'auto'" in generic_auto
+        # ...but as the same two-step shape the other branches use (the error
+        # card's "both help" line sits under every entitlement row), not as an
+        # either/or that contradicts it.
+        assert "for this session, and change the default model" in generic_auto
+        assert "or set agent.model" not in generic_auto
+
+    def test_invalid_model_id_frame_takes_the_same_entitlement_branch(self):
+        """MPS rejects with ``Invalid model ID: X`` rather than kiro-cli's
+        "The model 'X' is not available". Both must reach the same served-list
+        verdict and the same guidance, or a headless caller on the MPS wording
+        gets the generic fallback with no usable remedy.
+        """
+        from kiro_crew.acp.client import _format_acp_error, _is_transient_raw_error
+
+        served = ["gpt-5.6-sol", "glm-5"]
+        error = {"code": -32603, "message": "Internal error", "data": "ValidationException: Invalid model ID: auto"}
+        formatted = _format_acp_error(error, served)
+        assert "does not have access to model 'auto'" in formatted
+        assert "not available on your account" in formatted
+        assert "set agent.model to 'auto'" not in formatted
+        assert _is_transient_raw_error(error, served) is False
+        # An advertised id under the same wording stays a non-entitlement case.
+        ok = dict(error, data="ValidationException: Invalid model ID: glm-5")
+        assert "does not have access" not in _format_acp_error(ok, served)
+
+    def test_capacity_blip_drops_the_auto_step_where_auto_is_not_served(self):
+        """The two capacity-blip messages share the "(2) set agent.model to
+        'auto'" remedy. On a partition whose served list lacks ``auto`` that
+        advice re-opens the circle the unentitled branch closes, so it is
+        emitted only when ``auto`` is served or the list is unknown.
+        """
+        from kiro_crew.acp.client import _format_acp_error
+
+        # Advertised model rejected = capacity blip, not entitlement.
+        no_auto = ["claude-opus-4.8", "glm-5"]
+        with_auto = ["claude-opus-4.8", "auto"]
+        named = _format_acp_error(_MODEL_UNAVAILABLE, no_auto)
+        assert "does not have access" not in named
+        assert "set agent.model to 'auto'" not in named
+        assert "(1) pick a different model in the model picker, or (2) wait" in named
+        assert "set agent.model to 'auto'" in _format_acp_error(_MODEL_UNAVAILABLE, with_auto)
+        # Unknown served list keeps the historical three-step advice.
+        assert "set agent.model to 'auto'" in _format_acp_error(_MODEL_UNAVAILABLE, None)
+
+        unnamed = dict(_MODEL_UNAVAILABLE, data="The model you've selected is temporarily unavailable.")
+        assert "set agent.model to 'auto'" not in _format_acp_error(unnamed, no_auto)
+        assert "set agent.model to 'auto'" in _format_acp_error(unnamed, with_auto)
+
+    def test_auto_served_checks_agree_with_model_is_unusable(self):
+        """Both 'is ``auto`` served?' call sites route through the canonical
+        helper: feed mixed-case, whitespace-padded advertised lists and assert
+        each site's verdict is exactly the helper's, so a change to
+        advertised-list semantics lands once.
+        """
+        from kiro_crew.acp.client import (
+            DEFAULT_MODEL,
+            _auto_remedy,
+            _format_acp_error,
+            model_is_unusable,
+        )
+
+        for advertised in ([" Auto ", "claude-x"], ["CLAUDE-X"]):
+            served = not model_is_unusable(DEFAULT_MODEL, advertised)
+            # (a) _auto_remedy emits the "(2) set agent.model" step iff served.
+            remedy = _auto_remedy(advertised)
+            assert ("(2) set agent.model" in remedy) is served
+            # (b) an unentitled non-auto id picks the "set it to 'auto'"
+            # wording iff served ('claude-opus-4.8' is absent from both lists).
+            formatted = _format_acp_error(_MODEL_UNAVAILABLE, advertised)
+            assert "does not have access to model 'claude-opus-4.8'" in formatted
+            assert ("agent.model to 'auto' in ~/.kiro/crew/config.json to let" in formatted) is served
+
+
+class TestConnectionErrorClassification:
+    """Connection failures are transient, while credential failures win precedence."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "fetch failed",
+            "connect ECONNREFUSED 127.0.0.1:8484",
+            "Connection error.",
+            "socket hang up",
+            "read ECONNRESET",
+            "connect ETIMEDOUT 127.0.0.1:8484",
+            "getaddrinfo EAI_AGAIN fleet-router",
+            "write EPIPE",
+        ],
+    )
+    def test_connection_failures_are_transient(self, text):
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        assert _is_transient_raw_error({"code": -32603, "message": text, "data": ""})
+
+    def test_dns_resolution_failure_stays_terminal(self):
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        assert not _is_transient_raw_error(
+            {"code": -32603, "message": "getaddrinfo ENOTFOUND fleet-router", "data": ""}
+        )
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            "Monthly usage limit has been reached. connect ECONNREFUSED 127.0.0.1:8484",
+            "AccessDeniedException after connect ETIMEDOUT 127.0.0.1:8484",
+        ],
+    )
+    def test_terminal_branches_keep_precedence_over_connection(self, data):
+        from kiro_crew.acp.client import _is_transient_raw_error
+
+        assert not _is_transient_raw_error({"code": -32603, "message": "", "data": data})
+
+    def test_formatted_connection_wording_classifies_via_fallback(self):
+        from kiro_crew.acp.client import _format_acp_error
+        from kiro_crew.llm_helpers import is_transient_backend_error
+
+        formatted = _format_acp_error(
+            {"code": -32603, "message": "connect ECONNREFUSED 127.0.0.1:8484", "data": ""}
+        )
+
+        assert "Could not reach the model backend" in formatted
+        assert is_transient_backend_error(formatted)
+
+
+class TestMalformedRequestReachesTheHandlePath:
+    """The shared-runtime path must surface the structural-rejection guidance
+    and carry a terminal verdict, mirroring TestNoRawDictInUserFacingError.
+
+    "Improperly formed request" is a DETERMINISTIC structural rejection: the
+    identical payload cannot succeed on retry, so both handle raise sites must
+    format it into repair guidance (never the raw dict) and mark it
+    non-retryable so it is not re-sent in a loop.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_malformed_request_is_actionable(self, driver):
+        msg = str(await driver(_MALFORMED_REQUEST))
+
+        # The dict repr and the JSON-RPC boilerplate are gone.
+        assert "'code': -32603" not in msg
+        assert "ACP error: {" not in msg
+        assert "Internal error" not in msg
+        # It names the failure class and offers a repair affordance.
+        assert "malformed" in msg.lower()
+        assert "/compact" in msg
+        # request_id survives for support correlation.
+        assert "863ae6fe-de1d-4149-b3ff-6ee02d8d58a2" in msg
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_malformed_request_guidance_names_no_unknown_command(self, driver):
+        """Every command the guidance names must exist on the reader's surface.
+
+        This error is TERMINAL, so a channel dispatcher hands the formatted
+        string straight to the user (telegram's ``_user_safe_failure_reason``
+        only surfaces ``transient is False``). The formatter does not know which
+        surface will render it, so it may name only commands spelled the same
+        everywhere. ``/chat new`` was not one: it exists nowhere in the product
+        (``/new`` on Telegram and Discord, a new tab on the dashboard), so the
+        one actionable instruction a stuck user received was inert -- and on a
+        session this broken the non-command is forwarded as a prompt and
+        re-fails with this same error.
+
+        Asserted as an absence rather than by re-stating the sentence, so the
+        test constrains the CLASS of mistake (a fabricated command) instead of
+        pinning wording a later copy edit is entitled to change.
+        """
+        msg = str(await driver(_MALFORMED_REQUEST))
+
+        assert "/chat new" not in msg
+        # The reset affordance survives as prose, so the guidance still tells the
+        # user what to do -- deleting the wrong command must not delete the advice.
+        assert "new conversation" in msg.lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_malformed_request_verdict_is_terminal(self, driver):
+        """A structurally-rejected payload must not be re-sent by the ladder."""
+        assert (await driver(_MALFORMED_REQUEST)).transient is False

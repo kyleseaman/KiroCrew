@@ -8,18 +8,28 @@ fallback), and one genuine end-to-end run marked macOS-only.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import os
 import platform
+import stat
 import sys
+import threading
 from contextlib import ExitStack
-from unittest.mock import AsyncMock, patch
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from kiro_crew import apple_speech, platform_compat
-from kiro_crew.config.loader import SttConfig, _validated_stt_provider
+from kiro_crew import transcribe as _tr_mod
+from kiro_crew.config.loader import (
+    _VALID_STT_PROVIDERS,
+    STT_PROVIDER_LOCAL,
+    SttConfig,
+    _validated_stt_provider,
+)
 
 _IS_MACOS = platform.system() == "Darwin"
 
@@ -28,13 +38,16 @@ class TestProviderRegistration:
     def test_apple_is_a_valid_provider(self):
         assert _validated_stt_provider("apple") == "apple"
 
-    def test_unknown_provider_still_falls_back(self):
-        assert _validated_stt_provider("nope") == "whisper"
+    def test_unknown_provider_falls_back_to_local(self):
+        """An unusable stored provider degrades to the one with no precondition, so
+        voice input keeps working instead of the load failing on it."""
+        assert _validated_stt_provider("nope") == STT_PROVIDER_LOCAL
 
-    def test_default_provider_unchanged(self):
-        """Adding a provider must not move the default off whisper — `apple` is
-        macOS-only, and the default has to work on all three platforms."""
-        assert SttConfig().provider == "whisper"
+    def test_default_provider_is_local(self):
+        """Adding a provider must not move the default off the one that needs
+        nothing: `apple` is macOS-only and needs a Swift toolchain, and the default
+        has to work on all three platforms."""
+        assert SttConfig().provider == STT_PROVIDER_LOCAL
 
 
 class TestAvailability:
@@ -85,6 +98,20 @@ def _fake_native_audio(path):
     return _inner
 
 
+def _stub_probe_under_cap(monkeypatch):
+    """Answer the r26/r27 pre-remux duration gate with 'under the cap'.
+
+    Remux-driving tests fake the FFmpeg spawn, which would otherwise make the
+    probe unanswerable and trip the None-refuses gate before the code under
+    test runs.
+    """
+
+    async def _under_cap(path, max_secs, **kw):
+        return False
+
+    monkeypatch.setattr(_tr_mod, "audio_exceeds_secs", _under_cap)
+
+
 class TestHelperBuild:
     @pytest.mark.asyncio
     async def test_no_sandbox_backend_fails_with_a_remedy_not_an_exception(self, monkeypatch):
@@ -129,10 +156,17 @@ class TestHelperBuild:
 
         The backend probe runs `sandbox-exec` on macOS (measured 17.7ms cold, 0.3ms
         cached) and all three call sites are `async`. Keeping the probe out of
-        `availability()` was necessary but NOT sufficient. Pinned at the source level
-        so a new async call site that forgets `asyncio.to_thread` fails here instead
-        of stalling the gateway's loop in production.
+        `availability()` was necessary but NOT sufficient. Every async caller must
+        route through `_sandboxed_off_loop`, which owns both halves of the
+        invariant: the worker-thread hop (loop safety) and the shield around it
+        (a cancelled awaiter can still recover and drop the launcher the thread
+        made). Pinned at the source level so a new async call site that reaches
+        `_sandboxed` any other way fails here instead of stalling the gateway's
+        loop — or leaking one launcher per cancelled call — in production.
         """
+        hop = inspect.getsource(apple_speech._sandboxed_off_loop)
+        assert "to_thread" in hop, "the hop must stay off the event loop"
+        assert "shield" in hop, "the hop must stay recoverable under cancellation"
         for fn in (
             apple_speech.transcribe,
             apple_speech.inventory,
@@ -141,10 +175,10 @@ class TestHelperBuild:
             body = inspect.getsource(fn)
             if "_sandboxed" not in body:
                 continue
-            assert "to_thread" in body, fn.__name__
+            assert "_sandboxed_off_loop(" in body, fn.__name__
             for line in body.splitlines():
                 stripped = line.strip()
-                if "_sandboxed(" in stripped and "to_thread" not in stripped:
+                if "_sandboxed(" in stripped:
                     raise AssertionError(f"{fn.__name__} calls _sandboxed inline: {stripped}")
 
     def test_every_helper_execution_is_sandboxed(self):
@@ -184,8 +218,8 @@ class TestHelperBuild:
         `_build_helper` compiles with whatever the resolver returns and the gateway
         executes the product, so an agent-writable `swiftc` is the same escalation
         as an agent-writable output directory. `~/.local/bin` is on PATH for a
-        shell-launched gateway (mlx-whisper already installs there), which is what
-        makes this reachable rather than theoretical.
+        shell-launched gateway (it is where `pip install --user` and pipx put
+        executables), which is what makes this reachable rather than theoretical.
         """
         untrusted = [
             os.path.expanduser("~/.local/bin/swiftc"),
@@ -212,14 +246,121 @@ class TestHelperBuild:
         resolved = apple_speech._swiftc_fast()
         assert resolved is None or resolved in apple_speech._SWIFTC_FIXED_PATHS
 
+    def test_a_versioned_xcode_bundle_is_a_trusted_prefix(self):
+        """`Xcode.app` is a SYMLINK to the versioned bundle on a real install.
+
+        Every GitHub macOS runner, and any machine holding more than one Xcode,
+        spells the bundle `Xcode_<version>.app`, so `realpath` of a genuine
+        toolchain never starts with `/Applications/Xcode.app/`. This is a pure
+        string rule and grants nothing on its own -- the ownership walk still has
+        to reach root at every level up to the bundle root.
+        """
+        assert (
+            apple_speech._xcode_bundle_prefix(
+                "/Applications/Xcode_16.4.app/Contents/Developer/Toolchains/"
+                "XcodeDefault.xctoolchain/usr/bin/swiftc"
+            )
+            == "/Applications/Xcode_16.4.app/"
+        )
+        assert (
+            apple_speech._xcode_bundle_prefix("/Applications/Xcode-beta.app/Contents/x")
+            == "/Applications/Xcode-beta.app/"
+        )
+        assert (
+            apple_speech._xcode_bundle_prefix("/Applications/Xcode.app/Contents/x")
+            == "/Applications/Xcode.app/"
+        )
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            # Not under /Applications at all.
+            "/opt/planted/Xcode.app/Contents/x",
+            # Not an app bundle, so not one path component.
+            "/Applications/Xcodex/Contents/x",
+            # A DEEPER component named like a bundle cannot widen the rule.
+            "/Applications/Other.app/Xcode_1.app/Contents/x",
+            # The bundle root itself, with nothing under it, is not a toolchain path.
+            "/Applications/Xcode_16.4.app",
+            # A different vendor's app.
+            "/Applications/Safari.app/Contents/x",
+        ],
+    )
+    def test_the_xcode_bundle_rule_stays_one_component_under_applications(self, path):
+        assert apple_speech._xcode_bundle_prefix(path) is None
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="the bundle rule is a POSIX path prefix and the refusal is a POSIX "
+        "ownership walk (st_uid, mode bits); apple_speech never runs on Windows",
+    )
+    def test_a_planted_bundle_is_still_refused_by_ownership(self, tmp_path, monkeypatch):
+        """The bundle-name rule is a prefix, not a grant.
+
+        `/Applications` is `775 root:admin`, so an admin-group user can create a
+        bundle beside a real Xcode. It is owned by that user, and the walk from the
+        compiler up to the bundle root is what refuses it -- so widening the NAME
+        cannot widen the trust.
+        """
+        planted = tmp_path / "Applications" / "Xcode_99.app" / "usr" / "bin"
+        planted.mkdir(parents=True)
+        swiftc = planted / "swiftc"
+        swiftc.write_text("#!/bin/sh\n")
+        monkeypatch.setattr(apple_speech, "_APPLICATIONS_DIR", f"{tmp_path}/Applications/")
+        monkeypatch.setattr(apple_speech, "_TRUSTED_TOOLCHAIN_PREFIXES", ())
+
+        # The name matches, so the prefix resolves...
+        assert apple_speech._xcode_bundle_prefix(str(swiftc)) is not None
+        # ...and the ownership walk still refuses it, because this tree is ours.
+        assert not apple_speech._is_trusted_toolchain(str(swiftc))
+
     def test_trusted_toolchain_accepts_a_real_install(self):
-        """The tightened check must not refuse a genuine toolchain."""
+        """Ownership decides, in BOTH directions, on whatever toolchain the host has.
+
+        A genuine root-owned install (Command Line Tools, a root-owned Xcode) must
+        be accepted. A toolchain the invoking user can write must be refused even
+        when it is a complete, working Xcode: a hosted CI runner's Xcode is
+        installed by the runner account, so it is exactly the agent-writable
+        compiler the check exists to refuse, and asserting acceptance there would
+        pin the wrong contract. The expectation is derived from the ownership walk
+        the check is specified as, and the test names which case it ran.
+        """
         real = [p for p in apple_speech._SWIFTC_FIXED_PATHS if os.path.isfile(p)]
         if not real:
             pytest.skip("no Swift toolchain on this host")
+
+        def _root_owned_up_to_prefix(path: str) -> bool | None:
+            resolved = os.path.realpath(path)
+            prefix = next(
+                (p for p in apple_speech._TRUSTED_TOOLCHAIN_PREFIXES if resolved.startswith(p)),
+                None,
+            ) or apple_speech._xcode_bundle_prefix(resolved)
+            if prefix is None:
+                return None
+            stop = prefix.rstrip("/")
+            probe = resolved
+            while True:
+                st = os.lstat(probe)
+                if st.st_uid != 0 or (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+                    return False
+                if probe == stop:
+                    return True
+                probe = os.path.dirname(probe)
+
+        accepted = []
         for path in real:
-            assert apple_speech._is_trusted_toolchain(path), path
-        assert apple_speech._swiftc_fast() in real
+            expected = _root_owned_up_to_prefix(path)
+            assert expected is not None, f"{path} resolves outside every trusted prefix"
+            assert apple_speech._is_trusted_toolchain(path) is expected, (
+                f"{path}: root-owned-to-prefix={expected}, "
+                f"trusted={apple_speech._is_trusted_toolchain(path)}"
+            )
+            if expected:
+                accepted.append(path)
+        if accepted:
+            assert apple_speech._swiftc_fast() in accepted
+        else:
+            assert apple_speech._swiftc_fast() is None
 
     @pytest.mark.skipif(
         not platform_compat.IS_POSIX,
@@ -373,6 +514,26 @@ def _passthrough_sandbox():
     return patch.object(apple_speech, "_sandboxed", side_effect=lambda argv: (argv, {}, None))
 
 
+def _cleanup_file_sandbox(tmp_path):
+    """Stub `_sandboxed` like a host WITH a sandbox backend: a real cleanup file.
+
+    `sandboxed_spawn_argv` returns a real temp launcher/profile as its third
+    element on any host with a backend, and the caller must unlink it after the
+    child exits. Returns ``(patcher, created)`` where *created* collects every
+    file handed out, so a test can assert the call site dropped each one on the
+    exit path under test.
+    """
+    created: list = []
+
+    def _fake(argv):
+        launcher = tmp_path / f"sb-launcher-{len(created)}"
+        launcher.write_text("# fake sandbox launcher/profile")
+        created.append(launcher)
+        return argv, {}, str(launcher)
+
+    return patch.object(apple_speech, "_sandboxed", side_effect=_fake), created
+
+
 class TestTranscribePlumbing:
     @pytest.mark.asyncio
     async def test_unavailable_returns_reason_not_exception(self):
@@ -392,16 +553,144 @@ class TestTranscribePlumbing:
         assert (path, is_temp) == ("/tmp/voice.wav", False)
 
     @pytest.mark.asyncio
+    @pytest.mark.skipif(os.name == "nt", reason="descriptor paths are the POSIX branch")
+    async def test_a_descriptor_path_never_takes_the_native_fast_path(self, tmp_path):
+        """``/dev/fd/N`` names a descriptor of THIS process — meaningless to
+        the Swift helper (GPT review r23: a native-suffix import would 502).
+        The remux is the materializing path, so a descriptor input must reach
+        it even when its real suffix is native."""
+        real = tmp_path / "voice.wav"
+        real.write_bytes(b"x")
+        fd = os.open(str(real), os.O_RDONLY)
+        called = []
+        try:
+            with (
+                patch("kiro_crew.transcribe._open_ffmpeg_for_execution", return_value=None),
+                patch(
+                    "kiro_crew.transcribe.ensure_ffmpeg_in_path",
+                    side_effect=lambda: called.append(True),
+                ),
+            ):
+                await apple_speech._to_native_audio(f"/dev/fd/{fd}")
+        finally:
+            os.close(fd)
+        assert called, "the fast path must be skipped: the remux branch was never reached"
+
+    @pytest.mark.asyncio
+    async def test_an_over_cap_input_is_refused_before_the_remux(self, monkeypatch):
+        """The ``-t`` bound is a temp-disk guard, not a licence to truncate:
+        a recording the probe shows is over the ceiling must be REFUSED before
+        conversion (GPT review r26) — transcribing only its first hour would
+        be silent data loss for every non-import caller."""
+        from kiro_crew import transcribe as tr
+
+        async def _too_long(path, max_secs, **kw):
+            return True
+
+        monkeypatch.setattr(tr, "audio_exceeds_secs", _too_long)
+        with (
+            patch("kiro_crew.transcribe._resolve_ffmpeg_for_execution", return_value="ffmpeg"),
+            patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
+        ):
+            with pytest.raises(apple_speech.RecordingTooLongError, match="trim"):
+                await apple_speech._to_native_audio("/tmp/voice.webm")
+
+    @pytest.mark.asyncio
+    async def test_an_unverifiable_duration_is_refused_before_the_remux(self, monkeypatch):
+        """A ``None`` probe must refuse too (GPT review r27): a TRANSIENT
+        cause — a load spike that times the probe out but clears before the
+        remux — would let the ``-t``-bounded conversion succeed on the
+        truncated prefix of an over-cap recording. Only a persistent cause is
+        covered by the aligned-budget argument, so unknown duration is a loud,
+        retryable refusal — the same rule the meetings import gate applies."""
+        from kiro_crew import transcribe as tr
+
+        async def _unanswerable(path, max_secs, **kw):
+            return None
+
+        monkeypatch.setattr(tr, "audio_exceeds_secs", _unanswerable)
+        with (
+            patch("kiro_crew.transcribe._resolve_ffmpeg_for_execution", return_value="ffmpeg"),
+            patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
+        ):
+            with pytest.raises(apple_speech.DurationUnverifiedError, match="retry"):
+                await apple_speech._to_native_audio("/tmp/voice.webm")
+
+    @pytest.mark.asyncio
+    async def test_the_over_cap_refusal_surfaces_as_a_transcribe_error(self, monkeypatch):
+        from kiro_crew import transcribe as tr
+
+        async def _too_long(path, max_secs, **kw):
+            return True
+
+        monkeypatch.setattr(tr, "audio_exceeds_secs", _too_long)
+        monkeypatch.setattr(apple_speech, "availability", lambda: apple_speech.Availability(True))
+        monkeypatch.setattr(apple_speech, "helper_path", lambda: "/fake/helper")
+        with (
+            patch("kiro_crew.transcribe._resolve_ffmpeg_for_execution", return_value="ffmpeg"),
+            patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
+        ):
+            text, metrics = await apple_speech.transcribe("/tmp/voice.webm")
+        assert text is None
+        assert "ceiling" in metrics["error"]
+
+    @pytest.mark.asyncio
+    async def test_the_remux_is_bounded_by_the_decoder_ceiling(self, tmp_path, monkeypatch):
+        """An unbounded conversion of a large low-bitrate input could expand
+        into a multi-gigabyte WAV and exhaust the temp volume (GPT review
+        r23): the remux must carry ``-t _MAX_AUDIO_SECS``, the same ceiling
+        ``batch_duration_cap_secs`` reports for this lane."""
+        from kiro_crew import transcribe as tr
+
+        _stub_probe_under_cap(monkeypatch)
+        captured: dict = {}
+
+        async def fake_spawn(executable, *args, **kwargs):
+            captured["args"] = args
+            raise OSError("stop here — argv captured")
+
+        with (
+            patch("kiro_crew.transcribe._resolve_ffmpeg_for_execution", return_value="ffmpeg"),
+            patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
+            patch("kiro_crew.transcribe._create_ffmpeg_subprocess", side_effect=fake_spawn),
+        ):
+            with pytest.raises(OSError, match="argv captured"):
+                await apple_speech._to_native_audio("/tmp/voice.webm")
+
+        args = captured["args"]
+        assert "-t" in args
+        assert args[args.index("-t") + 1] == str(tr._MAX_AUDIO_SECS)
+
+    @pytest.mark.asyncio
     async def test_webm_without_ffmpeg_degrades_instead_of_refusing(self):
         """The dashboard records .webm, which the framework cannot read. With no
         ffmpeg we still hand the original path over so the caller surfaces the
         framework's own error rather than a silent unavailability."""
         with (
-            patch("kiro_crew.transcribe._find_ffmpeg", return_value=None),
+            patch("kiro_crew.transcribe._open_ffmpeg_for_execution", return_value=None),
             patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
         ):
             path, is_temp = await apple_speech._to_native_audio("/tmp/voice.webm")
         assert (path, is_temp) == ("/tmp/voice.webm", False)
+
+    @pytest.mark.asyncio
+    async def test_packaged_decoder_authentication_runs_off_the_event_loop(self, monkeypatch):
+        from kiro_crew import transcribe as tr
+
+        offloaded = []
+
+        async def run_off_loop(function, *args, **kwargs):
+            offloaded.append(function)
+            return function(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", run_off_loop)
+        monkeypatch.setattr(tr, "ensure_ffmpeg_in_path", lambda: None)
+        monkeypatch.setattr(tr, "_open_ffmpeg_for_execution", lambda: None)
+
+        path, is_temp = await apple_speech._to_native_audio("/tmp/voice.webm")
+
+        assert (path, is_temp) == ("/tmp/voice.webm", False)
+        assert tr._open_ffmpeg_for_execution in offloaded
 
     @pytest.mark.asyncio
     async def test_helper_error_json_is_propagated(self):
@@ -466,6 +755,304 @@ class TestTranscribePlumbing:
         assert meta["transcribe_secs"] == 0.15
 
 
+class TestTranscodeTempOwnership:
+    """The transcode temp is invocation-owned until explicitly handed over.
+
+    `_to_native_audio` creates the `.wav` with `mkstemp`, so it owns the file
+    until the success return transfers it to the caller; `transcribe` then owns
+    the received temp until its cleanup `finally`. Every failure exit on either
+    side must remove the owned temp, while an original input path — not created
+    by these invocations — is never removed on any path.
+    """
+
+    @staticmethod
+    def _owned_temp(tmp_path, monkeypatch):
+        """Pin `_mkstemp_path` to a known file so the tests can watch it."""
+        owned = tmp_path / "owned.wav"
+        owned.write_bytes(b"")
+        monkeypatch.setattr(apple_speech, "_mkstemp_path", lambda suffix: str(owned))
+        return owned
+
+    @pytest.mark.asyncio
+    async def test_spawn_failure_removes_the_owned_temp(self, tmp_path, monkeypatch):
+        """An ffmpeg that fails to spawn never ran, so nothing else will ever
+        remove the mkstemp output — the invocation must."""
+        _stub_probe_under_cap(monkeypatch)
+        owned = self._owned_temp(tmp_path, monkeypatch)
+        src = tmp_path / "voice.webm"
+        src.write_bytes(b"data")
+        with (
+            patch(
+                "kiro_crew.transcribe._open_ffmpeg_for_execution",
+                return_value="/fake/ffmpeg",
+            ),
+            patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
+            patch("asyncio.create_subprocess_exec", side_effect=OSError("spawn failed")),
+        ):
+            with pytest.raises(OSError):
+                await apple_speech._to_native_audio(str(src))
+        assert not owned.exists()
+        assert src.exists()
+
+    @pytest.mark.asyncio
+    async def test_transcode_closes_authenticated_decoder_after_child_exit(
+        self, tmp_path, monkeypatch
+    ):
+        """Cleanup at this call site: the staged decoder
+        handle outlives the spawn (the macOS syspolicy assessment resolves the
+        staged path asynchronously after ``create_subprocess_exec`` returns) and
+        is released exactly once, after the child has exited, by the invocation
+        itself rather than by ``__del__`` on the gateway event loop."""
+        from kiro_crew import transcribe as tr
+
+        _stub_probe_under_cap(monkeypatch)
+        owned = self._owned_temp(tmp_path, monkeypatch)
+        src = tmp_path / "voice.webm"
+        src.write_bytes(b"data")
+        events: list = []
+
+        binary = tmp_path / "ffmpeg"
+        binary.write_bytes(b"decoder")
+        descriptor = os.open(str(binary), os.O_RDONLY)
+
+        class _Recording(tr._AuthenticatedFfmpeg):
+            def close(self):
+                # Only the first effective close counts: ``close`` is
+                # idempotent and ``__del__`` re-enters it with the descriptor
+                # already surrendered.
+                if self.descriptor >= 0:
+                    events.append("closed")
+                super().close()
+
+        opened = _Recording(str(binary), descriptor, str(binary))
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self):
+                assert "closed" not in events, "handle closed before the child exited"
+                events.append("exited")
+                return b"", b""
+
+        async def fake_exec(*_args, **_kwargs):
+            assert "closed" not in events, "handle closed before the spawn returned"
+            return _Proc()
+
+        with (
+            patch(
+                "kiro_crew.transcribe._open_ffmpeg_for_execution",
+                return_value=opened,
+            ),
+            patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
+            patch("asyncio.create_subprocess_exec", side_effect=fake_exec),
+        ):
+            result_path, is_temp = await apple_speech._to_native_audio(str(src))
+        assert result_path == str(owned)
+        assert is_temp is True
+        assert events == ["exited", "closed"]
+
+    @pytest.mark.asyncio
+    async def test_cancellation_on_the_close_await_still_removes_the_owned_temp(
+        self, tmp_path, monkeypatch
+    ):
+        """A cancellation landing exactly on the deferred close await -- the
+        only suspension point between the child exiting and the success return
+        transferring the temp to the caller -- must not propagate with the
+        invocation-owned ``.wav`` still on disk."""
+        _stub_probe_under_cap(monkeypatch)
+        owned = self._owned_temp(tmp_path, monkeypatch)
+        src = tmp_path / "voice.webm"
+        src.write_bytes(b"data")
+
+        proc = AsyncMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        async def cancelled_close(_executable, **_kwargs):
+            raise asyncio.CancelledError
+
+        with (
+            patch(
+                "kiro_crew.transcribe._open_ffmpeg_for_execution",
+                return_value="/fake/ffmpeg",
+            ),
+            patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            patch(
+                "kiro_crew.transcribe._close_ffmpeg_for_execution",
+                side_effect=cancelled_close,
+            ),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await apple_speech._to_native_audio(str(src))
+        assert not owned.exists()
+        assert src.exists()
+
+    @pytest.mark.asyncio
+    async def test_temp_creation_failure_closes_authenticated_decoder_off_loop(
+        self, tmp_path, monkeypatch
+    ):
+        _stub_probe_under_cap(monkeypatch)
+        from kiro_crew import transcribe as tr
+
+        binary = tmp_path / "ffmpeg"
+        binary.write_bytes(b"decoder")
+        opened = tr._AuthenticatedFfmpeg(str(binary), os.open(binary, os.O_RDONLY), str(binary))
+        event_loop_thread = threading.get_ident()
+        close_threads = []
+        original_close = tr._AuthenticatedFfmpeg.close
+
+        def recording_close(self):
+            if self.descriptor >= 0:
+                close_threads.append(threading.get_ident())
+            original_close(self)
+
+        def disk_full(_suffix):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(tr._AuthenticatedFfmpeg, "close", recording_close)
+        monkeypatch.setattr(apple_speech, "_mkstemp_path", disk_full)
+        with (
+            patch.object(tr, "_resolve_ffmpeg_for_execution", return_value=opened),
+            patch.object(tr, "ensure_ffmpeg_in_path"),
+            pytest.raises(OSError, match="disk full"),
+        ):
+            await apple_speech._to_native_audio(str(tmp_path / "voice.webm"))
+
+        assert len(close_threads) == 1
+        assert close_threads[0] != event_loop_thread
+
+    @pytest.mark.asyncio
+    async def test_cancellation_reaps_ffmpeg_before_removing_the_owned_temp(
+        self, tmp_path, monkeypatch
+    ):
+        """`CancelledError` is a `BaseException`, so an `except Exception` guard
+        would miss it. The child must also be killed AND reaped before the
+        unlink: Windows keeps the output file locked until the child fully
+        exits, so an unlink issued earlier fails and the temp survives."""
+        owned = self._owned_temp(tmp_path, monkeypatch)
+        src = tmp_path / "voice.webm"
+        src.write_bytes(b"data")
+        events: list[str] = []
+
+        class _Proc:
+            def __init__(self):
+                self._calls = 0
+
+            async def communicate(self):
+                self._calls += 1
+                if self._calls == 1:
+                    raise asyncio.CancelledError()
+                events.append("reaped")
+                return b"", b""
+
+            def kill(self):
+                events.append("killed")
+
+        real_unlink = os.unlink
+
+        def tracked_unlink(path, *args, **kwargs):
+            if str(path) == str(owned):
+                events.append("unlinked")
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(apple_speech.os, "unlink", tracked_unlink)
+
+        async def _under_cap(path, max_secs, **kw):
+            return False
+
+        # The r26 pre-remux duration probe would otherwise consume the fake
+        # process; this test is about cancellation INSIDE the remux.
+        monkeypatch.setattr(_tr_mod, "audio_exceeds_secs", _under_cap)
+        with (
+            patch(
+                "kiro_crew.transcribe._open_ffmpeg_for_execution",
+                return_value="/fake/ffmpeg",
+            ),
+            patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
+            patch("asyncio.create_subprocess_exec", return_value=_Proc()),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await apple_speech._to_native_audio(str(src))
+        assert events == ["killed", "reaped", "unlinked"]
+        assert not owned.exists()
+        assert src.exists()
+
+    @pytest.mark.asyncio
+    async def test_successful_transcode_still_hands_the_temp_to_the_caller(
+        self, tmp_path, monkeypatch
+    ):
+        """The cleanup must not eat the success path: the caller's existing
+        cleanup relies on receiving the temp path with ownership."""
+        _stub_probe_under_cap(monkeypatch)
+        owned = self._owned_temp(tmp_path, monkeypatch)
+        src = tmp_path / "voice.webm"
+        src.write_bytes(b"data")
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        with (
+            patch(
+                "kiro_crew.transcribe._open_ffmpeg_for_execution",
+                return_value="/fake/ffmpeg",
+            ),
+            patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+        ):
+            path, is_temp = await apple_speech._to_native_audio(str(src))
+        assert (path, is_temp) == (str(owned), True)
+        assert owned.exists()
+        assert src.exists()
+
+    @pytest.mark.asyncio
+    async def test_sandbox_rejection_removes_the_owned_native_temp(self, tmp_path, monkeypatch):
+        """The fail-closed sandbox refusal returns after `transcribe` received an
+        owned temp, before the cleanup `finally` is armed, and must still remove it."""
+        from kiro_crew import sandbox as sb
+
+        owned = tmp_path / "native.wav"
+        owned.write_bytes(b"x")
+
+        async def fake_native(*_a, **_k):
+            return str(owned), True
+
+        def boom(argv):
+            raise sb.SandboxUnavailableError(
+                "no backend: unshare(CLONE_NEWNS) EPERM", "no_backend", "EPERM"
+            )
+
+        monkeypatch.setattr(apple_speech, "_to_native_audio", fake_native)
+        monkeypatch.setattr(apple_speech, "availability", lambda: apple_speech.Availability(True))
+        monkeypatch.setattr(apple_speech, "helper_path", lambda *a, **k: "/fake/helper")
+        monkeypatch.setattr(apple_speech, "_sandboxed", boom)
+        text, meta = await apple_speech.transcribe(str(tmp_path / "orig.webm"))
+        assert text is None
+        assert "no backend" in meta["error"]
+        assert not owned.exists()
+
+    @pytest.mark.asyncio
+    async def test_sandbox_rejection_never_removes_an_original_input(self, tmp_path, monkeypatch):
+        """A non-temp native path is the caller's own file; the widened cleanup
+        must stay keyed on the ownership flag, not on reaching the exit."""
+        from kiro_crew import sandbox as sb
+
+        original = tmp_path / "voice.wav"
+        original.write_bytes(b"x")
+
+        def boom(argv):
+            raise sb.SandboxUnavailableError(
+                "no backend: unshare(CLONE_NEWNS) EPERM", "no_backend", "EPERM"
+            )
+
+        monkeypatch.setattr(apple_speech, "availability", lambda: apple_speech.Availability(True))
+        monkeypatch.setattr(apple_speech, "helper_path", lambda *a, **k: "/fake/helper")
+        monkeypatch.setattr(apple_speech, "_sandboxed", boom)
+        text, meta = await apple_speech.transcribe(str(original))
+        assert text is None
+        assert "no backend" in meta["error"]
+        assert original.exists()
+
+
 class TestStreamingSession:
     """The live path. Plumbing only here; real audio is the macOS-only test below."""
 
@@ -522,6 +1109,467 @@ class TestStreamingSession:
         await session.close()
 
 
+class TestHelperArgvPinsFast:
+    """Pin the ``--fast`` flag in the STREAMING helper argv.
+
+    ``--fast`` inserts ``.frequentFinalization`` into the transcriber's reporting
+    options; without it the helper emits only volatile partials for the whole open
+    stream and never a mid-stream final, so the endpointer's ``note_final()``-driven
+    auto-submit can never fire. The live helper is macOS-only with no CI runner
+    coverage, so the spawned argv IS the verifiable contract: these tests pin the
+    flag's presence on the streaming path and its deliberate absence on the one-shot
+    batch path (where the final arrives at stream close and frequent finalization
+    would only trade accuracy for unneeded latency).
+    """
+
+    @pytest.mark.asyncio
+    async def test_streaming_argv_includes_fast(self):
+        """StreamingSession.start() must pass --fast to the helper."""
+        session = apple_speech.StreamingSession(locale="en-US")
+        # Failing the spawn keeps the test on the argv contract alone: by the
+        # time create_subprocess_exec is called the argv is fully built, and no
+        # pump/ready plumbing needs to be faked.
+        spawn = Mock(side_effect=OSError("argv pin: no real spawn"))
+        with (
+            patch.object(
+                apple_speech, "availability", return_value=apple_speech.Availability(True)
+            ),
+            patch.object(apple_speech, "stream_helper_path", return_value="/fake/stream-helper"),
+            patch("asyncio.create_subprocess_exec", spawn),
+            _passthrough_sandbox(),
+        ):
+            problem = await session.start()
+        assert "could not start streaming helper" in problem
+        argv = list(spawn.call_args.args)
+        assert argv[0] == "/fake/stream-helper"
+        assert "--fast" in argv
+        # The helper's parser treats --fast as a bare switch; it must not have
+        # swallowed a neighbouring option's value.
+        assert argv[argv.index("--locale") + 1] == "en-US"
+        assert argv[argv.index("--sample-rate") + 1] == str(apple_speech.STREAM_SAMPLE_RATE_HZ)
+
+    @pytest.mark.asyncio
+    async def test_one_shot_argv_excludes_fast(self):
+        """The batch path must NOT opt into frequent finalization."""
+        spawn = Mock(side_effect=OSError("argv pin: no real spawn"))
+        with (
+            patch.object(
+                apple_speech, "availability", return_value=apple_speech.Availability(True)
+            ),
+            patch.object(apple_speech, "helper_path", return_value="/fake/helper"),
+            patch("asyncio.create_subprocess_exec", spawn),
+            _passthrough_sandbox(),
+        ):
+            text, meta = await apple_speech.transcribe("/tmp/x.wav")
+        assert text is None
+        assert "could not run speech helper" in meta["error"]
+        argv = list(spawn.call_args.args)
+        assert argv[0] == "/fake/helper"
+        assert "--fast" not in argv
+
+    def test_swift_helper_still_accepts_fast(self):
+        """Pin the OTHER side of the cross-process contract, by source inspection.
+
+        The helper is never compiled in CI (macOS-only), so the argv pins above
+        cannot see a Swift-side regression: renaming or dropping the ``--fast``
+        case would leave every Python test green while the helper dies at
+        startup with ``unexpected argument: --fast``. The helper source ships in
+        the same package directory ``_build_helper`` reads it from, so anchor on
+        the module rather than a CWD-relative path.
+        """
+        swift_src = Path(apple_speech.__file__).with_name("StreamTranscribe.swift")
+        assert 'case "--fast":' in swift_src.read_text(encoding="utf-8")
+
+
+class TestSandboxCleanupPathIsDropped:
+    """Every `_sandboxed` call site must unlink the returned cleanup path.
+
+    The third tuple element is a real temp file on any host with a sandbox
+    backend (Linux namespace launcher / macOS ``.sb`` profile), and the
+    ``sandboxed_spawn_argv`` contract makes the CALLER unlink it after the child
+    exits. A site that discards it leaks one file per call, forever — and the
+    leak is per-call, so a launcher dropped only on the success path still
+    accumulates. Each test hands back a real file and asserts it is gone on the
+    exit path under test.
+    """
+
+    @staticmethod
+    def _availability_ok():
+        return patch.object(
+            apple_speech, "availability", return_value=apple_speech.Availability(True)
+        )
+
+    @pytest.mark.asyncio
+    async def test_transcribe_drops_launcher_on_success(self, tmp_path):
+        sandbox_patch, created = _cleanup_file_sandbox(tmp_path)
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(json.dumps({"text": "hi"}).encode(), b""))
+        proc.returncode = 0
+        with (
+            self._availability_ok(),
+            patch.object(apple_speech, "helper_path", return_value="/fake/helper"),
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            sandbox_patch,
+        ):
+            text, _ = await apple_speech.transcribe("/tmp/x.wav")
+        assert text == "hi"
+        assert created and not any(f.exists() for f in created)
+
+    @pytest.mark.asyncio
+    async def test_transcribe_drops_launcher_on_timeout(self, tmp_path):
+        """The timeout exit kills the child, and must drop the launcher too."""
+        sandbox_patch, created = _cleanup_file_sandbox(tmp_path)
+        killed = asyncio.Event()
+        proc = AsyncMock()
+
+        async def communicate():
+            # Hangs until kill(), like a wedged helper; returns once killed, so
+            # the reap in the timeout handler completes instead of hanging.
+            # No timing flake: the wait is unbounded-until-kill, and the small
+            # positive timeout (NOT 0: wait_for's `timeout <= 0` fast path
+            # cancels before the first step) only decides when kill() happens.
+            if not killed.is_set():
+                await killed.wait()
+            return b"", b""
+
+        proc.communicate = communicate
+        proc.kill = Mock(side_effect=killed.set)
+        proc.returncode = None
+        with (
+            self._availability_ok(),
+            patch.object(apple_speech, "helper_path", return_value="/fake/helper"),
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            sandbox_patch,
+        ):
+            text, meta = await apple_speech.transcribe("/tmp/x.wav", timeout_secs=0.01)
+        assert text is None
+        assert "timed out" in meta["error"]
+        proc.kill.assert_called_once()
+        assert created and not any(f.exists() for f in created)
+
+    @pytest.mark.asyncio
+    async def test_transcribe_drops_launcher_on_spawn_failure(self, tmp_path):
+        """OSError from the spawn means no child ever held the launcher."""
+        sandbox_patch, created = _cleanup_file_sandbox(tmp_path)
+        with (
+            self._availability_ok(),
+            patch.object(apple_speech, "helper_path", return_value="/fake/helper"),
+            patch("asyncio.create_subprocess_exec", side_effect=OSError("boom")),
+            sandbox_patch,
+        ):
+            text, meta = await apple_speech.transcribe("/tmp/x.wav")
+        assert text is None
+        assert "could not run speech helper" in meta["error"]
+        assert created and not any(f.exists() for f in created)
+
+    @pytest.mark.asyncio
+    async def test_inventory_drops_launcher_on_success(self, tmp_path):
+        sandbox_patch, created = _cleanup_file_sandbox(tmp_path)
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(
+            return_value=(json.dumps({"supported": ["en-US"], "installed": []}).encode(), b"")
+        )
+        with (
+            patch.object(apple_speech, "helper_path", return_value="/fake/helper"),
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            sandbox_patch,
+        ):
+            result = await apple_speech.inventory()
+        assert result == {"supported": ["en-US"], "installed": []}
+        assert created and not any(f.exists() for f in created)
+
+    @pytest.mark.asyncio
+    async def test_inventory_drops_launcher_on_spawn_failure(self, tmp_path):
+        sandbox_patch, created = _cleanup_file_sandbox(tmp_path)
+        with (
+            patch.object(apple_speech, "helper_path", return_value="/fake/helper"),
+            patch("asyncio.create_subprocess_exec", side_effect=OSError("boom")),
+            sandbox_patch,
+        ):
+            result = await apple_speech.inventory()
+        assert "error" in result
+        assert created and not any(f.exists() for f in created)
+
+    @pytest.mark.asyncio
+    async def test_inventory_timeout_kills_then_drops_launcher(self, tmp_path):
+        """The timeout exit must reap the wedged helper BEFORE the finally
+        unlinks — the contract is 'after the child exits', and a helper past
+        the ceiling must not be left running with nobody waiting on it."""
+        sandbox_patch, created = _cleanup_file_sandbox(tmp_path)
+        killed = asyncio.Event()
+        proc = AsyncMock()
+
+        async def communicate():
+            if not killed.is_set():
+                raise asyncio.TimeoutError  # stands in for the wait_for ceiling
+            return b"", b""
+
+        proc.communicate = communicate
+        proc.kill = Mock(side_effect=killed.set)
+        proc.returncode = None
+        with (
+            patch.object(apple_speech, "helper_path", return_value="/fake/helper"),
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            sandbox_patch,
+        ):
+            result = await apple_speech.inventory()
+        assert "error" in result
+        proc.kill.assert_called_once()
+        assert created and not any(f.exists() for f in created)
+
+    @pytest.mark.asyncio
+    async def test_streaming_start_failure_drops_launcher(self, tmp_path):
+        """The spawn-OSError exit has a launcher but no child; it must drop it."""
+        sandbox_patch, created = _cleanup_file_sandbox(tmp_path)
+        session = apple_speech.StreamingSession()
+        with (
+            self._availability_ok(),
+            patch.object(apple_speech, "stream_helper_path", return_value="/fake/helper"),
+            patch("asyncio.create_subprocess_exec", side_effect=OSError("boom")),
+            sandbox_patch,
+        ):
+            problem = await session.start()
+        assert "could not start streaming helper" in problem
+        assert created and not any(f.exists() for f in created)
+        assert session._sb_cleanup is None
+
+    @pytest.mark.asyncio
+    async def test_streaming_launcher_survives_start_and_drops_on_close(self, tmp_path):
+        """The streaming child OUTLIVES start(): unlinking there would pull the
+        profile/launcher out from under a live process. It is held on the
+        session and dropped in close(), after the process teardown — and a
+        double close must not trip over the already-removed file."""
+        sandbox_patch, created = _cleanup_file_sandbox(tmp_path)
+        proc = AsyncMock()
+        proc.stdout.readline = AsyncMock(side_effect=[b'{"type": "ready"}\n', b""])
+        proc.kill = Mock()
+        proc.returncode = None
+        session = apple_speech.StreamingSession()
+        with (
+            self._availability_ok(),
+            patch.object(apple_speech, "stream_helper_path", return_value="/fake/helper"),
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            sandbox_patch,
+        ):
+            assert await session.start() == ""
+            assert created and all(f.exists() for f in created), "unlinked under a live child"
+            await session.close()
+            assert not any(f.exists() for f in created)
+            await session.close()  # idempotent: the swap keeps this from re-unlinking
+
+    @pytest.mark.asyncio
+    async def test_streaming_finish_then_close_drops_launcher_once(self, tmp_path):
+        """The production teardown order (stt_stream.py) is finish() then
+        close(). finish() may leave the process draining, so the unlink belongs
+        to close() alone — a refactor moving it into finish() fails here."""
+        sandbox_patch, created = _cleanup_file_sandbox(tmp_path)
+        # Process methods are mixed sync/async.  Making the whole process an
+        # AsyncMock turns stdin.is_closing() into an unawaited coroutine even
+        # though the real subprocess API is synchronous at that seam.
+        proc = Mock()
+        proc.stdout.readline = AsyncMock(side_effect=[b'{"type": "ready"}\n', b""])
+        proc.stdin.is_closing.return_value = False
+        proc.wait = AsyncMock()
+        proc.kill = Mock()
+        proc.returncode = None
+        session = apple_speech.StreamingSession()
+        with (
+            self._availability_ok(),
+            patch.object(apple_speech, "stream_helper_path", return_value="/fake/helper"),
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            sandbox_patch,
+        ):
+            assert await session.start() == ""
+            await session.finish()
+            proc.stdin.close.assert_called_once_with()
+            assert created and all(f.exists() for f in created), "finish() must not unlink"
+            await session.close()
+            assert not any(f.exists() for f in created)
+
+    @pytest.mark.asyncio
+    async def test_streaming_ready_timeout_drops_launcher(self, tmp_path, monkeypatch):
+        """The readiness-timeout exit reaches the unlink through the close()
+        that start() already performs there."""
+        monkeypatch.setattr(apple_speech, "_READY_TIMEOUT_SECS", 0.05)
+        sandbox_patch, created = _cleanup_file_sandbox(tmp_path)
+        proc = AsyncMock()
+
+        async def never_ready(*_a, **_k):
+            await asyncio.sleep(60)
+            return b""
+
+        proc.stdout.readline = never_ready
+        proc.kill = Mock()
+        proc.returncode = None
+        session = apple_speech.StreamingSession()
+        with (
+            self._availability_ok(),
+            patch.object(apple_speech, "stream_helper_path", return_value="/fake/helper"),
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            sandbox_patch,
+        ):
+            problem = await session.start()
+        assert problem == "streaming helper did not become ready"
+        assert created and not any(f.exists() for f in created)
+
+
+class TestSandboxCancellationWindows:
+    """Cancellation around the launcher lifecycle must not orphan the temp.
+
+    `asyncio.CancelledError` is a `BaseException`, so the `except Exception` /
+    `except OSError` paths that own the unlink never see it. Two window shapes
+    are pinned here, at each await point: (1) cancellation DURING the
+    worker-thread `_sandboxed` hop — the thread still creates the launcher, but
+    the returned tuple is never bound, so no `finally` and no session field can
+    ever reach it; (2) `StreamingSession.start()` cancelled AFTER the tuple is
+    bound (mid-spawn, or anywhere in the readiness wait). The caller-side
+    guarantee at the `await session.start()` call site is pinned in
+    test_stt_stream.py.
+    """
+
+    @staticmethod
+    def _availability_ok():
+        return patch.object(
+            apple_speech, "availability", return_value=apple_speech.Availability(True)
+        )
+
+    @staticmethod
+    def _blocking_sandbox(tmp_path):
+        """A `_sandboxed` stub that parks the worker thread until released.
+
+        Reproduces the race deterministically: the awaiting coroutine is
+        cancelled while the thread is still inside `sandboxed_spawn_argv`, and
+        the launcher only comes into being AFTER the cancellation landed.
+        """
+        entered = threading.Event()
+        release = threading.Event()
+        created: list = []
+
+        def _fake(argv):
+            entered.set()
+            assert release.wait(timeout=10), "test never released the worker thread"
+            launcher = tmp_path / f"sb-launcher-{len(created)}"
+            launcher.write_text("# fake sandbox launcher/profile")
+            created.append(launcher)
+            return argv, {}, str(launcher)
+
+        patcher = patch.object(apple_speech, "_sandboxed", side_effect=_fake)
+        return patcher, entered, release, created
+
+    @staticmethod
+    async def _cancel_during_hop(task, entered, release):
+        """Cancel *task* while the worker thread is parked inside `_sandboxed`.
+
+        The thread entering the stub implies the awaiter is already suspended at
+        the shielded hop: the executor submission happens inside the inner task,
+        which only runs once the awaiting coroutine has yielded.
+        """
+        await asyncio.to_thread(entered.wait, 10)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    @pytest.mark.asyncio
+    async def test_transcribe_cancelled_in_sandbox_hop_drops_launcher(self, tmp_path):
+        sandbox_patch, entered, release, created = self._blocking_sandbox(tmp_path)
+        with (
+            self._availability_ok(),
+            patch.object(apple_speech, "helper_path", return_value="/fake/helper"),
+            sandbox_patch,
+        ):
+            task = asyncio.create_task(apple_speech.transcribe("/tmp/x.wav"))
+            await self._cancel_during_hop(task, entered, release)
+        assert created and not any(f.exists() for f in created)
+
+    @pytest.mark.asyncio
+    async def test_inventory_cancelled_in_sandbox_hop_drops_launcher(self, tmp_path):
+        sandbox_patch, entered, release, created = self._blocking_sandbox(tmp_path)
+        with (
+            patch.object(apple_speech, "helper_path", return_value="/fake/helper"),
+            sandbox_patch,
+        ):
+            task = asyncio.create_task(apple_speech.inventory())
+            await self._cancel_during_hop(task, entered, release)
+        assert created and not any(f.exists() for f in created)
+
+    @pytest.mark.asyncio
+    async def test_streaming_start_cancelled_in_sandbox_hop_drops_launcher(self, tmp_path):
+        sandbox_patch, entered, release, created = self._blocking_sandbox(tmp_path)
+        session = apple_speech.StreamingSession()
+        with (
+            self._availability_ok(),
+            patch.object(apple_speech, "stream_helper_path", return_value="/fake/helper"),
+            sandbox_patch,
+        ):
+            task = asyncio.create_task(session.start())
+            await self._cancel_during_hop(task, entered, release)
+        assert created and not any(f.exists() for f in created)
+        assert session._sb_cleanup is None
+
+    @pytest.mark.asyncio
+    async def test_streaming_start_cancelled_mid_spawn_drops_launcher(self, tmp_path):
+        """After the tuple is bound, a cancelled spawn must still drop the
+        launcher: `CancelledError` is not `OSError`, so the in-place drop on the
+        spawn-failure path never sees it."""
+        sandbox_patch, created = _cleanup_file_sandbox(tmp_path)
+        spawn_entered = asyncio.Event()
+
+        async def hanging_spawn(*_a, **_k):
+            spawn_entered.set()
+            await asyncio.sleep(60)
+
+        session = apple_speech.StreamingSession()
+        with (
+            self._availability_ok(),
+            patch.object(apple_speech, "stream_helper_path", return_value="/fake/helper"),
+            patch("asyncio.create_subprocess_exec", side_effect=hanging_spawn),
+            sandbox_patch,
+        ):
+            task = asyncio.create_task(session.start())
+            await spawn_entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert created and not any(f.exists() for f in created)
+        assert session._sb_cleanup is None
+
+    @pytest.mark.asyncio
+    async def test_streaming_start_cancelled_in_ready_wait_reaps_then_drops(self, tmp_path):
+        """Cancellation in the ~20s readiness wait leaves a LIVE helper riding
+        along with the launcher; the teardown must kill+reap it before the
+        unlink (Windows keeps the file locked until the child exits)."""
+        sandbox_patch, created = _cleanup_file_sandbox(tmp_path)
+        proc = AsyncMock()
+
+        async def never_ready(*_a, **_k):
+            await asyncio.sleep(60)
+            return b""
+
+        proc.stdout.readline = never_ready
+        proc.kill = Mock()
+        proc.returncode = None
+        session = apple_speech.StreamingSession()
+        with (
+            self._availability_ok(),
+            patch.object(apple_speech, "stream_helper_path", return_value="/fake/helper"),
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            sandbox_patch,
+        ):
+            task = asyncio.create_task(session.start())
+            # The pump task is created immediately before the readiness wait, so
+            # its appearance means start() is suspended at that wait (create_task
+            # does not yield; the wait_for is the next suspension point).
+            while session._pump is None:
+                await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        proc.kill.assert_called_once()
+        assert created and not any(f.exists() for f in created)
+        assert session._sb_cleanup is None
+
+
 class TestStreamingEndpointGate:
     def test_apple_is_an_accepted_streaming_provider(self):
         """The WS endpoint gates on this tuple; `apple` must be in it or the live path
@@ -531,23 +1579,30 @@ class TestStreamingEndpointGate:
         assert "apple" in stt_stream._STREAMING_PROVIDERS
         assert "transcribe" in stt_stream._STREAMING_PROVIDERS
 
-    def test_batch_only_providers_stay_out(self):
-        """whisper/mlx are whole-file CLIs with no partial-result channel — offering
-        them on the streaming endpoint would hang the client until end of audio."""
+    def test_the_gate_offers_exactly_the_selectable_providers(self):
+        """Every provider the loader can store produces partial results, so the gate
+        and the selectable set are the same set.
+
+        Pinned as an equality in both directions because each direction fails
+        differently and neither is visible from the endpoint: a selectable provider
+        missing from the tuple is a setting the user can choose and then get a 503
+        from, and a name in the tuple that the loader can never store (a retired
+        whole-file CLI with no partial-result channel) is a live path that would hang
+        a client until end of audio. Adding a provider without a partial channel has
+        to be a decision made here rather than inherited."""
         from kiro_crew.dashboard import stt_stream
 
-        assert "whisper" not in stt_stream._STREAMING_PROVIDERS
-        assert "mlx" not in stt_stream._STREAMING_PROVIDERS
+        assert set(stt_stream._STREAMING_PROVIDERS) == set(_VALID_STT_PROVIDERS)
 
 
 class TestNoBlockingCallOnEventLoop:
     """The loop-reachable probes must never spawn a process.
 
     `transcribe.is_available` runs synchronously on the asyncio loop from the
-    `/api/config/stt` GET, `api_stt_transcribe`, and the Slack voice path — its
-    sibling `_stt_prereq_commands` is `asyncio.to_thread`'d for exactly this
-    reason. An earlier revision reached `helper_path()` from here, which runs
-    `swiftc` with a 180s timeout: that freezes chat turns and the liveness
+    `/api/config/stt` GET, `api_stt_transcribe`, and the Slack voice path. The
+    answer they want ("can this work") is one step away from one they must not
+    ask: `helper_path()` compiles the Swift helper with a 180s `swiftc` timeout,
+    and reaching it from any of those callers freezes chat turns and the liveness
     heartbeat for the whole compile. These tests are the guard.
     """
 
@@ -599,14 +1654,48 @@ class TestNoBlockingCallOnEventLoop:
             assert is_available(SttConfig(enabled=True, provider="apple")) is True
 
     def test_provider_list_spawns_nothing(self):
-        """`_stt_providers` is called from the config GET handler on the loop."""
+        """`_stt_providers` is called from the config GET handler on the loop.
+
+        It is the one advertiser that has to ASK whether a provider is usable, so
+        it is the likeliest place for a compile to creep back onto the loop: it
+        drops `apple` when the platform or the toolchain rules it out, and both
+        facts are exactly what a spawn would answer. The providers with no
+        precondition are asserted alongside so a probe that started refusing
+        everything would not read as a pass.
+        """
         from kiro_crew.dashboard.handlers import core
 
         with ExitStack() as stack:
             for cm in self._no_spawn():
                 stack.enter_context(cm)
-            stack.enter_context(patch.object(core, "_is_apple_silicon", lambda: True))
-            assert "apple" in core._stt_providers()
+            offered = core._stt_providers()
+        assert "apple" in offered
+        assert STT_PROVIDER_LOCAL in offered
+        assert "transcribe" in offered
+
+    def test_apple_is_dropped_rather_than_offered_unusably(self):
+        """Off Darwin, `apple` is omitted from the list instead of listed and refused.
+
+        The same list is what the PUT accepts, so an entry the platform cannot run
+        is a choice the picker offers and the save then rejects. Answering that
+        without a spawn is the other half: the platform check has to be reached
+        before any resolver, which is also why this needs no `_swiftc` stub.
+        """
+        from kiro_crew.dashboard.handlers import core
+
+        def boom(*args, **kwargs):
+            raise AssertionError(f"spawned a subprocess on the event-loop path: {args[:1]}")
+
+        with (
+            patch("subprocess.run", boom),
+            patch("subprocess.Popen", boom),
+            patch("subprocess.check_output", boom),
+            patch("platform.system", lambda: "Linux"),
+        ):
+            offered = core._stt_providers()
+        assert "apple" not in offered
+        assert STT_PROVIDER_LOCAL in offered
+        assert "transcribe" in offered
 
     def test_fast_swiftc_resolver_never_spawns(self):
         def boom(*args, **kwargs):
@@ -654,7 +1743,13 @@ class TestEndToEndMacOS:
             pytest.skip("no `say` to synthesize a fixture")
 
         audio = tmp_path / "sample.aiff"
-        proc = await asyncio.create_subprocess_exec("say", "-o", str(audio), "the build is green")
+        # ``-o`` makes ``say`` write the AIFF instead of playing it through the
+        # sound output, so the fixture is silent on the developer's machine. The
+        # child runs from tmp_path so any file it creates lands there, not in
+        # the checkout it would otherwise inherit as CWD.
+        proc = await asyncio.create_subprocess_exec(
+            "say", "-o", str(audio), "the build is green", cwd=tmp_path
+        )
         await proc.wait()
         assert audio.is_file()
 
@@ -685,17 +1780,29 @@ class TestEndToEndMacOS:
                 pytest.skip(f"no `{tool}` to build a 16 kHz fixture")
 
         aiff = tmp_path / "s.aiff"
+        # ``-o`` writes the AIFF instead of playing it; cwd=tmp_path keeps any
+        # stray output out of the checkout (see test_round_trip).
         proc = await asyncio.create_subprocess_exec(
             "say",
             "-o",
             str(aiff),
             "the continuous integration build is green and the tests all pass",
+            cwd=tmp_path,
         )
         await proc.wait()
         wav = tmp_path / "s.wav"
         # LEI16 @ 16 kHz mono — the format the dashboard's audio worklet produces.
         proc = await asyncio.create_subprocess_exec(
-            "afconvert", str(aiff), str(wav), "-f", "WAVE", "-d", "LEI16@16000", "-c", "1"
+            "afconvert",
+            str(aiff),
+            str(wav),
+            "-f",
+            "WAVE",
+            "-d",
+            "LEI16@16000",
+            "-c",
+            "1",
+            cwd=tmp_path,
         )
         await proc.wait()
         if not wav.is_file():

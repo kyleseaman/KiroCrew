@@ -23,9 +23,14 @@ import { RemoteCrewPanel } from '../pages/settings/RemoteCrewPanel'
 vi.mock('../api/client', () => {
   class ApiError extends Error {
     status: number
-    constructor(status: number, message: string) {
+    // The real class carries the raw response body so a caller can read the
+    // structured `code` the human message collapses away — the panel branches
+    // on it to tell an unsupported-platform refusal from a load failure.
+    body: string
+    constructor(status: number, message: string, body = '') {
       super(message)
       this.status = status
+      this.body = body
     }
   }
   return {
@@ -45,6 +50,7 @@ vi.mock('../api/client', () => {
       patchConfig: vi.fn(),
       cloudLaunches: vi.fn(),
       cloudPreflight: vi.fn(),
+      cloudProvisioners: vi.fn(),
       cloudIamPolicy: vi.fn(),
       cloudLaunch: vi.fn(),
       cloudLaunchStatus: vi.fn(),
@@ -60,7 +66,9 @@ vi.mock('../api/client', () => {
 // is absent, and happy-dom implements neither — the fallback would reject and
 // surface as an unhandled rejection, which reddens CI with a green summary.
 vi.mock('../utils/clipboard', () => ({
-  copyToClipboard: vi.fn().mockResolvedValue(undefined),
+  // Resolves `true` like the real helper: the panel now branches on the boolean
+  // and reports a failed copy instead of painting "Copied" unconditionally.
+  copyToClipboard: vi.fn().mockResolvedValue(true),
   copyCode: vi.fn().mockResolvedValue(undefined),
 }))
 
@@ -76,6 +84,7 @@ const CLOUD_INSTANCE: InstanceView = {
   aws_profile: 'Admin',
   aws_region: 'us-west-2',
   ssm_run_as: '',
+  provisioner_id: 'aws_ec2',
   remote_port: 5476,
   local_port: 0,
   ttl: '20h',
@@ -107,6 +116,7 @@ const DONE_JOB: LaunchJob = {
   id: 'j-done',
   tag: 'kc-3f9a',
   instance_id: 'i-0abc123456789def0',
+  provider_id: 'aws_ec2',
   profile: 'Admin',
   region: 'us-west-2',
   size_key: 'balanced',
@@ -119,6 +129,7 @@ const DONE_JOB: LaunchJob = {
 const RUNNING_JOB: LaunchJob = {
   id: 'j-run',
   tag: 'kc-4d10',
+  provider_id: 'aws_ec2',
   profile: '',
   region: 'us-east-1',
   size_key: 'light',
@@ -173,12 +184,29 @@ async function openSetupTab(u: ReturnType<typeof setup>) {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  // The launch form's size now persists here (like its sibling profile/region), and
+  // the hand-off channel is a queue nothing drains, so without this a value left by
+  // one case leaks into the next.
   localStorage.clear()
+  sessionStorage.clear()
   // The copy affordances schedule a 1.5s revert. Without fake timers that
   // callback fires after teardown and throws as an unhandled error.
   vi.useFakeTimers({ shouldAdvanceTime: true })
   vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
   vi.mocked(api.cloudPreflight).mockResolvedValue(PREFLIGHT_OK)
+  // The setup tab asks which provisioners the gateway offers, and the AWS
+  // preflight waits for that answer (it must not probe AWS for a provisioner that
+  // has nothing to do with AWS). The stock single-row answer keeps every case
+  // here on the built-in form.
+  vi.mocked(api.cloudProvisioners).mockResolvedValue({
+    provisioners: [{
+      id: 'aws_ec2',
+      kind: 'aws_ec2',
+      label: 'AWS EC2 in your own account',
+      posix_only: true,
+      steps: [{ key: 'preflight', label: 'Check your AWS setup' }],
+    }],
+  })
   // The status query is enabled by the mere existence of a persisted job, so a
   // test that only cares about the crew list still polls it — an unmocked
   // resolve returns undefined, which React Query rejects noisily.
@@ -299,7 +327,10 @@ describe('RemoteCrewPanel — instance actions', () => {
     await u.click(await screen.findByRole('menuitem', { name: 'Diagnose dev-box-1' }))
     expect(await screen.findByText(/m1: host did not answer/, undefined, { timeout: 5_000 })).toBeInTheDocument()
 
-    await u.click(screen.getByRole('button', { name: 'Dismiss diagnosis' }))
+    // The note renders through ErrorNotice now, so its dismiss control carries
+    // the shared "Dismiss" label; scoped by testid because the actionErr notice
+    // on the same surface has an identical one.
+    await u.click(within(screen.getByTestId('remote-crew-diagnosis')).getByRole('button', { name: 'Dismiss' }))
     expect(screen.queryByText(/m1: host did not answer/)).not.toBeInTheDocument()
   })
 
@@ -391,7 +422,7 @@ describe('RemoteCrewPanel — instance actions', () => {
     renderWithProviders(<RemoteCrewPanel />)
 
     // An absent cap falls back to the default rather than advertising "up to 0".
-    expect(await screen.findByText(/Up to 5 stay warm at once/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Up to 10 stay warm at once/i)).toBeInTheDocument()
 
     await openRowMenu(u)
     await u.click(await screen.findByRole('menuitem', { name: /^Delete Kiro Crew Cloud/ }))
@@ -401,7 +432,7 @@ describe('RemoteCrewPanel — instance actions', () => {
 
     rows = []
     await u.click(screen.getByRole('button', { name: 'Refresh' }))
-    expect(await screen.findByText(/No crews yet/i, undefined, { timeout: 5_000 })).toBeInTheDocument()
+    expect(await screen.findByText(/No instances yet/i, undefined, { timeout: 5_000 })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Deleting/ })).not.toBeInTheDocument()
   })
 
@@ -620,7 +651,7 @@ describe('RemoteCrewPanel — disabled feature gate', () => {
     const u = setup()
     renderWithProviders(<RemoteCrewPanel />)
 
-    const enable = await screen.findByRole('button', { name: /Enable remote crew management/ })
+    const enable = await screen.findByRole('button', { name: /Enable remote instance management/ })
     await u.click(enable)
     await waitFor(() => expect(screen.getByRole('button', { name: /Enabling/ })).toBeDisabled())
     expect(api.patchConfig).toHaveBeenCalledWith('instances.enabled', true)
@@ -637,7 +668,7 @@ describe('RemoteCrewPanel — disabled feature gate', () => {
     const u = setup()
     renderWithProviders(<RemoteCrewPanel />)
 
-    await u.click(await screen.findByRole('button', { name: /Enable remote crew management/ }))
+    await u.click(await screen.findByRole('button', { name: /Enable remote instance management/ }))
     expect(await screen.findByText(/config is locked/, undefined, { timeout: 5_000 })).toBeInTheDocument()
   })
 
@@ -649,7 +680,7 @@ describe('RemoteCrewPanel — disabled feature gate', () => {
     renderWithProviders(<RemoteCrewPanel />)
 
     expect(await screen.findByText('owner only', undefined, { timeout: 5_000 })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /Enable remote crew management/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Enable remote instance management/ })).not.toBeInTheDocument()
     await u.click(screen.getAllByRole('button', { name: 'Refresh' })[0])
     await waitFor(() => expect(vi.mocked(api.listInstances).mock.calls.length).toBeGreaterThan(1))
   })
@@ -682,6 +713,7 @@ describe('RemoteCrewPanel — editing a crew', () => {
       expect(api.updateInstance).toHaveBeenCalledWith(
         'm1',
         expect.objectContaining({ ssh_host: 'dev-box-2', remote_port: 7999 }),
+        expect.objectContaining({ signal: expect.anything() }),
       ),
     )
     // The form closes on success rather than leaving a stale copy of the row open.
@@ -722,7 +754,7 @@ describe('RemoteCrewPanel — editing a crew', () => {
     await u.click(form.getByRole('button', { name: /Save changes/i }))
 
     await waitFor(() =>
-      expect(api.updateInstance).toHaveBeenCalledWith('m1', expect.objectContaining({ remote_bin: '' })),
+      expect(api.updateInstance).toHaveBeenCalledWith('m1', expect.objectContaining({ remote_bin: '' }), expect.objectContaining({ signal: expect.anything() })),
     )
   })
   it('closes the tunnel on a transport change and leaves reconnecting to the user', async () => {
@@ -743,7 +775,7 @@ describe('RemoteCrewPanel — editing a crew', () => {
     await u.click(form.getByRole('button', { name: /Save changes/i }))
 
     await waitFor(() =>
-      expect(api.updateInstance).toHaveBeenCalledWith('m1', expect.objectContaining({ remote_port: 7999 })),
+      expect(api.updateInstance).toHaveBeenCalledWith('m1', expect.objectContaining({ remote_port: 7999 }), expect.objectContaining({ signal: expect.anything() })),
     )
     expect(api.connectInstance).not.toHaveBeenCalled()
   })
@@ -868,7 +900,7 @@ describe('RemoteCrewPanel — editing a crew', () => {
     const ttl = form.getByRole('textbox', { name: /Token TTL/i })
     await u.clear(ttl)
     await u.type(ttl, '4h')
-    await u.click(await screen.findByRole('button', { name: /Apply my edits to the crew as it is now/i }))
+    await u.click(await screen.findByRole('button', { name: /Apply my edits to the instance as it is now/i }))
     await u.click(await screen.findByRole('button', { name: /Save changes/i }))
 
     await waitFor(() => expect(api.updateInstance).toHaveBeenCalled())
@@ -904,7 +936,7 @@ describe('RemoteCrewPanel — editing a crew', () => {
     await u.click(form.getByRole('button', { name: /Save changes/i }))
 
     await waitFor(() =>
-      expect(api.updateInstance).toHaveBeenCalledWith('m1', expect.objectContaining({ aws_profile: 'Fixed' })),
+      expect(api.updateInstance).toHaveBeenCalledWith('m1', expect.objectContaining({ aws_profile: 'Fixed' }), expect.objectContaining({ signal: expect.anything() })),
     )
   })
 
@@ -983,6 +1015,161 @@ describe('RemoteCrewPanel — editing a crew', () => {
     expect(refusal.closest('[data-crew-id]')?.getAttribute('data-crew-id')).toBe('m2')
   })
 
+
+  it('aborts an edit save on unmount and lets the restored draft save again', async () => {
+    vi.mocked(api.listInstances).mockResolvedValue(list([MANUAL_INSTANCE]))
+    vi.mocked(api.updateInstance).mockImplementation(
+      () => new Promise<InstanceView>(() => {}),
+    )
+    const u = setup()
+    const view = renderWithProviders(<RemoteCrewPanel />)
+
+    try {
+      await openRowMenu(u, /More actions for dev-box-1/i)
+      await u.click(await screen.findByRole('menuitem', { name: /Edit settings/i }))
+      const form = within(await screen.findByRole('group', { name: /Edit dev-box-1/i }))
+      const host = form.getByRole('textbox', { name: /SSH host/i })
+      await u.clear(host)
+      await u.type(host, 'dev-box-1-corrected')
+      await u.click(form.getByRole('button', { name: /Save changes/i }))
+      await waitFor(() => expect(api.updateInstance).toHaveBeenCalledTimes(1))
+
+      const firstSignal = vi.mocked(api.updateInstance).mock.calls[0]?.[2]?.signal
+      expect(firstSignal).toBeDefined()
+      expect(firstSignal?.aborted).toBe(false)
+
+      view.rerender(<></>)
+      expect(firstSignal?.aborted).toBe(true)
+
+      view.rerender(<RemoteCrewPanel />)
+      const restored = within(await screen.findByRole('group', { name: /Edit dev-box-1/i }))
+      expect(restored.getByRole('textbox', { name: /SSH host/i })).toHaveValue('dev-box-1-corrected')
+      expect(restored.getByRole('textbox', { name: /SSH host/i })).toBeEnabled()
+      const save = restored.getByRole('button', { name: /Save changes/i })
+      expect(save).toBeEnabled()
+      await u.click(save)
+      await waitFor(() => expect(api.updateInstance).toHaveBeenCalledTimes(2))
+    } finally {
+      view.unmount()
+      view.queryClient.clear()
+    }
+  })
+
+  it('freezes the live edit form while its save is pending', async () => {
+    let resolveSave!: (value: InstanceView) => void
+    vi.mocked(api.updateInstance).mockImplementation(
+      () => new Promise(resolve => { resolveSave = resolve }),
+    )
+    const u = setup()
+    renderWithProviders(<RemoteCrewPanel />)
+
+    await openRowMenu(u, /More actions for dev-box-1/i)
+    await u.click(await screen.findByRole('menuitem', { name: /Edit settings/i }))
+    const form = within(await screen.findByRole('group', { name: /Edit dev-box-1/i }))
+    const host = form.getByRole('textbox', { name: /SSH host/i })
+    await u.click(form.getByRole('button', { name: /Save changes/i }))
+
+    const save = form.getByRole('button', { name: /Saving/i })
+    expect(save).toBeDisabled()
+    expect(host).toBeDisabled()
+    // Disabled must also LOOK disabled: the freeze comes from the ancestor
+    // <fieldset disabled>, so only native `disabled:` variants can render it.
+    // The cue is a distinct fill plus a dashed border, not opacity, which is
+    // nearly invisible on bg-elevated in the dark theme.
+    expect(host).toHaveClass(
+      'disabled:bg-bg-hover',
+      'disabled:text-muted',
+      'disabled:border-dashed',
+      'disabled:cursor-not-allowed',
+    )
+    expect(screen.getByRole('button', { name: /Set up a new one/i })).toBeEnabled()
+    // Stop waiting is the in-form exit from a save whose request never returns.
+    expect(form.getByRole('button', { name: /^Stop waiting$/i })).toBeEnabled()
+
+    await act(async () => { resolveSave(MANUAL_INSTANCE) })
+    await waitFor(() =>
+      expect(screen.queryByRole('group', { name: /Edit dev-box-1/i })).not.toBeInTheDocument(),
+    )
+  })
+
+  it('Stop waiting aborts a pending save, refreshes the list and keeps the form open with the draft', async () => {
+    vi.mocked(api.listInstances).mockResolvedValue(list([MANUAL_INSTANCE]))
+    vi.mocked(api.updateInstance).mockImplementation(
+      (_id, _body, options) => new Promise<InstanceView>((_resolve, reject) => {
+        options?.signal?.addEventListener(
+          'abort',
+          () => reject(new DOMException('Aborted', 'AbortError')),
+          { once: true },
+        )
+      }),
+    )
+    const u = setup()
+    renderWithProviders(<RemoteCrewPanel />)
+
+    await openRowMenu(u, /More actions for dev-box-1/i)
+    await u.click(await screen.findByRole('menuitem', { name: /Edit settings/i }))
+    const form = within(await screen.findByRole('group', { name: /Edit dev-box-1/i }))
+    const name = form.getByRole('textbox', { name: /^Name$/i })
+    await u.clear(name)
+    await u.type(name, 'dev-box-1-renamed')
+    await u.click(form.getByRole('button', { name: /Save changes/i }))
+    await waitFor(() => expect(api.updateInstance).toHaveBeenCalledTimes(1))
+
+    const firstSignal = vi.mocked(api.updateInstance).mock.calls[0]?.[2]?.signal
+    expect(firstSignal).toBeDefined()
+    expect(firstSignal?.aborted).toBe(false)
+
+    const listCalls = vi.mocked(api.listInstances).mock.calls.length
+    await u.click(form.getByRole('button', { name: /^Stop waiting$/i }))
+    expect(firstSignal?.aborted).toBe(true)
+    await waitFor(() =>
+      expect(vi.mocked(api.listInstances).mock.calls.length).toBeGreaterThan(listCalls),
+    )
+
+    const resumedGroup = await screen.findByRole('group', { name: /Edit dev-box-1/i })
+    const resumed = within(resumedGroup)
+    expect(resumed.getByRole('textbox', { name: /^Name$/i })).toHaveValue('dev-box-1-renamed')
+    expect(resumed.getByRole('button', { name: /Save changes/i })).toBeEnabled()
+    const cancel = resumed.getByRole('button', { name: /^Cancel$/i })
+    expect(cancel).toBeEnabled()
+    expect(resumed.getByRole('status')).toHaveTextContent(
+      'Stopped waiting. That save may or may not have gone through; the list shows the current state. Your edits are still here. Save again or Cancel.',
+    )
+
+    await u.click(cancel)
+    await waitFor(() =>
+      expect(screen.queryByRole('group', { name: /Edit dev-box-1/i })).not.toBeInTheDocument(),
+    )
+  })
+
+  it('reuses the same-row edit form when Edit settings is chosen again', async () => {
+    const u = setup()
+    renderWithProviders(<RemoteCrewPanel />)
+
+    await openRowMenu(u, /More actions for dev-box-1/i)
+    await u.click(await screen.findByRole('menuitem', { name: /Edit settings/i }))
+    const settings = within(
+      await screen.findByRole('group', { name: /Edit dev-box-1/i }),
+    )
+    const host = settings.getByRole('textbox', { name: /SSH host/i })
+    await u.clear(host)
+    await u.type(host, 'dev-box-1-corrected')
+
+    // Re-choosing Edit settings on the row that already holds the draft is not
+    // the cross-row swap the panel refuses: the same form stays open with the
+    // typed correction intact.
+    await openRowMenu(u, /More actions for dev-box-1/i)
+    await u.click(await screen.findByRole('menuitem', { name: /Edit settings/i }))
+
+    expect(screen.queryByText(/Save or cancel the open edit/i)).not.toBeInTheDocument()
+    const reopened = within(screen.getByRole('group', { name: /Edit dev-box-1/i }))
+    const reopenedHost = reopened.getByRole('textbox', { name: /SSH host/i })
+    expect(reopenedHost).toHaveValue('dev-box-1-corrected')
+    expect(reopenedHost).not.toHaveAttribute('readonly')
+    expect(reopened.getByRole('textbox', { name: /^Name$/i })).not.toHaveAttribute('readonly')
+    expect(api.updateInstance).not.toHaveBeenCalled()
+  })
+
   it('keeps a typed edit across a switch to the setup tab and back', async () => {
     // The crew list unmounts when the setup tab opens, so an edit whose only home
     // was the form's own state was silently reverted to the stored values on the
@@ -1002,7 +1189,7 @@ describe('RemoteCrewPanel — editing a crew', () => {
     await u.click(screen.getByRole('button', { name: /Set up a new one/i }))
     expect(screen.queryByRole('group', { name: /Edit dev-box-1/i })).not.toBeInTheDocument()
 
-    await u.click(screen.getByRole('button', { name: /Your crews|Crews/i }))
+    await u.click(screen.getByRole('button', { name: /Your instances|Instances/i }))
     const reopened = within(await screen.findByRole('group', { name: /Edit dev-box-1/i }))
     expect((reopened.getByRole('textbox', { name: /SSH host/i }) as HTMLInputElement).value).toBe(
       'dev-box-1-corrected',
@@ -1038,13 +1225,13 @@ describe('RemoteCrewPanel — editing a crew', () => {
       await u.click(screen.getByRole('button', { name: 'Refresh' }))
     })
     await u.click(screen.getByRole('button', { name: /Set up a new one/i }))
-    await u.click(screen.getByRole('button', { name: /Your crews/i }))
-    const reopened = within(await screen.findByRole('group', { name: /Edit dev-box-1/i }))
+    await u.click(screen.getByRole('button', { name: /Your instances/i }))
+    await screen.findByRole('group', { name: /Edit dev-box-1/i })
 
     // The port moved externally, which is a machine coordinate, so the save is
     // withheld until the user adopts the current record. The point of the test
     // survives that: adopting must not turn the stale port into a write.
-    await u.click(await screen.findByRole('button', { name: /Apply my edits to the crew as it is now/i }))
+    await u.click(await screen.findByRole('button', { name: /Apply my edits to the instance as it is now/i }))
     // Adopting the record remounts the form (it re-seeds from the merged draft), so
     // the old scope is detached — re-query rather than reusing it.
     const afterRebase = within(await screen.findByRole('group', { name: /Edit dev-box-1/i }))
@@ -1160,7 +1347,7 @@ describe('RemoteCrewPanel — editing a crew', () => {
 
     // Adopting the current record restores Save, and the request is a partial update
     // against THAT record: the port the user never touched is not written back.
-    await u.click(screen.getByRole('button', { name: /Apply my edits to the crew as it is now/i }))
+    await u.click(screen.getByRole('button', { name: /Apply my edits to the instance as it is now/i }))
     await u.click(await screen.findByRole('button', { name: /Save changes/i }))
     await waitFor(() => expect(api.updateInstance).toHaveBeenCalled())
     const body = vi.mocked(api.updateInstance).mock.calls[0][1]

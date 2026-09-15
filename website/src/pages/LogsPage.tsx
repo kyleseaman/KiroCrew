@@ -1,12 +1,19 @@
 import { useState, useEffect, useRef, useCallback, useContext, useMemo, type ReactNode } from 'react'
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
+import { useQuery, useMutation } from '@tanstack/react-query'
 import { api } from '../api/client'
 import { WsContext } from '../App'
 import { PageHeader } from '../components/ui'
+import ErrorNotice from '../components/ErrorNotice'
 import { LAYOUT } from '../components/layout'
 
 import { i18nT } from '../i18n/t'
 const LEVELS = ['DEBUG', 'INFO', 'WARNING', 'ERROR'] as const
+
+/** The thrown value's own sentence — the api client rejects with an `ApiError`,
+ *  so this is the backend's message; anything else is stringified rather than
+ *  swallowed. */
+const errMsg = (e: unknown): string => (e instanceof Error && e.message ? e.message : String(e))
 const levelColor = (lvl: string) => lvl === 'ERROR' ? 'text-danger' : lvl === 'WARNING' ? 'text-warn' : lvl === 'DEBUG' ? 'text-muted' : 'text-text'
 const levelBg = (lvl: string, active: boolean) => {
   if (!active) return 'bg-transparent text-muted border-border hover:border-border-strong hover:text-text'
@@ -19,7 +26,9 @@ const levelBg = (lvl: string, active: boolean) => {
 /** Reusable log viewer — used in LogsPage and ActivityViewer */
 export function LogViewer({ compact }: { compact?: boolean }) {
   const [lines, setLines] = useState<{ level: string; msg: string }[]>([])
-  const [currentLevel, setCurrentLevel] = useState('INFO')
+  // The level the user picked here, once the backend accepted it. Until then
+  // the selector shows the backend's current level (INFO while that is loading).
+  const [chosenLevel, setChosenLevel] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [matchesOnly, setMatchesOnly] = useState(false)
   const [autoFollow, setAutoFollow] = useState(true)
@@ -29,7 +38,13 @@ export function LogViewer({ compact }: { compact?: boolean }) {
   const virtuosoRef = useRef<VirtuosoHandle>(null)
   const { subscribeLogs } = useContext(WsContext)
 
-  useEffect(() => { api.logLevel().then(d => setCurrentLevel(d.level)) }, [])
+  // useQuery rather than a bare `.then()`: a rejected read used to be an
+  // unhandled rejection with the selector silently stuck on the default.
+  const levelQuery = useQuery<{ level: string }>({
+    queryKey: ['logs', 'level'],
+    queryFn: () => api.logLevel(),
+  })
+  const currentLevel = chosenLevel ?? levelQuery.data?.level ?? 'INFO'
 
   const onLog = useCallback((data: { level: string; msg: string }) => {
     setLines(prev => { const next = [...prev, data]; return next.length > LAYOUT.LOG_LINE_CAP ? next.slice(-LAYOUT.LOG_LINE_CAP) : next })
@@ -40,7 +55,17 @@ export function LogViewer({ compact }: { compact?: boolean }) {
     return () => subscribeLogs(null)
   }, [subscribeLogs, onLog])
 
-  const changeLevel = async (level: string) => { const r = await api.setLogLevel(level); if (r.ok) setCurrentLevel(level) }
+  // A refused change keeps the old level selected AND says so — the `if (r.ok)`
+  // it replaces dropped both the `{ ok: false }` body and a rejected request.
+  const levelMutation = useMutation({
+    mutationFn: async (level: string) => {
+      const r = await api.setLogLevel(level)
+      if (!r?.ok) throw new Error(r?.error || i18nT('pages.logsPage.level_change_failed'))
+      return level
+    },
+    onSuccess: (level) => setChosenLevel(level),
+  })
+  const changeLevel = (level: string) => levelMutation.mutate(level)
 
   const { filtered, matchCount } = useMemo(() => {
     const levelIdx = LEVELS.indexOf(currentLevel as typeof LEVELS[number])
@@ -108,6 +133,9 @@ export function LogViewer({ compact }: { compact?: boolean }) {
         {LEVELS.map(l => (
           <button key={l} className={`${sz.btn} rounded-full font-medium font-body cursor-pointer border transition-all ${levelBg(l, currentLevel === l)}`} onClick={() => changeLevel(l)}>{l.charAt(0) + l.slice(1).toLowerCase()}</button>
         ))}
+        {/* A log panel holds no draft, so both failures offer the hand-off. */}
+        <ErrorNotice message={levelQuery.isError ? errMsg(levelQuery.error) : ''} variant="inline" askAgent testId="logs-level-error" />
+        <ErrorNotice message={levelMutation.isError ? errMsg(levelMutation.error) : ''} variant="inline" askAgent onDismiss={() => levelMutation.reset()} testId="logs-level-change-error" />
       </div>
       {/* `flex-wrap` for the same reason the level row above it carries one: the
           three trailing toggles are `whitespace-nowrap` and the filter field is
@@ -118,20 +146,20 @@ export function LogViewer({ compact }: { compact?: boolean }) {
       <div className={`flex gap-2 flex-wrap ${compact ? 'mb-2' : 'mb-3'} items-center`}>
         <input type="text" aria-label={i18nT('pages.logsPage.filter_logs')} placeholder={i18nT('pages.logsPage.filter_logs_2')} value={search}
           onChange={e => { const v = e.target.value; setSearch(v); if (!v) setMatchesOnly(false) }}
-          className={`flex-1 ${sz.input} rounded-lg border border-border bg-surface text-text font-mono placeholder:text-muted focus:outline-none focus-visible:border-accent`}
+          className={`flex-1 ${sz.input} rounded-lg border border-border bg-bg-elevated text-text font-mono placeholder:text-muted focus:outline-none focus-visible:border-accent`}
         />
         {search && (
           <>
-            <button className={`${sz.btn} rounded cursor-pointer border transition-all whitespace-nowrap ${matchesOnly ? 'bg-surface border-border-strong text-text' : 'bg-transparent border-border text-muted'}`}
+            <button className={`${sz.btn} rounded cursor-pointer border transition-all whitespace-nowrap ${matchesOnly ? 'bg-bg-elevated border-border-strong text-text' : 'bg-transparent border-border text-muted'}`}
               onClick={() => setMatchesOnly(p => !p)}>{i18nT('pages.logsPage.matches_only')}</button>
             <span className={`${sz.label} text-muted whitespace-nowrap`}>{matchCount} {i18nT('pages.logsPage.matches')}</span>
           </>
         )}
-        <button className={`${sz.btn} rounded cursor-pointer border transition-all whitespace-nowrap ml-auto ${newestFirst ? 'bg-surface border-border-strong text-text' : 'bg-transparent border-border text-muted'}`}
+        <button className={`${sz.btn} rounded cursor-pointer border transition-all whitespace-nowrap ml-auto ${newestFirst ? 'bg-bg-elevated border-border-strong text-text' : 'bg-transparent border-border text-muted'}`}
           onClick={() => setNewestFirst(p => !p)}>{newestFirst ? i18nT('pages.logsPage.latest_first') : i18nT('pages.logsPage.latest_last')}</button>
-        <button className={`${sz.btn} rounded cursor-pointer border transition-all whitespace-nowrap ${wrapLines ? 'bg-surface border-border-strong text-text' : 'bg-transparent border-border text-muted'}`}
+        <button className={`${sz.btn} rounded cursor-pointer border transition-all whitespace-nowrap ${wrapLines ? 'bg-bg-elevated border-border-strong text-text' : 'bg-transparent border-border text-muted'}`}
           onClick={() => setWrapLines(p => !p)}>{wrapLines ? i18nT('pages.logsPage.wrap_on') : i18nT('pages.logsPage.wrap_off')}</button>
-        <button className={`${sz.btn} rounded cursor-pointer border transition-all whitespace-nowrap ${autoFollow ? 'bg-surface border-border-strong text-text' : 'bg-transparent border-border text-muted'}`}
+        <button className={`${sz.btn} rounded cursor-pointer border transition-all whitespace-nowrap ${autoFollow ? 'bg-bg-elevated border-border-strong text-text' : 'bg-transparent border-border text-muted'}`}
           onClick={toggleTail}>{autoFollow ? i18nT('pages.logsPage.tail_on') : i18nT('pages.logsPage.tail_off')}</button>
       </div>
       <div className={`flex-1 flex flex-col min-h-0 ${compact ? 'border border-border rounded-lg overflow-hidden mb-2' : 'card-glow border border-border bg-card rounded-lg p-5 animate-rise shadow-sm transition-all'}`}>

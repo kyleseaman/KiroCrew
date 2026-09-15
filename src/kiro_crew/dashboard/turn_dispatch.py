@@ -1,27 +1,23 @@
 """Guarded dispatch for dashboard chat turns.
 
 Every chat turn runs under a wall-clock ceiling so a genuinely runaway turn
-cannot pin a session forever. That ceiling was correct; the way it fired was
-not. Each dispatch site wrapped the turn in ``asyncio.wait_for`` and attached
-exactly one done-callback — ``state._background_tasks.discard``, a ``set``
-method that ignores its argument's result. Nothing ever awaited the task or
-called ``.exception()``, so when the ceiling fired the resulting
-``TimeoutError`` was **never retrieved**: the turn simply stopped. No error
-card, no row in the session transcript, and no log line the user would think
-to look for — only a garbage-collection-time "Task exception was never
-retrieved" message, emitted whenever the collector happened to run.
+cannot pin a session forever. Reaching that ceiling must always produce a
+VISIBLE outcome: an error card and a row in the session transcript. A dispatch
+that only wrapped the turn in ``asyncio.wait_for`` and attached
+``state._background_tasks.discard`` — a ``set`` method that ignores its
+argument's result — never retrieves the resulting ``TimeoutError``, so the turn
+simply stops, leaving nothing but a garbage-collection-time "Task exception was
+never retrieved" message and a failure indistinguishable from the agent going
+quiet.
 
-That made the failure indistinguishable from the agent going quiet. A babysit
-loop polling a pull request reaches the ceiling routinely — ten review rounds
-at roughly five minutes of waiting each, plus the tool time in between — so
-this was an ordinary outcome of long-running work, not a rare edge case, and
-its symptom was "the agent abandoned my PR without saying anything".
+The ceiling is an ordinary outcome of long-running work, not a rare edge case: a
+babysit loop polling a pull request reaches it routinely — ten review rounds at
+roughly five minutes of waiting each, plus the tool time in between.
 
 This module owns the one dispatch path. Keeping the ceiling, the clamp against
 the transport's own timeout, and the visible-card guarantee together here is
-deliberate: they were previously re-derived at each of several call sites, so a
-new site could silently reintroduce the silent death by copying the old
-``add_done_callback(discard)`` shape.
+deliberate: re-deriving them at each call site lets a new site silently
+reintroduce the silent death by copying an ``add_done_callback(discard)`` shape.
 """
 
 from __future__ import annotations
@@ -69,7 +65,7 @@ def _acp_prompt_ceiling() -> float:
     """The transport's own per-prompt timeout.
 
     Resolves through :func:`~kiro_crew.acp.client.resolve_prompt_timeout`, which
-    follows a configured ceiling ABOVE the 2h default (plus a margin so this
+    follows a configured ceiling ABOVE the 4h default (plus a margin so this
     module's card always fires before the transport cut). The clamp in
     :func:`chat_turn_timeout_secs` therefore no longer fires in normal operation;
     it stays as the fail-safe for a resolver that could not read config.
@@ -195,10 +191,10 @@ def format_approval_no_budget_card() -> str:
 def format_approval_timeout_card(timeout_secs: float) -> str:
     """User-facing text for an approval prompt nobody answered in time.
 
-    Deliberately distinct from :func:`format_turn_timeout_card`: the two used to
-    be indistinguishable to the user because the approval window outlived the
-    turn, so an unanswered prompt always surfaced as a generic turn timeout and
-    the actual cause — and the fix, resending — was never stated.
+    Deliberately distinct from :func:`format_turn_timeout_card`: the approval
+    window can outlive the turn, and one shared card would surface an unanswered
+    prompt as a generic turn timeout, stating neither the actual cause nor the
+    fix, which is resending.
     """
     if timeout_secs >= 3600:
         waited = f"{timeout_secs / 3600:.1f}".rstrip("0").rstrip(".") + " hours"
@@ -292,7 +288,12 @@ def finish_turn_task(
     )
 
 
-async def _bounded_turn(coro: "Coroutine[Any, Any, Any]", timeout_secs: float) -> Any:
+async def _bounded_turn(
+    coro: "Coroutine[Any, Any, Any]",
+    timeout_secs: float,
+    *,
+    _started: "list[None] | None" = None,
+) -> Any:
     """Run *coro* under a wall-clock ceiling, raising even on a suppressed deadline.
 
     ``asyncio.wait_for`` cannot be used directly here. It cancels the coroutine
@@ -313,12 +314,19 @@ async def _bounded_turn(coro: "Coroutine[Any, Any, Any]", timeout_secs: float) -
     result. ``_run_chat``'s cancellation semantics are untouched — they are
     shared with the user's Stop button.
     """
+    # ``spawn_guarded_turn`` uses this yield-free marker to distinguish a
+    # wrapper that claimed its input coroutine from one cancelled before its
+    # first event-loop step.  In the latter case this function's ``finally``
+    # never runs, so the dispatch helper must close the still-unclaimed input.
+    if _started is not None:
+        _started.append(None)
+
     loop = asyncio.get_running_loop()
     deadline_fired = False
 
     def _on_deadline() -> None:
         nonlocal deadline_fired
-        if not task.done():
+        if task is not None and not task.done():
             deadline_fired = True
             task.cancel()
 
@@ -328,18 +336,30 @@ async def _bounded_turn(coro: "Coroutine[Any, Any, Any]", timeout_secs: float) -
     # copy carries it; reset in the finally so a direct `await _bounded_turn(...)`
     # cannot leak a spent deadline into the caller's context and starve the next
     # turn dispatched there.
-    deadline_token = _TURN_DEADLINE.set(loop.time() + timeout_secs)
-    task: "asyncio.Task[Any]" = asyncio.ensure_future(coro)
-    handle = loop.call_later(timeout_secs, _on_deadline)
+    previous_deadline = _TURN_DEADLINE.get()
+    _TURN_DEADLINE.set(loop.time() + timeout_secs)
+    task: "asyncio.Task[Any] | None" = None
+    handle: "asyncio.TimerHandle | None" = None
+    _generator_exit = False
     try:
+        try:
+            task = asyncio.ensure_future(coro)
+        except BaseException:
+            # Ownership was not transferred to a Task.
+            coro.close()
+            raise
+
+        # Keep timer creation inside the same ownership transaction.  Although
+        # the real event loop almost never rejects ``call_later``, a closing or
+        # instrumented loop can: the just-created Task must not outlive that
+        # failed dispatch.
+        handle = loop.call_later(timeout_secs, _on_deadline)
         try:
             result = await task
         except asyncio.CancelledError:
             if deadline_fired:
                 # Our ceiling cut it and the turn let the cancellation through.
-                raise TimeoutError(
-                    f"turn exceeded the {timeout_secs:.0f}s ceiling"
-                ) from None
+                raise TimeoutError(f"turn exceeded the {timeout_secs:.0f}s ceiling") from None
             # Cancelled by something else (Stop button, shutdown) — propagate.
             raise
         if deadline_fired:
@@ -347,12 +367,47 @@ async def _bounded_turn(coro: "Coroutine[Any, Any, Any]", timeout_secs: float) -
             # the production path: without this the ceiling is silently absorbed.
             raise TimeoutError(f"turn exceeded the {timeout_secs:.0f}s ceiling")
         return result
+    except GeneratorExit:
+        # This wrapper is being torn down directly -- its own coroutine object
+        # is being ``close()``-d, which happens when nothing ever awaited or
+        # cancelled it through a live Task and the garbage collector reclaims
+        # it instead (an orphaned ``spawn_guarded_turn`` dispatch nobody
+        # joined). Unlike a live ``CancelledError`` unwind, there is no
+        # guarantee the event loop that would drive ``task`` to completion is
+        # even still running -- ``close()`` resumes this frame synchronously
+        # from whatever thread the collector runs on, not from a loop
+        # callback. A coroutine that suspends again while unwinding a
+        # GeneratorExit gets "coroutine ignored GeneratorExit" from the
+        # interpreter, so ``_generator_exit`` below tells the ``finally`` to
+        # skip the join and only cancel best-effort.
+        _generator_exit = True
+        raise
     finally:
-        handle.cancel()
-        _TURN_DEADLINE.reset(deadline_token)
-        if not task.done():
-            # The wrapper itself was cancelled; don't orphan the turn.
-            task.cancel()
+        if handle is not None:
+            handle.cancel()
+        # Restore by value instead of retaining a ContextVar token. Test and
+        # shutdown harnesses may resume coroutine finalization in a copied
+        # Context (notably Windows xdist); reset(token) then raises and can take
+        # down the whole worker because tokens are context-bound.
+        _TURN_DEADLINE.set(previous_deadline)
+        if task is not None and not task.done():
+            # The wrapper itself was cancelled, or setup failed after Task
+            # creation.  Cancel AND join it: cancellation alone can leave an
+            # unstarted coroutine pending until a later GC cycle.
+            try:
+                task.cancel()
+            except RuntimeError:
+                # The loop that owned ``task`` is already closed (the
+                # GeneratorExit case, or a shutdown race). Nothing left to
+                # schedule the cancellation on.
+                pass
+            if not _generator_exit:
+                try:
+                    await task
+                except BaseException:
+                    # Cleanup must preserve the exception already leaving the
+                    # wrapper (setup failure or caller cancellation).
+                    pass
 
 
 async def bounded_chat_turn(coro: "Coroutine[Any, Any, Any]") -> Any:
@@ -386,8 +441,27 @@ def spawn_guarded_turn(
     keep doing so; this helper deliberately does not own those fields, because
     they carry site-specific stop/steer semantics.
     """
-    timeout = chat_turn_timeout_secs() if timeout_secs is None else timeout_secs
-    task = asyncio.create_task(_bounded_turn(coro, timeout))
+    started: list[None] = []
+    bounded = None
+    try:
+        timeout = chat_turn_timeout_secs() if timeout_secs is None else timeout_secs
+        bounded = _bounded_turn(coro, timeout, _started=started)
+        task = asyncio.create_task(bounded)
+    except BaseException:
+        # The caller created ``coro`` before entering this helper.  If timeout
+        # resolution or task creation fails, no Task owns either coroutine.
+        if bounded is not None:
+            bounded.close()
+        coro.close()
+        raise
     state._background_tasks.add(task)
-    task.add_done_callback(lambda t: finish_turn_task(state, slot, t, timeout))
+
+    def _finish(t: "asyncio.Task[Any]") -> None:
+        if not started:
+            # A Task cancelled before its first loop step closes the bounded
+            # wrapper but not the input coroutine stored in its arguments.
+            coro.close()
+        finish_turn_task(state, slot, t, timeout)
+
+    task.add_done_callback(_finish)
     return task

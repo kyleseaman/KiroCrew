@@ -145,6 +145,38 @@ class TestMapResponse:
         ]}
         assert "bonus_limit" not in api._map_response(data)
 
+    def test_warns_on_two_credit_typed_pools(self, caplog):
+        # The exact payload nobody has captured: TWO entries typed literally
+        # "CREDIT". The picker takes the first by list order; detection must fire
+        # AND selection must stay byte-for-byte identical (first entry wins).
+        data = {"usageBreakdownList": [
+            {"resourceType": "CREDIT", "currentUsage": 5, "usageLimit": 100},
+            {"resourceType": "CREDIT", "currentUsage": 999, "usageLimit": 2000},
+        ]}
+        with caplog.at_level("WARNING", logger=api.logger.name):
+            out = api._map_response(data)
+        # Selection unchanged: the first CREDIT entry still wins.
+        assert out["credits_used"] == 5.0
+        assert out["credits_plan"] == 100.0
+        warnings = [r for r in caplog.records if "CREDIT-typed pools" in r.getMessage()]
+        assert len(warnings) == 1
+        msg = warnings[0].getMessage()
+        assert "2 CREDIT-typed pools" in msg
+        assert "index 0" in msg
+        # Shape only — no balances/identifiers leak into the log line.
+        assert "999" not in msg and "2000" not in msg
+
+    def test_no_warn_on_single_credit_typed_pool(self, caplog):
+        # Mutate the fixture: one CREDIT entry. Detection must NOT fire — a
+        # detector that fires on every payload is worse than none.
+        data = {"usageBreakdownList": [
+            {"resourceType": "CREDIT", "currentUsage": 5, "usageLimit": 100},
+            {"resourceType": "FREE_TRIAL", "currentUsage": 10, "usageLimit": 50},
+        ]}
+        with caplog.at_level("WARNING", logger=api.logger.name):
+            api._map_response(data)
+        assert not [r for r in caplog.records if "CREDIT-typed pools" in r.getMessage()]
+
     def test_none_when_response_not_dict(self):
         assert api._map_response([]) is None
         assert api._map_response(None) is None
@@ -411,13 +443,15 @@ class TestLoadBearerToken:
 
 
 class TestWindowsCliStore:
-    """kiro-cli on Windows keeps the same auth store under ``%APPDATA%\\kiro-cli``
-    (``~/AppData/Roaming/kiro-cli`` by default).
+    """kiro-cli on Windows keeps the same auth store under
+    ``%LOCALAPPDATA%\\kiro-cli`` (``~/AppData/Local/kiro-cli`` by default);
+    older layouts used ``%APPDATA%\\kiro-cli`` (``~/AppData/Roaming/kiro-cli``).
 
-    Absent from ``_CLI_SQLITE_DBS``, a Windows host's only candidate was the
-    JSON SSO cache (``from_cli_store=False``), which can never satisfy the
-    provenance path -- so whenever the ARN anchor also failed, every candidate
-    was rejected and the credit pill silently disappeared.
+    With only the Roaming location in ``_CLI_SQLITE_DBS``, a current Windows
+    host's store was never discovered: no candidate carried
+    ``from_cli_store=True``, the source-anchored provenance path could never be
+    satisfied, and whenever the ARN anchor also failed the usage API returned
+    unavailable and the credit pill silently disappeared.
     """
 
     @pytest.fixture(autouse=True)
@@ -428,13 +462,17 @@ class TestWindowsCliStore:
         api._PROFILE_ARN_CACHE.clear()
         api._PROFILE_NAME_CACHE.clear()
 
-    def test_windows_store_is_a_default_candidate(self):
-        # The FIXED default Roaming location, not %APPDATA%-resolved: the
-        # sensitive-path fence that makes membership a trust claim is
-        # home-anchored at exactly this path, so an APPDATA-resolved location
-        # either equals it or falls outside the fence and must not be trusted.
-        expected = Path.home() / "AppData" / "Roaming" / "kiro-cli" / "data.sqlite3"
-        assert expected in api._CLI_SQLITE_DBS
+    def test_windows_stores_are_default_candidates(self):
+        # The FIXED default locations, not %LOCALAPPDATA%/%APPDATA%-resolved:
+        # the sensitive-path fence that makes membership a trust claim is
+        # home-anchored at exactly these paths, so an env-resolved location
+        # either equals an entry or falls outside the fence and must not be
+        # trusted. Local is where current kiro-cli writes; Roaming stays for
+        # older layouts.
+        local = Path.home() / "AppData" / "Local" / "kiro-cli" / "data.sqlite3"
+        roaming = Path.home() / "AppData" / "Roaming" / "kiro-cli" / "data.sqlite3"
+        assert local in api._CLI_SQLITE_DBS
+        assert roaming in api._CLI_SQLITE_DBS
 
     def test_windows_store_token_is_trusted_without_arn(self, tmp_path):
         # End-to-end: a token read out of a Windows-layout store carries
@@ -457,7 +495,7 @@ class TestWindowsCliStore:
         usage_body = {"usageBreakdownList": [
             {"resourceType": "CREDIT", "currentUsage": 7.0, "usageLimit": 100.0}]}
 
-        def fake_post(token, target, payload):
+        def fake_post(token, target, payload, **_kwargs):
             if target == api._TARGET_LIST_PROFILES:
                 return _resp(200, {"profiles": []})
             return _resp(200, usage_body)
@@ -473,6 +511,72 @@ class TestWindowsCliStore:
             out = api.fetch_usage_limits(expected_arn=None)
         assert out is not None
         assert out["credits_used"] == 7.0
+
+    def test_local_appdata_store_token_is_trusted_without_arn(self, tmp_path):
+        # Same end-to-end path for the CURRENT Windows layout
+        # (%LOCALAPPDATA%\kiro-cli): a token read out of a Local-layout store
+        # carries from_cli_store=True, so the provenance path accepts it when
+        # whoami reports no profile ARN -- the case where the store exists only
+        # under AppData/Local, which would otherwise blank the pill.
+        db = tmp_path / "AppData" / "Local" / "kiro-cli" / "data.sqlite3"
+        db.parent.mkdir(parents=True)
+        con = sqlite3.connect(str(db))
+        con.execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value TEXT)")
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        con.execute(
+            "INSERT INTO auth_kv VALUES (?, ?)",
+            ("kirocli:odic:token",
+             json.dumps({"access_token": "local-tok", "expires_at": future})),
+        )
+        con.commit()
+        con.close()
+
+        usage_body = {"usageBreakdownList": [
+            {"resourceType": "CREDIT", "currentUsage": 3.0, "usageLimit": 100.0}]}
+
+        def fake_post(token, target, payload, **_kwargs):
+            if target == api._TARGET_LIST_PROFILES:
+                return _resp(200, {"profiles": []})
+            return _resp(200, usage_body)
+
+        with patch("kiro_crew.hooks.safe_read_file_internal", return_value=None), \
+             patch("kiro_crew.hooks.emit_internal_read_audit", return_value=True), \
+             patch.object(api, "_CLI_SQLITE_DBS", (db,)), \
+             patch.object(api, "_OTHER_SQLITE_DBS", ()), \
+             patch.object(api, "_post", side_effect=fake_post):
+            cands = api._candidate_tokens()
+            assert [c.token for c in cands] == ["local-tok"]
+            assert cands[0].from_cli_store is True
+            out = api.fetch_usage_limits(expected_arn=None)
+        assert out is not None
+        assert out["credits_used"] == 3.0
+
+
+class TestRtsEndpoint:
+    """Regional RTS host is a hardcoded table keyed by the whoami ARN."""
+
+    def test_us_east_1_arn_keeps_codewhisperer_host(self):
+        arn = "arn:aws:codewhisperer:us-east-1:123:profile/A"
+        assert api._region_from_arn(arn) == "us-east-1"
+        assert api._rts_endpoint(arn) == "https://codewhisperer.us-east-1.amazonaws.com"
+
+    def test_eu_central_1_arn_uses_q_host(self):
+        # eu-central-1 is a different hostname, not codewhisperer.eu-central-1.
+        arn = "arn:aws:codewhisperer:eu-central-1:123:profile/A"
+        assert api._region_from_arn(arn) == "eu-central-1"
+        assert api._rts_endpoint(arn) == "https://q.eu-central-1.amazonaws.com"
+
+    def test_unknown_or_missing_arn_falls_back_to_us_east_1(self):
+        assert api._rts_endpoint(None) == api._RTS_ENDPOINT
+        assert api._rts_endpoint("") == api._RTS_ENDPOINT
+        assert api._rts_endpoint("not-an-arn") == api._RTS_ENDPOINT
+        assert api._rts_endpoint("arn:aws:codewhisperer:ap-south-1:1:profile/X") == (
+            api._RTS_ENDPOINT
+        )
+
+    def test_default_constant_is_the_us_east_1_literal(self):
+        assert api._RTS_ENDPOINT == api._RTS_ENDPOINTS["us-east-1"]
+        assert api._RTS_ENDPOINT == "https://codewhisperer.us-east-1.amazonaws.com"
 
 
 class TestPostSecurityControls:
@@ -507,6 +611,30 @@ class TestPostSecurityControls:
         assert req.get_header("X-amz-target") == api._TARGET_GET_USAGE
         assert req.get_header("User-agent")
         assert captured["timeout"] == api._TIMEOUT_SECS
+
+    def test_post_uses_explicit_regional_endpoint(self):
+        captured = {}
+
+        class _FakeResp:
+            status = 200
+
+            def read(self, n=None):
+                return b"{}"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_open(self, req, timeout=None):
+            captured["req"] = req
+            return _FakeResp()
+
+        eu = api._RTS_ENDPOINTS["eu-central-1"]
+        with patch("urllib.request.OpenerDirector.open", fake_open):
+            api._post("tok", api._TARGET_LIST_PROFILES, {}, endpoint=eu)
+        assert captured["req"].get_full_url() == eu
 
     def test_opener_verifies_tls_and_disables_redirects(self):
         opener = api._build_opener()
@@ -574,7 +702,7 @@ class TestFetchUsageLimits:
             {"resourceType": "CREDIT", "currentUsage": 5.0, "usageLimit": 100.0}]}
         arn = "arn:aws:codewhisperer:...:profile/X"
 
-        def fake_post(token, target, payload):
+        def fake_post(token, target, payload, **_kwargs):
             if target == api._TARGET_LIST_PROFILES:
                 return _resp(200, {"profiles": [
                     {"arn": arn,
@@ -586,13 +714,36 @@ class TestFetchUsageLimits:
             out = api.fetch_usage_limits(expected_arn=arn)
         assert out["account"] == "Acme Corp"
 
+    def test_eu_arn_posts_both_calls_to_q_eu_central_1(self):
+        # ListAvailableProfiles is region-scoped: hitting us-east-1 for an
+        # eu-central-1 IdC profile returns no ARN and the pill hides. Both
+        # RTS calls must use the EU host from the whoami ARN.
+        usage_body = {"usageBreakdownList": [
+            {"resourceType": "CREDIT", "currentUsage": 5.0, "usageLimit": 100.0}]}
+        arn = "arn:aws:codewhisperer:eu-central-1:123:profile/A"
+        seen: list[str | None] = []
+
+        def fake_post(token, target, payload, **kwargs):
+            seen.append(kwargs.get("endpoint"))
+            if target == api._TARGET_LIST_PROFILES:
+                return _resp(200, {"profiles": [{"arn": arn}]})
+            return _resp(200, usage_body)
+
+        with patch.object(api, "_candidate_tokens", return_value=[_cand("tok")]), \
+             patch.object(api, "_post", side_effect=fake_post):
+            out = api.fetch_usage_limits(expected_arn=arn)
+        assert out is not None
+        eu = api._RTS_ENDPOINTS["eu-central-1"]
+        assert seen == [eu, eu]
+        assert eu == "https://q.eu-central-1.amazonaws.com"
+
     def test_no_account_when_profile_has_no_name(self):
         # An org profile with an ARN but no profileName must not set ``account``
         # (individual Builder ID accounts likewise have no profile at all).
         usage_body = {"usageBreakdownList": [
             {"resourceType": "CREDIT", "currentUsage": 5.0, "usageLimit": 100.0}]}
 
-        def fake_post(token, target, payload):
+        def fake_post(token, target, payload, **_kwargs):
             if target == api._TARGET_LIST_PROFILES:
                 return _resp(200, {"profiles": [{"arn": "arn:x"}]})
             return _resp(200, usage_body)
@@ -608,7 +759,7 @@ class TestFetchUsageLimits:
             {"resourceType": "CREDIT", "currentUsage": 5.0, "usageLimit": 100.0}]}
         arn = "arn:aws:codewhisperer:us-east-1:1:profile/A"
 
-        def fake_post(token, target, payload):
+        def fake_post(token, target, payload, **_kwargs):
             if target == api._TARGET_LIST_PROFILES:
                 return _resp(200, {"profiles": [{"arn": arn}]})
             return _resp(403, {}) if token == "stale" else _resp(200, usage_body)
@@ -735,7 +886,7 @@ class TestExpectedArnAnchor:
     ARN_B = "arn:aws:codewhisperer:us-east-1:2:profile/B"
 
     def _fake_post(self, arn_for: dict[str, str], usage_for: dict[str, dict]):
-        def fake_post(token, target, payload):
+        def fake_post(token, target, payload, **_kwargs):
             if target == api._TARGET_LIST_PROFILES:
                 arn = arn_for.get(token)
                 profiles = [{"arn": arn}] if arn else []
@@ -773,7 +924,7 @@ class TestExpectedArnAnchor:
 
         inner = self._fake_post(arns, usage)
 
-        def recording_post(token, target, payload):
+        def recording_post(token, target, payload, **_kwargs):
             seen.append((token, target))
             return inner(token, target, payload)
 
@@ -801,7 +952,7 @@ class TestExpectedArnAnchor:
         usage = {"tok": {"usageBreakdownList": [
             {"resourceType": "CREDIT", "currentUsage": 1.0, "usageLimit": 10.0}]}}
 
-        def fake_post(token, target, payload):
+        def fake_post(token, target, payload, **_kwargs):
             if target == api._TARGET_LIST_PROFILES:
                 return _resp(500, {})
             return _resp(200, usage[token])
@@ -865,7 +1016,7 @@ class TestExpectedArnAnchor:
         sent: list[dict] = []
         inner = self._fake_post({"cli": arn}, usage)
 
-        def recording_post(token, target, payload):
+        def recording_post(token, target, payload, **_kwargs):
             if target == api._TARGET_GET_USAGE:
                 sent.append(payload)
             return inner(token, target, payload)
@@ -894,7 +1045,7 @@ class TestExpectedArnAnchor:
         seen: list[tuple[str, str]] = []
         inner = self._fake_post({}, usage)
 
-        def recording_post(token, target, payload):
+        def recording_post(token, target, payload, **_kwargs):
             seen.append((token, target))
             return inner(token, target, payload)
 
@@ -921,8 +1072,8 @@ class TestCandidateOrdering:
 
     def test_freshest_expiry_ranks_first(self, tmp_path):
         # A stale-but-unexpired JSON credential sits in the highest-priority PATH
-        # slot; the SQLite store holds a newer one. Path order used to decide,
-        # which is how a signed-out profile won.
+        # slot; the SQLite store holds a newer one. Deciding on path order here
+        # would let a signed-out profile win.
         now = datetime.now(timezone.utc)
         soon = (now + timedelta(minutes=20)).isoformat()
         later = (now + timedelta(hours=8)).isoformat()
@@ -1092,8 +1243,143 @@ class TestTokenStoreSensitivePath:
 
         from kiro_crew.security import is_sensitive_path
         home = Path.home()
-        for base in (".local/share", "Library/Application Support", "AppData/Roaming"):
+        for base in (".local/share", "Library/Application Support",
+                     "AppData/Local", "AppData/Roaming"):
             for app in ("kiro-cli", "amazon-q"):
                 # The DB and its WAL/SHM/journal sidecars must all be sensitive.
                 assert is_sensitive_path(str(home / base / app / "data.sqlite3"))
                 assert is_sensitive_path(str(home / base / app / "data.sqlite3-wal"))
+
+
+class TestExpectedArnSelection:
+    """The profile probe answers a question ("is the signed-in profile in this
+    token's list?"), never a position ("what is first?").
+
+    The failure mode being locked out: taking the FIRST entry carrying an
+    ARN means that, for a token entitled to two or more profiles, whether the
+    credit pill works depends on the order the upstream API happens to
+    return — the signed-in profile can be present in the list and never asked
+    about. A one-answer-per-token memo then makes that wrong selection sticky
+    for the process lifetime.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_arn_cache(self):
+        api._PROFILE_ARN_CACHE.clear()
+        api._PROFILE_NAME_CACHE.clear()
+        yield
+        api._PROFILE_ARN_CACHE.clear()
+        api._PROFILE_NAME_CACHE.clear()
+
+    ARN_A = "arn:aws:codewhisperer:us-east-1:1:profile/A"
+    ARN_B = "arn:aws:codewhisperer:us-east-1:2:profile/B"
+    USAGE = {"usageBreakdownList": [
+        {"resourceType": "CREDIT", "currentUsage": 1200.0, "usageLimit": 10000.0}]}
+
+    def _post_two_profiles(self, token, target, payload, **_kwargs):
+        # The signed-in profile (A) is SECOND — exactly the reporter's shape.
+        if target == api._TARGET_LIST_PROFILES:
+            return _resp(200, {"profiles": [
+                {"arn": self.ARN_B, "profileName": "Other Org"},
+                {"arn": self.ARN_A, "profileName": "My Org"}]})
+        return _resp(200, self.USAGE)
+
+    def test_expected_arn_second_in_list_is_matched(self):
+        # THE bug: a signed-in profile that is present but not first must still
+        # be found, and the pill must show real usage instead of degrading.
+        with patch.object(api, "_candidate_tokens", return_value=[_cand("tok")]), \
+             patch.object(api, "_post", side_effect=self._post_two_profiles):
+            out = api.fetch_usage_limits(expected_arn=self.ARN_A)
+        assert out is not None, "credential declined although the signed-in profile is listed"
+        assert out["_profile_arn"] == self.ARN_A
+        assert out["credits_used"] == 1200.0
+
+    def test_matched_profile_name_rides_along(self):
+        # The ``account`` label must be the MATCHED profile's name, not the
+        # first entry's — a wrong label attributes the credits to another org.
+        with patch.object(api, "_candidate_tokens", return_value=[_cand("tok")]), \
+             patch.object(api, "_post", side_effect=self._post_two_profiles):
+            out = api.fetch_usage_limits(expected_arn=self.ARN_A)
+        assert out is not None
+        assert out.get("account") == "My Org"
+
+    def test_expected_arn_absent_declines_the_credential(self):
+        # A multi-profile list WITHOUT the expected ARN proves nothing: the
+        # credential must be declined without spending a GetUsageLimits call —
+        # presence is the proof, and mere listing of OTHER profiles is not.
+        seen: list[str] = []
+
+        def recording(token, target, payload, **_kwargs):
+            seen.append(target)
+            if target == api._TARGET_LIST_PROFILES:
+                return _resp(200, {"profiles": [
+                    {"arn": self.ARN_B}, {"arn": "arn:other"}]})
+            return _resp(200, self.USAGE)
+
+        with patch.object(api, "_candidate_tokens", return_value=[_cand("tok")]), \
+             patch.object(api, "_post", side_effect=recording):
+            assert api.fetch_usage_limits(expected_arn=self.ARN_A) is None
+        assert api._TARGET_GET_USAGE not in seen
+
+    def test_single_profile_path_unchanged(self):
+        def fake_post(token, target, payload, **_kwargs):
+            if target == api._TARGET_LIST_PROFILES:
+                return _resp(200, {"profiles": [{"arn": self.ARN_A}]})
+            return _resp(200, self.USAGE)
+
+        with patch.object(api, "_candidate_tokens", return_value=[_cand("tok")]), \
+             patch.object(api, "_post", side_effect=fake_post):
+            out = api.fetch_usage_limits(expected_arn=self.ARN_A)
+        assert out is not None
+        assert out["_profile_arn"] == self.ARN_A
+
+    def test_no_expected_arn_keeps_first_with_arn(self):
+        # Source-anchored mode asks no question, so the first entry carrying an
+        # ARN is still the answer (the provenance check is the proof there).
+        with patch.object(api, "_post", side_effect=self._post_two_profiles):
+            assert api._list_profile_arn("tok") == self.ARN_B
+
+    def test_warm_cache_does_not_cross_expectations(self):
+        # Two probes with the same token and different expected ARNs must not
+        # return each other's answer: one memoized ARN per token digest made
+        # the wrong first selection sticky for the process lifetime.
+        with patch.object(api, "_candidate_tokens", return_value=[_cand("tok")]), \
+             patch.object(api, "_post", side_effect=self._post_two_profiles):
+            first = api.fetch_usage_limits(expected_arn=self.ARN_B)
+            second = api.fetch_usage_limits(expected_arn=self.ARN_A)
+        assert first is not None
+        assert first["_profile_arn"] == self.ARN_B
+        assert second is not None, "warm cache served the other expectation's answer"
+        assert second["_profile_arn"] == self.ARN_A
+
+    def test_name_cache_keyed_with_the_arn_it_belongs_to(self):
+        # The co-cached display name must follow the same composite key, so an
+        # account label can never be served for a different expectation.
+        with patch.object(api, "_post", side_effect=self._post_two_profiles):
+            assert api._list_profile_arn("tok", expected_arn=self.ARN_A) == self.ARN_A
+            assert api._list_profile_arn("tok", expected_arn=self.ARN_B) == self.ARN_B
+        assert api._account_name("tok", self.ARN_A) == "My Org"
+        assert api._account_name("tok", self.ARN_B) == "Other Org"
+
+    def test_anchored_miss_is_not_cached(self):
+        # An absent expected ARN may be post-login propagation lag; the next
+        # refresh must re-probe rather than serve a pinned miss.
+        with patch.object(api, "_post",
+                          return_value=_resp(200, {"profiles": [{"arn": self.ARN_B}]})):
+            assert api._list_profile_arn("tok", expected_arn=self.ARN_A) is None
+        with patch.object(api, "_post", side_effect=self._post_two_profiles) as mp:
+            assert api._list_profile_arn("tok", expected_arn=self.ARN_A) == self.ARN_A
+        assert mp.call_count == 1
+
+    def test_anchored_match_is_memoized(self):
+        # The composite key still saves the round-trip on the SAME question.
+        with patch.object(api, "_post", side_effect=self._post_two_profiles) as mp:
+            assert api._list_profile_arn("tok", expected_arn=self.ARN_A) == self.ARN_A
+            assert api._list_profile_arn("tok", expected_arn=self.ARN_A) == self.ARN_A
+        assert mp.call_count == 1
+
+    def test_empty_anchor_behaves_as_no_anchor_in_probe(self):
+        # A falsy anchor means "no question asked" — first-with-ARN, matching
+        # fetch_usage_limits' own truthiness convention for expected_arn.
+        with patch.object(api, "_post", side_effect=self._post_two_profiles):
+            assert api._list_profile_arn("tok", expected_arn="") == self.ARN_B

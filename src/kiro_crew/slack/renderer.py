@@ -13,8 +13,7 @@ approve/deny buttons. The interactive decision is awaited via
 :class:`SlackApprovalDecider`, whose future is resolved by the Slack
 interaction handler when the user clicks a button.
 
-Two channel-neutral halves do the work this module used to do badly or not at
-all:
+Two channel-neutral halves own work this module deliberately does not:
 
 * **Length splitting** belongs to
   :func:`kiro_crew.messaging.split.split_markdown_safe`, the shared fence-safe
@@ -62,6 +61,7 @@ from kiro_crew.slack.handler import (
     _APPROVAL_TIMEOUT,
     _CURSOR,
     _EDIT_INTERVAL,
+    _STREAM_CONTINUED,
     _THINKING,
     StatusReactionController,
     _append_footer_actions,
@@ -95,6 +95,24 @@ _SPLIT_HEADROOM = 100
 #: lines explain a reply; twelve bury it.
 _MAX_REJECTION_LINES = 3
 
+#: Appended to a partially-streamed assistant row that the dispatcher rescues when
+#: a turn dies mid-flight. Without it the retry reads a reply that simply stops
+#: mid-sentence and cannot tell a truncated turn from a finished one — so it may
+#: treat the work as already reported and answer nothing. The wording addresses
+#: the next turn directly, because that turn is the only consumer.
+#:
+#: It lives here rather than in the shared ``messaging`` layer because the rescue
+#: it belongs to is Slack-only, and for the reason in ``delivered_text``: Slack is
+#: the one renderer that records WHICH appended bytes the API acknowledged, so it
+#: is the one channel where a turn that dies mid-flight can persist text the user
+#: provably saw. Other renderers on the shared path do emit mid-turn; none of them
+#: can say afterwards what the user retained.
+PARTIAL_TURN_MARKER = (
+    "\n\n_[This turn was cut off here by a transport/backend failure, not finished. "
+    "Everything above was already established — continue from this point instead of "
+    "starting the request over.]_"
+)
+
 
 def _redact_all(text: str) -> str:
     """Both outbound redactors as one callable, in the canonical order."""
@@ -119,8 +137,8 @@ def _display_safe(text: str) -> str:
 
 
 #: Slack channel capabilities live in ``slack/transport.py`` (imported above).
-#: This module used to carry a second literal copy of the declaration; two
-#: literals for one fact is a drift hazard, and they had already diverged once.
+#: This module deliberately carries no second literal copy of the declaration;
+#: two literals for one fact is a drift hazard.
 
 
 def _approval_registry_key(session_key: str, request_id: str | int) -> str:
@@ -332,6 +350,12 @@ class SlackRenderer(Renderer):
         # transport split, so the dispatcher passes in the one operation it owns.
         self.stamp_options: Callable[[str], Awaitable[str | None]] | None = None
         self._accumulated = ""
+        # Text Slack has actually SHOWN for this turn — the delivery ledger read by
+        # the dispatcher's partial-progress rescue (see ``delivered_text``). It is
+        # deliberately NOT ``_accumulated``: that one grows the instant a chunk
+        # arrives, while a chunk only reaches Slack when the edit throttle opens,
+        # so between flushes ``_accumulated`` holds text nobody has seen.
+        self._delivered = ""
         self._bracket_hold = ""  # held text from '[' until ']' to filter [OPTIONS:]
         self._stream_buffer = ""  # unsent text buffered between throttled flushes
         self._last_edit = 0.0  # monotonic ts of the last stream edit (throttle)
@@ -365,7 +389,11 @@ class SlackRenderer(Renderer):
         self._started = True
         self._t0 = self._now()
         self._ensure_controller()  # set_phase("queued")
-        await self.slack.set_thread_status(self.channel, self.thread_ts or "", _STATUS_WORKING)
+        # Best-effort: MUST NOT raise. Decoration only.
+        try:
+            await self.slack.set_thread_status(self.channel, self.thread_ts or "", _STATUS_WORKING)
+        except Exception:
+            logger.warning("Slack set_thread_status failed — skipping status", exc_info=True)
 
     def _ensure_controller(self) -> Any:
         """Lazily create the (reused) StatusReactionController.
@@ -388,30 +416,66 @@ class SlackRenderer(Renderer):
             ctrl.set_phase(phase)
             ctrl.on_progress()
 
-    async def _ensure_stream(self) -> str:
+    async def _ensure_stream(self) -> str | None:
         if self._stream_ts is None:
-            ts = await self.slack.start_stream(
-                self.channel, self.thread_ts or "", user_id=self._user_id or None
-            )
+            # Best-effort: MUST NOT raise. The real client swallows and
+            # returns None, but a raising client/transport would escape into
+            # the transport catch-all and post a terminal error on a live
+            # turn. A raise is the same event as a None return — streaming
+            # unavailable — so map it onto the fallback below.
+            try:
+                ts = await self.slack.start_stream(
+                    self.channel, self.thread_ts or "", user_id=self._user_id or None
+                )
+            except Exception:
+                logger.warning("Slack start_stream failed — demoting to chat.update", exc_info=True)
+                ts = None
             if ts:
                 self._stream_ts = ts
                 self._use_slack_stream = True
             else:
                 # No streaming surface — fall back to chat.update on a posted
                 # placeholder message (native ``_ensure_stream_started``).
+                # The placeholder post is best-effort too: on failure leave
+                # ``_stream_ts`` None — there is no placeholder to edit, and
+                # ``on_done`` posts the final answer directly with a fresh
+                # ``post_message`` (mirrors the native semantics; do NOT
+                # substitute a truthy sentinel).
                 self._use_slack_stream = False
-                self._stream_ts = await self.slack.post_message(
-                    self.channel, _THINKING, self.thread_ts
-                )
+                try:
+                    self._stream_ts = await self.slack.post_message(
+                        self.channel, _THINKING, self.thread_ts
+                    )
+                except Exception:
+                    logger.warning("Failed to post chat.update placeholder", exc_info=True)
+                    self._stream_ts = None
         return self._stream_ts
 
     async def _rotate_stream(self) -> str | None:
-        """Stop the dead stream and start a fresh one (native ``_rotate_stream``)."""
+        """Stop the dead stream and start a fresh one (native ``_rotate_stream``).
+
+        Best-effort: MUST NOT raise. A failed rotation is the existing,
+        handled outcome (``new_ts`` None → demote), so map a raise onto it
+        rather than letting it reach the transport catch-all.
+        """
         if self._stream_ts:
-            await self.slack.stop_stream(self.channel, self._stream_ts)
-        new_ts = await self.slack.start_stream(
-            self.channel, self.thread_ts or "", user_id=self._user_id or None
-        )
+            try:
+                await self.slack.stop_stream(self.channel, self._stream_ts)
+            except Exception:
+                logger.warning(
+                    "Slack stop_stream failed during rotation — abandoning old stream",
+                    exc_info=True,
+                )
+        try:
+            new_ts = await self.slack.start_stream(
+                self.channel,
+                self.thread_ts or "",
+                initial_text=_STREAM_CONTINUED,
+                user_id=self._user_id or None,
+            )
+        except Exception:
+            logger.warning("Slack start_stream failed during rotation", exc_info=True)
+            new_ts = None
         if new_ts:
             self._stream_ts = new_ts
         else:
@@ -426,11 +490,37 @@ class SlackRenderer(Renderer):
         # appended text on this path is FINAL (chat.stopStream does not replace
         # it), which makes an unscanned append unrecoverable.
         text = _display_safe(text)
-        ok = await self.slack.append_stream(self.channel, self._stream_ts, text)
+        # Best-effort: MUST NOT raise. A raising append is the same event as a
+        # refused append — the text is not on the stream — and the refusal
+        # path below (rotate, then retry once) already handles it. Letting it
+        # raise would reach the transport catch-all and fake a terminal error
+        # on a live turn.
+        try:
+            ok = await self.slack.append_stream(self.channel, self._stream_ts, text)
+        except Exception:
+            logger.warning("Slack append_stream failed — attempting rotation", exc_info=True)
+            ok = False
         if not ok and self._use_slack_stream:
             if await self._rotate_stream():
                 assert self._stream_ts is not None
-                return await self.slack.append_stream(self.channel, self._stream_ts, text)
+                try:
+                    ok = await self.slack.append_stream(self.channel, self._stream_ts, text)
+                except Exception:
+                    logger.warning("Slack append_stream failed after rotation", exc_info=True)
+                    ok = False
+        # A delta that failed both the append and the post-rotation retry is
+        # not re-delivered here: this matches the shipped client's refused-
+        # append outcome on this path. Confirmed-delivery recovery for the
+        # class is a designed subsystem tracked as its own issue (delivery
+        # debt), deliberately not grown inside this guard sweep.
+        if ok:
+            # Delivery ledger. This is the ONE sink every streamed assistant string
+            # passes through, and it reports whether Slack accepted the append — so
+            # recording here, and only on success, is what makes ``delivered_text``
+            # mean "shown" rather than "produced". Appends on this path are
+            # cumulative and final, so the ledger needs no reconciliation when
+            # ``_accumulated`` is reset at a ``wait`` boundary.
+            self._delivered += text
         return ok
 
     async def _flush_stream_buffer(self) -> None:
@@ -643,7 +733,7 @@ class SlackRenderer(Renderer):
         """Final no-stream render: the whole answer, not a truncated prefix.
 
         ``_safe_update`` truncates at Slack's message limit, so an over-limit
-        answer used to lose its tail with only a notice where the native handler
+        answer would lose its tail with only a notice where the native handler
         splits. Consumes the splitter's contract by sealing chunk 0 into the live
         message and posting the rest as thread replies, in order.
         """
@@ -657,19 +747,31 @@ class SlackRenderer(Renderer):
                 logger.debug("slack: posting a continuation chunk failed", exc_info=True)
 
     async def _append_task(self, task_id: str, title: str, status: str, details: str = "") -> bool:
-        """Append a task card, rotating once on failure (native ``_append_task``)."""
+        """Append a task card. Never rotates (native ``_append_task``).
+
+        The card is progress decoration and ``_tool_elapsed_updater`` re-sends it
+        every 30s for as long as a tool runs, so on a long tool phase it is the
+        only caller touching the stream — and rotating on its failure would cost
+        the reader the message they are watching and split the answer in two.
+        ``_append_stream`` still rotates for real text.
+
+        Best-effort: MUST NOT raise. Guarded at this single definition,
+        covering all call sites (the native handler guards its twin the same
+        way): the unguarded ``on_tool_call`` call site runs before any text
+        streams, and a propagated Slack error there reaches the transport
+        catch-all in ``transport_dispatch``, which posts a terminal "🔧
+        Something went wrong (transport path)" reply on a turn that is still
+        live.
+        """
         if not self._stream_ts:
             return False
-        ok = await self.slack.append_task(
-            self.channel, self._stream_ts, task_id, title, status, details=details
-        )
-        if not ok and self._use_slack_stream:
-            if await self._rotate_stream():
-                assert self._stream_ts is not None
-                return await self.slack.append_task(
-                    self.channel, self._stream_ts, task_id, title, status, details=details
-                )
-        return ok
+        try:
+            return await self.slack.append_task(
+                self.channel, self._stream_ts, task_id, title, status, details=details
+            )
+        except Exception:
+            logger.warning("Slack append_task failed — skipping progress card", exc_info=True)
+            return False
 
     def _tool_elapsed_str(self) -> str:
         """Formatted elapsed time for the active tool, or '' (native helper)."""
@@ -726,6 +828,57 @@ class SlackRenderer(Renderer):
                 pass  # non-critical teardown; never raise from close()
         self._finalized = True
 
+    @property
+    def delivered_text(self) -> str:
+        """Assistant text Slack has actually SHOWN for this turn.
+
+        The dispatcher's partial-progress rescue persists this when a turn dies
+        mid-flight, so that a retry resumes from what was already established
+        instead of re-deriving it. It is a delivery ledger, not a copy of the
+        model's output, and the distinction is the whole point: ``_accumulated``
+        grows the moment a chunk arrives, but a chunk only reaches Slack when the
+        edit throttle opens, so persisting that would record text nobody saw as
+        established fact.
+
+        Only ``_append_stream`` advances it, and only when Slack accepted the
+        append. Two consequences worth knowing before relying on it:
+
+        * On the no-stream fallback (``_use_slack_stream`` False) this stays
+          empty, because that sink cannot confirm delivery — see the note at the
+          throttled ``_safe_update``. The rescue then does nothing, which is
+          correct.
+        * It holds the text as SHOWN: thinking tags stripped, ``[OPTIONS:…]``
+          markup suppressed by the bracket-hold, and image-adjacent text still
+          withheld by ``_ref_hold`` until the seal releases it. That is a subset
+          of ``_accumulated``, never a superset.
+
+        Slack is the only renderer this exists on because Slack is the only
+        renderer that can say afterwards WHICH bytes the user retained. Others on
+        the shared ``messaging/dispatch.drive_turn`` path do emit mid-turn —
+        ``telegram`` live-edits per chunk, ``wecom`` pushes stream frames,
+        ``webex`` rides the buffer tail on a status frame — but each of those
+        frames is throttled, replaced wholesale, or truncated, so none yields a
+        per-append record of acknowledged output to rescue from.
+        """
+        return self._delivered
+
+    @property
+    def turn_finalized(self) -> bool:
+        """Whether this turn already reached a normal end.
+
+        ``on_done`` sets it, so it answers exactly one question for the
+        dispatcher's partial-progress rescue: did the reply COMPLETE before the
+        exception? A failure raised after a finished stream — a footer post that
+        4xxs, say — still unwinds through the same ``except``, and marking that
+        already-complete reply as cut off would tell the next turn to resume
+        work that had in fact finished.
+
+        Read it in the ``except`` branch only. ``close()`` also sets it during
+        the dispatcher's ``finally``, which runs AFTER that branch, so by the
+        time teardown flips it the rescue has already made its decision.
+        """
+        return self._finalized
+
     async def on_text_chunk(self, text: str) -> None:
         # Reuses the native streaming machinery verbatim: bracket-hold filter,
         # edit-throttle batching (``_EDIT_INTERVAL``), and the chat.update
@@ -763,13 +916,28 @@ class SlackRenderer(Renderer):
                 # A frame shows a fence-safe prefix rather than a truncated one;
                 # the final render lands the whole answer.
                 frame = await self._split_for_slack(filtered, reserve=len(_CURSOR))
-                await _safe_update(self.slack, self.channel, ts, frame[0] + _CURSOR)
+                # The delivery ledger deliberately does NOT advance here. This sink
+                # cannot confirm anything: ``_safe_update`` returns None, swallows
+                # its own exceptions, and truncates at ``SLACK_MSG_LIMIT``, and the
+                # frame is a prefix rather than the whole text. So on the no-stream
+                # fallback ``delivered_text`` stays empty and the dispatcher's
+                # rescue is a no-op — the correct outcome, because nothing here can
+                # be shown to have reached the user.
+                # ``ts`` may be None: both the stream start and the
+                # placeholder post failed, so there is no message to edit. Skip
+                # the cursor edit — ``on_done`` posts the final answer directly.
+                if ts is not None:
+                    await _safe_update(self.slack, self.channel, ts, frame[0] + _CURSOR)
             self._last_edit = now
 
     async def on_thinking(self, text: str) -> None:
         self._set_phase("thinking")
         # Thinking is surfaced via the thread status indicator, not the stream.
-        await self.slack.set_thread_status(self.channel, self.thread_ts or "", "is_typing")
+        # Best-effort: MUST NOT raise. Decoration only.
+        try:
+            await self.slack.set_thread_status(self.channel, self.thread_ts or "", "is_typing")
+        except Exception:
+            logger.warning("Slack set_thread_status failed — skipping status", exc_info=True)
         # When enabled, accumulate the reasoning so it can be posted as a 💭
         # thread reply above the answer (honors slack.show_thinking, matching
         # native). When disabled, reasoning is never accumulated or surfaced.
@@ -794,7 +962,12 @@ class SlackRenderer(Renderer):
         # the whole 💭 reply, not its tail. Split it fence-safely so a long
         # chain of thought arrives as ordered replies instead of vanishing.
         for chunk in await self._split_for_slack(f"💭 {reasoning}"):
-            await self.slack.post_message(self.channel, chunk, self.thread_ts)
+            # Best-effort: MUST NOT raise. Reasoning is a
+            # decorative side channel — the answer is delivered separately.
+            try:
+                await self.slack.post_message(self.channel, chunk, self.thread_ts)
+            except Exception:
+                logger.warning("Failed to post thinking chunk", exc_info=True)
 
     async def on_tool_call(
         self, tool_call_id: str, title: str, tool_kind: str = "", tool_purpose: str = ""
@@ -808,9 +981,15 @@ class SlackRenderer(Renderer):
         if self._controller is not None and self._tool_to_phase is not None:
             self._controller.set_phase(self._tool_to_phase(tool_name, tool_kind))
             self._controller.on_progress()
-        await self.slack.set_thread_status(
-            self.channel, self.thread_ts or "", f"is using {tool_name}"
-        )
+        # Best-effort: MUST NOT raise. Decoration only — a raise
+        # escapes to the transport catch-all and fakes a terminal error on a
+        # live turn.
+        try:
+            await self.slack.set_thread_status(
+                self.channel, self.thread_ts or "", f"is using {tool_name}"
+            )
+        except Exception:
+            logger.warning("Slack set_thread_status failed — skipping tool status", exc_info=True)
         # Flush any buffered streamed text before the tool status, like native.
         if self._use_slack_stream:
             await self._flush_stream_buffer()
@@ -842,7 +1021,18 @@ class SlackRenderer(Renderer):
             if self._ref_hold:
                 await self._append_stream(self._ref_hold)
                 self._ref_hold = ""
-            await self.slack.stop_stream(self.channel, self._stream_ts)
+            # Best-effort: MUST NOT raise. The stream is being abandoned
+            # either way (``_stream_ts`` is cleared just below and the next
+            # chunk opens a fresh one), so a raising ``stop_stream`` changes
+            # nothing except — unguarded — faking a terminal error on a live
+            # turn via the transport catch-all.
+            try:
+                await self.slack.stop_stream(self.channel, self._stream_ts)
+            except Exception:
+                logger.warning(
+                    "Slack stop_stream failed at wait finalize — abandoning stream",
+                    exc_info=True,
+                )
             self._stream_ts = None
             self._accumulated = ""
             self._stream_buffer = ""
@@ -874,9 +1064,13 @@ class SlackRenderer(Renderer):
         )
 
     async def on_compaction(self, context_usage_pct: float) -> None:
-        await self.slack.set_thread_status(
-            self.channel, self.thread_ts or "", "compacting context…"
-        )
+        # Best-effort: MUST NOT raise. Decoration only.
+        try:
+            await self.slack.set_thread_status(
+                self.channel, self.thread_ts or "", "compacting context…"
+            )
+        except Exception:
+            logger.warning("Slack set_thread_status failed — skipping status", exc_info=True)
 
     async def on_done(self, stop_reason: str = "") -> None:
         # Surface any reasoning not already flushed by the first text chunk
@@ -945,18 +1139,44 @@ class SlackRenderer(Renderer):
                     await self._append_stream(tail)
                 if upload_notes:
                     await self._append_stream(f"\n\n{upload_notes}")
-                await self.slack.stop_stream(self.channel, self._stream_ts, clean_text or None)
+                try:
+                    await self.slack.stop_stream(self.channel, self._stream_ts, clean_text or None)
+                except Exception:
+                    logger.warning("Slack stop_stream failed at finalize", exc_info=True)
             else:
                 # No-stream fallback: _stream_ts is a regular message ts (the
                 # _THINKING placeholder), not a stream handle — finalize it via
                 # chat.update, mirroring the on_tool_call gating.
                 await self._render_fallback(clean_text or "")
+        elif clean_text:
+            # No stream and no placeholder exists (both the stream start and
+            # the placeholder post failed) — post the final answer
+            # directly, mirroring the native handler's end-of-turn else branch.
+            # This is the answer-carrying call, not decoration: a raise
+            # propagates (the transport catch-all recording a failure is the
+            # honest outcome), with ``_finalized`` reset FIRST so the
+            # dispatcher's partial-progress rescue is not suppressed, and each
+            # confirmed part recorded in the delivery ledger so the rescue
+            # knows what was already shown.
+            try:
+                for part in await self._split_for_slack(clean_text):
+                    await self.slack.post_message(self.channel, part, self.thread_ts)
+                    self._delivered += part
+            except Exception:
+                self._finalized = False
+                raise
         if files:
             # After the text, so the answer reads first and each picture lands
             # under the sentence that introduced it.
             await self._upload_files(files)
-        # Clear thread status now that the turn is complete.
-        await self.slack.set_thread_status(self.channel, self.thread_ts or "", "")
+        # Clear thread status now that the turn is complete. Best-effort, and
+        # MUST NOT raise: the answer is already delivered above — a
+        # raising status clear must not convert a delivered turn into a
+        # recorded failure.
+        try:
+            await self.slack.set_thread_status(self.channel, self.thread_ts or "", "")
+        except Exception:
+            logger.warning("Slack set_thread_status failed — skipping status clear", exc_info=True)
         # Timing footer (always posted at turn end), mirroring native.
         turn_elapsed = (self._now() - self._t0) if self._t0 else 0.0
         footer_blocks, footer_text = build_timing_footer(turn_elapsed, None)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from kiro_crew import model_registry as mr
 
 
@@ -215,7 +217,7 @@ class TestModelRegistry:
             mr.to_provider_id("claude-opus-4.5", "claude_code")
             == "global.anthropic.claude-opus-4-8"
         )
-        # The -1m form of 4.6 no longer downgrades to 4.7; it maps to the flagship.
+        # The -1m form of 4.6 maps to the flagship, not a 4.7 downgrade.
         assert mr.to_provider_id("claude-opus-4.6-1m", "claude_code") == flagship
 
     def test_fable_5_canonical_round_trip(self):
@@ -440,3 +442,219 @@ class TestCorruptRegistryFallback:
             mr.to_provider_id("opus-4.8-1m", "claude_code")
             == "global.anthropic.claude-opus-4-8[1m]"
         )
+
+
+class TestAdvertisedModelCache:
+    """The provider-advertised model cache: seed source + wire-id folding.
+
+    Uses monkeypatch to isolate the module-global ``_ADVERTISED_MODELS`` per
+    test (it is process-wide runtime state, like ``_KIRO_WINDOWS``).
+    """
+
+    def test_seed_is_empty_on_cold_cache_rather_than_registry_derived(self, monkeypatch):
+        # The seed is provider-advertised ONLY. Falling back to the static registry
+        # here is what pinned a served-but-unregistered model to the base window:
+        # the adapter merges availableModels union+dedup, so a registry list that
+        # has not caught up REPLACES the adapter's correct provider list with one
+        # carrying no [1m] id for that model. Seeding nothing leaves the adapter on
+        # its own list, so no registry edit is needed per new model per provider.
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
+        assert mr.seed_available_models("claude_code") == []
+        # The registry itself still answers the picker/window questions — only the
+        # seed path stopped reading it.
+        assert mr.available_models("claude_code")
+
+    def test_seed_drops_base_window_sibling_of_a_1m_id(self, monkeypatch):
+        # The 4.8 fix: when a backend advertises both the [1m] and the 200K
+        # spelling of Opus 4.8, the seed must carry only the 1M one so the adapter
+        # cannot collapse a 4.8 pick to the base window.
+        monkeypatch.setattr(
+            mr,
+            "_ADVERTISED_MODELS",
+            {
+                "claude_code": [
+                    "global.anthropic.claude-opus-4-8[1m]",
+                    "global.anthropic.claude-opus-4-8",
+                ]
+            },
+        )
+        seed = mr.seed_available_models("claude_code")
+        assert "global.anthropic.claude-opus-4-8[1m]" in seed
+        assert "global.anthropic.claude-opus-4-8" not in seed
+
+    def test_seed_dedups_advertised_siblings_too(self, monkeypatch):
+        # A backend that advertises BOTH spellings is deduped the same way.
+        monkeypatch.setattr(
+            mr,
+            "_ADVERTISED_MODELS",
+            {
+                "claude_code": [
+                    "global.anthropic.claude-opus-4-8[1m]",
+                    "global.anthropic.claude-opus-4-8",
+                    "global.anthropic.claude-sonnet-5",
+                ]
+            },
+        )
+        assert mr.seed_available_models("claude_code") == [
+            "global.anthropic.claude-opus-4-8[1m]",
+            "global.anthropic.claude-sonnet-5",
+        ]
+
+    def test_dedup_keeps_order_and_drops_exact_dupes(self):
+        # No 1M sibling to collapse against → only exact duplicates removed,
+        # order preserved.
+        assert mr._dedup_window_siblings(["a", "b", "a", "c"]) == ["a", "b", "c"]
+
+    def test_dedup_keeps_distinct_base_models(self):
+        # Two different 1M models are both kept — dedup is per normalized base.
+        ids = ["global.anthropic.claude-opus-5[1m]", "global.anthropic.claude-opus-4-8[1m]"]
+        assert mr._dedup_window_siblings(ids) == ids
+
+    def test_seed_prefers_advertised_when_warm(self, monkeypatch):
+        served = [
+            "global.anthropic.claude-opus-5[1m]",
+            "global.anthropic.claude-opus-4-8[1m]",
+        ]
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": served})
+        assert mr.seed_available_models("claude_code") == served
+
+    def test_refresh_reports_change_and_dedupes(self, monkeypatch):
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
+        assert mr.refresh_advertised_models("claude_code", ["a", "b", "a"]) is True
+        assert mr.advertised_models("claude_code") == ["a", "b"]
+        # Same set again → no change.
+        assert mr.refresh_advertised_models("claude_code", ["a", "b"]) is False
+
+    def test_refresh_empty_never_wipes_a_good_cache(self, monkeypatch):
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": ["a"]})
+        assert mr.refresh_advertised_models("claude_code", []) is False
+        assert mr.advertised_models("claude_code") == ["a"]
+
+    def test_persist_round_trips(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
+        monkeypatch.setattr(mr, "_advertised_models_cache_path", lambda: tmp_path / "pm.json")
+        mr.refresh_advertised_models("claude_code", ["global.anthropic.claude-opus-5[1m]"])
+        mr.persist_advertised_models()
+        # Reload into a fresh dict and confirm the sidecar was written.
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
+        mr._load_advertised_models()
+        assert mr.advertised_models("claude_code") == ["global.anthropic.claude-opus-5[1m]"]
+
+    def test_wire_id_folds_bare_onto_advertised_versioned(self, monkeypatch):
+        # The core fix: a bare id the registry does not carry folds onto the
+        # versioned [1m] id the backend advertised, so it stops collapsing to
+        # the base window.
+        monkeypatch.setattr(
+            mr, "_ADVERTISED_MODELS", {"claude_code": ["global.anthropic.claude-opus-5[1m]"]}
+        )
+        assert (
+            mr.resolve_wire_model_id("claude-opus-5", "claude_code")
+            == "global.anthropic.claude-opus-5[1m]"
+        )
+
+    def test_wire_id_prefers_1m_when_both_spellings_advertised(self, monkeypatch):
+        monkeypatch.setattr(
+            mr,
+            "_ADVERTISED_MODELS",
+            {
+                "claude_code": [
+                    "global.anthropic.claude-opus-5",
+                    "global.anthropic.claude-opus-5[1m]",
+                ]
+            },
+        )
+        assert (
+            mr.resolve_wire_model_id("claude-opus-5", "claude_code")
+            == "global.anthropic.claude-opus-5[1m]"
+        )
+
+    def test_wire_id_passthrough_when_cold_or_unmatched(self, monkeypatch):
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
+        # Cold cache → unchanged.
+        assert mr.resolve_wire_model_id("claude-opus-5", "claude_code") == "claude-opus-5"
+        # Warm but no normalized match → unchanged (never rewrites to a model
+        # the provider does not serve).
+        monkeypatch.setattr(
+            mr, "_ADVERTISED_MODELS", {"claude_code": ["global.anthropic.claude-sonnet-4-6[1m]"]}
+        )
+        assert mr.resolve_wire_model_id("claude-opus-5", "claude_code") == "claude-opus-5"
+
+    def test_wire_id_leaves_auto_and_empty_alone(self, monkeypatch):
+        monkeypatch.setattr(
+            mr, "_ADVERTISED_MODELS", {"claude_code": ["global.anthropic.claude-opus-5[1m]"]}
+        )
+        assert mr.resolve_wire_model_id("auto", "claude_code") == "auto"
+        assert mr.resolve_wire_model_id("", "claude_code") == ""
+
+    def test_wire_id_keeps_an_already_advertised_id(self, monkeypatch):
+        served = "global.anthropic.claude-opus-4-8[1m]"
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": [served]})
+        assert mr.resolve_wire_model_id(served, "claude_code") == served
+
+    def test_to_provider_id_unknown_still_passes_through(self, monkeypatch):
+        # Guard: the pure translation is unchanged — folding lives in
+        # resolve_wire_model_id, not to_provider_id.
+        monkeypatch.setattr(
+            mr, "_ADVERTISED_MODELS", {"claude_code": ["global.anthropic.claude-opus-5[1m]"]}
+        )
+        assert mr.to_provider_id("claude-opus-5", "claude_code") == "claude-opus-5"
+
+
+class TestImportDoesNotCreateTheDataHome:
+    """Importing the registry must not ``mkdir`` the data home.
+
+    ``_load_kiro_windows`` runs at import to pick up the persisted window
+    sidecar. Resolving that path through ``config_dir()`` would CREATE
+    ``~/.kiro/crew`` (and refresh the recovery breadcrumb) as a side effect of a
+    plain import -- observed as a real-host write from every test collector, and
+    a surprise for any read-only tool that imports the package. The import must
+    only ever peek at the path.
+    """
+
+    def test_a_fresh_interpreter_import_leaves_an_absent_home_absent(self, tmp_path):
+        import subprocess
+        import sys
+
+        home = tmp_path / "home"
+        home.mkdir()
+        # The audit hook names the call site on failure, so a regression is
+        # diagnosable from the assertion message alone.
+        probe = (
+            "import os, sys, traceback\n"
+            "def hook(ev, args):\n"
+            "    if ev == 'os.mkdir' and str(args[0]).startswith(sys.argv[1]):\n"
+            "        sys.stderr.write('mkdir %s\\n' % args[0])\n"
+            "        sys.stderr.write(''.join(traceback.format_stack(limit=12)[:-1]))\n"
+            "sys.addaudithook(hook)\n"
+            "import kiro_crew.model_registry\n"
+            "from kiro_crew.config import paths\n"
+            "sys.exit(1 if paths._default_home().exists() else 0)\n"
+        )
+        env = {k: v for k, v in os.environ.items() if k != "KIROCREW_HOME"}
+        env["HOME"] = str(home)
+        env["USERPROFILE"] = str(home)
+        proc = subprocess.run(
+            # ``-B``: the child imports the source package; without it the import
+            # leaves ``__pycache__`` in the checkout (no-test-side-effects).
+            [sys.executable, "-B", "-c", probe, str(home)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=120,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert not (home / ".kiro").exists()
+
+    def test_the_sidecar_path_follows_the_data_home_without_creating_it(
+        self, tmp_path, monkeypatch
+    ):
+        from kiro_crew.config import paths
+
+        data = tmp_path / "data"
+        monkeypatch.setenv("KIROCREW_HOME", str(data))
+        assert mr._kiro_windows_cache_path() == data.resolve() / "model_windows.json"
+        assert mr._advertised_models_cache_path() == data.resolve() / "provider_models.json"
+        assert not data.exists(), "resolving a sidecar path must not create the home"
+        assert mr._kiro_windows_cache_path().parent == paths.config_dir()

@@ -4,11 +4,12 @@ The sibling suite (``test_tailnet_origin.py``) pins the opposite property — th
 the READ path swallows everything and degrades to "contributes nothing". Here the
 weighting is inverted, because a publish that fails silently is the bug:
 
-* :class:`TestFailureReporting` pins that the daemon's own stderr reaches the
-  caller **verbatim**, and that the two refusals with different remedies
-  (permission vs. daemon down) are told apart. The classifier matches on upstream
-  wording we do not own, so the tests assert the raw text is present regardless of
-  whether the classification lands.
+* :class:`TestFailureReporting` pins that the daemon's own output reaches the
+  caller **verbatim** — stderr first, stdout when the reason lives there, and a
+  timeout's captured streams too — and that the two refusals with different
+  remedies (permission vs. daemon down) are told apart. The classifier matches on
+  upstream wording we do not own, so the tests assert the raw text is present
+  regardless of whether the classification lands.
 * :class:`TestGovernance` pins the ASYMMETRY that makes the ceiling coherent:
   publishing is refused when pinned and does not spawn the CLI at all, while
   *withdrawing* is never gated — a fail-closed control that could not un-expose a
@@ -17,10 +18,13 @@ weighting is inverted, because a publish that fails silently is the bug:
   derived origin (which carries no port) match, and the upstream target is
   loopback so publishing never widens the gateway's bind.
 * :class:`TestPublishedDetection` pins that an unreadable status document reports
-  ``None`` rather than ``False``. This code has never seen a real
-  ``tailscale serve status --json``, so "we could not tell" has to be
-  representable — reporting "not published" for a published node is the
-  checked-but-never-ran defect in a new costume.
+  ``None`` rather than ``False``. This code has seen exactly one real
+  ``tailscale serve status --json`` (embedded in
+  ``test_other_ports_only_reads_our_port_as_free``), so "we could not tell" has
+  to stay representable — reporting "not published" for a published node is the
+  checked-but-never-ran defect in a new costume — while the one determination
+  the real document licenses (port-shaped keys, none of them ours, means our
+  port is free) reads as free rather than unknown.
 """
 
 from __future__ import annotations
@@ -66,7 +70,12 @@ def _patch_cli(**run_kwargs):
     )
 
 
-def _patch_cli_write_fails(returncode: int = 1, stderr: str = "", exc: BaseException | None = None):
+def _patch_cli_write_fails(
+    returncode: int = 1,
+    stderr: str = "",
+    stdout: str = "",
+    exc: BaseException | None = None,
+):
     """CLI installed; `serve status` SUCCEEDS with a free mount, the WRITE fails.
 
     A single mock answering every invocation identically is not how a daemon behaves —
@@ -81,7 +90,7 @@ def _patch_cli_write_fails(returncode: int = 1, stderr: str = "", exc: BaseExcep
             return _proc("{}")
         if exc is not None:
             raise exc
-        return _proc(returncode=returncode, stderr=stderr)
+        return _proc(stdout=stdout, returncode=returncode, stderr=stderr)
 
     return (
         patch.object(tailnet_serve, "_cli_path", return_value=_CLI),
@@ -193,6 +202,9 @@ class TestFailureReporting:
             ("must be run as root", "no_permission"),
             ("tailscaled is not running", "daemon_unavailable"),
             ("cannot connect to local tailscaled", "daemon_unavailable"),
+            # The exact wording a stopped daemon fails with; without this entry
+            # it falls through to generic "failed" and no hint fires.
+            ("Tailscale is stopped.", "daemon_unavailable"),
             ("something nobody predicted", "failed"),
         ],
     )
@@ -253,6 +265,181 @@ class TestFailureReporting:
         assert not result.ok
 
 
+class TestTimeoutOutputIsNotDiscarded:
+    """The timeout's captured streams ARE the diagnosis, so they must survive it.
+
+    On a tailnet where Serve is not enabled (the default), ``tailscale serve``
+    prints the enablement URL to stdout and then blocks waiting for the
+    capability — a timeout is the only reachable outcome, and dropping the
+    exception's ``.stdout``/``.stderr`` rendered the one actionable line as a
+    bare "did not respond in time".
+    """
+
+    _URL = "https://login.tailscale.com/f/serve?node=nTEST"
+
+    @staticmethod
+    def _timeout_exc(
+        stdout: str | bytes | None = None, stderr: str | bytes | None = None
+    ) -> subprocess.TimeoutExpired:
+        return subprocess.TimeoutExpired("tailscale", 15, output=stdout, stderr=stderr)
+
+    def test_run_returns_the_captured_streams(self) -> None:
+        cli, run = _patch_cli(side_effect=self._timeout_exc(stdout="from out", stderr="from err"))
+        with cli, run:
+            rc, out, err = tailnet_serve._run(["serve"], 1.0)
+        assert (rc, out, err) == (-2, "from out", "from err")
+
+    def test_none_streams_become_empty_strings(self) -> None:
+        """A timeout that captured nothing must not grow a dangling suffix."""
+        cli, run = _patch_cli(side_effect=self._timeout_exc())
+        with cli, run:
+            rc, out, err = tailnet_serve._run(["serve"], 1.0)
+        assert (rc, out, err) == (-2, "", "")
+
+    def test_bytes_streams_are_decoded(self) -> None:
+        """POSIX raises the exception below the text layer, so streams arrive as bytes.
+
+        An invalid sequence (a multibyte character split by the deadline) must
+        degrade to a replacement character, never to a decode error that eats the
+        rest of the reason.
+        """
+        cli, run = _patch_cli(
+            side_effect=self._timeout_exc(stdout=self._URL.encode() + b"\xff", stderr=b"warn")
+        )
+        with cli, run:
+            rc, out, err = tailnet_serve._run(["serve"], 1.0)
+        assert rc == -2
+        assert self._URL in out
+        assert "\ufffd" in out
+        assert err == "warn"
+
+    def test_publish_timeout_surfaces_the_enablement_url(self) -> None:
+        cli, run = _patch_cli_write_fails(exc=self._timeout_exc(stdout=self._URL))
+        with cli, run, patch.object(
+            tailnet_serve, "is_governance_pinned_off", return_value=False
+        ):
+            result = tailnet_serve.publish(_PORT)
+        assert result.code == "timeout"
+        # The ambiguity warning is kept — the config may still have applied.
+        assert "may still have applied" in result.detail
+        assert self._URL in result.detail
+
+    def test_publish_timeout_without_output_has_no_dangling_suffix(self) -> None:
+        cli, run = _patch_cli_write_fails(exc=self._timeout_exc())
+        with cli, run, patch.object(
+            tailnet_serve, "is_governance_pinned_off", return_value=False
+        ):
+            result = tailnet_serve.publish(_PORT)
+        assert result.code == "timeout"
+        assert "it printed" not in result.detail
+
+    def test_unpublish_timeout_surfaces_output(self) -> None:
+        cli, run = _patch_cli(side_effect=self._timeout_exc(stderr="context deadline exceeded"))
+        with cli, run, patch.object(
+            tailnet_serve, "serve_state", return_value=ServeState(True, True, "ours")
+        ):
+            result = tailnet_serve.unpublish(_PORT)
+        assert result.code == "timeout"
+        assert "did not respond in time" in result.detail
+        assert "context deadline exceeded" in result.detail
+
+    def test_serve_state_timeout_surfaces_output(self) -> None:
+        cli, run = _patch_cli(side_effect=self._timeout_exc(stdout="partial status text"))
+        with cli, run:
+            state = tailnet_serve.serve_state(_PORT)
+        assert state.published is None
+        assert "did not respond in time" in state.detail
+        assert "partial status text" in state.detail
+
+
+class TestStdoutCarriedReasons:
+    """A fast non-zero exit whose reason went to stdout must not report blank.
+
+    Upstream does not reserve stderr for its refusals, and ``detail`` built from
+    stderr alone rendered a stdout-only message as the bare fallback string.
+    """
+
+    def test_a_stdout_only_reason_reaches_the_detail(self) -> None:
+        cli, run = _patch_cli_write_fails(stdout="Serve is not enabled; visit https://x")
+        with cli, run, patch.object(
+            tailnet_serve, "is_governance_pinned_off", return_value=False
+        ):
+            result = tailnet_serve.publish(_PORT)
+        assert not result.ok
+        assert "Serve is not enabled; visit https://x" in result.detail
+
+    def test_a_stdout_only_reason_feeds_classification(self) -> None:
+        cli, run = _patch_cli_write_fails(stdout="access denied: serve config")
+        with cli, run, patch.object(
+            tailnet_serve, "is_governance_pinned_off", return_value=False
+        ):
+            result = tailnet_serve.publish(_PORT)
+        assert result.code == "no_permission"
+
+    def test_stderr_leads_when_both_streams_carry_text(self) -> None:
+        cli, run = _patch_cli_write_fails(stderr="the refusal", stdout="the context")
+        with cli, run, patch.object(
+            tailnet_serve, "is_governance_pinned_off", return_value=False
+        ):
+            result = tailnet_serve.publish(_PORT)
+        assert "the refusal" in result.detail
+        assert "the context" in result.detail
+        assert result.detail.index("the refusal") < result.detail.index("the context")
+
+    def test_stdout_never_flips_a_correct_stderr_classification(self) -> None:
+        """Classification reads the leading stream, never the concatenation.
+
+        Incidental stdout text containing "operator" beside a daemon-down stderr
+        would otherwise flip the code to ``no_permission`` and attach a sudo /
+        --operator remedy to a stopped daemon — a confidently wrong hint, which is
+        the defect class this module exists to avoid. The verbatim detail still
+        carries both streams.
+        """
+        cli, run = _patch_cli_write_fails(
+            stderr="tailscaled is not running",
+            stdout="run `tailscale set --operator=$USER` to allow serve",
+        )
+        with cli, run, patch.object(
+            tailnet_serve, "is_governance_pinned_off", return_value=False
+        ):
+            result = tailnet_serve.publish(_PORT)
+        assert result.code == "daemon_unavailable"
+        assert "tailscaled is not running" in result.detail
+
+    def test_recovered_output_is_capped_not_dumped(self) -> None:
+        """A status read that dies mid-document must not paste multi-KB JSON.
+
+        The leading slice survives (the actionable line comes first), the tail is
+        elided — a raw serve-config dump in a refusal string is worse for the
+        operator than no detail at all.
+        """
+        blob = "x" * 5000
+        cli, run = _patch_cli(return_value=_proc(blob, returncode=1))
+        with cli, run:
+            state = tailnet_serve.serve_state(_PORT)
+        assert len(state.detail) < 1200
+        assert state.detail.endswith("…")
+
+    def test_unpublish_keeps_a_stdout_only_reason(self) -> None:
+        def _dispatch(argv, *_a, **_k):
+            if argv[1:4] == ["serve", "status", "--json"]:
+                return _proc(_doc(f"http://127.0.0.1:{_PORT}"))
+            return _proc(stdout="cannot remove: reason on stdout", returncode=1)
+
+        cli, run = _patch_cli(side_effect=_dispatch)
+        with cli, run:
+            result = tailnet_serve.unpublish(_PORT)
+        assert not result.ok
+        assert "cannot remove: reason on stdout" in result.detail
+
+    def test_serve_state_keeps_a_stdout_only_reason(self) -> None:
+        cli, run = _patch_cli(return_value=_proc("health warning on stdout", returncode=1))
+        with cli, run:
+            state = tailnet_serve.serve_state(_PORT)
+        assert state.published is None
+        assert "health warning on stdout" in state.detail
+
+
 class TestSpawnHardening:
     def test_path_is_never_consulted(self) -> None:
         """Binary resolution is shared with the read path, which forbids PATH.
@@ -306,9 +493,36 @@ class TestPublishDoesNotOverwrite:
             return tailnet_serve.publish(_PORT), m
 
     def test_a_free_mount_is_published(self) -> None:
-        result, run = self._publish_with_state(ServeState(False, False, "nothing configured"))
+        result, run = self._publish_with_state(
+            ServeState(False, False, "nothing configured", port_free=True)
+        )
         assert result.ok
         run.assert_called_once()
+
+    def test_other_ports_only_is_published(self) -> None:
+        """Serve config that sits entirely on other ports does not block ours.
+
+        The dev-machine case: another project published on port 80, and the old
+        ``configured is False`` guard read that as "443 might be taken" and
+        refused a publish that would have replaced nothing.
+        """
+        result, run = self._publish_with_state(
+            ServeState(False, True, "other ports only", port_free=True)
+        )
+        assert result.ok
+        run.assert_called_once()
+
+    def test_an_inconsistent_state_without_the_free_reading_refuses(self) -> None:
+        """``configured=False`` alone is not the deciding read — ``port_free`` is.
+
+        A state object that claims nothing is configured but carries no explicit
+        port-free determination is one this module's own reader never produces,
+        and the guard takes the refusing direction for it.
+        """
+        result, run = self._publish_with_state(ServeState(False, False, "no determination"))
+        assert not result.ok
+        assert result.code == "not_ours"
+        run.assert_not_called()
 
     def test_republishing_our_own_mount_is_allowed(self) -> None:
         """Idempotent: `up` twice must not be a refusal."""
@@ -365,15 +579,16 @@ class TestPublishDoesNotOverwrite:
 class TestLaunchFailureIsNotReportedAsMissing:
     """A binary that exists but cannot be launched is NOT "tailscale not found".
 
-    Both used to collapse to the same synthetic return code, so an `OSError` from
-    the spawn was reported as "not installed" about a binary sitting right there.
-    A Windows CI run produced exactly that, which is what surfaced it.
+    The two must not collapse to the same synthetic return code, or an `OSError` from
+    the spawn is reported as "not installed" about a binary sitting right there.
     """
 
     def test_publish_says_it_could_not_launch(self) -> None:
         cli, run = _patch_cli(side_effect=OSError("Exec format error"))
         with cli, run, patch.object(
-            tailnet_serve, "serve_state", return_value=ServeState(False, False, "free")
+            tailnet_serve,
+            "serve_state",
+            return_value=ServeState(False, False, "free", port_free=True),
         ), patch.object(tailnet_serve, "is_governance_pinned_off", return_value=False):
             result = tailnet_serve.publish(_PORT)
         assert result.code != "no_cli"
@@ -446,6 +661,49 @@ class TestWithdrawalSafety:
         assert result.ok
         run.assert_not_called()
 
+    def _unpublish_write_fails(self, stderr: str):
+        cli, run = _patch_cli(return_value=_proc(returncode=1, stderr=stderr))
+        with cli, run, patch.object(
+            tailnet_serve, "serve_state", return_value=ServeState(True, True, "ours")
+        ):
+            return tailnet_serve.unpublish(_PORT)
+
+    def test_failed_withdrawal_against_stopped_daemon_names_failure_and_remedy(self) -> None:
+        """The silent-failure case: the daemon's whole answer is
+        "Tailscale is stopped.", which reads like a status line, so without an
+        appended hint the operator cannot tell that nothing was withdrawn. The
+        verbatim daemon words must survive alongside the hint, never be
+        replaced by it."""
+        result = self._unpublish_write_fails("Tailscale is stopped.")
+        assert not result.ok
+        assert result.code == "daemon_unavailable"
+        assert "Tailscale is stopped." in result.detail
+        assert "Nothing was withdrawn" in result.detail
+        assert "tailscale status" in result.detail
+
+    def test_failed_withdrawal_permission_refusal_names_the_remedy(self) -> None:
+        result = self._unpublish_write_fails("access denied: serve config")
+        assert not result.ok
+        assert result.code == "no_permission"
+        assert "access denied: serve config" in result.detail
+        assert "--operator" in result.detail
+
+    def test_failed_withdrawal_with_unclassified_output_stays_verbatim(self) -> None:
+        """No hint branch fires for an unrecognized failure — the daemon's own
+        words remain the whole answer, unchanged from before the hints."""
+        result = self._unpublish_write_fails("something nobody predicted")
+        assert not result.ok
+        assert result.code == "failed"
+        assert result.detail == "something nobody predicted"
+
+    def test_other_ports_only_is_an_idempotent_success(self) -> None:
+        """Nothing on our port to withdraw; the other ports' config is not touched."""
+        result, run = self._unpublish_with_state(
+            ServeState(False, True, "other ports only", port_free=True)
+        )
+        assert result.ok
+        run.assert_not_called()
+
 
 class TestPublishedDetection:
     def _state(self, stdout: str = "", returncode: int = 0, stderr: str = ""):
@@ -515,6 +773,113 @@ class TestPublishedDetection:
         st = self._state(_doc("http://127.0.0.1:9999"))
         assert st.published is False
         assert st.configured is True
+        # 443 carries a stranger's handler, so the port is NOT free.
+        assert st.port_free is False
+
+    def test_other_ports_only_reads_our_port_as_free(self) -> None:
+        """A real status document from a Windows tailscale 1.x daemon (hostname
+        anonymized).
+
+        One mapping on HTTP 80, nothing anywhere naming 443. The document keys
+        its mappings by port in both maps (``TCP`` by bare number, ``Web`` by
+        ``host:port``), which is the evidence that lets the absent 443 key be a
+        determination — the port is free — rather than an unknown.
+        """
+        doc = {
+            "TCP": {"80": {"HTTP": True}},
+            "Web": {
+                "desk.tail1a2b3c.ts.net:80": {
+                    "Handlers": {"/": {"Proxy": "http://127.0.0.1:9980"}}
+                }
+            },
+        }
+        st = self._state(json.dumps(doc))
+        assert st.published is False
+        assert st.configured is True
+        assert st.port_free is True
+
+    def test_a_foreground_serve_on_another_port_reads_as_free(self) -> None:
+        """``Foreground`` nests whole ServeConfigs under session ids; the port
+        keys inside them are recursed into like any others."""
+        doc = {
+            "Foreground": {
+                "session-abc123def": {
+                    "TCP": {"8080": {"HTTP": True}},
+                    "Web": {"desk.tail1a2b3c.ts.net:8080": {"Handlers": {"/": {"Proxy": "x"}}}},
+                }
+            }
+        }
+        st = self._state(json.dumps(doc))
+        assert st.published is False
+        assert st.port_free is True
+
+    def test_a_services_only_document_reads_as_free(self) -> None:
+        """The tailscale/tailscale#18289 shape: ``Services`` (virtual-IP
+        services) is the only content, with a bare TCP port key, while plain
+        ``serve status`` says "No serve config" and the node's own 443 is free.
+        """
+        doc = {"Services": {"svc:mything": {"TCP": {"27224": {"HTTP": True}}}}}
+        st = self._state(json.dumps(doc))
+        assert st.published is False
+        assert st.port_free is True
+
+    def test_the_free_reading_requires_port_shaped_evidence(self) -> None:
+        """Six digits is not a port, so it is not evidence of a port-keyed schema."""
+        st = self._state(json.dumps({"Sessions": {"123456": {"proxy": "somewhere"}}}))
+        assert st.published is None
+        assert st.port_free is None
+
+    def test_an_out_of_range_number_is_not_port_evidence(self) -> None:
+        st = self._state(json.dumps({"Things": {"host:99999": {"x": 1}}}))
+        assert st.published is None
+        assert st.port_free is None
+
+    def test_a_key_that_is_evidence_of_our_port_is_never_invisible_to_it(self) -> None:
+        """The invariant the free determination stands on, pinned as a property.
+
+        Any key the evidence read parses to OUR port must also be found by the
+        port detector — otherwise one key could simultaneously be the hidden
+        443 and the port-shaped evidence could declare 443 free. The
+        adversarial shapes here (leading zeros, a trailing newline that ``$``
+        would match before, Unicode decimal digits that ``\\d`` and ``int()``
+        both accept) are exactly the classes where the two predicates can
+        disagree.
+        """
+        adversarial = [
+            "443",
+            "host:443",
+            "host:0443",
+            "0443",
+            "443\n",
+            "host:443\n",
+            "host:٤٤٣",  # Arabic-Indic digits: int("٤٤٣") == 443
+            "[::1]:443",
+            ":443",
+            "svc:00443",
+        ]
+        port = tailnet_serve.SERVE_HTTPS_PORT
+        for key in adversarial:
+            evidence_port = tailnet_serve._key_port(key)
+            if evidence_port == port:
+                assert tailnet_serve._port_scoped_subtrees({key: {}}, port), (
+                    f"key {key!r} parses as port {port} for the evidence read "
+                    f"but the port detector does not find it"
+                )
+
+    def test_a_leading_zero_443_key_is_detected_not_free(self) -> None:
+        """``host:0443`` names 443; it must land on the refusing path, never on
+        the free one."""
+        doc = {"Web": {"host:0443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3000"}}}}}
+        st = self._state(json.dumps(doc))
+        assert st.port_free is not True
+
+    def test_a_trailing_newline_key_is_not_port_evidence(self) -> None:
+        st = self._state(json.dumps({"TCP": {"443\n": {"HTTPS": True}}}))
+        assert st.port_free is not True
+
+    def test_unicode_digit_keys_are_not_port_evidence(self) -> None:
+        st = self._state(json.dumps({"Web": {"host:٤٤٣": {"x": 1}}}))
+        assert st.port_free is not True
 
     def test_our_handler_beside_a_strangers_at_the_mount_is_not_ours(self) -> None:
         """Ours at `/api`, a stranger's at `/` — the mount we would remove.
@@ -549,6 +914,9 @@ class TestPublishedDetection:
         st = self._state(json.dumps({"Foreign": {"proxy": f"http://127.0.0.1:{_PORT}"}}))
         assert st.published is None
         assert st.configured is True
+        # Only dict KEYS carry the document's indexing shape; the ``:5476`` in
+        # the proxy VALUE above must not count as port-keyed evidence.
+        assert st.port_free is None
 
     @pytest.mark.parametrize("stdout", ["not json at all", "<html>nope</html>"])
     def test_unreadable_output_is_unknown_not_negative(self, stdout: str) -> None:

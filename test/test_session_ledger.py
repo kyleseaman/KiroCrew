@@ -1,6 +1,6 @@
 """Session work ledger — core primitive, nudge injection, routes, cleanup.
 
-Covers the contracts docs/system-specs/features/session-work-ledger.md pins:
+Covers the contracts docs/system-specs/modules/session-work-ledger.md pins:
 exact-key identity (lossless fold, no channel-key collisions), directory
 guarding, the crash-atomic phase-requires-event discipline, partial updates
 preserving stored state, bounds (tried/events/artifacts/state-file size), the
@@ -12,7 +12,9 @@ purge.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -245,34 +247,228 @@ def test_coerce_preserves_unknown_fields():
     assert state["tried"] == []
 
 
-def test_purge_removes_dir_and_tolerates_bad_keys():
-    key = "chat-10-000"
-    sl.record(key, goal="x")
-    assert sl.has_ledger(key)
-    sl.purge(key)
-    assert not sl.has_ledger(key)
-    sl.purge("")  # hostile key: no-op, never raises
-    sl.purge("a/b")
+# -- the bounded write reports what it discards -----------------------------
+
+
+def test_record_returns_exactly_what_landed_on_disk(monkeypatch):
+    """``record``'s return value is the authoritative post-write view.
+
+    The dashboard handler puts it straight into ``{"ok": True, "state": ...}``
+    and the MCP tool reports it as "what is now recorded", so it must not
+    describe entries the write budget evicted. ``_serialize_bounded`` evicts
+    from the very dict ``record`` returns, which is what keeps the two equal;
+    serializing a copy instead would return the pre-eviction lists while disk
+    held the evicted ones. Pinned so that aliasing is not "cleaned up" later.
+    """
+    key = "chat-62-90a"
+    sl.record(key, goal="keep me", event="seed", event_kind="progress")
+    for i in range(4):
+        sl.record(key, tried_approach=f"a{i}", tried_rejected_because="x" * 400)
+        sl.record(key, event=f"e{i}" + "y" * 400, event_kind="progress")
+    path = sl.ledger_dir(key) / sl._STATE_FILE
+    before = json.loads(path.read_text(encoding="utf-8"))
+
+    # Squeeze the ceiling so the budget lands just UNDER the current document:
+    # the next write must evict, while the read that precedes it still passes
+    # the same ceiling's file-size guard. Derived from the real size so a
+    # timestamp-width change cannot silently turn this into a no-op.
+    size = path.stat().st_size
+    monkeypatch.setattr(sl, "_MAX_STATE_BYTES", size + 4096 - 200)
+    returned = sl.record(key, next_step="advance")
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+
+    kept = len(returned["events"]) + len(returned["tried"])
+    assert kept < len(before["events"]) + len(before["tried"]), "no eviction happened"
+    assert returned["events"] or returned["tried"], "eviction emptied the history entirely"
+    assert returned == on_disk, "the caller's post-write view diverged from disk"
+    assert returned["goal"] == "keep me"
+
+
+class TestBoundedWriteIsLoudAboutLoss:
+    """``_serialize_bounded`` drops history to keep the document readable.
+
+    That data never reaches disk, so — unlike the read side, where the
+    original file survives until a write-back — the loss is unrecoverable the
+    moment the write lands. ``_read_state_unlocked`` already WARNs when the
+    same ceiling makes it discard a whole file; these pin that the partial
+    discard is reported too, that the counts are named, that a refused write
+    still reports, and that a document which fits stays silent.
+    """
+
+    def _warnings(self, caplog: pytest.LogCaptureFixture) -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and "serialization budget" in r.getMessage()
+        ]
+
+    def _over_budget_state(self, extra_events: int = 6) -> dict[str, Any]:
+        state = sl._empty_state()
+        state["goal"] = "survives"
+        state["events"] = [
+            {"ts": "t", "kind": "progress", "text": "e" * 200} for _ in range(extra_events)
+        ]
+        state["tried"] = [
+            {"approach": "a" * 200, "rejected_because": "r" * 200, "at": "t"} for _ in range(3)
+        ]
+        return state
+
+    def test_a_record_that_fits_logs_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The control that makes this safe to ship: no discard, no line.
+        Without it every ledger write would emit a WARNING."""
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_ledger"):
+            sl.record("chat-62-fits", goal="small", event="tiny", event_kind="note")
+        assert self._warnings(caplog) == []
+
+    def test_evicted_history_is_counted(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sl, "_MAX_STATE_BYTES", 4096 + 600)
+        state = self._over_budget_state()
+        before_events, before_tried = len(state["events"]), len(state["tried"])
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_ledger"):
+            blob = sl._serialize_bounded(state, source="chat-62-abcd1234")
+        found = self._warnings(caplog)
+        assert len(found) == 1, f"the discard was silent (warnings: {found})"
+        msg = found[0]
+        evicted_events = before_events - len(state["events"])
+        assert evicted_events > 0, "fixture did not cross the budget"
+        assert f"oldest events[] evicted x{evicted_events}" in msg
+        assert "chat-62-abcd1234" in msg, "the line must name which ledger lost data"
+        # Reporting the loss changes nothing about what is kept or written.
+        assert len(blob.encode("utf-8")) <= sl._MAX_STATE_BYTES - 4096
+        assert json.loads(blob) == state
+        assert json.loads(blob)["goal"] == "survives"
+        if len(state["tried"]) < before_tried:
+            assert f"oldest tried[] evicted x{before_tried - len(state['tried'])}" in msg
+
+    def test_dropped_unknown_fields_are_named(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Forward-compat baggage from a newer writer is dropped wholesale.
+        That is the widest discard this function makes and was the quietest."""
+        monkeypatch.setattr(sl, "_MAX_STATE_BYTES", 4096 + 600)
+        state = sl._empty_state()
+        state["goal"] = "survives"
+        state["future_blob"] = "z" * 4000
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_ledger"):
+            blob = sl._serialize_bounded(state, source="chat-62-ffff0000")
+        found = self._warnings(caplog)
+        assert len(found) == 1, f"the discard was silent (warnings: {found})"
+        assert "unknown fields dropped: future_blob" in found[0]
+        assert json.loads(blob)["goal"] == "survives"
+        assert "future_blob" not in json.loads(blob)
+
+    def test_a_refused_write_reports_what_it_gutted(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The refusal raises with the in-memory record already stripped —
+        the moment an operator most needs to know what went."""
+        monkeypatch.setattr(sl, "_MAX_STATE_BYTES", 4096 + 10)
+        state = self._over_budget_state(extra_events=2)
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_ledger"):
+            with pytest.raises(ValueError, match="too large"):
+                sl._serialize_bounded(state, source="chat-62-dead0000")
+        found = self._warnings(caplog)
+        assert len(found) == 1, f"the refusal was silent (warnings: {found})"
+        assert "oldest events[] evicted x2" in found[0]
+
+    def test_a_failed_write_still_reports_but_leaves_the_stored_file_intact(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Why the line describes the DOCUMENT, not a durable write.
+
+        ``atomic_write`` runs after the serializer and can fail (ENOSPC),
+        leaving the previous state file whole — so nothing was durably lost,
+        even though this call's in-memory record was already stripped. A
+        message claiming a write discarded data would be false here.
+        """
+        key = "chat-62-enospc"
+        sl.record(key, goal="on disk")
+        for i in range(5):
+            sl.record(key, event=f"e{i}" + "y" * 300, event_kind="progress")
+        path = sl.ledger_dir(key) / sl._STATE_FILE
+        before = path.read_text(encoding="utf-8")
+
+        def _boom(*a: Any, **kw: Any) -> None:
+            raise OSError(28, "No space left on device")
+
+        # Gentle squeeze: one evicted event is enough to fit, so serialization
+        # SUCCEEDS and the failing write is genuinely reached.
+        monkeypatch.setattr(sl, "_MAX_STATE_BYTES", path.stat().st_size + 4096 - 200)
+        monkeypatch.setattr(sl, "atomic_write", _boom)
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_ledger"):
+            with pytest.raises(OSError):
+                sl.record(key, next_step="never lands")
+        found = self._warnings(caplog)
+        assert len(found) == 1, f"the discard was silent (warnings: {found})"
+        assert "oldest events[] evicted x" in found[0]
+        assert "write" not in found[0], "must not claim a write that did not happen"
+        assert path.read_text(encoding="utf-8") == before, "the stored file must be untouched"
+
+    def test_the_eviction_branch_needs_both_lists_at_scale(self) -> None:
+        """Why these tests squeeze the budget instead of using real bounds.
+
+        A full astral-script EVENT tail is ~806 KB — under the 995,904-byte
+        budget on its own, so ``test_writer_guarantees_the_read_ceiling_...``
+        never actually reaches the eviction branch. Crossing it at production
+        bounds needs ``events`` AND ``tried`` both loaded (~1.87 MB), which
+        costs 150 locked read-modify-write cycles over a multi-megabyte
+        document. Pinned as arithmetic so the reason stays visible.
+        """
+        four_byte = 4  # astral-plane char in UTF-8
+        events = sl._MAX_EVENTS * sl._MAX_TEXT * four_byte
+        tried = sl._MAX_TRIED * 2 * sl._MAX_TEXT * four_byte
+        budget = sl._MAX_STATE_BYTES - 4096
+        assert events < budget, "events alone would cross the budget; revisit the fast tests"
+        assert events + tried > budget, "the eviction branch would be unreachable"
+
+
+def test_purge_matching_tolerates_bad_and_absent_keys():
+    """The one delete primitive: a hostile or unknown key removes nothing and never
+    raises."""
+    sl.record("chat-10-000", goal="x")
+    assert sl.purge_matching({"", "a/b", "chat-never"}, guard=lambda _d: True) == 0
+    assert sl.has_ledger("chat-10-000")
 
 
 @pytest.mark.skipif(not IS_POSIX, reason="flock-based holder simulation is POSIX-only")
 def test_record_fails_closed_on_held_lock(monkeypatch):
-    """A wedged cross-process holder costs one refused write (OSError), never
-    an unbounded wait — and removing the lock entirely would break this test,
-    because an unlocked record would succeed while the lock is held."""
+    """A live cross-process flock HOLDER costs one refused write (``OSError``),
+    and the refusal is bounded rather than an unbounded wait — removing the
+    lock entirely would break this test, because an unlocked record would
+    succeed while the lock is held.
+
+    Deliberately NOT asserted: a bound on a wedged FILESYSTEM/mount. The
+    pre-lock mkdir/os.open are ordinary syscalls that a dead mount can stall
+    unboundedly, and no in-process deadline can interrupt a stalled syscall
+    (see ``session_ledger._locked``). There is no portable way to simulate a
+    hung mkdir/os.open, and asserting a bound there would re-assert the
+    over-broad "never a parked worker thread" promise the docs do not make.
+    """
     import fcntl
 
+    timeout = 0.2
+    # Generous absolute ceiling: the claim under test is "bounded, not
+    # forever", so the margin only has to exclude an unbounded wait.
+    slack = 2.0
     key = "chat-lock-1"
     sl.record(key, goal="x")  # create the dir + lock inode
-    monkeypatch.setattr(sl, "_LOCK_TIMEOUT_SECS", 0.2)
+    monkeypatch.setattr(sl, "_LOCK_TIMEOUT_SECS", timeout)
     fd = os.open(str(sl.ledger_dir(key) / ".lock"), os.O_RDWR)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
+        start = time.monotonic()
         with pytest.raises(OSError, match="held by another process"):
             sl.record(key, goal="y")
+        elapsed = time.monotonic() - start
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+    assert elapsed < timeout + slack, (
+        f"refusal took {elapsed:.3f}s; the deadline is not governing the "
+        f"acquire poll (expected < {timeout + slack:.3f}s)"
+    )
     # Holder released: the next write goes through.
     sl.record(key, goal="z")
     assert sl.read_state(key)["goal"] == "z"
@@ -373,16 +569,31 @@ async def test_compose_nudge_body_survives_snapshot_failure(monkeypatch):
 
 
 def test_gateway_fire_callbacks_use_the_composer():
-    """All three fire paths must go through compose_nudge_body — reverting a
-    call site to the snapshot-less render_nudge_message drops ledger
-    injection for that surface silently."""
+    """EVERY fire path must go through compose_nudge_body — reverting a call site
+    to the snapshot-less render_nudge_message drops ledger injection for that
+    surface silently.
+
+    Enumerated rather than counted. A hardcoded total says "3" until a channel is
+    added, and then it fails for the one reason that is NOT a defect (a new
+    adapter) while a channel that quietly opted itself out could keep the total
+    correct by existing. Naming the offenders also tells whoever broke it which
+    surface lost its ledger.
+    """
     import inspect
+    import re
 
     from kiro_crew.slack import gateway
 
     src = inspect.getsource(gateway)
-    assert (
-        src.count("compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)") == 3
+    # Split on the adapter definitions so each body is attributed to its own name.
+    parts = re.split(r"\n    async def (?=_fire_\w+_nudge\()", src)[1:]
+    adapters = {p.split("(", 1)[0]: p for p in parts}
+    assert adapters, "no _fire_*_nudge adapters found — this pattern went stale"
+
+    offenders = sorted(name for name, body in adapters.items() if "compose_nudge_body" not in body)
+    assert not offenders, (
+        "these fire adapters do not call compose_nudge_body, so their surface's "
+        f"loops start each cycle without the work-ledger snapshot: {offenders}"
     )
 
 
@@ -491,11 +702,11 @@ def test_routes_are_on_the_strict_internal_allowlist():
     assert "/api/session-ledger" in _STRICT_INTERNAL_API_PATHS
 
 
-# ── permanent-delete purge funnel ─────────────────────────────────────────
+# ── permanent-delete preservation boundary ─────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_remove_slot_for_history_key_purges_ledger():
+async def test_remove_slot_for_history_key_preserves_ledger():
     from kiro_crew.dashboard.handlers.sessions import _remove_slot_for_history_key
 
     history_key = "dashboard_chat-88-123"
@@ -505,17 +716,13 @@ async def test_remove_slot_for_history_key_purges_ledger():
 
     state = MagicMock()
     state._slots = {}
-    state.crew = None
-    state.remove_chat_pins_for_slots = AsyncMock()
     await _remove_slot_for_history_key(state, history_key)
-    assert not sl.has_ledger(ledger_key)
+    assert sl.has_ledger(ledger_key)
 
 
 @pytest.mark.asyncio
-async def test_delete_with_folded_spelling_reaps_exact_channel_key_ledger():
-    """A channel session's ledger is keyed by its EXACT session key, but a
-    slotless permanent delete may only hold the folded transcript spelling —
-    the breadcrumb sweep must still reap the exact-key ledger."""
+async def test_delete_with_folded_spelling_preserves_exact_channel_key_ledger():
+    """A lossy transcript spelling never authorizes work-ledger deletion."""
     from kiro_crew.dashboard.handlers.sessions import _remove_slot_for_history_key
     from kiro_crew.dashboard.state import _normalize_slot_key
 
@@ -525,30 +732,330 @@ async def test_delete_with_folded_spelling_reaps_exact_channel_key_ledger():
 
     state = MagicMock()
     state._slots = {}
-    state.crew = None
-    state.remove_chat_pins_for_slots = AsyncMock()
-    # The funnel is handed only the folded spelling (what the transcript
-    # filename layer uses); the raw colon-structured key is not among the
-    # candidates.
+    # The route receives only the folded transcript spelling; that lossy alias
+    # does not authorize deletion of the exact channel ledger.
     await _remove_slot_for_history_key(state, _normalize_slot_key(channel_key))
-    assert not sl.has_ledger(channel_key)
+    assert sl.has_ledger(channel_key)
 
 
-def test_purge_matching_exact_and_folded_and_nonmatch():
+@pytest.mark.skipif(not IS_POSIX, reason="symlink creation needs no privilege on POSIX")
+def test_purge_matching_never_follows_a_linked_store_or_a_linked_entry(tmp_path):
+    """A linked store directory is skipped whatever its breadcrumb says, and a
+    linked entry INSIDE a store is unlinked as a name, never walked."""
+    import shutil
+
+    # A whole store that is a link: skipped, target untouched.
+    key = "chat-60-linked-store"
+    sl.record(key, goal="g", phase="done", event="x", event_kind="phase")
+    directory = sl.ledger_dir(key)
+    target = tmp_path / "store-target"
+    shutil.move(str(directory), str(target))
+    directory.symlink_to(target, target_is_directory=True)
+    assert sl.purge_matching({key}, guard=lambda _d: True) == 0
+    assert (target / "state.json").exists()
+
+    # A linked entry inside a real store: the link goes, the target stays.
+    key2 = "chat-61-linked-entry"
+    sl.record(key2, goal="g", phase="done", event="x", event_kind="phase")
+    directory2 = sl.ledger_dir(key2)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "precious.txt").write_text("keep", encoding="utf-8")
+    (directory2 / "attachments").symlink_to(elsewhere, target_is_directory=True)
+    assert sl.purge_matching({key2}, guard=lambda _d: True) == 1
+    assert not directory2.exists()
+    assert (elsewhere / "precious.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_purge_matching_is_exact_and_a_folded_spelling_matches_nothing():
+    """The primitive matches exact keys only: the folded spelling of a channel key
+    names no ledger, so a lossy alias can never remove one the caller did not
+    list by its exact key."""
     from kiro_crew.dashboard.state import _normalize_slot_key
 
     sl.record("slack:C1:1.1", goal="a")
     sl.record("slack:C2:2.2", goal="b")
     sl.record("chat-keep-1", goal="keep")
     removed = sl.purge_matching(
-        {"slack:C1:1.1"},
-        {_normalize_slot_key("slack:C2:2.2")},
-        _normalize_slot_key,
+        {"slack:C1:1.1", _normalize_slot_key("slack:C2:2.2")}, guard=lambda _d: True
     )
-    assert removed == 2
+    assert removed == 1
     assert not sl.has_ledger("slack:C1:1.1")
-    assert not sl.has_ledger("slack:C2:2.2")
+    assert sl.has_ledger("slack:C2:2.2"), "a folded spelling is not the exact key"
     assert sl.has_ledger("chat-keep-1")
+
+
+def test_guarded_purge_keeps_the_record_and_breadcrumb_when_any_content_survives(
+    monkeypatch,
+):
+    """Removal is ordered and the identity files go LAST, only once everything
+    else is gone -- so a failed removal (a Windows sharing violation on one held
+    entry) leaves a store that still has its record and still names itself,
+    never a residue no purge can address."""
+    key = "chat-30-held"
+    sl.record(key, goal="g", phase="done", event="x", event_kind="phase")
+    directory = sl.ledger_dir(key)
+    (directory / "stray.bin").write_bytes(b"held by another handle")
+    real_unlink = os.path.exists  # placeholder to keep the name in scope
+
+    import pathlib
+
+    original = pathlib.Path.unlink
+
+    def _refuse_stray(self, *args, **kwargs):
+        if self.name == "stray.bin":
+            raise PermissionError(32, "sharing violation")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", _refuse_stray)
+
+    removed = sl.purge_matching({key}, guard=lambda _d: True)
+
+    assert removed == 0, "a store that could not be fully removed is not counted"
+    assert (directory / "state.json").exists(), "the record must survive"
+    assert (directory / "slot_key").exists(), "the breadcrumb must survive"
+    assert sl.read_state(key)["phase"] == "done", "the store is still a ledger"
+    del real_unlink
+
+
+def test_guarded_purge_counts_rmtree_failures_instead_of_ignoring_them(monkeypatch):
+    key = "chat-31-subtree"
+    sl.record(key, goal="g", phase="done", event="x", event_kind="phase")
+    directory = sl.ledger_dir(key)
+    (directory / "attachments").mkdir()
+    (directory / "attachments" / "a.bin").write_bytes(b"x")
+    real_rmtree = sl.shutil.rmtree
+
+    def _refuse(path, *args, **kwargs):
+        onerror = kwargs.get("onerror")
+        if onerror is not None:
+            onerror(None, str(path), None)
+            return None
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(sl.shutil, "rmtree", _refuse)
+
+    with sl._locked(directory):
+        assert sl._remove_store_contents(directory) is False
+    assert (directory / "state.json").exists()
+    assert (directory / "slot_key").exists()
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="the detached-inode shape needs POSIX unlink semantics")
+def test_a_record_queued_behind_a_purge_refuses_instead_of_publishing():
+    """A writer that acquires ``_locked`` on an inode the store does not have must
+    refuse, not write a breadcrumb-less state into a recreated directory."""
+    key = "chat-40-purged-under-me"
+    sl.record(key, goal="g", phase="done", event="x", event_kind="phase")
+    directory = sl.ledger_dir(key)
+    lock_path = directory / ".lock"
+    import shutil
+
+    fd = os.open(str(lock_path), os.O_RDWR)
+    try:
+        shutil.rmtree(directory)  # the purge completes while this writer holds a stale fd
+        with pytest.raises(OSError, match="removed while waiting"):
+            sl.require_lock_inode(fd, lock_path)
+    finally:
+        os.close(fd)
+    # The store is gone and stays gone: nothing was published into it.
+    assert not directory.exists()
+
+
+def test_locked_runs_the_inode_check_inside_the_hold(monkeypatch):
+    seen: list[str] = []
+    real = sl.require_lock_inode
+
+    def _spy(fd, path):
+        seen.append(path.name)
+        return real(fd, path)
+
+    monkeypatch.setattr(sl, "require_lock_inode", _spy)
+    sl.record("chat-41-checked", goal="g")
+    assert seen == [".lock"]
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="in-hold unlink is the POSIX path; Windows refuses it")
+def test_the_lock_inode_is_unlinked_inside_the_hold(monkeypatch):
+    """Unlinked INSIDE the hold, a queued writer that acquires the old inode finds
+    its path gone and refuses. Unlinked after release there is a window where it
+    acquires, validates against a path that still exists, proceeds, and the late
+    unlink detaches the inode it holds -- so the next writer gets a second inode
+    and the two are not serialised."""
+    key = "chat-50-inhold"
+    sl.record(key, goal="g", phase="done", event="x", event_kind="phase")
+    directory = sl.ledger_dir(key)
+    lock_path = directory / ".lock"
+
+    gone_while_held: list[bool] = []
+    real_release = sl.release_lock
+
+    def _observe_then_release(fd):
+        # Observed on the way OUT of the hold: the lock path must already be gone.
+        gone_while_held.append(not lock_path.exists())
+        return real_release(fd)
+
+    monkeypatch.setattr(sl, "release_lock", _observe_then_release)
+
+    assert sl.purge_matching({key}, guard=lambda _d: True) == 1
+    assert gone_while_held == [True], "the lock inode must be unlinked before release"
+    assert not directory.exists()
+
+
+def test_purge_matching_succeeds_under_windows_unlink_rules(monkeypatch):
+    """Windows: a handle has no FILE_SHARE_DELETE, so unlinking a held lock raises.
+    The store's lock must therefore be unlinked only after its descriptor is
+    closed -- by the shell, after release -- or the directory stays non-empty and
+    the purge reports nothing removed over a store it already emptied. Simulated
+    portably by making every lock-file unlink raise while its fd is open; the
+    work half has the same test, and its earlier version was blind to one of the
+    two lock handles."""
+    from pathlib import Path
+
+    key = "chat-52-windows"
+    sl.record(key, goal="g", phase="done", event="x", event_kind="phase")
+    directory = sl.ledger_dir(key)
+
+    open_locks: set[Path] = set()
+    fd_paths: dict[int, Path] = {}
+    real_os_open, real_close, real_unlink = os.open, os.close, Path.unlink
+
+    def _tracking_open(path, flags, *args, **kwargs):
+        fd = real_os_open(path, flags, *args, **kwargs)
+        p = Path(path)
+        if p.name.endswith(".lock"):
+            fd_paths[fd] = p
+            open_locks.add(p.resolve())
+        return fd
+
+    def _tracking_close(fd):
+        p = fd_paths.pop(fd, None)
+        if p is not None:
+            open_locks.discard(p.resolve())
+        return real_close(fd)
+
+    def _windows_unlink(self, *args, **kwargs):
+        if self.name.endswith(".lock") and self.resolve() in open_locks:
+            raise PermissionError(32, "The process cannot access the file because it is being used")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", _tracking_open)
+    monkeypatch.setattr(os, "close", _tracking_close)
+    monkeypatch.setattr(Path, "unlink", _windows_unlink)
+
+    assert sl.purge_matching({key}, guard=lambda _d: True) == 1
+    assert not directory.exists()
+    assert not open_locks, "every lock handle was closed"
+
+
+def test_purge_matching_with_an_accept_all_guard_is_still_locked_and_ordered(monkeypatch):
+    """There is one spelling of deletion: an accept-all guard means the match alone
+    decides, under the same hold and the same identity-last ordering. A refused
+    stray entry therefore keeps the record and breadcrumb exactly as it does with
+    a selective guard."""
+    key = "chat-51-noguard"
+    sl.record(key, goal="g", phase="done", event="x", event_kind="phase")
+    directory = sl.ledger_dir(key)
+    (directory / "stray.bin").write_bytes(b"held")
+    import pathlib
+
+    original = pathlib.Path.unlink
+
+    def _refuse_stray(self, *args, **kwargs):
+        if self.name == "stray.bin":
+            raise PermissionError(32, "sharing violation")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", _refuse_stray)
+    seen: list[str] = []
+    real = sl.require_lock_inode
+    monkeypatch.setattr(
+        sl, "require_lock_inode", lambda fd, path: (seen.append(path.name), real(fd, path))[1]
+    )
+
+    assert sl.purge_matching({key}, guard=lambda _d: True) == 0
+    assert seen == [".lock"], "the removal ran under the ledger lock"
+    assert (directory / "state.json").exists() and (directory / "slot_key").exists()
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="in-hold unlink is the POSIX path")
+def test_the_post_release_shell_never_touches_a_lock_the_hold_already_removed():
+    """After the in-hold unlink a refused writer may retry, rebuild the store and
+    take a FRESH lock at the same path. The post-release shell must not unlink
+    that: it would detach the fresh inode under its holder and hand the next
+    writer a third one, un-serialised against the second."""
+    key = "chat-52-rebuilt"
+    sl.record(key, goal="g", phase="done", event="x", event_kind="phase")
+    directory = sl.ledger_dir(key)
+    lock_path = directory / ".lock"
+
+    # Simulate the race: the hold removed the lock (lock_gone=True) and, before the
+    # shell runs, a writer rebuilt the store with a fresh lock inode.
+    lock_path.unlink()
+    lock_path.touch()
+    fresh = os.stat(lock_path).st_ino
+
+    sl._remove_store_shell(directory, lock_gone=True)
+
+    assert lock_path.exists(), "a fresh lock at the path is not ours to remove"
+    assert os.stat(lock_path).st_ino == fresh
+    # And the Windows-shaped case, where the hold could NOT unlink: the shell may.
+    sl._remove_store_shell(directory, lock_gone=False)
+    assert not lock_path.exists()
+
+
+def test_a_partial_identity_removal_is_logged_accurately(monkeypatch, caplog):
+    """If ``state.json`` went and only ``slot_key`` refused, the log must not claim
+    both were kept -- an operator reading it would look for a record that is gone."""
+    import logging
+    import pathlib
+
+    key = "chat-53-partial"
+    sl.record(key, goal="g", phase="done", event="x", event_kind="phase")
+    directory = sl.ledger_dir(key)
+    original = pathlib.Path.unlink
+
+    def _refuse_breadcrumb(self, *args, **kwargs):
+        if self.name == "slot_key":
+            raise PermissionError(32, "sharing violation")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", _refuse_breadcrumb)
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.session_ledger"):
+        assert sl.purge_matching({key}, guard=lambda _d: True) == 0
+
+    assert not (directory / "state.json").exists()
+    assert (directory / "slot_key").exists()
+    text = caplog.text
+    assert "kept: slot_key" in text
+    assert "state.json and slot_key kept" not in text
+
+
+def test_a_purge_racing_a_finished_purge_recreates_nothing(monkeypatch):
+    """Same property on the session half: a store removed between the listing and
+    the purge's lock is skipped, never rebuilt as a lock-only directory."""
+    import shutil
+
+    key = "chat-54-raced"
+    sl.record(key, goal="g", phase="done", event="x", event_kind="phase")
+    directory = sl.ledger_dir(key)
+    real_locked = sl._locked
+
+    def _first_sweep_wins(dir_path, **kwargs):
+        shutil.rmtree(dir_path)  # the other sweep finished just before our acquire
+        return real_locked(dir_path, **kwargs)
+
+    monkeypatch.setattr(sl, "_locked", _first_sweep_wins)
+
+    assert sl.purge_matching({key}, guard=lambda _d: True) == 0
+    assert not directory.exists(), "the purge must not recreate the store it found gone"
+
+
+def test_a_writer_lock_still_creates_the_store():
+    directory = sl.ledger_dir("chat-55-fresh")
+    assert not directory.exists()
+    with sl._locked(directory):
+        assert (directory / ".lock").exists()
 
 
 # ── MCP tool identity ─────────────────────────────────────────────────────

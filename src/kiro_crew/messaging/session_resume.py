@@ -1,6 +1,6 @@
-"""Resuming a dashboard session inside a channel conversation, channel-neutrally.
+"""Resuming a persisted session inside a channel conversation, channel-neutrally.
 
-A user picks one of their dashboard chats from a channel and continues it there. Two
+A user picks one of their resumable chats from a channel and continues it there. Two
 channels grew this independently -- Discord first, and Teams would have been a second
 copy of ~600 lines -- so this module is the half that is genuinely shared, split on
 the same line ``queue_receipt.py`` uses:
@@ -31,16 +31,28 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 
-from kiro_crew.history import is_incognito_transcript, needles_match_text, parse_search_query
-from kiro_crew.messaging.link import UNBIND_REASON_USER_UNLINK, ChannelLink
+from kiro_crew.history import (
+    is_incognito_transcript,
+    needles_match_text,
+    parse_search_query,
+    transcript_stem,
+)
+from kiro_crew.messaging.link import (
+    UNBIND_REASON_ORIGIN_REBIND,
+    UNBIND_REASON_USER_UNLINK,
+    ChannelLink,
+    split_dm_session_key,
+)
 from kiro_crew.messaging.renderer import new_approval_nonce
 from kiro_crew.messaging.resume_expectation import (
     ExpectationStoreError,
     ResumeExpectation,
     ResumeExpectations,
 )
+from kiro_crew.sel import sel
+from kiro_crew.session_map import ConversationOwnershipConflict
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +80,83 @@ SETTLE_ADOPT = "adopt"  # link moved; adopt the new session
 #: is refused rather than routed on a guess.
 _MAX_ROUTE_ATTEMPTS = 3
 
+#: Dashboard metadata values that delegate agent selection to the current surface.
+#: They are not kiro-cli agent names and must never reach ``session/set_mode``.
+_AGENT_SENTINELS = frozenset({"default", "auto"})
+
+
+def session_agent_from_metadata(meta: dict) -> str:
+    """Return a provider template, translating a positively owned member alias.
+
+    Dashboard history records the member alias in ``agent``. Channel-native
+    history records a provider template there instead. Only private memory's
+    declared owner disambiguates these namespaces; unowned V1 remains unchanged.
+    The execution path separately validates the actual memory before acquisition.
+    """
+    recorded = str((meta or {}).get("agent") or "").strip()
+    store = (meta or {}).get("memory_store")
+    if isinstance(store, str) and store not in ("", "default"):
+        try:
+            from kiro_crew.config.loader import KiroCrewConfig, resolve_agent_bindings
+
+            cfg = KiroCrewConfig.load()
+            record = cfg.memory_stores.get(store)
+            owner = getattr(record, "owner_member", "")
+            if (
+                owner
+                and getattr(record, "memory_version", 1) == 2
+                and (recorded == owner or not recorded or recorded.casefold() in _AGENT_SENTINELS)
+            ):
+                binding = resolve_agent_bindings(cfg, owner, validate_memory_files=False)
+                return binding.kiro_agent or cfg.agent.default_agent or "kirocrew"
+        except Exception:
+            # The strict session-memory check refuses broken private bindings
+            # before a provider starts. Hydration alone never repairs/rebinds it.
+            logger.debug("resume: member template lookup failed", exc_info=True)
+    return "" if recorded.casefold() in _AGENT_SENTINELS else recorded
+
+
+def persisted_session_agent(conv_log: Any | None, session_key: str) -> str:
+    """Return a resumed session's recorded agent, or ``""`` to use the route agent.
+
+    Metadata access is blocking; async callers run this helper off the event loop. Missing,
+    unreadable, blank, and dashboard-sentinel values all degrade to the caller's route agent
+    rather than failing the turn or forwarding a non-agent mode to ACP.
+    """
+    if conv_log is None:
+        return ""
+    try:
+        meta = conv_log.get_metadata(session_key)
+    except Exception:
+        logger.debug("resume: could not read persisted agent for %s", session_key, exc_info=True)
+        return ""
+    return session_agent_from_metadata(meta)
+
+
+def session_title_of(conv_log: Any | None, session_key: str, channel: str = "") -> str:
+    """The stored title for *session_key*, or the bare key as a stable fallback.
+
+    Discord, Teams and Telegram each grew their own copy of this read, so a fix
+    to the unwrap or the fallback landed in one and missed the others. The read
+    shape lives here for the same reason ``persisted_session_agent`` does: the
+    three adapters differ in addressing and wording, not in how they name a
+    resumed conversation.
+
+    Metadata access is blocking; async callers run this helper off the event loop
+    (see ``persisted_session_agent``). *channel* only names the caller in its
+    debug line, so a channel's log attribution survives the consolidation.
+    """
+    title = ""
+    if conv_log is not None:
+        try:
+            meta = conv_log.get_metadata(session_key)
+            title = str((meta or {}).get("title") or "")
+        except Exception:
+            logger.debug("%s resume: title lookup failed", channel or "session", exc_info=True)
+    # The picker's fallback for an untitled session, so a bootstrapped record
+    # names the conversation the way the user saw it listed.
+    return title or session_key.removeprefix("dashboard:")
+
 
 class ResumeReleaseError(RuntimeError):
     """A resumed binding removal could not be made durable."""
@@ -75,7 +164,7 @@ class ResumeReleaseError(RuntimeError):
 
 @dataclass(frozen=True)
 class SessionChoice:
-    """One offered session: the dashboard key, and the label the user sees."""
+    """One offered session: its canonical key and the label the user sees."""
 
     key: str
     title: str
@@ -112,6 +201,47 @@ class RoutingDecision:
     adopt_title: str = ""
 
 
+async def refused_resume_is_restricted(
+    native_session_key: str,
+    *,
+    resolve: Callable[[], Awaitable[RoutingDecision]],
+    is_restricted: Callable[[str], Awaitable[bool]],
+) -> bool:
+    """Resolve every possible resume target before persisting a refused message.
+
+    A routing refusal can carry the expected, observed, or adopted session even
+    when ``resumed_key`` is empty. Check all of them plus the native key so an
+    update-pause spool cannot persist content belonging to a temporary or
+    incognito conversation. Any resolution failure denies persistence: losing
+    one restart notice is reversible, while writing restricted content is not.
+    """
+    try:
+        decision = await resolve()
+        if decision.observed is not None and decision.observed.ambiguous:
+            return True
+        candidates = (
+            native_session_key,
+            decision.resumed_key,
+            decision.adopt_key,
+            decision.described.key if decision.described is not None else None,
+            decision.observed.key if decision.observed is not None else None,
+        )
+        seen: set[str] = set()
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            if await is_restricted(candidate):
+                return True
+    except Exception:
+        logger.warning(
+            "resume: could not resolve refused callback privacy; denying persistence",
+            exc_info=True,
+        )
+        return True
+    return False
+
+
 @dataclass(frozen=True)
 class ResumeCopy:
     """The per-channel words in shared refusals.
@@ -133,16 +263,31 @@ class ResumeSurface(Protocol):
 
     The address is bound at CONSTRUCTION, which is what keeps every channel id, chat
     id and conversation id out of this module -- the same reason ``ReceiptSurface``
-    exists. A channel implements four things and nothing else.
+    exists. A channel implements its own rendering and exact wording.
     """
 
-    #: Channel name for the session map, the store file and log lines.
-    channel_type: str
-    #: Per-channel wording for the shared refusals.
-    copy: ResumeCopy
+    #: Durable conversation identity for the expectation store. This can be
+    #: narrower than ``ChannelLink.channel_id`` (for example a forum Topic).
+    expectation_id: str
+    owner_refusal: str
+    choice_owner_refusal: str
+    choice_expired: str
+    choice_missing: str
+    choice_expectation_failed: str
+    choice_claim_lost: str
+    choice_binding_failed: str
 
     def display_safe(self, text: str, max_chars: int) -> str:
         """Redact + neutralize + budget *text* for THIS channel's rendering."""
+
+    def no_choices(self, query: str) -> str:
+        """The exact empty-result message for a listing or search."""
+
+    def picker_heading(self, query: str, total: int) -> str:
+        """The exact text accompanying a picker with *total* eligible sessions."""
+
+    def choice_success(self, choice: SessionChoice) -> str:
+        """The exact successful-resume settlement for *choice*."""
 
     async def post_picker(
         self, heading: str, nonce: str, choices: tuple[SessionChoice, ...]
@@ -161,7 +306,7 @@ def history_dashboard_key(raw_key: object) -> str | None:
 
     A transcript stem is not always the session key: the same session can appear as
     ``dashboard:<slot>`` or as the file-stem form ``dashboard_<slot>``, and a row from
-    some other surface is not resumable at all.
+    some other surface is not resumable by the default resolver.
 
     The stem prefix is stripped in a LOOP, not once: a re-archived transcript can carry
     it stacked (``dashboard_dashboard_<slot>``), and stripping one layer would bind
@@ -178,6 +323,59 @@ def history_dashboard_key(raw_key: object) -> str | None:
     return None
 
 
+def native_generation_bucket(key: str) -> str:
+    """Return the durable DM bucket for a trusted canonical session key."""
+    parsed = split_dm_session_key(key)
+    return parsed[0] if parsed is not None else ""
+
+
+def resumable_history_key(
+    row: dict[str, Any],
+    *,
+    sessions: Any,
+    native_key: str,
+) -> str | None:
+    """Resolve a dashboard or exact-same-bucket native history row.
+
+    A native transcript stem is irreversible: agent and scope segments may
+    contain underscores. Rows therefore require the session map's authoritative
+    resolver; a zero-turn generation has no history row and nothing to recover.
+    """
+    dashboard_key = history_dashboard_key(row.get("key"))
+    if dashboard_key is not None:
+        return dashboard_key
+
+    raw_key = str(row.get("key") or "")
+    if not raw_key:
+        return None
+    resolve_stem = getattr(sessions, "channel_key_for_stem", None)
+    candidate = str(resolve_stem(raw_key) or "") if callable(resolve_stem) else ""
+    if not candidate or raw_key not in {candidate, transcript_stem(candidate)}:
+        return None
+
+    native_bucket = native_generation_bucket(native_key)
+    candidate_bucket = native_generation_bucket(candidate)
+    if not native_bucket or candidate_bucket != native_bucket:
+        return None
+    return candidate
+
+
+def same_bucket_origin_keys(sessions: Any, link: ChannelLink, native_key: str) -> frozenset[str]:
+    """Outbound mirror occupants that are generations of one native DM bucket."""
+    native_bucket = native_generation_bucket(native_key)
+    if not native_bucket:
+        return frozenset()
+    resolve_stem = getattr(sessions, "channel_key_for_stem", None)
+    keys: set[str] = set()
+    for stored_key in sessions.find_mirror_sessions(link):
+        candidate = stored_key
+        if stored_key.startswith("dashboard:") and callable(resolve_stem):
+            candidate = str(resolve_stem(stored_key.removeprefix("dashboard:")) or "")
+        if candidate and native_generation_bucket(candidate) == native_bucket:
+            keys.add(stored_key)
+    return frozenset(keys)
+
+
 async def resolve_session_choices(
     conv_log: Any,
     query: str,
@@ -185,6 +383,8 @@ async def resolve_session_choices(
     *,
     limit: int = PICKER_LIMIT,
     fetch_limit: int = SEARCH_FETCH_LIMIT,
+    sessions: Any | None = None,
+    native_key: str = "",
 ) -> tuple[list[SessionChoice], int]:
     """The offerable sessions for *query* (newest-first when blank), and the total.
 
@@ -196,6 +396,11 @@ async def resolve_session_choices(
 
     Order is already meaningful -- ``search_sessions`` returns best-scored first,
     ``list_sessions`` newest first -- so it is never re-sorted.
+
+    With no native key, only dashboard sessions are admitted. A channel passes its
+    canonical native key and session map to include exact-same-bucket generations;
+    eligibility remains centralized here so privacy filtering, ordering and display
+    budgets do not drift between picker implementations.
 
     Raises whatever the history layer raises; the caller decides what to tell the user.
     """
@@ -226,6 +431,7 @@ async def resolve_session_choices(
         rows = await asyncio.to_thread(conv_log.list_sessions)
 
     eligible: list[SessionChoice] = []
+    seen: set[str] = set()
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -233,9 +439,13 @@ async def resolve_session_choices(
         # deliberately unpersisted conversation into a channel that does persist.
         if is_incognito_transcript(row.get("memory_mode")):
             continue
-        key = history_dashboard_key(row.get("key"))
-        if key is None:
+        if sessions is not None and native_key:
+            key = resumable_history_key(row, sessions=sessions, native_key=native_key)
+        else:
+            key = history_dashboard_key(row.get("key"))
+        if key is None or key in seen:
             continue
+        seen.add(key)
         raw_title = str(row.get("title") or key.removeprefix("dashboard:"))
         title = display_safe(" ".join(raw_title.split()), TITLE_LIMIT) or "Untitled session"
         eligible.append(SessionChoice(key=key, title=title))
@@ -651,3 +861,364 @@ class SessionBinder:
                     exc_info=True,
                 )
         return seen.key or (cleared[0] if cleared else None)
+
+
+class SessionResumeController:
+    """Own the session picker and bind transaction for every resume surface."""
+
+    def __init__(
+        self,
+        sessions: Any,
+        conv_log: Any | None,
+        *,
+        channel_type: str,
+        copy: ResumeCopy,
+        title_display: Any,
+    ) -> None:
+        self.sessions = sessions
+        self.conv_log = conv_log
+        self.channel_type = channel_type
+        self.pickers = PickerRegistry()
+        self.binder = SessionBinder(sessions, channel_type=channel_type, copy=copy)
+        self.binder.title_display = title_display
+        self.dashboard_state: object | None = None
+
+    def push_slots(self) -> None:
+        state = self.dashboard_state
+        if state is None:
+            return
+        try:
+            push = getattr(state, "push_slots_update", None)
+            if callable(push):
+                push()
+        except Exception:
+            logger.debug(
+                "%s: slots push after binding change failed",
+                self.channel_type,
+                exc_info=True,
+            )
+
+    async def show_picker(
+        self,
+        surface: ResumeSurface,
+        *,
+        caller: str,
+        picker_owner: str,
+        is_owner: bool,
+        query: str = "",
+        native_key: str = "",
+    ) -> None:
+        """List eligible sessions and register only a picker that reached the surface."""
+        operation = f"{self.channel_type}.sessions_data_access"
+        if not is_owner:
+            sel().log_api_access(
+                caller=caller,
+                operation=operation,
+                outcome="denied",
+                source=self.channel_type,
+            )
+            await surface.say(surface.owner_refusal)
+            return
+        if self.conv_log is None:
+            await surface.say("⚠️ Recent sessions are unavailable.")
+            return
+
+        try:
+            choices, total = await resolve_session_choices(
+                self.conv_log,
+                query,
+                surface.display_safe,
+                sessions=self.sessions,
+                native_key=native_key,
+            )
+        except Exception as exc:
+            sel().log_api_access(
+                caller=caller,
+                operation=operation,
+                outcome="error",
+                source=self.channel_type,
+                resources="0 sessions read",
+                error=surface.display_safe(str(exc), 200),
+            )
+            logger.exception("%s sessions: history listing failed", self.channel_type)
+            await surface.say("⚠️ Recent sessions are unavailable.")
+            return
+
+        sel().log_api_access(
+            caller=caller,
+            operation=operation,
+            outcome="allowed",
+            source=self.channel_type,
+            resources=f"{len(choices)} sessions read",
+        )
+        if not choices:
+            await surface.say(surface.no_choices(query))
+            return
+
+        self.pickers.purge()
+        self.pickers.drop_for(picker_owner)
+        nonce = self.pickers.mint()
+        frozen = tuple(choices)
+        message_id = await surface.post_picker(
+            surface.picker_heading(query, total),
+            nonce,
+            frozen,
+        )
+        if message_id:
+            self.pickers.register(nonce, picker_owner, message_id, frozen)
+
+    async def choose(
+        self,
+        surface: ResumeSurface,
+        *,
+        caller: str,
+        picker_owner: str,
+        is_owner: bool,
+        message_id: str,
+        nonce: str,
+        index: int,
+        link: ChannelLink,
+        replace_outbound_keys: frozenset[str] = frozenset(),
+    ) -> SessionChoice | None:
+        """Consume one picker press and atomically claim its inbound binding."""
+        if not is_owner:
+            sel().log_api_access(
+                caller=caller,
+                operation=f"{self.channel_type}.session_resume_choice",
+                outcome="denied",
+                source=self.channel_type,
+            )
+            await surface.settle_picker(message_id, surface.choice_owner_refusal)
+            return None
+
+        choice = self.pickers.take(nonce, index, picker_owner, message_id)
+        if choice is None:
+            await surface.settle_picker(message_id, surface.choice_expired)
+            return None
+        if self.conv_log is None or not await asyncio.to_thread(
+            self.conv_log.has_log,
+            choice.key,
+        ):
+            await surface.settle_picker(message_id, surface.choice_missing)
+            return None
+
+        async with self.binder.lock:
+
+            def conflict_and_displaced() -> tuple[str | None, list[str]]:
+                conflict = self.binder.binding_conflict(choice.key, choice.title, link)
+                if conflict is None or not replace_outbound_keys:
+                    return conflict, []
+                existing = self.sessions.get_mirror_link(choice.key)
+                inbound = self.sessions.find_mirror_sessions(link, inbound_only=True)
+                occupants = [
+                    key for key in self.sessions.find_mirror_sessions(link) if key != choice.key
+                ]
+                # A channel adapter may identify its own native session generations
+                # as replaceable. Every occupant must be in that explicit set: an
+                # unrelated dashboard mirror is deliberate user state and cannot be
+                # inferred from sharing the same destination.
+                replaceable = occupants and set(occupants) <= replace_outbound_keys
+                if (existing is None or existing == link) and not inbound and replaceable:
+                    return None, occupants
+                return conflict, []
+
+            conflict, displaced = conflict_and_displaced()
+            if conflict is not None:
+                await surface.settle_picker(message_id, conflict)
+                return None
+
+            # Snapshot what this pick is about to overwrite. ``record`` replaces the
+            # channel's expectation outright, so on a failed bind, retiring the
+            # replacement is not a rollback: it leaves a DETACHED marker in place of the
+            # ACTIVE record, and that record was the evidence a lost
+            # link owes the user a notice. The next message would then route
+            # natively and the notice would never be delivered.
+            #
+            # Guarded for the same reason the ``record`` call below is: the choice
+            # has already been CONSUMED from the picker registry, so an escaping
+            # store error would discard the press with no reply at all and leave
+            # the button dead. A store this read cannot parse is also one the
+            # write could not have trusted, so it settles fail-closed.
+            try:
+                prior = await self.binder.expectations.get(surface.expectation_id)
+            except Exception:
+                logger.warning(
+                    "%s resume: could not read the expectation store for %s",
+                    self.channel_type,
+                    choice.key,
+                    exc_info=True,
+                )
+                await surface.settle_picker(message_id, surface.choice_expectation_failed)
+                return None
+
+            try:
+                expectation = await self.binder.expectations.record(
+                    surface.expectation_id,
+                    choice.key,
+                    choice.title,
+                )
+            except Exception:
+                # Path resolution can fail before the store normalizes an OSError.
+                # Every persistence failure must settle fail-closed rather than leave
+                # a live-looking picker whose binding never took effect.
+                logger.warning(
+                    "%s resume: the pick of %s did not take effect",
+                    self.channel_type,
+                    choice.key,
+                    exc_info=True,
+                )
+                await surface.settle_picker(message_id, surface.choice_expectation_failed)
+                return None
+
+            async def retire_failed_expectation() -> None:
+                """Undo this pick's expectation write, restoring what it displaced.
+
+                Compare-and-set on the replacement's own version throughout, so a
+                newer picker or dashboard record that landed meanwhile wins instead
+                of being reverted to this pick's view.
+                """
+                try:
+                    if prior is not None and not prior.retired:
+                        # An ACTIVE record was displaced: put it back, so the
+                        # refusal or adopt notice it owed is still owed.
+                        await self.binder.expectations.record_if(
+                            surface.expectation_id,
+                            expectation.version,
+                            prior.key,
+                            prior.title,
+                        )
+                    else:
+                        # Nothing meaningful to restore — no record, or an already
+                        # detached one. A retired marker is the same "detached"
+                        # state either way, so retiring is the faithful undo.
+                        await self.binder.expectations.retire_if(
+                            surface.expectation_id, expectation.version
+                        )
+                except Exception:
+                    logger.warning(
+                        "%s resume: could not undo failed expectation for %s",
+                        self.channel_type,
+                        choice.key,
+                        exc_info=True,
+                    )
+
+            if not await surface.settle_picker(message_id, surface.choice_success(choice)):
+                await retire_failed_expectation()
+                return None
+
+            conflict, displaced = conflict_and_displaced()
+            if conflict is not None:
+                await retire_failed_expectation()
+                await surface.settle_picker(message_id, conflict)
+                return None
+
+            cleared: list[str] = []
+            claimed = False
+            selected_original: ChannelLink | None = None
+            selected_was_inbound = False
+            late_conflict: str | None = None
+
+            # Both batches run in a WORKER THREAD. ``batched_save`` holds
+            # ``session_map._MAP_LOCK`` across the block and rewrites the whole map
+            # file on the way out, so leaving it on the loop stalls every task —
+            # gateway, heartbeat and unrelated channels — on that disk write. The
+            # map documents itself as callable from any thread, and off the loop its
+            # writes are inline and synchronous, which is exactly what a
+            # transactional batch needs.
+            #
+            # Each closure is deliberately await-free: the lock is per-thread
+            # reentrant, so an await inside a batch would let another coroutine walk
+            # into the critical section. ``self.binder.lock`` is still held around
+            # both, so a second PICKER cannot interleave with this transaction.
+            def commit_binding() -> None:
+                nonlocal claimed, selected_original, selected_was_inbound, late_conflict
+                with self.sessions.batched_save():
+                    # Re-derived INSIDE the lock, not reused from the loop. Anything
+                    # read before this thread acquired ``_MAP_LOCK`` may already be
+                    # stale: the dashboard and other channels bind without taking
+                    # ``binder.lock``, so a rebind of a displaced session can land in
+                    # that window. Acting on the loop-side view would clear a key
+                    # whose newer, deliberate mirror we never saw.
+                    conflict_now, displaced_now = conflict_and_displaced()
+                    if conflict_now is not None:
+                        late_conflict = conflict_now
+                        return
+                    selected_original = self.sessions.get_mirror_link(choice.key)
+                    selected_was_inbound = choice.key in self.sessions.find_mirror_sessions(
+                        link, inbound_only=True
+                    )
+                    for displaced_key in displaced_now:
+                        if self.sessions.clear_mirror_link(
+                            displaced_key, reason=UNBIND_REASON_ORIGIN_REBIND
+                        ):
+                            cleared.append(displaced_key)
+                    self.sessions.set_mirror_link(choice.key, link, accepts_inbound=True)
+                    claimed = True
+
+            def rollback_binding() -> None:
+                # Conditional, for the same reason the commit re-derives: this runs
+                # in a SECOND critical section, so between the two a rebind may have
+                # taken either row. Undo only what still looks like this
+                # transaction's own work; anything newer is deliberate state.
+                with self.sessions.batched_save():
+                    if claimed and self.sessions.get_mirror_link(choice.key) == link:
+                        self.sessions.clear_mirror_link(
+                            choice.key, reason=UNBIND_REASON_ORIGIN_REBIND
+                        )
+                        if selected_original == link:
+                            self.sessions.set_mirror_link(
+                                choice.key,
+                                link,
+                                accepts_inbound=selected_was_inbound,
+                                reason=UNBIND_REASON_ORIGIN_REBIND,
+                            )
+                    for displaced_key in cleared:
+                        if self.sessions.get_mirror_link(displaced_key) is None:
+                            self.sessions.set_mirror_link(
+                                displaced_key,
+                                link,
+                                accepts_inbound=False,
+                                reason=UNBIND_REASON_ORIGIN_REBIND,
+                            )
+
+            try:
+                await asyncio.to_thread(commit_binding)
+            except Exception as exc:
+                try:
+                    # ``claimed``, ``cleared`` and both snapshots are read after the
+                    # commit thread joined, so the awaited future is the barrier that
+                    # publishes how far the failed transaction actually got.
+                    await asyncio.to_thread(rollback_binding)
+                except Exception:
+                    logger.warning(
+                        "%s resume: could not roll back failed binding for %s",
+                        self.channel_type,
+                        choice.key,
+                        exc_info=True,
+                    )
+                await retire_failed_expectation()
+                if isinstance(exc, ConversationOwnershipConflict):
+                    logger.debug(
+                        "%s resume: lost the claim race for this conversation",
+                        self.channel_type,
+                    )
+                    await surface.settle_picker(message_id, surface.choice_claim_lost)
+                else:
+                    logger.exception("%s resume: failed to persist binding", self.channel_type)
+                    await surface.settle_picker(message_id, surface.choice_binding_failed)
+                return None
+            if late_conflict is not None:
+                # The re-check under the lock refused, so nothing was written.
+                await retire_failed_expectation()
+                await surface.settle_picker(message_id, late_conflict)
+                return None
+            self.push_slots()
+
+        sel().log_api_access(
+            caller=caller,
+            operation=f"{self.channel_type}.session_resume",
+            outcome="allowed",
+            source=self.channel_type,
+            resources=choice.key,
+        )
+        return choice

@@ -19,8 +19,6 @@ from aiohttp.test_utils import make_mocked_request
 from kiro_crew.cloud import launch_job as lj
 from kiro_crew.dashboard import handlers_cloud as hc
 
-pytestmark = pytest.mark.asyncio
-
 
 @pytest.fixture(autouse=True)
 def _posix_host(monkeypatch):
@@ -99,6 +97,7 @@ def _body(resp):
     return json.loads(resp.body.decode("utf-8"))
 
 
+@pytest.mark.asyncio
 class TestGuards:
     async def test_slack_origin_rejected(self, tmp_path):
         resp = await hc.api_cloud_iam_policy(
@@ -119,6 +118,48 @@ class TestGuards:
         )
         assert resp.status == 400
         assert "POSIX" in _body(resp)["error"]
+
+    async def test_windows_may_still_read_launch_history(self, tmp_path, monkeypatch):
+        """The two read-only launch routes answer on Windows; the writes do not.
+
+        The Remote Crew list waits for BOTH the instances and the launch history
+        before it renders anything, so POSIX-gating this read replaced the whole
+        list — hand-added SSH crews included — with a cloud-provisioning error,
+        leaving no way to connect, edit or remove any of them. The route parses a
+        local job store and shells to nothing, so there is nothing to gate.
+        """
+        state = _state(tmp_path)
+        monkeypatch.setattr(hc.sys, "platform", "win32")
+
+        lst = await hc.api_cloud_launch_list(_req("GET", "/api/cloud/launch", state=state))
+        assert lst.status == 200
+        # Empty because THIS store is tmp-rooted and untouched — the route reports
+        # whatever is persisted, so it is not asserting "Windows is always empty".
+        assert _body(lst)["jobs"] == []
+
+        got = await hc.api_cloud_launch_get(
+            _req("GET", "/api/cloud/launch/nope", state=state, match_info={"id": "nope"})
+        )
+        assert got.status == 404  # reached the store, not the platform gate
+
+        # Provisioning itself stays refused — the deploy engine needs bash/aws.
+        created = await hc.api_cloud_launch_create(
+            _req(
+                "POST", "/api/cloud/launch", state=state,
+                body={"profile": "dev", "region": "us-east-1", "size_key": "balanced"},
+            )
+        )
+        assert created.status == 400
+        assert _body(created)["code"] == "posix_host_required"
+
+    async def test_windows_launch_read_still_owner_only(self, tmp_path, monkeypatch):
+        """Dropping the POSIX gate must not drop the owner gate with it."""
+        monkeypatch.setattr(hc.sys, "platform", "win32")
+        resp = await hc.api_cloud_launch_list(
+            _req("GET", "/api/cloud/launch", state=_state(tmp_path), slack=True)
+        )
+        assert resp.status == 403
+        assert _body(resp)["code"] == "cloud_owner_only"
 
     async def test_app_token_rejected(self, tmp_path):
         """token_auth sets request["app"] alongside request["user"], so checking
@@ -141,6 +182,7 @@ class TestGuards:
         assert _body(resp)["code"] == "cloud_owner_only"
 
 
+@pytest.mark.asyncio
 class TestReadEndpoints:
     async def test_iam_policy_returns_document(self, tmp_path):
         resp = await hc.api_cloud_iam_policy(
@@ -234,6 +276,7 @@ class TestPluginInstallCommand:
         assert self._cmd(monkeypatch, "Windows", "x86_64", set()) == ""
 
 
+@pytest.mark.asyncio
 class TestLaunch:
     async def test_create_runs_job_to_done(self, tmp_path):
         state = _state(tmp_path)
@@ -371,6 +414,7 @@ class TestLaunch:
         assert stored.step(lj.STEP_PROVISION).state == lj.STEP_FAILED
 
 
+@pytest.mark.asyncio
 class TestLaunchConcurrency:
     async def test_a_second_launch_while_one_runs_is_refused(self, tmp_path):
         """Two jobs means two tags and two CloudFormation stacks — two billed
@@ -439,6 +483,7 @@ class TestLaunchConcurrency:
         assert len(state.cloud_launch_store.list()) == 2
 
 
+@pytest.mark.asyncio
 class TestSignin:
     async def test_signin_pending_returns_prompt(self, tmp_path):
         state = _state(tmp_path)
@@ -470,6 +515,7 @@ class TestSignin:
         assert resp.status == 409
 
 
+@pytest.mark.asyncio
 class TestInstanceMutations:
     async def test_stop_start_destroy_dispatch(self, tmp_path, monkeypatch):
         seen = {}
@@ -551,7 +597,7 @@ class TestInstanceMutations:
     ):
         """DELETE_FAILED means the crew is still there. Dropping its registration
         and source archive then would strand a live, billing instance the user can
-        no longer see in the dashboard — so both must survive."""
+        not see in the dashboard — so both must survive."""
         calls = {}
         monkeypatch.setattr(hc.ec2, "describe", lambda tag, p, r: {"instance_id": "i-0abc"})
         monkeypatch.setattr(hc.ec2, "destroy", lambda tag, p, r, **kw: {"destroyed": False})
@@ -670,7 +716,7 @@ class TestInstanceMutations:
         self, tmp_path, monkeypatch
     ):
         """A restart kills the teardown watcher mid-wait, so the stack goes but the
-        registry row stays. On the retry `describe` can no longer answer — the stack is
+        registry row stays. On the retry `describe` cannot answer — the stack is
         gone — so without the launch-job fallback the retry would delete nothing, resolve
         no id, skip the unregister again, and the row could never be cleared here."""
         calls = {}
@@ -711,3 +757,250 @@ class TestInstanceMutations:
             _req("DELETE", "/api/cloud/kc-1/", state=_state(tmp_path), match_info={"tag": "kc-1"})
         )
         assert resp.status == 403
+
+
+# ── The remote_provisioners CPP seam ─────────────────────────────────────────
+class _Provisioner:
+    """A minimal RemoteProvisioner stand-in (duck-typed like the real dataclass)."""
+
+    def __init__(self, id, kind=None, label="", posix_only=True, step_labels=()):
+        self.id = id
+        self.kind = kind or id
+        self.label = label or id
+        self.posix_only = posix_only
+        self.step_labels = tuple(step_labels)
+
+
+class _Provider:
+    def __init__(self, rows, engines):
+        self._rows = rows
+        self._engines = engines
+        self.asked: list = []
+
+    def provisioners(self):
+        return list(self._rows)
+
+    def engine_for(self, provisioner_id):
+        self.asked.append(provisioner_id)
+        return self._engines[provisioner_id]
+
+
+class RecordingEngine(FakeEngine):
+    def __init__(self):
+        self.calls: list = []
+
+    def provision(self, *, tag, size_key, profile, region):
+        self.calls.append(("provision", tag, size_key, profile, region))
+        return "ds-devspace-0001"
+
+
+def _compose(monkeypatch, provider):
+    """Install *provider* as ``current_context().remote_provisioners``."""
+    from kiro_crew.platform import context as ctx_mod
+
+    monkeypatch.setattr(
+        ctx_mod, "current_context", lambda: SimpleNamespace(remote_provisioners=provider)
+    )
+
+
+@pytest.mark.asyncio
+class TestProvisionerSeam:
+    async def test_stock_listing_is_the_builtin_lane(self, tmp_path):
+        """No composition: exactly the EC2 descriptor, drawn by the core's own form."""
+        resp = await hc.api_cloud_provisioners(
+            _req("GET", "/api/cloud/provisioners", state=_state(tmp_path))
+        )
+        assert resp.status == 200
+        rows = _body(resp)["provisioners"]
+        assert [r["id"] for r in rows] == ["aws_ec2"]
+        assert rows[0]["kind"] == "aws_ec2"
+        assert rows[0]["posix_only"] is True
+        assert [s["key"] for s in rows[0]["steps"]] == [
+            lj.STEP_PREFLIGHT, lj.STEP_PROVISION, lj.STEP_SIGNIN, lj.STEP_CONNECT,
+        ]
+
+    async def test_listing_answers_on_windows(self, tmp_path, monkeypatch):
+        """The tab needs the list to pick a form; per-row ``posix_only`` carries
+        the platform answer, so the listing itself must not be POSIX-gated."""
+        monkeypatch.setattr(hc.sys, "platform", "win32")
+        resp = await hc.api_cloud_provisioners(
+            _req("GET", "/api/cloud/provisioners", state=_state(tmp_path))
+        )
+        assert resp.status == 200
+
+    async def test_listing_is_owner_only(self, tmp_path):
+        resp = await hc.api_cloud_provisioners(
+            _req("GET", "/api/cloud/provisioners", state=_state(tmp_path), slack=True)
+        )
+        assert resp.status == 403
+
+    async def test_composed_rows_are_listed_with_their_step_labels(self, tmp_path, monkeypatch):
+        provider = _Provider(
+            [
+                _Provisioner("aws_ec2"),
+                _Provisioner(
+                    "devspace", kind="amazon_devspace", label="Amazon DevSpace",
+                    posix_only=False,
+                    step_labels=((lj.STEP_PROVISION, "Create the DevSpace"), ("bogus", "x")),
+                ),
+            ],
+            engines={},
+        )
+        _compose(monkeypatch, provider)
+        resp = await hc.api_cloud_provisioners(
+            _req("GET", "/api/cloud/provisioners", state=_state(tmp_path))
+        )
+        rows = _body(resp)["provisioners"]
+        assert [r["id"] for r in rows] == ["aws_ec2", "devspace"]
+        dev = rows[1]
+        assert dev["kind"] == "amazon_devspace"
+        assert dev["label"] == "Amazon DevSpace"
+        assert dev["posix_only"] is False
+        by_key = {s["key"]: s["label"] for s in dev["steps"]}
+        assert by_key[lj.STEP_PROVISION] == "Create the DevSpace"
+        # An override for a key that is not a step is ignored, and the other
+        # three keep the core's labels: the KEYS are the contract.
+        assert "bogus" not in by_key
+        assert by_key[lj.STEP_CONNECT] == "Connect"
+
+    async def test_degraded_seam_read_keeps_the_builtin_lane(self, tmp_path, monkeypatch):
+        class Broken:
+            def provisioners(self):
+                raise RuntimeError("adapter down")
+
+        _compose(monkeypatch, Broken())
+        resp = await hc.api_cloud_provisioners(
+            _req("GET", "/api/cloud/provisioners", state=_state(tmp_path))
+        )
+        assert [r["id"] for r in _body(resp)["provisioners"]] == ["aws_ec2"]
+
+    async def test_launch_defaults_to_the_builtin_and_persists_provider_id(self, tmp_path):
+        """A pre-seam client body (no provider_id) launches exactly what it did."""
+        state = _state(tmp_path)
+        resp = await hc.api_cloud_launch_create(
+            _req(
+                "POST", "/api/cloud/launch", state=state,
+                body={"profile": "dev", "region": "us-east-1", "size_key": "balanced"},
+            )
+        )
+        assert resp.status == 202
+        assert _body(resp)["provider_id"] == "aws_ec2"
+        lst = await hc.api_cloud_launch_list(_req("GET", "/api/cloud/launch", state=state))
+        assert all("provider_id" in j for j in _body(lst)["jobs"])
+
+    async def test_launch_unknown_provisioner_400(self, tmp_path):
+        state = _state(tmp_path)
+        resp = await hc.api_cloud_launch_create(
+            _req(
+                "POST", "/api/cloud/launch", state=state,
+                body={"provider_id": "nope", "profile": "", "region": "", "size_key": "x"},
+            )
+        )
+        assert resp.status == 400
+        assert _body(resp)["code"] == "unknown_provisioner"
+        # Refused BEFORE a job existed: nothing for a restart to reap as interrupted.
+        assert state.cloud_launch_store.list() == []
+
+    async def test_launch_routes_to_the_provisioners_engine(self, tmp_path, monkeypatch):
+        """The seam's engine drives the job, the size is NOT checked against the EC2
+        ladder, and the job's steps carry the provisioner's labels."""
+        engine = RecordingEngine()
+        provider = _Provider(
+            [_Provisioner("aws_ec2"), _Provisioner(
+                "devspace", kind="amazon_devspace",
+                step_labels=((lj.STEP_PROVISION, "Create the DevSpace"),),
+            )],
+            engines={"devspace": engine},
+        )
+        _compose(monkeypatch, provider)
+        state = _state(tmp_path)
+        state.cloud_launch_engine = None  # let the seam, not the test hook, answer
+        resp = await hc.api_cloud_launch_create(
+            _req(
+                "POST", "/api/cloud/launch", state=state,
+                body={
+                    "provider_id": "devspace", "profile": "", "region": "us-west-2",
+                    "size_key": "dev.standard1.large",
+                },
+            )
+        )
+        assert resp.status == 202, _body(resp)
+        job = _body(resp)
+        assert job["provider_id"] == "devspace"
+        assert job["status"] == lj.DONE
+        assert job["instance_id"] == "ds-devspace-0001"
+        assert {s["key"]: s["label"] for s in job["steps"]}[lj.STEP_PROVISION] == "Create the DevSpace"
+        assert provider.asked == ["devspace"]
+        assert engine.calls == [("provision", job["tag"], "dev.standard1.large", "", "us-west-2")]
+
+    async def test_launch_builtin_still_validates_size_against_the_ec2_ladder(
+        self, tmp_path, monkeypatch
+    ):
+        provider = _Provider([_Provisioner("aws_ec2")], engines={"aws_ec2": FakeEngine()})
+        _compose(monkeypatch, provider)
+        resp = await hc.api_cloud_launch_create(
+            _req(
+                "POST", "/api/cloud/launch", state=_state(tmp_path),
+                body={"provider_id": "aws_ec2", "profile": "", "region": "", "size_key": "nope"},
+            )
+        )
+        assert resp.status == 400
+        assert _body(resp)["code"] == "invalid_launch_request"
+
+    async def test_listed_but_engineless_provisioner_400_and_no_job(self, tmp_path, monkeypatch):
+        provider = _Provider([_Provisioner("aws_ec2"), _Provisioner("ghost")], engines={})
+        _compose(monkeypatch, provider)
+        state = _state(tmp_path)
+        state.cloud_launch_engine = None
+        resp = await hc.api_cloud_launch_create(
+            _req(
+                "POST", "/api/cloud/launch", state=state,
+                body={"provider_id": "ghost", "profile": "", "region": "", "size_key": "x"},
+            )
+        )
+        assert resp.status == 400
+        assert _body(resp)["code"] == "unknown_provisioner"
+        assert state.cloud_launch_store.list() == []
+
+    async def test_posix_gate_is_per_provisioner(self, tmp_path, monkeypatch):
+        """A provisioner that does not shell to aws may launch from a Windows
+        gateway; the built-in still may not."""
+        monkeypatch.setattr(hc.sys, "platform", "win32")
+        engine = RecordingEngine()
+        provider = _Provider(
+            [_Provisioner("aws_ec2"), _Provisioner("devspace", posix_only=False)],
+            engines={"devspace": engine},
+        )
+        _compose(monkeypatch, provider)
+        state = _state(tmp_path)
+        state.cloud_launch_engine = None
+        ok = await hc.api_cloud_launch_create(
+            _req(
+                "POST", "/api/cloud/launch", state=state,
+                body={"provider_id": "devspace", "profile": "", "region": "", "size_key": "s"},
+            )
+        )
+        assert ok.status == 202, _body(ok)
+        refused = await hc.api_cloud_launch_create(
+            _req(
+                "POST", "/api/cloud/launch", state=_state(tmp_path),
+                body={"provider_id": "aws_ec2", "profile": "", "region": "", "size_key": "balanced"},
+            )
+        )
+        assert refused.status == 400
+        assert _body(refused)["code"] == "posix_host_required"
+
+    async def test_test_hook_engine_outranks_the_seam(self, tmp_path, monkeypatch):
+        """``state.cloud_launch_engine`` keeps the launch-job tests independent of
+        any composed context, so it wins when set."""
+        provider = _Provider([_Provisioner("aws_ec2")], engines={"aws_ec2": RecordingEngine()})
+        _compose(monkeypatch, provider)
+        state = _state(tmp_path)  # carries FakeEngine via the hook
+        resp = await hc.api_cloud_launch_create(
+            _req(
+                "POST", "/api/cloud/launch", state=state,
+                body={"profile": "", "region": "", "size_key": "balanced"},
+            )
+        )
+        assert resp.status == 202
+        assert provider.asked == []

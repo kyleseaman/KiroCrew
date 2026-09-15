@@ -26,6 +26,7 @@ from kiro_crew.apps.builtins.meetings.backend.routes._common import (
     BadRequest,
     audit,
     data_root,
+    dispatch_line,
     field_bool,
     field_str,
     json_body,
@@ -283,12 +284,29 @@ async def handle_mute_agent(request: web.Request) -> web.Response:
             {"error": "meeting not found", "code": "meeting_not_found"}, status=404
         )
 
-    session = ACTIVE.get(meeting_id)
-    if session is not None:
-        if muted:
-            session.muted_agents.add(agent_id)
-        else:
-            session.muted_agents.discard(agent_id)
+    # Under the admission lock, because a dispatch RESOLVES its recipients from
+    # this set across an awaited transcript write. Mutating it unlocked let a mute
+    # land inside that window, so the line was addressed by the mute state of a
+    # moment AFTER it was spoken — it reached the wrong agent set, and for a line
+    # held through initialization the wrong set was recorded and replayed later.
+    #
+    # The lock belongs HERE, on the one unlocked writer, rather than on the reader:
+    # both the live fan-out and the initialization hold read this set after their
+    # own transcript-append await inside `_common.dispatch_line`, so guarding a
+    # single dispatch branch would close one
+    # window and leave its twin open. Every other writer already holds this lock
+    # (`handle_toggle_agent` takes it, and `add_agent` runs inside it).
+    #
+    # Only the in-memory mutation is covered: the metadata write above is already
+    # serialized by its own transaction, and pulling it in would hold the admission
+    # lock across disk IO that dispatch does not need to wait for.
+    async with DISPATCH_LOCK:
+        session = ACTIVE.get(meeting_id)
+        if session is not None:
+            if muted:
+                session.muted_agents.add(agent_id)
+            else:
+                session.muted_agents.discard(agent_id)
 
     return web.json_response({"ok": True, "muted_agents": meta["muted_agents"]})
 
@@ -307,57 +325,16 @@ async def handle_dispatch_text(request: web.Request) -> web.Response:
     text = field_str(body, "text", required=True, max_len=k.MAX_TRANSCRIPT_CHARS)
     is_chat = field_bool(body, "chat", default=False)
 
-    # The transcript append creates its parent directory when needed. Keep the
-    # live-session check, append, and fan-out in the lifecycle transaction so a
-    # concurrent stop followed by deletion cannot remove the meeting while this
-    # request is awaiting disk IO and then have the append recreate an orphan.
-    expired_session: sess.MeetingSession | None = None
-    async with DISPATCH_LOCK:
-        session = ACTIVE.get_for_dispatch(meeting_id)
-        if session is None:
-            return web.json_response(
-                {"error": "no active meeting", "code": "no_active_meeting"}, status=409
-            )
-        if session.expired:
-            # Close admission before the slow drain. A later request can then fail
-            # promptly instead of waiting behind agent IO, while the lifecycle lock
-            # below still serializes the actual teardown with start/stop/delete.
-            ACTIVE.suspend_dispatches(session)
-            expired_session = session
-        else:
-            transcript_text = redact(text)
-            source = k.TRANSCRIPT_SOURCE_TYPED if is_chat else k.TRANSCRIPT_SOURCE_SPEECH
-            segment = await asyncio.to_thread(
-                store.append_transcript,
-                meeting_id,
-                transcript_text,
-                source,
-                data_root(request),
-            )
-            if segment is None:
-                raise BadRequest(
-                    "meeting transcript is too large",
-                    status=413,
-                    code="transcript_too_large",
-                )
-
-            line = f"{k.CHAT_PREFIX} {transcript_text}" if is_chat else transcript_text
-            accepted = session.broadcast(line)
-
-    if expired_session is not None:
-        async with START_LOCK:
-            if ACTIVE.get(meeting_id) is expired_session:
-                # Drain, not cancel: a long meeting whose next line arrives after the
-                # session lapsed still has whatever was queued when it went quiet.
-                await ACTIVE.drain_and_clear()
-                await asyncio.to_thread(sess.end_meeting_meta, meeting_id, data_root(request))
-        return web.json_response(
-            {
-                "error": "meeting session expired",
-                "code": "meeting_session_expired",
-            },
-            status=410,
-        )
+    # The admission transaction (live-session check, transcript append, fan-out,
+    # and the expiry side effects) is shared with the audio-import producer — see
+    # `_common.dispatch_line`. Only THIS producer opts into the initialization
+    # hold: a line of live speech arriving while the agents are still starting is
+    # wanted and is buffered, whereas a file import has no business
+    # trickling into a hold buffer — it is refused whole and retried.
+    source = k.TRANSCRIPT_SOURCE_TYPED if is_chat else k.TRANSCRIPT_SOURCE_SPEECH
+    segment, accepted, line = await dispatch_line(
+        request, meeting_id, text, source, chat=is_chat, hold_during_init=True
+    )
     return web.json_response({"ok": True, "dispatched": accepted, "text": line, "segment": segment})
 
 

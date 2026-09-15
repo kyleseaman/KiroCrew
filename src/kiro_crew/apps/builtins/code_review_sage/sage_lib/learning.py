@@ -303,16 +303,7 @@ def list_patterns_for_review(root: Path | None = None) -> list[dict]:
 
 def _atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = store.open_locked_temp(path.parent)
-    try:
-        try:
-            os.write(fd, text.encode("utf-8"))
-        finally:
-            os.close(fd)  # always close the fd, even if os.write raised
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+    store.atomic_write_text(path, text)
 
 
 def _normalize_pattern(pattern: dict) -> dict:
@@ -407,9 +398,9 @@ def clear_candidate(root: Path | None = None, namespace: str | None = None,
     cf = candidate_file(root, namespace)
     if not cf.exists():
         return False
-    # Both branches run under the lock. The full unlink used to sit outside it,
-    # so a `stage_learning` append could complete between the exists() check and
-    # the unlink and be deleted without ever being read — the same read-modify-
+    # Both branches run under the lock. With the full unlink outside it, a
+    # `stage_learning` append can complete between the exists() check and the
+    # unlink and be deleted without ever being read — the same read-modify-
     # write race the selective branch takes the lock for.
     with _candidate_lock(root, namespace):
         if not cf.exists():          # a concurrent clear got there first

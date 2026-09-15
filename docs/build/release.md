@@ -18,7 +18,7 @@ macOS signing mechanics and notary-credential rotation live in
 |---------|---------|---------------|
 | `nightly` | `nightly.yml`: cron `0 6 * * *` (06:00 UTC) plus manual dispatch, from `main` HEAD | `<base>-nightly.<YYYYMMDD>t<HHMMSS>` |
 | `insider` | `release.yml`: push of a prerelease tag (`v0.2.0-rc.1`) | `<x.y.z>-rc.N` |
-| `stable` | `release.yml`: push of a bare semver tag (`v0.2.0`) on a recorded candidate's commit; the run verifies and promotes that candidate's exact bytes, never rebuilding | Release identity `<x.y.z>`; artifacts retain the selected candidate's embedded `<x.y.z>rcN` version |
+| `stable` | `release.yml`: push of a bare semver tag (`v0.2.0`) on the cleared candidate's commit; the run REBUILDS from that commit under the bare version. Byte-for-byte republication of the candidate's artifacts happens only when `vars.STABLE_PROMOTE_BYTES` names that exact base | `<x.y.z>`; under `STABLE_PROMOTE_BYTES` the republished artifacts retain the candidate's embedded `<x.y.z>rcN` version |
 
 The channel name is a literal path segment everywhere (`cli/insider/...`,
 `feed/insider/...`, the `:insider` image tag), so there is no name-to-prefix
@@ -33,49 +33,128 @@ deciding to promote, and merging back are human steps the pipeline knows nothing
 about, which is why there is no cut/promote/rollback workflow (see "Deliberately
 not built").
 
-## Stable promotion: exact tested bytes, never a rebuild
+## Stable release: a fresh build at the bare version, never a byte republish
 
-Stable must ship the bytes insiders actually validated, not a same-commit
-rebuild that hopes for reproducibility. The mechanism:
+A stable release must ship bytes whose own embedded version is a bare `X.Y.Z`,
+with no prerelease suffix anywhere in the artifact, its filename, or the feed.
+That is what rules out republishing the candidate's bytes: they were stamped
+from the prerelease tag, and nothing downstream can re-stamp them without
+invalidating the recorded digests and the macOS signatures. So a bare tag
+rebuilds from the commit the candidate cleared, rather than reusing what the
+candidate produced. The mechanism:
 
-- **A successful prerelease run records the candidate.** After every publish
-  lane succeeds, `record-promotion` assembles the exact wheel/sdist, AppImage,
-  notarized zip/DMG, and the attested OCI manifest digest into a
+- **A successful prerelease run clears the candidate commit.** After every
+  publish lane succeeds, `record-promotion` assembles the exact wheel/sdist,
+  AppImage, notarized zip/DMG, and the attested OCI manifest digest into a
   `stable-promotion-<x.y.z>` GitHub artifact (90-day retention) whose manifest
   (`scripts/release_promotion.py create`) carries per-file SHA-256/SHA-512/size
-  plus the source SHA, tag, run id, and versions.
-- **A bare `vX.Y.Z` tag resolves and verifies that record.** The
-  `resolve-promotion` job finds the newest **successful** same-commit,
-  same-base-version prerelease run, verifies the artifact ZIP against GitHub's
-  API-recorded digest, safely extracts it, and verifies every manifest field
-  and file digest (`scripts/release_promotion.py verify`). Only then do the
-  publish lanes move stable pointers/tags to those bytes. The stable run never
-  invokes the build workflows, CDSigner, Apple notarization, or the OCI
-  builder.
-- **Everything fails closed.** A missing, expired, ambiguous, or
-  digest-mismatched record aborts the promotion: cut and validate a fresh RC
-  rather than rebuilding stable.
-- **Promoted binaries retain the candidate's embedded version** (see "Version
-  stamping"), because rewriting embedded metadata would produce bytes users
-  never baked and invalidate the recorded digests and macOS signatures. The
-  bare git tag, GitHub Release, and stable channel are the final release
-  identity. pip users selecting a promoted (prerelease-versioned) wheel by
-  version must allow prereleases; the stable channel feed remains
-  channel-sticky.
-- **Stable DISPLAYS a clean base version even though the bytes keep the RC
-  stamp.** The embedded version cannot change under promotion, so the remedy is
-  at the read layer: `_display_version()` in
-  `src/kiro_crew/dashboard/handlers/updates.py` folds the running version to its
-  bare `X.Y.Z` on the **stable** channel only (insider/nightly keep the full
-  stamp), so About and the Releases page show `0.4.0`, not `0.4.0rc3` /
-  `0.4.0-insider.3`. It is DISPLAY-ONLY — every version *comparison* still reads
-  the raw `__version__`, so it cannot cause an update loop —
-  `test/test_stable_version_display.py` is the regression gate. **This fix must
-  ride in the RC bytes**: promotion never rebuilds, so a display change added
-  after the RC is cut can never reach the promoted stable. Land it before the RC
-  is cut, or stable shows the RC stamp with no in-band remedy.
+  plus the source SHA, tag, run id, and versions. Its primary role is evidence
+  that this commit shipped clean on insider; the bytes it carries are only
+  consumed by the byte-reuse escape hatch below.
+- **A bare `vX.Y.Z` tag rebuilds that commit at the bare version.** `stable-gate`
+  confirms a **successful** same-commit prerelease run exists, so stable still
+  only ships code that soaked. Then the ordinary build path runs on the stable
+  channel — `build-wheel.yml`, `build-desktop.yml`, `build-windows.yml`,
+  `sign-and-notarize.yml`, the OCI builder — receiving `X.Y.Z` exactly the way an
+  insider build receives `X.Y.Z-rc.N`. What a stable release gives up is byte
+  identity with the binary insiders ran; what it never gives up is that the
+  commit soaked.
+- **Byte-for-byte reuse remains available, and names its own cost.** Setting
+  `vars.STABLE_PROMOTE_BYTES` to exactly the base version being released takes
+  the promotion path instead: `resolve-promotion` verifies the recorded bundle
+  and the publish lanes move stable pointers to those exact bytes. Use it when
+  stable must run the identical binary that was validated. The cost is the whole
+  reason it is not the default — those bytes advertise the candidate's `rcN`
+  stamp in the wheel name, the feed, `pip show`, and `kirocrew --version`. The
+  variable is scoped to one version so it cannot be left switched on, and the
+  gate prints a warning naming the consequence.
+- **Everything fails closed.** No successful same-commit prerelease run, an
+  undocumented version, or a release branch still declaring the RC spelling all
+  abort the release before any lane publishes. On the byte-reuse path a missing,
+  expired, ambiguous, or digest-mismatched record aborts it too.
+- **The bare version is stamped in at build time, not patched afterwards** (see
+  "Version stamping"). There is no metadata-rewrite step to trust. `stable-gate`
+  additionally compares the tag against all three declaration files, because a
+  rebuild would otherwise paper over a release branch that never landed its
+  drop-RC-suffix PR: the artifact would be right while every source install and
+  every later RC on that branch still read the stale spelling. The 0.4.0
+  promotion was nearly tagged in exactly that state, because only the tag name
+  was checked.
+- **A stable wheel installs without `--pre`**, because its own version carries no
+  prerelease suffix. A wheel published through the byte-reuse hatch does need it.
+- **The display fold still exists, and stable is no longer its main job.** A
+  rebuilt stable has nothing to fold — its stamp is already bare. The fold
+  remains load-bearing for insider and nightly, where the prerelease number is
+  meaningful information, and for any install shipped before this policy that is
+  still running promoted RC-stamped bytes. It is a CONTRACT over every surface,
+  not a fix at two spots — the 0.4.0 promotion shipped with only the
+  running-version fold wired, and users then reported the raw stamp on four other
+  surfaces one by one (the About panel's available-update line, the version chip,
+  the Settings footer,
+  and the proactive update popup), each needing its own hotfix.
+
+  The contract:
+
+  - *Fold rule*: `_display_version()` in
+    `src/kiro_crew/dashboard/handlers/updates.py` folds a version to its bare
+    `X.Y.Z` on the **stable** channel only (insider/nightly keep the full
+    stamp, where the prerelease number is meaningful information). The SPA
+    mirror for desktop-reported versions that never cross the gateway is
+    `website/src/utils/displayVersion.ts` — keep it the ONLY TypeScript
+    spelling.
+  - *Every RAW version field is functional and must never be folded in place*:
+    `__version__` and the status frame's `version` (the SPA compares it across
+    pushes to force a reload over a gateway upgrade), `latest_version` /
+    `update_latest_version` (the arm target `verify_shadow_venv` compares
+    byte-for-byte, and the update popup's per-version snooze/skip keys),
+    Electron's `info.version` (`versionLooksPrerelease` derives the update lane
+    from the `-` suffix), and every `_is_newer` / floor comparison. Folding one
+    of these in place broke the entire stable in-app apply path once (caught in
+    review); folding the snooze key would make dismissing `0.4.0` swallow the
+    next release's rc candidate.
+  - *Display therefore always reads a folded SIBLING field, never the raw one*:
+    `version_display` and `update_latest_version_display` on the status frame,
+    `latest_version_display` on `/api/update/check` and the channel-switch
+    response, `current_version` on the check response. **Any NEW surface that
+    prints a version to the user must consume one of these (with a raw
+    fallback for older gateways) or add its own sibling — never render a raw
+    field directly.** A UI review that sees `status?.version`,
+    `update_latest_version`, or `info?.version` in display JSX should treat it
+    as a bug.
+
+  `test/test_stable_version_display.py`, the `version_display` /
+  `update_latest_version_display` tests in
+  `test/test_dashboard_status_snapshot.py`, and the AboutPanel /
+  UpdateFoundModal / SettingsPage frontend tests are the regression gates.
+  **A display change still wants to land before the RC is cut**, so the surface
+  it fixes is exercised during the soak rather than first appearing in the
+  release. It is no longer unrecoverable if it does not: stable is rebuilt from
+  the commit, so a fold landed on the release branch before the bare tag does
+  reach stable. Under the byte-reuse hatch the original constraint holds in
+  full — those bytes are the RC's, so a fold added after the RC was cut can
+  never reach that release.
 - **Hot patches follow the same rule**: at least one recorded RC before the
-  bare patch tag.
+  bare patch tag. A hot patch is the NEXT three-segment version (`0.4.0` →
+  `0.4.1`): the release workflow's Derive-Version step rejects a four-segment
+  base like `0.4.0.1` outright, and re-using the shipped version is impossible —
+  its published keys are immutable.
+- **A hotfix RC never moves the insider channel backward.** The channel feeds
+  are mutable last-writer-wins pointers, and the insider line is usually AHEAD
+  of the line being hotfixed — when `v0.4.1-insider.1` published while insider
+  served `0.5.0-insider.1`, the feed rolled back and every insider client was
+  offered a downgrade (electron-updater accepts one whenever the installed
+  version carries a prerelease suffix). Every publish workflow now runs
+  `scripts/check_feed_advance.py` before its pointer writes: the versioned
+  assets and the GitHub release always publish (that is what the stable gate
+  and promotion consume), but the feed, the legacy mac feed, and the `latest/`
+  aliases are rewritten only when this run's version is the newest the channel
+  has seen — judged against the live feed (via the public CDN; the publish
+  role is Put-only on `feed/*`) AND the repo's tags, which close the CDN's
+  `max-age` staleness window. Equal versions advance, so re-running a
+  half-finished publish stays idempotent. A stable release is unaffected either
+  way: whether it rebuilds or republishes the candidate's bytes, its version is
+  newer than everything the stable feed has served.
+  `test/test_check_feed_advance.py` pins the verdicts and the wiring.
 
 ### Runbook: promoting an RC to stable
 
@@ -84,29 +163,51 @@ anything a stable user will see must already be in the RC that gets promoted** �
 there is no build step at stable-tag time to add it.
 
 1. **Before the RC is cut — bake the fix in.**
-   - *CHANGELOG*: the release branch already carries `## [X.Y.Z] — <date>` (no
+   - *Version drop PR*: merge the PR that changes `__version__` from
+     `X.Y.Z-rc.N` to the bare `X.Y.Z` in all three version files — step 1 of
+     the three-step sequence in "Version numbering policy". **This PR is what
+     makes the next RC a promotion candidate**; the 0.4.0 promotion was nearly
+     tagged before it existed because this step lived only in the policy
+     section, not here. The checklist in step 2 below verifies it landed.
+   - *CHANGELOG*: the release branch already carries `## [X.Y.Z] - <date>` (no
      `[Unreleased]`, enforced by the changelog gate). Confirm at cut time.
    - *Version display*: the base-version fold above must be merged to `main`
      and cherry-picked to `release/X.Y` **before the RC is cut**, or stable will
      show the RC stamp.
 2. **Cut the RC — verify content, not PR status.** On the target commit confirm:
    `github-release` has an `if:`; `CHANGELOG.md` line 5 is `## [X.Y.Z]` with zero
-   non-bare-release `##` headings; exactly one `### Contributors`;
-   `__version__ = "X.Y.Z"`; the bytecode/pycache test fix is present; the
-   base-version fold is present (stable About shows `X.Y.Z`); no existing bare
+   non-bare-release `##` headings; no `### Contributors` (the GitHub Release
+   page renders its own); no em or en dash anywhere in the new section;
+   `__version__ = "X.Y.Z"` **in all three version files** (`src/kiro_crew/__init__.py`,
+   `pyproject.toml`, `website/electron/package.json` — the 0.4.0 promotion was
+   nearly tagged on a commit still declaring `0.4.0-rc.9` because only the tag
+   name was checked); the bytecode/pycache test fix is present; the display-fold
+   contract above is fully present (run the regression gates:
+   `test_stable_version_display.py` + the `version_display` tests — a stamped
+   stable build must show `X.Y.Z` on the version chip, the Settings footer, the
+   available-update line, AND the update popup); no existing bare
    `vX.Y.Z` tag. Then tag `vX.Y.Z-insider.N`.
 3. **Soak.** Ship the RC on insider and let real users run it. **Do not push any
-   byte-affecting change to the release branch between soak and promote** — the
-   guarantee is that stable gets exactly the soaked bytes.
-4. **Promote (bare tag).** Confirm the `vX.Y.Z-insider.N` run at the target
-   commit is SUCCESS (`resolve-promotion` finds the candidate by it). Push a bare
-   `vX.Y.Z` tag on that commit. The build lanes skip; `resolve-promotion`
-   re-verifies the recorded bundle and republishes it to stable.
-   `Create GitHub Release` runs (the `if:` fix) and renders GitHub's own
-   contributor block — **do not hand-write a contributors list in the body**
-   (that duplicated the native block on v0.3.0). Verify: stable feed points at
-   the RC's version, About shows the clean `X.Y.Z` via the fold, CHANGELOG shows
-   no draft heading.
+   change to the release branch between soak and release** — stable is rebuilt
+   from this commit, so a commit that lands after the soak ships code nobody ran.
+4. **Release (bare tag).** Confirm the `vX.Y.Z-insider.N` run at the target
+   commit is SUCCESS — `stable-gate` requires it, so a candidate whose run was
+   cancelled or failed cannot be released. Push a bare `vX.Y.Z` tag on that
+   commit. The build lanes RUN: stable is rebuilt from this commit with `X.Y.Z`
+   stamped in, so the shipped wheel is `kirocrew-X.Y.Z-py3-none-any.whl` and
+   `kirocrew --version` prints `X.Y.Z`. Expect the full build time, not a
+   pointer move. `Create GitHub Release` runs (the `if:` fix) and renders
+   GitHub's own contributor block, so the body must not carry a second one —
+   see "What the release body must not contain" below, because the body is
+   ASSEMBLED, not written, and the duplicate arrives on its own. Verify: stable
+   feed carries the bare `X.Y.Z`, the wheel filename has no `rc`, About shows
+   `X.Y.Z`, CHANGELOG shows no draft heading.
+
+   To ship the candidate's exact bytes instead — the only mode where stable runs
+   the identical binary that was validated — set `vars.STABLE_PROMOTE_BYTES` to
+   exactly `X.Y.Z` before pushing the tag, and unset it afterwards. That release
+   will advertise the candidate's `rcN` version everywhere its bytes are read,
+   and the gate warns about it in the run log.
 
 ## Workflows in the release path
 
@@ -119,7 +220,7 @@ concurrency group, and their version derivation.
 |---|---|---|
 | `nightly.yml` | trigger (schedule + dispatch) | Derives the date stamp, then calls everything below. `concurrency: nightly-build` with `cancel-in-progress: true`. |
 | `release.yml` | trigger (`push` on `v*` tags) | Derives version + channel + wheel version from the tag. A prerelease tag builds, publishes to insider, and records the immutable promotion bundle; a bare tag verifies that same-commit bundle and promotes the exact files/OCI digest to stable without building. Then creates the GitHub Release. `concurrency: release-publish` with `cancel-in-progress: false` (queued). |
-| `dependency-vulnerability.yml` | reusable gate | `scripts/check_npm_audit.py`. Runs first; every build job needs it. |
+| `dependency-vulnerability.yml` | reusable gate | `scripts/check_npm_audit.py`. On a release every build job needs it; on a nightly every **publish** job needs it and no build job does, so a slow registry delays publication rather than failing the build. |
 | `build-wheel.yml` | reusable build | Stamps the PEP 440 version into `pyproject.toml` and `__init__.py`, stamps the distribution channel, builds the frontend and stages it into the package, then `python -m build`. Uploads artifact `cli-wheel` (wheel + sdist). Credential-free. |
 | `build-desktop.yml` | reusable build | Matrix `macos-15` (universal macOS app) and `ubuntu-22.04` / `ubuntu-22.04-arm` (AppImage + deb + rpm) via `packaging/build-desktop.sh`, then a `smoke-linux-packages` job that installs the deb and rpm in Ubuntu 24.04 and Amazon Linux 2023 containers. Deliberately credential-free (`contents: read` only, pinned by `test_workflow_permissions.py`), so it builds **unsigned** and hands the `.app` downstream. |
 | `build-windows.yml` | reusable build | `windows-latest`, an NSIS `Setup.exe`. Separate from `build-desktop.yml` because Authenticode signing has to happen *inside* the build (the installer compresses its own already-signed executable), so this job holds an AWS Signer identity and `build-desktop.yml` can stay credential-free. Callers pass `soft_fail: true`, so a Windows failure cannot skip the mac/Linux lanes. |
@@ -454,7 +555,7 @@ signed with a non-exportable RSA KMS key:
   "channel": "insider",
   "key_id": "sha256:<SubjectPublicKeyInfo DER digest>",
   "pub_date": "2026-07-18T06:15:00Z",
-  "python_requires": ">=3.10",
+  "python_requires": ">=3.12",
   "schema": "kirocrew-cli-artifact-manifest-v1",
   "sha256": "<wheel digest>",
   "signature": "<base64 RSA signature over canonical JSON without this field>",
@@ -494,6 +595,15 @@ Key provisioning, the `kms:GetPublicKey` + `kms:Sign` grant, and the rotation
 procedure (dual-trust, never an in-place swap, because schema v1 pins exactly
 one key) are in [../../packaging/signing/README.md](../../packaging/signing/README.md).
 
+**The pinned key has three consumers, not two.** `cli.sh` and the gateway's
+update-feed reader verify `cli-manifest.json` against it, and the gateway's
+feature-video manifest (`src/kiro_crew/platform/feed_trust.py`, schema
+`kirocrew-feature-videos/1`) verifies against the same key. A rotation therefore
+moves `cli.sh`, the feed publisher and the feature-video manifest publisher
+together, and every hosted manifest a release still reads back (this release,
+this minor's `.0`, and the `.0` of up to three earlier minors) must be re-signed
+under the new key, or those installs lose their clips until the next publish.
+
 `publish-installer.yml` mechanically enforces the rollout order rather than
 trusting it. It publishes only from `main` (checked explicitly, because
 `workflow_dispatch` lets a maintainer pick any ref and `environment: prod` does
@@ -505,6 +615,48 @@ match its embedded key, and refuses unless **every live channel feed** verifies
 against that pinned key using the same `cli-manifest.py verify` checks the
 installer runs. A channel serving no feed at all is skipped with a warning,
 since publishing is not a regression for it.
+
+### Breaking releases: the forced-update floor
+
+A release that older clients must not keep running against (a feed-schema
+break, a protocol break, a data migration without back-compat) declares a
+**minimum supported version** in [`packaging/MIN_VERSION`](../../packaging/MIN_VERSION):
+one bare release version on its own line (comments and blank lines are
+ignored; more than one value line fails the publish). Every CLI feed manifest
+published from a commit carrying that value embeds it as the optional signed
+`min_version` field.
+
+What each consumer does with it:
+
+- **Running gateways** compare the floor against their own version on the
+  normal feed check — after verifying the manifest's signature against the
+  same pinned key the installer uses (`platform/feed_trust.py`), because the
+  floor coerces the UI and a tampered feed must not be able to hold every
+  dashboard hostage. Versions are folded per channel first (a promoted
+  stable build's `0.3.0rc13` stamp IS the `0.3.0` release). Below the floor,
+  `update_required` turns true on the status frame and
+  `GET /api/update/check`, and the dashboard's proactive update modal drops
+  its snooze/skip/Escape affordances — the prompt stays up until the install
+  is updated. The gateway itself keeps running, and every verification or
+  parse failure degrades to the ordinary dismissible prompt: the floor fails
+  toward freedom, never toward coercion.
+- **The installer** verifies the field's format and otherwise ignores it — it
+  always installs the signed version, which is exactly how a floored install
+  gets satisfied.
+- **The enterprise governance pin** (`updates.min_version` in
+  `security_policy.json`) is independent and OR'd with the feed floor;
+  either alone makes the update mandatory.
+
+Rules for setting the floor:
+
+- Set it to the first version old clients can safely land on — usually the
+  breaking release itself.
+- Never set it in the same release that introduces floor support: clients
+  only learn to read the field after updating once, so a floor only moves
+  clients that already run a floor-aware build.
+- Clear or lower it only to roll back a mistake; installs above the floor are
+  never affected. `cli-manifest.py` refuses a floor above the manifest's own
+  version and any non-bare-release value at publish time.
 
 ### Installing and switching channels
 
@@ -559,10 +711,18 @@ Two Windows details do not generalise from the other platforms:
   Windows arch is a second entry inside that one file, never a second feed, and
   it also has to contend with `Provider.findFile()` disambiguating entries by
   matching `process.arch` against the URL path.
-- **`quitAndInstall` passes `isSilent` on win32 only.** `NsisUpdater` adds `/S`
-  only when silent, and the installer is assisted (`nsis.oneClick: false`), so
-  without it the app would quit and then wait for the user to click through a
-  setup wizard rather than swapping silently the way macOS and Linux do.
+- **Windows updates are visible but non-interactive.** `quitAndInstall` passes
+  `isSilent=false` and `isForceRunAfter=true`. The assisted installer
+  (`nsis.oneClick: false`) uses update-only hooks in `installer.nsh` to skip the
+  Welcome, install-mode, and Finish decisions, leaving only the native
+  extraction page and its real progress visible. At completion it runs the
+  locked electron-builder `StartApp` contract and exits successfully. The same
+  hooks call `SetSilent normal` for `/S --updated`, so a client released before
+  this behavior change also gets visible progress on its first upgrade into it.
+  The downloaded installer owns this UI contract: a downgrade or channel
+  switch-back to an installer that predates these hooks shows that release's
+  legacy assisted wizard instead, so operators and users must retain the
+  install scope detected by that wizard.
 
 `SUPPORTED_PLATFORMS` is necessary but not sufficient: a channel can lack a
 desktop publish lane entirely, which is what `KNOWN_CHANNELS` and
@@ -621,7 +781,10 @@ those installs permanently with a manual DMG re-download as the only escape.
 safe to remove once no pre-migration installs remain.
 
 Four updater policy flags each differ from the library default on purpose:
-`autoDownload=false` (consent-first: discovery must never pull megabytes),
+`autoDownload=false` (the library must never fetch from inside
+`checkForUpdates`; whether a discovered update downloads without a click is a
+separate preference read per discovery, and keeping the flag false is what
+routes the automatic and the consented download through one guarded function),
 `autoInstallOnAppQuit=false` (the default would swap the bundle on quit without
 stopping the embedded Python gateway), `allowDowngrade=true` (the gate is
 difference-based, so a feed pointed at an older version is offered, which is
@@ -630,14 +793,37 @@ nightly and insider stamp is a semver prerelease and would otherwise be
 invisible to its own channel). The library still refuses an equal version before
 the `allowDowngrade` branch, which is what prevents a self-reinstall loop.
 
+**Desktop updates download automatically by default, and install on the next
+quit.** The `autoDownloadUpdates` preference (electron-store, default `true`,
+opt out in Settings → About) decides whether the `update-available` handler
+calls `startDownload()` itself. The INSTALL is not made automatic by this: the
+existing `update-downloaded` handler arms a `before-quit` install that stops the
+gateway first, so a downloaded update lands on the user's own next quit rather
+than interrupting a live session. `autoInstallOnAppQuit` stays false on every
+platform — on macOS that flag stages eagerly, which arms ShipIt to swap the
+bundle on ANY exit (including exits that skip the gateway teardown) and cannot
+be un-armed, so it would also defeat release retraction.
+
+Turning the preference off keeps bytes already fetched but **disarms the
+install-on-quit for a stage that was downloaded automatically**, so the update a
+user just declined does not land on their next quit; a stage they explicitly
+downloaded stays armed, because the preference is not what put it there. The
+stage itself is never discarded, so an explicit Install still applies it with
+nothing to re-download.
+
 **Which channel a build follows is a default plus an opt-in, not a property of
 the bytes.** `channelForVersion()` classifies the version stamp and `nightly`
 stays pinned by it, but for the two production lanes `resolveChannel()` honours
 the persisted Settings → About preference and defaults to **stable** when none is
-set. It cannot read the lane out of the stamp, because stable is PROMOTED: the
-stable and insider downloads of a promoted version are the same notarized file
-carrying the same `-insider.N` stamp, so a stamp-derived channel would send every
-promoted-stable install to the insider feed. The consequences to know:
+set. It cannot read the lane out of the stamp, and a rebuilt stable does not
+change that. For every install shipped while stable was PROMOTED, the stable and
+insider downloads of a release were the same notarized file carrying the same
+`-insider.N` stamp, so a stamp-derived channel would send all of those installs
+to the insider feed. Those binaries are still in the field, and `resolveChannel()`
+has to keep answering correctly for them. A stable build produced by a rebuild
+does carry its own bare stamp, but reading the lane from it would only be safe
+once no promoted install remains — which is not a condition this code can check.
+The consequences to know:
 
 - **Insider is an explicit opt-in.** Any install with no recorded preference
   follows stable — including one installed from the insider DMG, and including an
@@ -834,6 +1020,115 @@ For the desktop swap itself, `ota-test.yml` is the end-to-end proof; run it on
 demand after a change to the updater. It validates the swap mechanism, not
 Gatekeeper acceptance, since it signs with a throwaway identity.
 
+### After a stable release: check the version the user actually sees
+
+The recipe above proves the bytes are live. It does not prove they are labelled
+correctly, and that is where every stable release so far has gone wrong — each
+time one layer further out than the last:
+
+| Release | Bytes | What was wrong anyway |
+|---|---|---|
+| v0.3.0 | correct | fed the RC's own `0.3.0-insider.13` stamp, so stable clients read as insider |
+| v0.4.0 | correct | source files were re-stamped bare, but the shipped wheel was still `0.4.0rc14` |
+| v0.5.0 | correct | wheel and feeds finally bare — the GitHub Release page had no Windows asset |
+
+So the failure mode is not "the release did not happen". It is "the release
+happened and advertises the wrong thing", which no lane fails on. Check the
+label surfaces explicitly:
+
+```bash
+CH=stable; V=0.5.0            # the version you just tagged
+PTR=https://updates.crew.kiro.dev
+BYTES=https://download.crew.kiro.dev
+
+# 1. Every feed advertises the BARE version -- no rc/insider suffix anywhere.
+for f in latest-cli.json latest-mac.yml latest-linux.yml latest-linux-arm64.yml latest.yml; do
+  printf '%-22s ' "$f"
+  curl -fsS "$PTR/feed/$CH/$f" | grep -oE "\"?version\"?:? *\"?[0-9][^\",]*" | head -1
+done
+
+# 2. The wheel's EMBEDDED version, not just its filename. This is what
+#    `pip show` and `kirocrew --version` print, and a promotion cannot change it.
+curl -fsS "$PTR/feed/$CH/latest-cli.json" > /tmp/feed.json
+python3 - <<'PY'
+import hashlib, io, json, re, urllib.request, zipfile
+d = json.load(open("/tmp/feed.json"))
+raw = urllib.request.urlopen(d["wheel_url"], timeout=120).read()
+assert hashlib.sha256(raw).hexdigest() == d["sha256"], "wheel does not match the feed digest"
+z = zipfile.ZipFile(io.BytesIO(raw))
+meta = next(n for n in z.namelist() if n.endswith(".dist-info/METADATA"))
+print("filename:", d["wheel_url"].rsplit("/", 1)[-1])
+print("METADATA Version:", re.search(r"^Version: (.+)$", z.read(meta).decode(), re.M).group(1))
+PY
+
+# 3. The GitHub Release page carries every platform, with no RC-stamped asset.
+gh api "repos/kirodotdev/KiroCrew/releases/tags/v$V" --jq '.assets[].name' | sort
+gh api "repos/kirodotdev/KiroCrew/releases/tags/v$V" --jq '.assets[].name' \
+  | grep -Ei 'rc[0-9]|insider' && echo 'STALE RC ASSET' || echo 'no rc-stamped asset'
+```
+
+What each check is really for:
+
+- **The feeds** are what a running client reads, so a suffix here is what makes a
+  stable install describe itself as a prerelease. All five must agree.
+- **The embedded wheel version** is the one surface a byte-reuse promotion can
+  never fix, which is why stable rebuilds by default. Verify it from the wheel
+  itself: a clean filename around RC-stamped metadata is exactly the v0.4.0
+  shape.
+- **The release page** is assembled by an extension allowlist, so a platform is
+  omitted silently rather than loudly. Compare the asset list against the
+  publish lanes that ran; `test_release_promotion_contract.py` pins the two
+  together, but a lane added without a matching extension still deserves a look
+  here. macOS and Windows are the two the allowlist does NOT cover: each has two
+  possible producers in a promotion run — the promoted bundle and a fresh
+  build — so each is taken from an explicit path, and exactly one asset per
+  platform should appear. Two Windows installers, or one whose name carries a
+  version other than the tag's, means the page is offering a rebuild the
+  promotion was supposed to replace.
+
+A discrepancy is NOT recoverable in place — published keys are immutable and the
+feed is already advertising the wrong label. The remedy is the next version
+forward, so it is worth spending the five minutes on these three checks while
+the run is still fresh.
+
+### What the release body must not contain
+
+The body is **assembled, not written**, and that is why the same three defects
+keep reaching the page. `github-release` passes the extracted CHANGELOG section
+as `body_path` AND sets `generate_release_notes: true`, and
+`softprops/action-gh-release` **pre-pends** the body to the generated notes
+rather than replacing them — so the published body is always
+`CHANGELOG section + whatever GitHub generates`. Nobody has to write a mistake
+for one to appear.
+
+- **No commit list.** `generate_release_notes: true` appends a
+  `## What's Changed` line per commit since the previous tag. On v0.5.0 that was
+  **746 lines for 922 commits** — 65% of the body, and it pushed the whole thing
+  to 125,219 characters, past GitHub's 125,000-character ceiling, so the body was
+  published TRUNCATED mid-word. The page already links "N commits to main since
+  this release", and the reader-facing summary is the CHANGELOG section. Strip it.
+- **No contributors list.** The page renders GitHub's own contributor block from
+  the tag range, natively, whatever the body says. The CHANGELOG section is
+  *required* to end with `### Contributors` (it ships inside the wheel and feeds
+  the dashboard's Releases page, where no such block exists) — so copying that
+  section into the body duplicates the list immediately above GitHub's own. This
+  duplicated on v0.3.0 and again on v0.5.0; the rule is about the BODY, and it
+  does not relax the CHANGELOG's requirement.
+- **No hard-wrapped paragraphs.** GitHub renders issue / PR / release bodies with
+  GFM line breaks ON, so a newline inside a paragraph becomes a real `<br>`.
+  CHANGELOG prose is wrapped at ~76 columns, and copied in verbatim it renders as
+  a fixed-width column with a wide empty gutter down the right of the page — the
+  "big blank area" reported on v0.5.0. The identical text looks correct in
+  `CHANGELOG.md` because a rendered *file* does not enable that option. Join each
+  paragraph and each list item onto one line and let the browser reflow;
+  headings, list nesting, code fences and tables are unaffected.
+
+Trimming the body after the fact is safe and is the normal remedy: release notes
+are prose on the GitHub page, editable independently of the tag, the CHANGELOG,
+and the published bytes. Editing them changes nothing a client downloads and does
+not touch the immutable CDN keys. What is NOT editable is the CHANGELOG section
+itself once shipped.
+
 ## Recovery: roll forward
 
 **There is no rollback.** The recovery path for a bad release is to cut a new
@@ -863,10 +1158,10 @@ Practical consequences when something goes wrong mid-release:
 
 ## Changelog
 
-Every release lands a `## [X.Y.Z] — YYYY-MM-DD` section in `CHANGELOG.md`
+Every release lands a `## [X.Y.Z] - YYYY-MM-DD` section in `CHANGELOG.md`
 through a normal PR, alongside any version bump. The section format (ordering,
-tone, contributor lines) is specified once in
-[AGENTS.md](../../AGENTS.md) → "Release Changelog". The dashboard reads the
+tone, the three-sentence budget per subsection) is specified once in
+[changelog.md](changelog.md). The dashboard reads the
 changelog from `KIROCREW_PROJECT_DIR/CHANGELOG.md` for source installs and from
 the bundled copy inside the package for wheel installs.
 

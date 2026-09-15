@@ -1,14 +1,15 @@
 import { useMemo, useRef, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  Bell, RefreshCw, ExternalLink, Trash2, AlertTriangle, Sparkles, ListChecks, Users, Wand2, Tags, Check, Handshake, type LucideIcon,
+  Bell, RefreshCw, ExternalLink, Trash2, AlertTriangle, Sparkles, ListChecks, Users, Wand2, Tags, Check, Handshake, FolderGit2, FolderOpen, type LucideIcon,
 } from 'lucide-react'
+import ProjectPicker from '../../../../components/ProjectPicker'
 import { ProviderLogo, ProviderHostTag } from '../../components/ProviderBadge'
 import {
   issueRadarApi, DEFAULT_REPO_SETTINGS, SettingsConflictError,
   type RepoSettings, type RepoLabel, type Issue, type RepoMember, type RepoRef,
 } from '../../api'
-import { repoWebUrl, userUrlFor, membersUrlFor, providerTerms, repoScopeKey } from '../../lib/links'
+import { repoWebUrl, userUrlFor, membersUrlFor, providerTerms, repoScopeKey, sameRepoRef } from '../../lib/links'
 import { useIssueRadar } from '../../context'
 import ReadOnlyTag, { isReadOnly } from '../../components/ReadOnlyTag'
 import LabelPicker from '../../components/LabelPicker'
@@ -16,6 +17,8 @@ import CrewProtocolSettings from './CrewProtocolSettings'
 import { asArray } from '../../lib/format'
 
 import { i18nT } from '../../../../i18n/t'
+import ErrorNotice from '../../../../components/ErrorNotice'
+import { findReport } from '../../../../utils/errorReport'
 // Heuristic name patterns used only to *suggest* likely labels (one-click add);
 // the user always confirms. Repos name these things a dozen different ways.
 const TRIAGE_PATTERN = /(^|[\s:_/-])(triage|untriaged|unconfirmed|pending|needs?[\s_/-]?(triage|info|repro|reproduction|investigation|review|response|details?|decision))/i
@@ -80,12 +83,7 @@ export default function RepoSettings({ repoRef }: { repoRef: RepoRef }) {
   const { repos, active, openSettings, openDashboard, switchRepo } = useIssueRadar()
   // Full-identity match: the same slug can exist on two providers, and a loose
   // match would show the other repo's permissions and settings.
-  const entry = repos.find(
-    (r) => r.owner === owner
-      && r.repo === repo
-      && (r.provider || 'github') === (repoRef.provider || 'github')
-      && (r.host || 'github.com') === (repoRef.host || 'github.com'),
-  )
+  const entry = repos.find((r) => sameRepoRef(r, repoRef))
 
   const labelsQuery = useQuery({
     queryKey: ['issue-radar', 'labels', scopeKey],
@@ -136,6 +134,11 @@ export default function RepoSettings({ repoRef }: { repoRef: RepoRef }) {
   // change. Failures surface in the banner below instead of silently reverting.
   const [draft, setDraft] = useState<RepoSettings | null>(null)
   const settings = draft ?? settingsQuery.data?.settings ?? DEFAULT_REPO_SETTINGS
+
+  // Workspace folder picker (same dashboard ProjectPicker chat/folders use). The
+  // Browse button is the popover's anchor; the picker portals to <body>.
+  const [wsPickerOpen, setWsPickerOpen] = useState(false)
+  const wsBrowseRef = useRef<HTMLButtonElement>(null)
 
   /** Saves are SERIALIZED and the newest draft always wins.
    *
@@ -373,17 +376,33 @@ export default function RepoSettings({ repoRef }: { repoRef: RepoRef }) {
           : saveMutation.isSuccess ? <span className="ml-2 opacity-70 inline-flex items-center gap-1">{i18nT('apps.issueRadar.views.settings.repoSettings.saved')} <Check size={12} className="lucide-inline" /></span> : null}
       </p>
 
-      {(settingsQuery.isError || saveMutation.isError) && (
-        <div className="rounded-lg border border-danger/40 bg-danger/5 px-4 py-3 mb-6 text-[12px] text-danger">
-          <div className="font-medium mb-0.5">
-            {settingsQuery.isError ? i18nT('apps.issueRadar.views.settings.repoSettings.couldn_t_load_saved_settings') : i18nT('apps.issueRadar.views.settings.repoSettings.couldn_t_save_your_changes')}
-          </div>
-          <div className="opacity-80">
-            {((settingsQuery.error ?? saveMutation.error) as Error)?.message}
-            {' — '}{i18nT('apps.issueRadar.views.settings.repoSettings.your_edits_are_kept_here_but_won_t_persist_if_yo')}
-          </div>
-        </div>
-      )}
+      {(settingsQuery.isError || saveMutation.isError) && (() => {
+        // The "edits are kept here / restart the backend" consequence rides
+        // INSIDE the alert as a second line, so a screen reader hears the fix
+        // with the failure. The raw message is still what the journal lookup
+        // keys on, so it is resolved separately and passed as `report`.
+        const raw = ((settingsQuery.error ?? saveMutation.error) as Error)?.message ?? ''
+        const message = `${raw}\n${i18nT('apps.issueRadar.views.settings.repoSettings.your_edits_are_kept_here_but_won_t_persist_if_yo')}`
+        return settingsQuery.isError ? (
+          // A read; the form below still edits fine, so nothing is at stake.
+          <ErrorNotice
+            title={i18nT('apps.issueRadar.views.settings.repoSettings.couldn_t_load_saved_settings')}
+            message={message}
+            report={findReport(raw)}
+            askAgent
+            className="mb-6"
+          />
+        ) : (
+          /* No hand-off: the settings form below (label pickers, toggles) holds
+             the unsaved edits this failure is about. */
+          <ErrorNotice
+            title={i18nT('apps.issueRadar.views.settings.repoSettings.couldn_t_save_your_changes')}
+            message={message}
+            report={findReport(raw)}
+            className="mb-6"
+          />
+        )
+      })()}
 
       <Card
         icon={Bell}
@@ -401,6 +420,57 @@ export default function RepoSettings({ repoRef }: { repoRef: RepoRef }) {
           {i18nT('apps.issueRadar.views.settings.repoSettings.checks_about_once_a_minute_inside_kirocrew_no_cr')} <code>{terms.cli}</code> {i18nT('apps.issueRadar.views.settings.repoSettings.sign_in_no_extra_credentials_no_webhook', { provider: terms.providerName })}
         </StatLine>
       </Card>
+
+      <Card
+        icon={FolderGit2}
+        title={i18nT('apps.issueRadar.views.settings.repoSettings.workspace')}
+        desc={i18nT('apps.issueRadar.views.settings.repoSettings.where_this_repo_is_checked_out_investigate_cwd')}
+      >
+        <label className="block text-[13px] font-medium text-text mb-1.5">
+          {i18nT('apps.issueRadar.views.settings.repoSettings.local_workspace_path')}
+        </label>
+        <div className="flex gap-2">
+          <input
+            type="text"
+            className="flex-1 min-w-0 rounded-lg border border-border bg-bg px-3 py-2 text-[13px] font-mono text-text placeholder:text-muted focus:border-accent focus:outline-none disabled:opacity-50"
+            aria-label={i18nT('apps.issueRadar.views.settings.repoSettings.local_workspace_path')}
+            placeholder={i18nT('apps.issueRadar.views.settings.repoSettings.users_you_code_owner_repo')}
+            spellCheck={false}
+            autoCapitalize="off"
+            autoCorrect="off"
+            value={settings.workspace_path}
+            disabled={!settingsReady}
+            onChange={(e) => update({ workspace_path: e.target.value })}
+          />
+          <button
+            ref={wsBrowseRef}
+            type="button"
+            disabled={!settingsReady}
+            onClick={() => setWsPickerOpen(true)}
+            aria-label={i18nT('apps.issueRadar.views.settings.repoSettings.browse_for_workspace_folder')}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-bg px-3 py-2 text-[13px] text-text hover:bg-bg-hover disabled:opacity-40 cursor-pointer shrink-0"
+          >
+            <FolderOpen size={13} className="text-accent" /> {i18nT('apps.issueRadar.views.settings.repoSettings.browse')}
+          </button>
+        </div>
+        <StatLine>
+          {settings.workspace_path
+            ? <>{i18nT('apps.issueRadar.views.settings.repoSettings.investigate_will_run_in')} <code>{settings.workspace_path}</code>.</>
+            : i18nT('apps.issueRadar.views.settings.repoSettings.leave_empty_to_use_the_default_working_directory')}
+        </StatLine>
+      </Card>
+
+      {/* Portals to <body> at z-[9999], anchored to the Browse button. Reused
+       *  rather than reimplemented so workspace picking stays identical to the
+       *  chat/folder project pickers. */}
+      {wsPickerOpen && (
+        <ProjectPicker
+          open={true}
+          onOpenChange={(o) => { if (!o) setWsPickerOpen(false) }}
+          anchorRef={wsBrowseRef}
+          onSelect={(path) => { update({ workspace_path: path }); setWsPickerOpen(false) }}
+        />
+      )}
 
       <Card
         icon={ListChecks}
@@ -466,10 +536,7 @@ export default function RepoSettings({ repoRef }: { repoRef: RepoRef }) {
             // Only when it actually differs, though — switchRepo resets the saved
             // issue and PR filters, which would be a surprising side effect of
             // navigating within the repo you are already on.
-            const sameActive = active.owner === owner
-              && active.repo === repo
-              && (active.provider || 'github') === (repoRef.provider || 'github')
-              && (active.host || 'github.com') === (repoRef.host || 'github.com')
+            const sameActive = sameRepoRef(active, repoRef)
             if (!sameActive) switchRepo(repoRef)
             openDashboard('tagging')
           }}
@@ -601,8 +668,9 @@ export default function RepoSettings({ repoRef }: { repoRef: RepoRef }) {
             <Trash2 size={13} /> {i18nT('apps.issueRadar.views.settings.repoSettings.disconnect')}
           </button>
         )}
+        {/* Disconnect acts on the persisted connection; the confirm has no input. */}
         {disconnectMutation.error && (
-          <div className="text-[12px] text-danger mt-2">{(disconnectMutation.error as Error).message}</div>
+          <ErrorNotice message={(disconnectMutation.error as Error).message} askAgent className="mt-2" />
         )}
       </div>
     </div>

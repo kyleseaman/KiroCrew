@@ -40,11 +40,8 @@ TRUST = TailnetTrust(
 
 
 @pytest.fixture(autouse=True)
-def _clear_whois_cache(monkeypatch):
-    """Isolate the process-global whois cache, and pin IS_POSIX=True so the
-    resolution matrix is exercised identically on the Windows CI shard (the
-    explicit Windows-degrade test overrides it back to False itself)."""
-    monkeypatch.setattr(tailnet, "IS_POSIX", True)
+def _clear_whois_cache():
+    """Isolate the process-global whois cache between resolution tests."""
     tailnet._whois_cache.clear()
     yield
     tailnet._whois_cache.clear()
@@ -199,15 +196,22 @@ class TestResolutionMatrix:
         assert peer is not None
 
     @pytest.mark.asyncio
-    async def test_windows_degrades_to_none(self, monkeypatch) -> None:
-        """RFC OQ4: resolution is POSIX-only; Windows falls to the token path."""
+    async def test_windows_uses_the_same_daemon_verified_path(self, monkeypatch) -> None:
+        """The supported Windows CLI exposes ``whois --json`` too.
+
+        A platform gate here would silently turn update-persistent sessions back
+        into token-only sessions on the platform where the mobile setup UI is
+        most commonly used.
+        """
         whois = _patch_whois(monkeypatch, _whois_json())
         monkeypatch.setattr(tailnet, "IS_POSIX", False)
         peer = await resolve_forwarded_peer(
             _req("127.0.0.1", {"X-Forwarded-For": "100.64.0.5"}), TRUST
         )
-        assert peer is None
-        whois.assert_not_called()
+        assert peer == ForwardedPeer(
+            login="you@example.com", node="phone.tail.ts.net", address="100.64.0.5"
+        )
+        whois.assert_called_once()
 
 
 class TestDaemonFailureModes:
@@ -511,7 +515,7 @@ class TestRefreshRotationRebind:
             app={"tailnet_trust": TRUST},
         )
         await _rebind_rotated_token_to_peer(req, "new-token", 9999999999.0)
-        key, _exp, proxied = _ta._state._peer_bindings["new-token"]
+        key, _exp, proxied = _ta._state._peer_bindings[_ta._token_pin_key("new-token")]
         assert key == "ts:node:you@example.com|phone.tail.ts.net"
         assert proxied is False
         _ta._state.clear_all()
@@ -531,10 +535,10 @@ class TestRefreshRotationRebind:
             app={"tailnet_trust": TRUST},
         )
         await _rebind_rotated_token_to_peer(req, "new-token", 9999999999.0)
-        assert "new-token" not in _ta._state._peer_bindings
+        assert not _ta._state.has_binding("new-token")
         req2 = SimpleNamespace(remote="127.0.0.1", headers=CIMultiDict(), app={})
         await _rebind_rotated_token_to_peer(req2, "other-token", 9999999999.0)
-        assert "other-token" not in _ta._state._peer_bindings
+        assert not _ta._state.has_binding("other-token")
 
 
 class TestCliPathTrust:

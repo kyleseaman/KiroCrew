@@ -18,6 +18,7 @@ Two layers of defence:
 from __future__ import annotations
 
 import logging
+from collections.abc import Container
 
 from kiro_crew.config.loader import (
     ConfigReadError,
@@ -34,6 +35,15 @@ logger = logging.getLogger(__name__)
 # in a single asyncio event loop.
 _validated_team_id: str = ""
 _validated_enterprise_id: str = ""
+
+# The gateway's OWN bot_id, from the same startup ``auth.test`` response.
+# Consulted by the trusted-bot admission in ``events.py`` so an operator who
+# mistakenly lists this gateway's own bot id in ``slack.trusted_bot_ids``
+# cannot make the gateway reply to itself in a loop.  Empty when auth.test
+# was unavailable — the admission then fails CLOSED (trusts nobody), because
+# a trust feature without verifiable self identity cannot apply its
+# self-exclusion.
+_validated_self_bot_id: str = ""
 
 # Set of team_ids accepted by check_message_origin().  Contains the
 # validated team_id plus any workspace IDs explicitly listed in
@@ -229,6 +239,54 @@ def _load_allowed_team_ids() -> bool:
     return False
 
 
+def reload_allowed_team_ids() -> bool:
+    """Re-read ``slack.allowed_enterprise_ids`` after a config write.
+
+    The hot-apply entry point for the allowlist: a write from the dashboard, the
+    CLI or ``$EDITOR`` must narrow (or widen) admission without a gateway
+    restart, and ``check_message_origin`` reads the module cache this refills.
+
+    Deliberately re-runs :func:`_load_allowed_team_ids` rather than taking the
+    caller's reloaded config, because that function's validated read is the SOLE
+    source of the allowlist -- a caller's ``KiroCrewConfig.load()`` snapshot
+    normalizes bad input away and would reopen the allowlist it is meant to
+    narrow (the two-reader widening this module documents at length). So a
+    degraded read still fails CLOSED here: the allowlist stays "configured" and
+    admits nothing until the file is readable again.
+
+    Runs blocking file I/O (the config read), so callers on the event loop must
+    dispatch it to a thread. Returns True when the read was DEGRADED.
+
+    Runs whether or not a workspace has been validated yet. Before validation
+    the module is default-open (nothing has populated the cache), so a reload
+    that skipped this state would leave an operator's freshly written allowlist
+    unapplied and every workspace admitted; :func:`_load_allowed_team_ids`
+    already handles the unvalidated case -- it adds the validated team id only
+    when there is one and enforces the configured ids regardless -- and
+    ``validate_enterprise()`` re-runs it once the workspace is known.
+    """
+    degraded = _load_allowed_team_ids()
+    if degraded:
+        logger.error(
+            "slack.allowed_enterprise_ids reload read a degraded config; "
+            "admitting no origin until it is readable"
+        )
+    else:
+        logger.info(
+            "slack.allowed_enterprise_ids reloaded (%d id(s) admitted, allowlist %s)",
+            len(_allowed_team_ids),
+            "configured" if _allowlist_configured else "unconfigured",
+        )
+    sel().log_api_access(
+        caller="config",
+        operation="slack.allowed_team_ids_reload",
+        outcome="denied" if degraded else "allowed",
+        source="config",
+        error="config_load_degraded_fail_closed" if degraded else "",
+    )
+    return degraded
+
+
 def _governance_posture_permits_workspace(enterprise_id: str, team_id: str) -> bool:
     """Check the workspace against ``channels.posture.slack.allowed_enterprise_ids``.
 
@@ -323,13 +381,14 @@ def validate_enterprise(
     another edition implements against a different allowlist source.
     """
     global _validated_team_id, _validated_enterprise_id, _allowed_team_ids
-    global _allowlist_configured
+    global _allowlist_configured, _validated_self_bot_id
 
     # Clear stale state before re-validating.
     _validated_team_id = ""
     _validated_enterprise_id = ""
     _allowed_team_ids = set()
     _allowlist_configured = False
+    _validated_self_bot_id = ""
 
     extra = extra_ids or set()
 
@@ -436,6 +495,11 @@ def validate_enterprise(
     # slack.allowed_enterprise_ids config).
     _validated_team_id = team_id
     _validated_enterprise_id = enterprise_id
+    # auth.test on a bot token also names the bot's OWN bot_id; cache it so
+    # the trusted-bot admission can refuse the gateway's own id (self-reply
+    # loop guard). str() defends against a non-string field in a degraded
+    # response.
+    _validated_self_bot_id = str(resp.get("bot_id") or "")
     degraded = _load_allowed_team_ids()
     if extra and degraded:
         # The config read REFUSED, and ``extra`` is the caller's own
@@ -537,6 +601,67 @@ def validate_enterprise(
         resources=f"enterprise_id={enterprise_id} team={team} team_id={team_id}",
     )
     return True
+
+
+def validated_self_bot_id() -> str:
+    """The gateway's own bot_id from startup ``auth.test`` ("" when unavailable).
+
+    Zero-cost in-memory read.  Consulted by the trusted-bot admission so the
+    gateway's own id is never trusted even when an operator mistakenly lists
+    it in ``slack.trusted_bot_ids`` (a self-reply loop otherwise).  Empty when
+    auth.test failed or has not run — the admission then FAILS CLOSED and
+    trusts nobody: a trust feature is configured but the identity needed to
+    apply its self-exclusion cannot be verified, the same posture enterprise
+    validation takes for an allowlist with unverifiable workspace identity.
+    """
+    return _validated_self_bot_id
+
+
+def trusted_bot_admission(bot_id: str, trusted_ids: Container[str]) -> tuple[bool, str]:
+    """Decide whether a bot-authored event is admitted, and why it is not.
+
+    Returns ``(from_trusted_bot, deny_error)``.  ``deny_error`` is non-empty
+    exactly when the event must be dropped and audited; it is ``""`` both for a
+    human-authored event (no ``bot_id``) and for an admitted peer bot.
+
+    This is the ONE owner of the admission rule.  Both drop sites — the live
+    Socket Mode gate and the transport's ``receive`` — call it, so a rule change
+    cannot land on one path while missing the other.  The rule is:
+
+    - **Deny by default.** Admission requires a POSITIVE match against
+      ``trusted_ids``, so an empty or unset allow-list drops every bot-authored
+      event.
+    - **The gateway's own id is never trusted**, even when an operator lists it:
+      admitting it would make every reply re-enter as fresh input, a self-reply
+      loop.
+    - **Unverified self identity fails closed.** When startup ``auth.test`` did
+      not run or failed, :func:`validated_self_bot_id` is empty and the
+      self-exclusion above cannot be applied, so nobody is trusted — the same
+      posture enterprise validation takes for an allow-list it cannot bind to a
+      verified workspace.
+
+    ``trusted_ids`` is an ARGUMENT rather than a config read, because the two
+    callers deliberately differ on read timing: the event gate reads the live
+    config per event, while the transport freezes a constructor snapshot to
+    match its ``allowed_users`` pattern.  Which timing is right depends on the
+    wiring, not on the rule, so the wiring layer keeps that choice and this
+    predicate stays free of config access.
+
+    Loop bounding (the per-thread trusted-bot turn cap) is the dispatch layer's
+    job; this decides admissibility only.
+    """
+    self_bot_id = validated_self_bot_id()
+    is_own_bot = bool(bot_id) and bot_id == self_bot_id
+    from_trusted_bot = (
+        bool(bot_id) and bool(self_bot_id) and not is_own_bot and bot_id in trusted_ids
+    )
+    if not bot_id or from_trusted_bot:
+        return from_trusted_bot, ""
+    if is_own_bot and bot_id in trusted_ids:
+        return False, "own_bot_id_never_trusted"
+    if not self_bot_id and bot_id in trusted_ids:
+        return False, "trusted_bot_requires_verified_self_id"
+    return False, "untrusted_bot"
 
 
 def check_message_origin(event_team_id: str) -> bool:

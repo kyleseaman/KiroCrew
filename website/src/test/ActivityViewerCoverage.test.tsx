@@ -29,6 +29,7 @@ vi.mock('../api/client', () => ({
     artifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
     createArtifact: vi.fn().mockResolvedValue({ slug: 'new-slug', version: 1 }),
     setArtifactPinned: vi.fn().mockResolvedValue({}),
+    workflowRuns: vi.fn().mockResolvedValue({ runs: [] }),
   },
 }))
 
@@ -123,9 +124,12 @@ function storeTracking(agent: SubagentActivity) {
   })
 }
 
-/** A fetch stub that answers the two endpoints this component reaches for. */
+/** A fetch stub that answers the two endpoints this component reaches for.
+ *  The workflow-runs list goes through the api client now (so a non-OK
+ *  response rejects), so the stub feeds `api.workflowRuns` the same `runs`. */
 function stubFetch(opts: { runs?: unknown[]; fileText?: string; fileOk?: boolean } = {}) {
   const { runs = [], fileText = 'file body', fileOk = true } = opts
+  vi.mocked(api.workflowRuns).mockResolvedValue({ runs } as Awaited<ReturnType<typeof api.workflowRuns>>)
   const impl = vi.fn().mockImplementation((input: RequestInfo | URL) => {
     const url = String(input)
     if (url.includes('/api/workflows/runs')) {
@@ -206,7 +210,10 @@ describe('ActivityViewer — subagent transcript loading', () => {
     fireEvent.click(cardHeader(container))
     fireEvent.click(screen.getByRole('button', { name: 'Load output from disk' }))
 
-    const retry = await screen.findByRole('button', { name: 'Failed — click to retry' })
+    // The failure is a notice with the agent hand-off; the retry is its own
+    // button beside it, no longer folded into the error text.
+    expect(await screen.findByRole('alert')).toHaveTextContent("Couldn't load the output")
+    const retry = screen.getByRole('button', { name: 'Retry' })
     vi.mocked(api.spawnStatus).mockResolvedValue({ result: 'second time lucky' })
     fireEvent.click(retry)
 
@@ -777,5 +784,157 @@ describe('ActivityViewer — panel behaviour', () => {
     fireEvent.click(await screen.findByRole('button', { name: /Browse all/ }))
 
     await waitFor(() => expect(screen.getByTestId('path')).toHaveTextContent('/artifacts'))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Live model-downgrade flag (#5326)
+// ---------------------------------------------------------------------------
+describe('ActivityViewer — live model downgrade flag (#5326)', () => {
+  it('shows normal accent chip when requested model matches resolved', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', {
+            status: 'running',
+            model: 'claude-opus-4.8',
+            requestedModel: 'claude-opus-4.8',
+          }),
+        }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-model')
+    // No amber classes when there is no downgrade.
+    expect(chip.className).not.toContain('text-warn')
+    expect(chip.className).toContain('text-accent')
+  })
+
+  it('renders amber chip when resolved model differs from requested', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', {
+            status: 'running',
+            model: 'claude-opus-4.7',
+            requestedModel: 'claude-opus-4.8',
+          }),
+        }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-model')
+    expect(chip.className).toContain('text-warn')
+    expect(chip.className).not.toContain('text-accent')
+  })
+
+  it('chip title contains requested and resolved when downgraded', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', {
+            status: 'running',
+            model: 'claude-opus-4.7',
+            requestedModel: 'claude-opus-4.8',
+          }),
+        }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-model')
+    expect(chip.title).toContain('claude-opus-4.8')
+    expect(chip.title).toContain('claude-opus-4.7')
+  })
+
+  it('exposes the downgrade fact via aria-label (not icon/colour only)', () => {
+    // The downgrade cue is an aria-hidden AlertCircle + amber colour + a title;
+    // assistive tech gets none of those, so the chip must carry an aria-label
+    // naming both the requested and the served model.
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', {
+            status: 'running',
+            model: 'claude-opus-4.7',
+            requestedModel: 'claude-opus-4.8',
+          }),
+        }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-model')
+    const label = chip.getAttribute('aria-label') || ''
+    expect(label).toContain('claude-opus-4.8')
+    expect(label).toContain('claude-opus-4.7')
+  })
+
+  it('shows normal chip when requestedModel is absent', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{ s1: mkAgent('s1', { status: 'running', model: 'gpt-5.6' }) }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-model')
+    expect(chip.className).toContain('text-accent')
+    expect(chip.className).not.toContain('text-warn')
+  })
+
+  it('shows a neutral muted chip when only requestedModel is set (no resolved yet)', () => {
+    // Unpinned spawn: backend sets requested_model="auto", resolved="" — the
+    // frontend should show a neutral chip (not accent, not amber) using requestedModel.
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', { status: 'running', model: undefined, requestedModel: 'auto' }),
+        }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-model')
+    expect(chip.textContent).toContain('auto')
+    expect(chip.className).not.toContain('text-accent')
+    expect(chip.className).not.toContain('text-warn')
+    expect(chip.className).toContain('text-muted')
+    // Tooltip uses model_effective ("backend selects the model") for the auto sentinel.
+    expect(chip.title).toContain('backend selects')
+  })
+
+  it('uses model_label tooltip for a concrete requested-only chip (pinned, pre-resolve)', () => {
+    // A pinned spawn before the session resolves: requestedModel is a concrete id,
+    // resolved is still "". No chip should render — showing an unconfirmed pin as
+    // fact is misleading. The chip appears once the model actually resolves.
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', {
+            status: 'running',
+            model: undefined,
+            requestedModel: 'gpt-5.6-sol',
+          }),
+        }}
+      />,
+    )
+    // Concrete requested-only id must NOT render a chip.
+    expect(screen.queryByTestId('subagent-model')).toBeNull()
+  })
+
+  it('hides the chip when both model and requestedModel are absent', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{ s1: mkAgent('s1', { status: 'running' }) }}
+      />,
+    )
+    expect(screen.queryByTestId('subagent-model')).toBeNull()
   })
 })

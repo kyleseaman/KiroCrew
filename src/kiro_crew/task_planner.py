@@ -11,8 +11,8 @@ from typing import TYPE_CHECKING, Any
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.hooks import TOOL_DENY
 from kiro_crew.llm_helpers import _extract_json_of_type
+from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, EVENT_TEXT_CHUNK
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.task_models import (
     SESSION_PREFIX,
@@ -184,12 +184,19 @@ def parse_tasks(text: str) -> list[Task]:
             # Bound the payload: an uncapped ERROR record would evict the
             # rotating gateway.log window other subsystems tail, and the raw
             # LLM text can echo credentials or exfiltration URLs, so redact
-            # before the bounded slice is written to log surfaces. URLs are
-            # redacted FIRST: replacing a credential embedded in a URL would
-            # split the URL so the URL redactor no longer matches it, leaving
-            # the rest of its sensitive query string in the log.
-            snippet, _ = redact_exfiltration_urls(text)
-            snippet, _ = redact_credentials(snippet)
+            # before the bounded slice is written to log surfaces.
+            #
+            # Through the CONTEXT (`redact_log_via_context`) so a loaded
+            # companion's extra credential regexes apply -- an LLM response can
+            # echo a host-specific token shape the OSS baseline does not know.
+            # The `_log_` spelling because this is a diagnostic path: it must not
+            # raise, and on a process with no composed context it keeps the
+            # baseline rather than blanking the snippet. It also subsumes the
+            # URL-before-credential ordering this site would otherwise spell out by
+            # hand -- `security.redact` runs the exfil pass first for exactly
+            # that reason (replacing a credential inside a URL would split it so
+            # the URL redactor no longer matches).
+            snippet = redact_log_via_context(text)
             logger.error("Failed to parse tasks JSON (%d chars): %.500s", len(text), snippet)
             return []
 
@@ -276,9 +283,10 @@ async def decompose(
     )
     # Route onto the run's shared AcpRuntime (one process per run), keyed by the
     # run's task_id. get_or_create would cold-start a dedicated process instead.
-    parent_key = (
-        f"{SESSION_PREFIX}:{task_id}:runtime" if task_id else f"{SESSION_PREFIX}:runtime"
-    )
+    parent_key = f"{SESSION_PREFIX}:{task_id}:runtime" if task_id else f"{SESSION_PREFIX}:runtime"
+    from kiro_crew.context import inherit_session_memory
+
+    memory_store = await inherit_session_memory(ctx, parent_key, session_key)
     try:
         client, is_new, _resumed = await sessions.open_task_session(
             parent_key, session_key, agent=agent or None, cwd=work_dir or None
@@ -292,6 +300,9 @@ async def decompose(
                 session_key,
                 agent=agent or None,
                 project=work_dir or None,
+                memory_store=memory_store,
+                context_provider=client,
+                resumed=_resumed,
             )
         else:
             full_prompt = prompt
@@ -313,8 +324,12 @@ async def decompose(
                         agent=agent,
                         tool_kind=event.tool_kind,
                         raw_params=event.raw_tool_params,
+                        diff_path=event.diff_path,
                         command=event.shell_command,
                         is_shell=event.is_shell,
+                        mcp_server_name=event.mcp_server_name,
+                        mcp_tool_name=event.tool_name,
+                        mcp_identity_trusted=event.mcp_identity_trusted,
                     )
                     if hook_result.action == TOOL_DENY:
                         await client.reject_tool(event.request_id)
@@ -471,9 +486,19 @@ def update_plan_tasks(run: Project, tasks: list[dict]) -> Project:
 
 # ── YAML Workflow Decomposition ──
 
-_YAML_ALLOWED_AGENT_KEYS = frozenset({
-    "agent", "timeout", "depends_on", "description", "prompt", "shell",
-})
+_YAML_ALLOWED_AGENT_KEYS = frozenset(
+    {
+        "agent",
+        "timeout",
+        "depends_on",
+        "description",
+        "prompt",
+        "shell",
+        "requires_approval",
+        "force_approval",
+    }
+)
+_YAML_APPROVAL_KEYS = ("requires_approval", "force_approval")
 
 
 def _check_acyclic(tasks: list[Task]) -> None:
@@ -510,6 +535,14 @@ def decompose_yaml(yaml_content: str) -> list[Task]:
     """Parse a YAML workflow definition directly into Task objects.
 
     Bypasses the LLM decomposer entirely — depends_on is enforced as-is.
+
+    Every "this is not a valid workflow spec" outcome leaves here as
+    ``ValueError``, INCLUDING an unparseable document. Callers distinguish a
+    rejected spec from a broken runtime by that class alone (``taskrunner``
+    decides between the LLM fallback and a hard failure on it), so leaking
+    ``yaml``'s own exception hierarchy through would make a syntax error — the
+    most ordinary way for a hand-written spec to be wrong — take the runtime
+    path instead.
     """
     if len(yaml_content) > _MAX_YAML_SIZE:
         raise ValueError(f"YAML too large ({len(yaml_content)} bytes, max {_MAX_YAML_SIZE})")
@@ -519,7 +552,10 @@ def decompose_yaml(yaml_content: str) -> list[Task]:
         raise ImportError(
             "PyYAML is required for YAML workflow decomposition: pip install PyYAML"
         ) from exc
-    wf = _yaml.safe_load(yaml_content)
+    try:
+        wf = _yaml.safe_load(yaml_content)
+    except _yaml.YAMLError as exc:
+        raise ValueError(f"YAML is not parseable: {exc}") from exc
     if not wf or not isinstance(wf, dict) or "agents" not in wf:
         raise ValueError("YAML must have an 'agents' key with agent definitions")
 
@@ -544,6 +580,12 @@ def decompose_yaml(yaml_content: str) -> list[Task]:
         bad_keys = set(spec.keys()) - _YAML_ALLOWED_AGENT_KEYS
         if bad_keys:
             raise ValueError(f"Agent '{name}' has unknown keys: {bad_keys}")
+        for string_key in ("description", "prompt", "shell", "agent", "timeout"):
+            if string_key in spec and not isinstance(spec[string_key], str):
+                raise ValueError(f"Agent '{name}' {string_key} must be a string")
+        for approval_key in _YAML_APPROVAL_KEYS:
+            if approval_key in spec and not isinstance(spec[approval_key], bool):
+                raise ValueError(f"Agent '{name}' {approval_key} must be a boolean")
 
         deps = spec.get("depends_on", [])
         if deps is None:
@@ -553,7 +595,9 @@ def decompose_yaml(yaml_content: str) -> list[Task]:
         dep_indices = []
         for d in deps:
             if not isinstance(d, str):
-                raise ValueError(f"Agent '{name}' depends_on entries must be strings, got {type(d).__name__}: {d!r}")
+                raise ValueError(
+                    f"Agent '{name}' depends_on entries must be strings, got {type(d).__name__}: {d!r}"
+                )
             if d not in name_to_idx:
                 raise ValueError(f"Agent '{name}' depends on unknown agent '{d}'")
             dep_indices.append(name_to_idx[d])
@@ -564,12 +608,16 @@ def decompose_yaml(yaml_content: str) -> list[Task]:
             f"Timeout: {spec.get('timeout', '45m')}\n\n{prompt}"
         ).strip()
 
-        tasks.append(Task(
-            index=i,
-            title=spec.get("description", name.replace("-", " ").title()),
-            description=description,
-            depends_on=dep_indices,
-        ))
+        tasks.append(
+            Task(
+                index=i,
+                title=spec.get("description", name.replace("-", " ").title()),
+                description=description,
+                depends_on=dep_indices,
+                requires_approval=spec.get("requires_approval", False),
+                force_approval=spec.get("force_approval", False),
+            )
+        )
 
     _check_acyclic(tasks)
     return normalize_cross_group_deps(tasks)
@@ -604,8 +652,8 @@ def plan_to_yaml(tasks: list[Task]) -> str:
     Inverse of :func:`decompose_yaml` — the emitted YAML re-imports through
     ``decompose_yaml`` to the same task graph (titles + dependency structure).
     ``depends_on`` is emitted as agent-name references (not indices) so the DAG
-    survives re-import's renumbering. ``requires_approval`` has no YAML
-    representation (not an allowed agent key) and is intentionally dropped.
+    survives re-import's renumbering. Approval gates round-trip so saving a
+    reusable plan never weakens it.
     """
     if not tasks:
         raise ValueError("no tasks to export")
@@ -618,7 +666,9 @@ def plan_to_yaml(tasks: list[Task]) -> str:
 
     ordered = sorted(tasks, key=lambda t: t.index)
     used: set[str] = set()
-    idx_to_name: dict[int, str] = {t.index: _slugify_agent_name(t.title, t.index, used) for t in ordered}
+    idx_to_name: dict[int, str] = {
+        t.index: _slugify_agent_name(t.title, t.index, used) for t in ordered
+    }
 
     agents: dict[str, Any] = {}
     for t in ordered:
@@ -638,6 +688,10 @@ def plan_to_yaml(tasks: list[Task]) -> str:
         deps = [idx_to_name[d] for d in t.depends_on if d in idx_to_name]
         if deps:
             spec["depends_on"] = deps
+        if t.requires_approval:
+            spec["requires_approval"] = True
+        if t.force_approval:
+            spec["force_approval"] = True
         agents[idx_to_name[t.index]] = spec
 
     return _yaml.safe_dump(

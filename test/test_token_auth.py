@@ -13,7 +13,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import web
 
-from kiro_crew.dashboard.refresh_tokens import REFRESH_COOKIE_PREFIX, refresh_cookie_name
+from kiro_crew.dashboard.refresh_tokens import (
+    REFRESH_COOKIE_PREFIX,
+    refresh_cookie_name,
+    refresh_token_peer_key,
+)
 from kiro_crew.dashboard.token_auth import (
     MAX_CONCURRENT_NONCES,
     MAX_SESSION_TTL_SECS,
@@ -23,10 +27,12 @@ from kiro_crew.dashboard.token_auth import (
     app_token_path_allowed,
     bind_token_ip,
     check_token_ip,
+    claims_an_app_unverified,
     generate_token,
     is_consumed,
     mark_consumed,
     parse_duration,
+    required_peer_key_unverified,
     revoke_access_cookie,
     revoke_all_sessions,
     token_auth_middleware,
@@ -179,7 +185,7 @@ def test_try_consume_returns_true_once_then_false() -> None:
 
 
 def test_expired_token_rejected() -> None:
-    """Token link window (5 min) expires — URL no longer valid."""
+    """Token link window (5 min) expires — the URL stops being valid."""
     with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
         mock_time.time.return_value = 1000.0
         token = generate_token("user6", ttl_seconds=3600)
@@ -202,6 +208,41 @@ def test_session_exp_still_valid_after_link_window() -> None:
         valid, uid, _ = validate_token(token, use_session_exp=True)
     assert valid is True
     assert uid == "user6b"
+
+
+def test_link_window_never_outlives_a_short_session() -> None:
+    """The link-click window clamps to the session TTL, never exceeds it.
+
+    The query-param path validates against ``exp`` alone (the nonce set is
+    membership-only), so an uncapped 5-minute window would let the raw link
+    keep authenticating after ``session_exp`` passed. A token whose session
+    lifetime was capped by its caller's own bounds (the mobile-link and
+    tailnet-QR mints lend the caller's remaining lifetime) would then outlive
+    the session that authorized it by up to the full window — the residual
+    half of the laundering those mints exist to prevent.
+    """
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        token = generate_token("user6c", ttl_seconds=60)
+    # Past the short session but still inside the nominal 5-minute window:
+    # the LINK path must refuse too, not just the cookie path.
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0 + 61
+        link_valid, _, link_reason = validate_token(token)
+        cookie_valid, _, _ = validate_token(token, use_session_exp=True)
+    assert link_valid is False
+    assert "expired" in link_reason
+    assert cookie_valid is False
+    # A full-length session keeps the whole window: the clamp only ever
+    # tightens, so ordinary links are unaffected.
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        long_token = generate_token("user6d", ttl_seconds=3600)
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0 + 299
+        valid, uid, _ = validate_token(long_token)
+    assert valid is True
+    assert uid == "user6d"
 
 
 def test_tampered_token_rejected() -> None:
@@ -294,7 +335,7 @@ async def test_cookie_set_on_query_param_auth() -> None:
 
 @pytest.mark.asyncio
 async def test_embed_parent_port_claim_survives_session_exchange() -> None:
-    """PR #118 follow-up: the connect link token carries an embed_parent_port
+    """The connect link token carries an embed_parent_port
     claim, but token_auth_middleware exchanges the link token for a fresh
     session cookie (CWE-613, never reuse the URL token). That exchange MUST
     carry the claim across, or the cookie the framed document actually presents
@@ -317,8 +358,34 @@ async def test_embed_parent_port_claim_survives_session_exchange() -> None:
     # And the middleware stashed the validated parent port on the request BEFORE
     # revoking the link nonce, so the first ?token= framed document's header
     # (server._extra_frame_ancestors) sees it even though the link token is now
-    # revoked (PR #129 follow-up — the first-hit blank-pane fix).
+    # revoked — the first-hit blank-pane fix.
     req.__setitem__.assert_any_call("embed_parent_port", "5476")
+
+
+@pytest.mark.asyncio
+async def test_no_refresh_claim_survives_session_exchange() -> None:
+    """The ``no_refresh`` bound must survive the link→cookie exchange like
+    ``boot`` does. The exchange already honors it by never minting the refresh
+    chain, but a downstream consumer that reads the SESSION cookie to learn the
+    caller's bounds (the mobile-link mint) would otherwise see an unbounded
+    session and re-mint an unbounded, refresh-chained credential — laundering
+    the exact ceiling the claim encodes."""
+    import json as _json
+
+    from kiro_crew.dashboard.token_auth import _b64url_decode
+
+    mw = token_auth_middleware()
+    token = generate_token("qruser", ttl_seconds=300, extra={"no_refresh": "1"})
+    req = _make_request(query={"token": token}, remote="10.0.0.1")
+
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 200
+
+    cookie_header = resp.cookies.get("mc_token_5476")
+    assert cookie_header is not None
+    assert cookie_header.value != token
+    claims = _json.loads(_b64url_decode(cookie_header.value.split(".", 1)[0]))
+    assert claims["no_refresh"] == "1"
 
 
 # -- Property 7: Cookie not re-set when already matching --
@@ -337,6 +404,147 @@ async def test_cookie_not_reset_when_present() -> None:
     assert resp.status == 200
     # Cookie should NOT be re-set on cookie-based auth
     assert "mc_token_5476" not in resp.cookies
+
+
+# -- Stale ?token= must not veto a valid session cookie (query→cookie fallback) --
+
+
+@pytest.mark.asyncio
+async def test_expired_query_token_falls_back_to_valid_cookie() -> None:
+    """Re-opening a bookmarked link replays a long-expired ``?token=`` alongside
+    the still-valid session cookie that link was exchanged for. The dead query
+    token must be ignored, not act as a one-vote veto over the live cookie."""
+    mw = token_auth_middleware()
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale = generate_token("staleuser", ttl_seconds=300)
+    cookie = generate_token("staleuser", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+
+    req = _make_request(query={"token": stale}, cookies={"mc_token_5476": cookie})
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 200
+    # Fallback lands on the COOKIE path: no token→session exchange, no re-set.
+    assert "mc_token_5476" not in resp.cookies
+
+
+@pytest.mark.asyncio
+async def test_expired_query_token_without_cookie_still_denied() -> None:
+    """The fallback adds no capability: a dead query token alone stays denied
+    (the SPA-shell carve-out aside — this data path is not a shell request)."""
+    mw = token_auth_middleware()
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale = generate_token("staleuser2", ttl_seconds=300)
+    req = _make_request(path="/api/status", query={"token": stale})
+    resp = await mw(req, _ok_handler)
+    assert resp.status in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_expired_query_token_with_expired_cookie_denied() -> None:
+    """When BOTH credentials are dead, the query token's failure reason stands
+    (the credential the caller actually presented) and the request is denied."""
+    mw = token_auth_middleware()
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale = generate_token("staleuser3", ttl_seconds=300)
+        dead_cookie = generate_token("staleuser3", ttl_seconds=300)
+    req = _make_request(
+        path="/api/status", query={"token": stale}, cookies={"mc_token_5476": dead_cookie}
+    )
+    resp = await mw(req, _ok_handler)
+    assert resp.status in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_valid_query_token_still_wins_over_cookie() -> None:
+    """The fallback fires only on an INVALID query token. A valid one keeps
+    today's precedence — including its token→session exchange (fresh cookie)."""
+    mw = token_auth_middleware()
+    fresh = generate_token("precedence", ttl_seconds=300)
+    cookie = generate_token("someoneelse", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+    req = _make_request(query={"token": fresh}, cookies={"mc_token_5476": cookie})
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 200
+    assert resp.cookies.get("mc_token_5476") is not None
+
+
+@pytest.mark.asyncio
+async def test_internal_path_expired_query_token_falls_back_to_cookie() -> None:
+    """The internal-path helper (_extract_and_validate_token) applies the same
+    rule: a stale ``?token=`` on a polled internal path must not 401 a request
+    whose session cookie is still valid."""
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale = generate_token("intuser", ttl_seconds=300)
+    cookie = generate_token("intuser", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+    mw = token_auth_middleware(internal_paths=frozenset({"/api/spawn"}), internal_secret="s")
+    req = _make_request(
+        path="/api/spawn", query={"token": stale}, cookies={"mc_token_5476": cookie}
+    )
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_expired_app_token_does_not_fall_back_to_user_cookie() -> None:
+    """An expired APP token must NOT adopt the dashboard user's cookie.
+
+    An installed app's UI is served from this same origin, so the browser sends
+    the user's session cookie alongside the app's own ``?token=``. If the
+    fallback fired here, ``app_name`` would come back empty, the app-scope gate
+    would become a no-op, and an app whose token merely expired would silently
+    gain the user's full API reach. It must stay denied so the app re-exchanges
+    its secret instead.
+    """
+    mw = token_auth_middleware()
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale_app = generate_token("appsub", ttl_seconds=300, app="someapp")
+    cookie = generate_token("realuser", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+
+    req = _make_request(
+        path="/api/status", query={"token": stale_app}, cookies={"mc_token_5476": cookie}
+    )
+    resp = await mw(req, _ok_handler)
+    assert resp.status in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_internal_path_expired_app_token_does_not_fall_back_to_cookie() -> None:
+    """The internal-path helper applies the same app-token exception."""
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale_app = generate_token("appsub2", ttl_seconds=300, app="someapp")
+    cookie = generate_token("realuser2", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+    mw = token_auth_middleware(internal_paths=frozenset({"/api/spawn"}), internal_secret="s")
+    req = _make_request(
+        path="/api/spawn", query={"token": stale_app}, cookies={"mc_token_5476": cookie}
+    )
+    resp = await mw(req, _ok_handler)
+    assert resp.status in (401, 403)
+
+
+def test_claims_an_app_unverified_only_ever_refuses() -> None:
+    """The unverified reader answers True only for a payload that names an app.
+
+    Garbage and app-less payloads answer False, so the claim can never widen the
+    fallback — it can only withhold it.
+    """
+    assert claims_an_app_unverified(generate_token("u", ttl_seconds=60, app="a")) is True
+    assert claims_an_app_unverified(generate_token("u", ttl_seconds=60)) is False
+    assert claims_an_app_unverified("not-a-token") is False
+    assert claims_an_app_unverified("") is False
 
 
 # -- Cookie keyed by browser-facing (Host) port for tunneled multi-instance --
@@ -400,6 +608,7 @@ async def test_cookie_server_port_name_denied_when_host_differs() -> None:
         "/fonts/AWSDiatype-Regular.woff2",
         "/vendor/tailwindcss-browser.js",
         "/logo.png",
+        "/favicon.ico",
         "/manifest.json",
         "/sw.js",
         "/icon-192.png",
@@ -561,7 +770,7 @@ async def test_bare_app_path_is_spa_shell_request(path: str, method: str) -> Non
     refresh (which issues a direct GET to the gateway) returns index.html
     rather than 404.
 
-    Regression for: GET /apps/code-review-sage on refresh returned 404 because
+    Without the shell fallback, GET /apps/code-review-sage on refresh returns 404 because
     SPA_FALLBACK_EXCLUDED_PREFIXES included '/apps/' wholesale, causing the
     spa_fallback middleware to re-raise HTTPNotFound instead of serving shell.
     """
@@ -573,7 +782,6 @@ async def test_bare_app_path_is_spa_shell_request(path: str, method: str) -> Non
     ), f"{method} {path} should be a SPA shell request (browser refresh must work)"
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "path",
     [
@@ -615,7 +823,7 @@ def test_apps_router_subpaths_are_spa_shell(path: str, method: str) -> None:
     """React Router owns /apps/detail/{name} and /apps/migrate/{name} (App.tsx).
     Neither has a server-side route, so both must get the SPA shell.
 
-    Regression for: _APPS_SPA_EXCLUDED_RE matched any /apps/{seg}/ path, so it
+    If _APPS_SPA_EXCLUDED_RE matched any /apps/{seg}/ path, it would
     read "detail" and "migrate" as the app name and excluded these from the
     shell. Pasting /apps/detail/task-runner into the address bar (or refreshing
     on it) returned 404; the routes worked only via in-app navigation.
@@ -675,7 +883,7 @@ def test_app_assets_paths_are_not_spa_shell(path: str) -> None:
     letting the <img onError> fallback run) instead of being answered with
     index.html.
 
-    Regression for: recently added colorful builtin icons / hero images did not
+    Without the exclusion, the colorful builtin icons / hero images would not
     render because /app-assets/ had no static route AND was not in
     SPA_FALLBACK_EXCLUDED_PREFIXES, so the SVG requests were served index.html
     (HTML) and every <img> tripped its placeholder fallback.
@@ -689,7 +897,7 @@ def test_app_assets_paths_are_not_spa_shell(path: str) -> None:
     ), f"GET {path} should NOT be a SPA shell request (static brand asset)"
 
 
-# -- Property 9: Loopback no longer bypasses auth (port-forward fix) --
+# -- Property 9: Loopback does not bypass auth (port-forward fix) --
 
 
 @pytest.mark.asyncio
@@ -1028,7 +1236,7 @@ def test_revoke_all_sessions_kills_established_cookie() -> None:
 def test_signing_secret_persisted_across_loads(tmp_path, monkeypatch) -> None:
     """Regression: the HMAC signing secret must persist across processes.
 
-    Previously _SECRET was os.urandom(32) per import, so every restart rotated
+    A per-import ``os.urandom(32)`` _SECRET would rotate
     the key and invalidated all outstanding tokens/cookies ("invalid
     signature"). The secret is now loaded-or-created from a 0600 key file.
     """
@@ -1042,7 +1250,7 @@ def test_signing_secret_persisted_across_loads(tmp_path, monkeypatch) -> None:
     assert key_file.exists()
     assert len(s1) >= 32
     # Owner-only permissions. POSIX enforces this via chmod 0o600; Windows applies
-    # an owner DACL (icacls) that does not surface in st_mode (files report
+    # an owner DACL that does not surface in st_mode (files report
     # 0o666), so the POSIX-bit assertion is only meaningful off Windows (the
     # Windows DACL path is covered by test_platform_compat::TestRestrictToOwner).
     if os.name != "nt":
@@ -1053,7 +1261,7 @@ def test_signing_secret_persisted_across_loads(tmp_path, monkeypatch) -> None:
 
 
 def test_signing_secret_concurrent_first_init_converges(tmp_path, monkeypatch) -> None:
-    """Regression (PR #338 / GPT 5.6 HIGH): concurrent first-time inits MUST
+    """Concurrent first-time inits MUST
     converge on a single signing key.
 
     ``warm_auth_singletons()`` primes the signing secret BEFORE the gateway
@@ -1105,7 +1313,7 @@ def test_signing_secret_concurrent_first_init_converges(tmp_path, monkeypatch) -
     assert all(r == on_disk for r in results), "concurrent inits diverged from the on-disk key"
     assert len(set(results)) == 1, "more than one distinct signing key was issued"
     # Winner's create still locked the file down to owner-only. POSIX enforces
-    # this via chmod 0o600; Windows applies an owner-only DACL (icacls) that does
+    # this via chmod 0o600; Windows applies an owner-only DACL that does
     # NOT surface in st_mode (files report 0o666), so the POSIX-bit assertion is
     # only meaningful off Windows — the Windows DACL path has direct coverage in
     # test_platform_compat::TestRestrictToOwner.
@@ -1150,32 +1358,333 @@ def test_signing_secret_read_contention_retries_not_ephemeral(tmp_path, monkeypa
 
 
 def test_signing_secret_create_contention_retries_not_ephemeral(tmp_path, monkeypatch) -> None:
-    """A TRANSIENT sharing violation on the EXCLUSIVE-CREATE of the key file must
-    be retried, not degraded to an ephemeral secret.
+    """A TRANSIENT sharing violation on the PUBLISH of the key file must be
+    retried, not degraded to an ephemeral secret.
 
-    On Windows a racer's ``os.open(..., O_CREAT|O_EXCL)`` can hit a sharing
-    violation (``PermissionError`` / WinError 32) while the winner holds the
-    freshly-created file open — landing on ``os.open``, not the read. The
-    create-side companion to ``test_signing_secret_read_contention_retries_not_ephemeral``;
-    reproduced deterministically with the ``os.open`` simulator so it is caught
+    On Windows the publishing link can hit a sharing violation
+    (``PermissionError`` / WinError 32) while another handle holds the
+    destination open — landing on ``os.link``, not the read. The publish-side
+    companion to ``test_signing_secret_read_contention_retries_not_ephemeral``;
+    reproduced deterministically with the ``os.link`` simulator so it is caught
     on the POSIX dev loop.
     """
-    from windows_sim import open_sharing_violation
+    from windows_sim import link_sharing_violation
 
     from kiro_crew.dashboard import token_secret as ts
 
     monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
     key_file = tmp_path / ts._SECRET_KEY_FILE
 
-    # Fault the FIRST exclusive-create of the key file; the retry must succeed.
-    with open_sharing_violation(match=ts._SECRET_KEY_FILE, times=1) as state:
+    # Fault the FIRST publish of the key file; the retry must succeed.
+    with link_sharing_violation(match=ts._SECRET_KEY_FILE, times=1) as state:
         secret = ts._load_or_create_secret()
 
-    assert state["n"] >= 2, "the contended exclusive-create was not retried"
+    assert state["n"] >= 2, "the contended publish was not retried"
     assert key_file.exists(), "key must be persisted after retrying the create"
     on_disk = key_file.read_bytes()
     assert len(on_disk) >= ts._MIN_KEY_BYTES, "retry wrote a short/incomplete key"
     assert secret == on_disk, "must return the persisted key, not an ephemeral one"
+
+
+def test_signing_secret_destination_never_exists_while_incomplete(tmp_path, monkeypatch) -> None:
+    """Regression (Mesh-3720): ``token_signing.key`` must never exist on disk in a
+    partial state, so an interrupted update cannot leave a 0-byte key.
+
+    The old creator opened the DESTINATION with ``O_CREAT|O_EXCL`` and only then
+    wrote the 32 random bytes. Its ``finally`` cleaned up an exception, but a
+    kill has no ``finally``: an update completing during shutdown, or a reboot,
+    that ended the process between the create and the write persisted a 0-byte
+    key. Every later boot then read <32 bytes, exhausted the retry budget and
+    fell back to a fresh ephemeral secret — a dashboard that loads while every
+    signed action fails, and a plain restart cannot fix it because it re-reads
+    the same empty file.
+
+    The fix stages the whole key into a private sibling and publishes it with
+    ``os.link``, so the destination name only ever appears already-complete.
+    This samples the destination on every ``os.write`` that carries key bytes:
+    with the fix it is absent throughout; before it, it is present at 0 bytes.
+    """
+    from kiro_crew.dashboard import token_secret as ts
+
+    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
+    key_file = tmp_path / ts._SECRET_KEY_FILE
+    assert not key_file.exists()
+
+    # Sizes the destination had at each point a key byte was being written.
+    # ``None`` means "did not exist", which is the only acceptable value.
+    sizes_during_write: list[int | None] = []
+    real_write = os.write
+
+    def _spy(fd, data):  # type: ignore[no-untyped-def]
+        try:
+            sizes_during_write.append(key_file.stat().st_size)
+        except OSError:
+            sizes_during_write.append(None)
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", _spy)
+    secret = ts._load_or_create_secret()
+    monkeypatch.undo()
+
+    on_disk = key_file.read_bytes()
+    assert secret == on_disk, "returned key must be the persisted one"
+    assert len(on_disk) >= ts._MIN_KEY_BYTES
+
+    partial = [n for n in sizes_during_write if n is not None and n < ts._MIN_KEY_BYTES]
+    assert not partial, (
+        "the destination existed in a partial state during the write "
+        f"(observed sizes {partial}); a kill there would persist a truncated key"
+    )
+
+
+def test_signing_secret_transient_publish_failure_never_creates_the_destination(
+    tmp_path, monkeypatch
+) -> None:
+    """A publish failure that is NOT "no hard links" must leave the key path alone.
+
+    The in-place fallback creates the destination empty and writes afterwards, so
+    it carries the truncation window this fix removes. Reaching it on a *transient*
+    error — a Windows sharing violation, a security product holding the path, a
+    policy refusal — would recreate exactly the 0-byte key the PR exists to
+    prevent, on a filesystem that can hard-link perfectly well. Only an
+    unsupported-link error may unlock that fallback; anything else degrades to an
+    ephemeral secret with the destination untouched.
+    """
+    from windows_sim import link_sharing_violation
+
+    from kiro_crew.dashboard import token_secret as ts
+
+    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
+    key_file = tmp_path / ts._SECRET_KEY_FILE
+
+    # A sharing violation (EACCES / WinError 32) on EVERY publish attempt: never
+    # cleared, but never evidence about hard-link support either.
+    with link_sharing_violation(match=ts._SECRET_KEY_FILE, times=10**6) as state:
+        secret = ts._load_or_create_secret()
+
+    assert state["n"] >= ts._CREATE_MAX_ATTEMPTS, "the publish was not retried"
+    assert len(secret) >= ts._MIN_KEY_BYTES, "no usable secret for this session"
+    assert not key_file.exists(), (
+        "a transient publish failure created the destination anyway — a kill in "
+        "that write window persists the 0-byte key this fix removes"
+    )
+    # Nothing of ours is left in the config dir either.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_signing_secret_persists_on_a_filesystem_without_hard_links(tmp_path, monkeypatch) -> None:
+    """A volume that cannot hard-link must still get a PERSISTED key.
+
+    The publish step is ``os.link``, which FAT/exFAT and some network mounts
+    reject outright. Degrading those hosts to an ephemeral secret would trade
+    one breakage for another (tokens dying on every restart), so the loader
+    falls back to the historical in-place create once the publish budget is
+    spent.
+    """
+    from windows_sim import link_unsupported
+
+    from kiro_crew.dashboard import token_secret as ts
+
+    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
+    key_file = tmp_path / ts._SECRET_KEY_FILE
+
+    with link_unsupported(match=ts._SECRET_KEY_FILE) as state:
+        secret = ts._load_or_create_secret()
+
+    assert state["n"] >= 1, "the publish link was never attempted"
+    assert key_file.exists(), "no key was persisted on a link-less filesystem"
+    on_disk = key_file.read_bytes()
+    assert len(on_disk) >= ts._MIN_KEY_BYTES, "persisted a short key"
+    assert secret == on_disk, "returned an ephemeral key instead of the persisted one"
+
+
+def test_signing_secret_concurrent_first_init_converges_without_hard_links(
+    tmp_path, monkeypatch
+) -> None:
+    """Concurrent first boots on a LINK-LESS home must still converge on one key.
+
+    The publish path is ``os.link``, so a filesystem that cannot hard-link sends
+    every racing gateway down the in-place fallback instead. ``O_EXCL`` lets
+    exactly one of them create the key; the loser must read the winner's bytes,
+    not mint its own. A loser that returns an ephemeral secret while the winner
+    persists a real one leaves the pair unable to validate each other's tokens —
+    the divergence the exclusive create exists to prevent, and what a single
+    post-loop create attempt with no re-read reintroduces.
+    """
+    from windows_sim import link_unsupported
+
+    from kiro_crew.dashboard import token_secret as ts
+
+    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
+    key_file = tmp_path / ts._SECRET_KEY_FILE
+    assert not key_file.exists()
+
+    n = 8
+    barrier = threading.Barrier(n)
+    results: list[bytes] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def _worker() -> None:
+        try:
+            barrier.wait()
+            secret = ts._load_or_create_secret()
+        except BaseException as exc:  # noqa: BLE001 - surfaced via assert below
+            with lock:
+                errors.append(exc)
+            return
+        with lock:
+            results.append(secret)
+
+    with link_unsupported(match=ts._SECRET_KEY_FILE):
+        threads = [threading.Thread(target=_worker) for _ in range(n)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+
+    assert not errors, f"workers raised: {errors!r}"
+    assert len(results) == n
+    on_disk = key_file.read_bytes()
+    assert len(on_disk) >= ts._MIN_KEY_BYTES, "no full key was persisted"
+    assert set(results) == {on_disk}, (
+        "racing first inits diverged on a link-less filesystem: "
+        f"{len(set(results))} distinct secrets for one persisted key"
+    )
+
+
+def test_signing_secret_failed_dir_sync_keeps_a_recoverable_name(tmp_path, monkeypatch) -> None:
+    """A directory sync that FAILS must not be followed by dropping the second name.
+
+    The key bytes are fsynced during staging, but the published NAME lives in the
+    parent directory and is not durable until that directory is synced. Unlinking
+    the staging name after a failed sync leaves a power loss with neither name
+    pointing at the inode: the key becomes unreachable, the next boot mints a
+    fresh one, and every outstanding cookie and link signed by the old key is
+    invalid — the same class of breakage this fix exists to remove.
+
+    So a genuine sync failure keeps the staging name as a recoverable second
+    reference, and still returns the key that is on disk rather than degrading to
+    an ephemeral secret (which would diverge from the persisted key). The kept
+    leftover is safe precisely because it ends in ``.tmp`` and so stays behind the
+    keystone fence.
+    """
+    import errno as _errno
+
+    from kiro_crew.dashboard import token_secret as ts
+
+    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
+
+    def _failing_sync(path, **kwargs):  # type: ignore[no-untyped-def]
+        # best_effort would swallow this; strict must let it surface here.
+        assert not kwargs.get("best_effort"), (
+            "the publish must sync the directory STRICTLY — best_effort hides the "
+            "very EIO that makes dropping the second name unsafe"
+        )
+        raise OSError(_errno.EIO, "simulated: device refused the directory sync")
+
+    monkeypatch.setattr(ts, "fsync_dir", _failing_sync)
+    secret = ts._load_or_create_secret()
+    monkeypatch.undo()
+
+    key_file = tmp_path / ts._SECRET_KEY_FILE
+    assert key_file.exists(), "the key was not published"
+    assert key_file.read_bytes() == secret, (
+        "returned an ephemeral secret while a valid key sits on disk — the "
+        "divergence the exclusive publish exists to prevent"
+    )
+
+    leftovers = [p for p in tmp_path.iterdir() if p.name != ts._SECRET_KEY_FILE]
+    assert len(leftovers) == 1, (
+        "a failed directory sync must keep exactly one recoverable second name, "
+        f"found {[p.name for p in leftovers]}"
+    )
+    kept = leftovers[0]
+    assert kept.read_bytes() == secret, "the kept name does not resolve to the key"
+    assert kept.stat().st_ino == key_file.stat().st_ino, (
+        "the kept name is a separate inode, so it is a second COPY of the signing "
+        "key rather than a second name for it"
+    )
+    # And it is still fenced, which is what makes keeping it acceptable.
+    from kiro_crew import security
+
+    assert kept.name.endswith(security._KEYSTONE_ARTIFACT_SUFFIXES)
+
+
+def test_signing_secret_staging_file_is_covered_by_the_keystone_fence(
+    tmp_path, monkeypatch
+) -> None:
+    """A leftover staging file must be fenced exactly like the key it copies.
+
+    The staging sibling holds the FULL signing key until the publish link lands,
+    and a kill between that link and the cleanup unlink leaves it on disk. The
+    keystone fence in ``security.py`` protects a publish artifact by SHAPE — a
+    direct child of a keystone leaf's own directory whose name ends in one of
+    ``_KEYSTONE_ARTIFACT_SUFFIXES`` — so a staging name outside those suffixes
+    leaves a readable copy of the key for an agent tool to fetch and forge tokens
+    with.
+
+    Asserted against the real predicate rather than against the literal suffix, so
+    the coupling survives a rename on either side. The name is tested in the
+    directory the key actually lives in: the fence resolves its parent set from
+    the real crew-home prefixes, so pointing ``KIROCREW_HOME`` at a temp dir would
+    move the key without moving the fence and prove nothing.
+    """
+    from kiro_crew import security
+    from kiro_crew.dashboard import token_secret as ts
+
+    captured: list[str] = []
+    real_link = os.link
+
+    def _spy_link(src_path, dst_path, **kwargs):  # type: ignore[no-untyped-def]
+        captured.append(str(src_path))
+        return real_link(src_path, dst_path, **kwargs)
+
+    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
+    monkeypatch.setattr(os, "link", _spy_link)
+    ts._load_or_create_secret()
+    monkeypatch.undo()
+
+    assert captured, "the publish never linked, so no staging name was observed"
+    staged_name = os.path.basename(captured[0])
+    assert staged_name.endswith(
+        security._KEYSTONE_ARTIFACT_SUFFIXES
+    ), f"staging name {staged_name!r} is outside the keystone artifact suffixes"
+
+    # Now ask the fence about that same name where the key really sits.
+    parents = security._home_dir_targets(security._KEYSTONE_ARTIFACT_PARENTS)
+    assert parents, "the fence resolved no keystone artifact parents"
+    for parent in sorted(parents):
+        candidate = os.path.join(parent, staged_name)
+        assert security._is_keystone_publish_artifact(candidate), (
+            f"a leftover {staged_name!r} in {parent} would not be fenced — it "
+            "holds a full copy of the signing key and agent tools could read it"
+        )
+
+
+def test_signing_secret_publish_leaves_no_staging_file_behind(tmp_path, monkeypatch) -> None:
+    """The staging sibling is this process's private file and must not survive.
+
+    A leftover staging file is inert (the key is published under its own name)
+    but it holds a full copy of the signing secret, so the config directory must
+    contain exactly the key file after a successful publish -- and after a
+    publish this process LOST to a sibling, where its candidate is dropped
+    rather than installed.
+    """
+    from kiro_crew.dashboard import token_secret as ts
+
+    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
+    key_file = tmp_path / ts._SECRET_KEY_FILE
+
+    secret = ts._load_or_create_secret()
+    assert key_file.read_bytes() == secret
+    assert [p.name for p in tmp_path.iterdir()] == [ts._SECRET_KEY_FILE]
+
+    # Now the losing path: a key already exists, so a second loader must read it
+    # and leave nothing of its own candidate behind.
+    again = ts._load_or_create_secret()
+    assert again == secret, "second loader diverged from the persisted key"
+    assert [p.name for p in tmp_path.iterdir()] == [ts._SECRET_KEY_FILE]
 
 
 def test_signing_secret_binary_write_survives_windows_text_mode(tmp_path, monkeypatch) -> None:
@@ -1183,7 +1692,7 @@ def test_signing_secret_binary_write_survives_windows_text_mode(tmp_path, monkey
 
     On Windows ``os.open()`` defaults to TEXT mode, so the ``os.write()`` that
     persists the random key translates every ``0x0A`` ('\\n') byte to
-    ``0x0D 0x0A`` ('\\r\\n'). The on-disk key then grows and no longer equals
+    ``0x0D 0x0A`` ('\\r\\n'). The on-disk key then grows and does not equal
     the creator's in-memory bytes (nor a sibling's read) — silent auth
     divergence, and the root cause of the flaky Windows failures in
     ``test_signing_secret_{concurrent_first_init_converges,create_contention_retries_not_ephemeral,write_failure_cleans_up_incomplete_file}``.
@@ -1217,7 +1726,7 @@ def test_signing_secret_binary_write_survives_windows_text_mode(tmp_path, monkey
 
 
 def test_signing_secret_existing_file_never_overwritten(tmp_path, monkeypatch) -> None:
-    """Regression (PR #338): warming must never overwrite or truncate an
+    """Warming must never overwrite or truncate an
     existing key file.
 
     A pre-existing valid key is read verbatim across repeated warms (multiple
@@ -1245,22 +1754,23 @@ def test_signing_secret_existing_file_never_overwritten(tmp_path, monkeypatch) -
 
 
 def test_signing_secret_write_failure_cleans_up_incomplete_file(tmp_path, monkeypatch) -> None:
-    """Regression (PR #338 / GPT 5.6 HIGH): a write failure DURING exclusive
+    """A write failure DURING exclusive
     creation must NOT leave a poisoned short key file behind.
 
-    The exclusive creator opens ``token_signing.key`` with ``O_CREAT|O_EXCL``
-    then writes 32 bytes. If that write fails partway (ENOSPC, quota) the file
-    exists but is < 32 bytes. Previously the incomplete file was left on disk:
-    every future boot's fast-path read saw < 32 bytes, the O_EXCL create then
-    hit FileExistsError, the bounded retry budget exhausted, and the gateway
-    fell back to a FRESH ephemeral key on EVERY restart (tokens die on each
-    restart; concurrent gateways cannot validate one another) until a human
+    A creator that writes 32 bytes and fails partway (ENOSPC, quota) must leave
+    NOTHING short or empty where the key belongs. An incomplete file left on disk makes every future boot's fast-path read see < 32 bytes, the
+    create then hit FileExistsError, the bounded retry budget exhausted, and the
+    gateway fell back to a FRESH ephemeral key on EVERY restart (tokens die on
+    each restart; concurrent gateways cannot validate one another) until a human
     deleted the file by hand.
 
-    The fix removes the creator's OWN incomplete file (guarded by a
-    device+inode identity check so a racing sibling's valid key is never
-    deleted) before degrading to an ephemeral secret, so the NEXT init can
-    create a valid, persisted key.
+    Two mechanisms now hold that invariant. The publish path stages the key in a
+    private sibling, so a failed write never touches the destination at all; the
+    in-place fallback (a filesystem with no hard links) removes the creator's OWN
+    incomplete file, guarded by a device+inode identity check so a racing
+    sibling's valid key is never deleted. This faults EVERY key-persist write, so
+    the loader exhausts the publish budget, reaches the fallback, and has to
+    clean up after itself before degrading to an ephemeral secret.
     """
     from kiro_crew.dashboard import token_secret as ts
 
@@ -1272,11 +1782,15 @@ def test_signing_secret_write_failure_cleans_up_incomplete_file(tmp_path, monkey
     calls = {"n": 0}
 
     def _failing_write(fd, data):  # type: ignore[no-untyped-def]
-        # Fail the FIRST os.write (the key-persist write inside the
-        # exclusive-create path) with ENOSPC; delegate every other write to the
-        # real syscall so the second init below can persist a real key.
-        calls["n"] += 1
-        if calls["n"] == 1:
+        # Fail every KEY-PERSIST write with ENOSPC, identified by its payload
+        # length -- both the staged publish and the in-place fallback write the
+        # key in one 32-byte call. Narrowing by length rather than by call count
+        # leaves pytest's own writes alone AND makes the fault persistent, which
+        # is what drives the loader through the publish retries into the cleanup
+        # path. Every other write delegates, so the second init below can
+        # persist a real key.
+        if len(data) == ts._MIN_KEY_BYTES:
+            calls["n"] += 1
             raise OSError(errno.ENOSPC, "No space left on device")
         return real_write(fd, data)
 
@@ -1291,7 +1805,7 @@ def test_signing_secret_write_failure_cleans_up_incomplete_file(tmp_path, monkey
     #     left behind to poison future boots.
     assert not key_file.exists(), "incomplete key file was left on disk (poisoned)"
 
-    # Restore a working write and prove the path is no longer poisoned: the
+    # Restore a working write and prove the path is not poisoned: the
     # next init must create a full, durable, owner-only key and return it.
     monkeypatch.setattr(os, "write", real_write)
     secret2 = ts._load_or_create_secret()
@@ -1357,7 +1871,7 @@ def test_signing_secret_incomplete_file_not_deleted_if_replaced(tmp_path, monkey
 
 def test_evict_expired_removes_old_entries() -> None:
     """Verify evict_expired removes expired IP bindings, consumed tokens, and nonces."""
-    from kiro_crew.dashboard.token_auth import _state
+    from kiro_crew.dashboard.token_auth import _state, _token_pin_key
 
     # Generate a token and bind IP / mark consumed
     token = generate_token("evict_user")
@@ -1373,7 +1887,8 @@ def test_evict_expired_removes_old_entries() -> None:
 
     # Verify expired entries were removed
     with _state._lock:
-        assert token not in _state._peer_bindings, "expired IP binding should be evicted"
+        pin_key = _token_pin_key(token)
+        assert pin_key not in _state._peer_bindings, "expired pin should be evicted"
         assert token not in _state._consumed, "expired consumed token should be evicted"
         assert "expired_nonce" not in _state._nonces, "expired nonce should be evicted"
 
@@ -1422,6 +1937,8 @@ async def test_non_api_path_gets_html_403() -> None:
     resp = await mw(req, _ok_handler)
     assert resp.status == 403
     assert resp.content_type == "text/html"
+    assert b"Settings \xe2\x86\x92 Security \xe2\x86\x92 Sign in on mobile" in resp.body
+    assert b"kirocrew token" in resp.body
 
 
 # -- Property 12b: SPA shell is public so the app can cold-start refresh --
@@ -1530,7 +2047,7 @@ def test_no_get_route_outside_shell_exclusions() -> None:
 
     Note: /apps/ routes are validated against _APPS_SPA_EXCLUDED_RE (which
     requires a sub-path after {name}/), NOT against SPA_FALLBACK_EXCLUDED_PREFIXES
-    (which no longer contains "/apps/" since that entry was dead code after
+    (which does not contain "/apps/"; that entry is dead code given
     _is_spa_shell_request gained its own /apps/ early-return branch).
     (Reads source rather than importing server.py to avoid heavy import side effects.)
     """
@@ -1582,6 +2099,49 @@ def test_no_get_route_outside_shell_exclusions() -> None:
         f"shell unauthenticated: {offenders}. Add their namespace to "
         f"SPA_FALLBACK_EXCLUDED_PREFIXES (or _APPS_SPA_EXCLUDED_RE for /apps/ "
         f"sub-paths) in token_auth.py."
+    )
+
+
+def test_apps_routes_get_paths_are_matched_by_the_apps_spa_regex() -> None:
+    """Every ``/apps/`` GET registered in ``apps/routes.py`` must be matched by
+    ``_APPS_SPA_EXCLUDED_RE`` once its placeholders are filled in.
+
+    The sibling guard above only scans ``server.py``, and its ``"{" in p``
+    escape hatch treats any pattern route as a real handler without ever asking
+    the regex. So nothing coupled the regex to the app routes it exists to
+    describe: adding ``/apps/{name}/art/{path:.*}`` to ``apps/routes.py`` while
+    leaving the regex at ``(?:api|ui)`` left the route registered and
+    unreachable — ``_is_spa_shell_request`` classified it as a React Router
+    navigation and the middleware answered the SPA shell, so an ``<img>``
+    pointed at it received HTML with a 200 and rendered nothing. Silent by
+    construction: the route works under a token, the handler is never the thing
+    that fails, and no existing test looks at this pair.
+
+    Instantiating the pattern is the whole point — the regex requires a
+    lowercase app name AND a following slash, so only a concrete path can
+    exercise it.
+    """
+    import re as _re
+
+    import kiro_crew.apps.routes as app_routes
+    import kiro_crew.dashboard.token_auth as ta
+
+    source = open(app_routes.__file__, encoding="utf-8").read()
+    get_paths = [p for p in _re.findall(r'add_get\(\s*["\']([^"\']+)["\']', source)]
+    apps_paths = [p for p in get_paths if p.startswith("/apps/")]
+    assert apps_paths, "expected /apps/ add_get route literals in apps/routes.py"
+
+    def concrete(pattern: str) -> str:
+        """Fill each ``{…}`` placeholder with a value the regex would accept."""
+        out = _re.sub(r"\{name[^}]*\}", "demo-app", pattern)
+        return _re.sub(r"\{[^}]+\}", "assets/icon.webp", out)
+
+    unmatched = [p for p in apps_paths if not ta._APPS_SPA_EXCLUDED_RE.match(concrete(p))]
+    assert not unmatched, (
+        f"/apps/ GET route(s) in apps/routes.py that _APPS_SPA_EXCLUDED_RE does not "
+        f"match: {unmatched}. The middleware will answer these with the SPA shell "
+        f"instead of the handler — add the sub-namespace verb to the regex in "
+        f"token_auth.py."
     )
 
 
@@ -2019,7 +2579,7 @@ def test_revoked_store_locks_the_file_down_to_its_owner(tmp_path, monkeypatch) -
     locked: list[tuple[str, int]] = []
     real_restrict = platform_compat.restrict_to_owner
 
-    def _spy(path) -> None:
+    def _spy(path, **_kw) -> None:
         # Record the size at lockdown time: the nonce list must not be sitting
         # in the file yet (see the ordering assertion below).
         locked.append((str(path), os.path.getsize(str(path))))
@@ -2038,9 +2598,9 @@ def test_revoked_store_locks_the_file_down_to_its_owner(tmp_path, monkeypatch) -
     )
     locked_path, size_at_lockdown = locked[0]
     assert size_at_lockdown == 0, (
-        "the denylist was written before the lockdown applied; on Windows "
-        "restrict_to_owner shells out to icacls, so the nonces would sit under "
-        "the parent-inherited DACL for the length of that call"
+        "the denylist was written before the lockdown applied; on Windows the "
+        "lockdown replaces the DACL rather than setting it at create time, so "
+        "the nonces would sit under the parent-inherited DACL until it landed"
     )
     assert locked_path.startswith(
         str(state_path)
@@ -2102,6 +2662,59 @@ def test_app_owns_path_boundaries() -> None:
     # Unrelated dashboard endpoints are never owned.
     assert not _app_owns_path("foo", "/api/sessions")
     assert not _app_owns_path("foo", "/api/config/kirocrew")
+    # An app named `registry` cannot claim the store's manual refresh, and TWO
+    # independent controls now say so. Route placement: the endpoint lives at
+    # /api/app-store/refresh, a namespace no app name can collide with. The
+    # reserved-segment carve-out below: even under the /api/apps/registry/refresh
+    # spelling (never a registered route — this pins the boundary, not a live
+    # endpoint) the name does not own the path, so relocating a shared route
+    # under /api/apps/ cannot silently hand it to a same-named app.
+    assert not _app_owns_path("registry", "/api/app-store/refresh")
+    assert not _app_owns_path("registry", "/api/apps/registry/refresh")
+
+    # Reserved-segment carve-out: the literal
+    # first-segment routes under /api/apps/ (registry, registries, blob, install,
+    # register) are SHARED routes registered before the /api/apps/{name}
+    # catch-all. An app that names itself after one of them must NOT implicitly
+    # own that route via _app_owns_path — that was the CWE-269 authorization
+    # bypass (POST /api/apps/registries/refresh triggers outbound git fetches of
+    # every configured registry with no permissions.api grant).
+    assert not _app_owns_path("registries", "/api/apps/registries/refresh")
+    assert not _app_owns_path("registries", "/api/apps/registries")
+    assert not _app_owns_path("registry", "/api/apps/registry/install")
+    assert not _app_owns_path("registry", "/api/apps/registry/install-stream")
+    assert not _app_owns_path("install", "/api/apps/install")
+    assert not _app_owns_path("register", "/api/apps/register")
+    assert not _app_owns_path("blob", "/api/apps/blob")
+
+    # A normal app name is UNAFFECTED: only the reserved literal segments are
+    # carved out, and path-boundary protection is unchanged.
+    assert _app_owns_path("foo", "/api/apps/foo/config")
+
+    # The /apps/ reverse-proxy/UI branch is a SEPARATE namespace and is
+    # intentionally left unchanged by the carve-out: its literal-page
+    # reservations live in apps.manifest.RESERVED_ROUTE_APP_NAMES, not here. An
+    # app can never actually be named one of these segments (manifest validation
+    # now rejects them), but were the /apps/ proxy reached it would still resolve
+    # by name — the carve-out deliberately touches only /api/apps/.
+    assert _app_owns_path("registries", "/apps/registries/api/x")
+    assert _app_owns_path("registry", "/apps/registry/ui/index.js")
+
+
+def test_reserved_app_path_segments_stay_in_sync() -> None:
+    """Drift guard: RESERVED_APP_PATH_SEGMENTS is defined
+    INDEPENDENTLY in dashboard.token_auth and apps.manifest (duplicated rather
+    than shared to avoid a manifest <-> token_auth import cycle). Both sets, plus
+    the literal /api/apps/<segment> route table in apps.routes.setup_routes, are
+    hand-maintained sources of truth that must agree; if they silently drift the
+    _app_owns_path carve-out reopens for the un-mirrored segment (the CWE-269
+    authorization bypass this fix closes). This asserts the two module sets are
+    identical so a future edit to one without the other fails loudly here.
+    """
+    from kiro_crew.apps.manifest import RESERVED_APP_PATH_SEGMENTS as manifest_segments
+    from kiro_crew.dashboard.token_auth import RESERVED_APP_PATH_SEGMENTS as token_auth_segments
+
+    assert token_auth_segments == manifest_segments
 
 
 def test_app_token_path_allowed_empty_name_denies() -> None:
@@ -2118,6 +2731,24 @@ async def test_app_token_denied_on_unscoped_endpoint(monkeypatch) -> None:
     mw = token_auth_middleware()
     token = generate_token("file-explorer", ttl_seconds=300, app="file-explorer")
     req = _make_request(path="/api/sessions", query={"token": token})
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 403
+
+
+@pytest.mark.asyncio
+async def test_app_token_named_registries_denied_on_refresh(monkeypatch) -> None:
+    """An app token named 'registries' must NOT reach the shared
+    POST /api/apps/registries/refresh (which triggers outbound git fetches of
+    every configured registry). With _app_api_allowlist forced empty, the only
+    way a grant could happen is the _app_owns_path carve-out failing — so a 403
+    here proves the deny is attributable to the carve-out, not a missing perm.
+    """
+    import kiro_crew.dashboard.token_auth as _ta
+
+    monkeypatch.setattr(_ta, "_app_api_allowlist", lambda name: ())
+    mw = token_auth_middleware()
+    token = generate_token("registries", ttl_seconds=300, app="registries")
+    req = _make_request(path="/api/apps/registries/refresh", query={"token": token})
     resp = await mw(req, _ok_handler)
     assert resp.status == 403
 
@@ -2406,13 +3037,13 @@ async def test_index_serves_guidance_when_bundle_missing(tmp_path, monkeypatch) 
     # Recognizable heading preserved + actionable guidance added.
     assert "<h1>Dashboard HTML not found</h1>" in body
     assert "restarting Kiro Crew" in body
-    assert "kirocrew service restart" in body
+    assert "kirocrew restart" in body
     # Request-independent and secret-free (same contract as the served shell).
     assert resp_anon.text == resp_authed.text
     assert "someminted.token.value" not in body
 
 
-# -- index() SPA shell caching (issue #5087) -----------------------------------
+# -- index() SPA shell caching -----------------------------------
 
 
 @pytest.mark.asyncio
@@ -2421,8 +3052,8 @@ async def test_index_caches_html_and_rerereads_only_on_rebuild(tmp_path, monkeyp
     an UNCHANGED file read disk once; a rebuild (mtime change) is picked up on
     the next request WITHOUT a restart.
 
-    Regression test for #5087 (unnecessary per-request read of a static bundle)
-    AND for the review finding that a process-lifetime cache would pin a
+    Two things are pinned: no unnecessary per-request read of a static bundle,
+    and no process-lifetime cache that would pin a
     pre-rebuild shell after a Vite rebuild rewrote the hashed asset refs.
     """
     import kiro_crew.dashboard.handlers.core as core
@@ -2639,8 +3270,8 @@ def test_warm_auth_singletons_primes_both_off_loop(monkeypatch) -> None:
     the middleware serves requests.
 
     Both lazily do blocking file I/O on first use (read/create
-    token_signing.key + read the nonce denylist; on Windows an icacls
-    subprocess to lock the DACL). They are NO LONGER warmed synchronously in
+    token_signing.key + read the nonce denylist; on Windows also the owner-only
+    DACL). They are not warmed synchronously in
     the token_auth_middleware() factory, because that factory runs on the loop
     via the async start_dashboard()/start_api_server(). The async startup paths
     await this helper instead, so the first auth op hits warm singletons with
@@ -2717,7 +3348,7 @@ def test_start_paths_warm_auth_singletons_off_loop() -> None:
 
 
 def test_ambiguous_app_and_window_names_cannot_collide(tmp_path) -> None:
-    """The pair that used to collide now yields two distinct routes.
+    """A name pair that could collide now yields two distinct routes.
 
     The old scheme served these flat at ``/<app>-<window>.html``, which is
     ambiguous the moment either name contains a hyphen: app ``foo`` + window
@@ -2807,7 +3438,7 @@ def test_app_window_entries_register_route_and_exclusion(tmp_path) -> None:
         ta._APP_WINDOW_EXCLUDED_PATHS = prior
 
 
-# -- Identity-pinned sessions (RFC Phase 3, issue #1762) --
+# -- Identity-pinned sessions (RFC Phase 3) --
 #
 # Middleware-level behaviour of the peer-keyed pin: the tailnet branch is new,
 # the ip: branch must be byte-for-byte the pre-peer behaviour. Whois is mocked
@@ -2871,7 +3502,7 @@ async def test_verified_peer_session_pins_to_identity_key(_tailnet_env) -> None:
     assert resp.status == 200
     cookie = resp.cookies.get("mc_token_5476")
     assert cookie is not None
-    key, _exp, proxied = _ta._state._peer_bindings[cookie.value]
+    key, _exp, proxied = _ta._state._peer_bindings[_ta._token_pin_key(cookie.value)]
     assert key == "ts:node:you@example.com|phone.tail.ts.net"
     assert proxied is False
     from kiro_crew.dashboard.token_auth import proxied_pin_observed
@@ -2978,7 +3609,7 @@ async def test_xff_injection_from_non_loopback_peer_gets_ip_pin(_tailnet_env) ->
     resp = await mw(_peer_request(remote="203.0.113.7", query={"token": token}), _ok_handler)
     assert resp.status == 200
     cookie = resp.cookies.get("mc_token_5476")
-    assert _ta._state._peer_bindings[cookie.value][0] == "ip:203.0.113.7"
+    assert _ta._state._peer_bindings[_ta._token_pin_key(cookie.value)][0] == "ip:203.0.113.7"
     whois.assert_not_called()
 
 
@@ -2994,9 +3625,46 @@ async def test_daemon_failure_degrades_to_token_ip_path(_tailnet_env) -> None:
     resp = await mw(_peer_request(query={"token": token}), _ok_handler)
     assert resp.status == 200
     cookie = resp.cookies.get("mc_token_5476")
-    key, _exp, proxied = _ta._state._peer_bindings[cookie.value]
+    key, _exp, proxied = _ta._state._peer_bindings[_ta._token_pin_key(cookie.value)]
     assert key == "ip:127.0.0.1"
     assert proxied is True  # same-host proxy pin — posture reports SHARED
+
+
+@pytest.mark.asyncio
+async def test_require_peer_link_refuses_daemon_failure_before_cookie_exchange(
+    _tailnet_env,
+) -> None:
+    """A persistent QR link must not become a shared loopback session when
+    whois is unavailable during its first exchange."""
+    _tailnet_env(None)
+    mw = token_auth_middleware(tailnet_trust=_tailnet_trust())
+    token = generate_token("tsuser", ttl_seconds=300, extra={"require_peer": "1"})
+    resp = await mw(_peer_request(query={"token": token}), _ok_handler)
+    assert resp.status == 403
+    assert b"tailnet identity unverified" in resp.body
+    assert resp.cookies.get("mc_token_5476") is None
+
+
+@pytest.mark.asyncio
+async def test_require_peer_link_exchanges_for_verified_allowed_peer(_tailnet_env) -> None:
+    """The fail-closed claim still permits the intended verified peer and the
+    exchanged access cookie keeps the identity-required claim."""
+    from kiro_crew.dashboard import token_auth as _ta
+
+    _tailnet_env(_whois_payload())
+    mw = token_auth_middleware(tailnet_trust=_tailnet_trust())
+    token = generate_token("tsuser", ttl_seconds=300, extra={"require_peer": "1"})
+    resp = await mw(_peer_request(query={"token": token}), _ok_handler)
+    assert resp.status == 200
+    cookie = resp.cookies.get("mc_token_5476")
+    assert cookie is not None
+    assert _ta.requires_verified_peer_unverified(cookie.value) is True
+    expected = "ts:node:you@example.com|phone.tail.ts.net"
+    assert required_peer_key_unverified(cookie.value) == expected
+    assert _ta._state._peer_bindings[_ta._token_pin_key(cookie.value)][0] == expected
+    refresh = resp.cookies.get(refresh_cookie_name("5476"))
+    assert refresh is not None
+    assert refresh_token_peer_key(refresh.value) == expected
 
 
 @pytest.mark.asyncio
@@ -3012,7 +3680,7 @@ async def test_non_tailscale_tunnel_behaviour_is_unchanged(_tailnet_env) -> None
     resp = await mw(_peer_request(query={"token": token}), _ok_handler)
     assert resp.status == 200
     cookie = resp.cookies.get("mc_token_5476")
-    key, _exp, proxied = _ta._state._peer_bindings[cookie.value]
+    key, _exp, proxied = _ta._state._peer_bindings[_ta._token_pin_key(cookie.value)]
     assert key == "ip:127.0.0.1"
     assert proxied is True
     assert proxied_pin_observed() is True
@@ -3136,7 +3804,7 @@ async def test_restart_first_use_repins_verified_peer_cookie(_tailnet_env) -> No
     # No bind_token_peer call: simulates the post-restart unbound state.
     resp = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
     assert resp.status == 200
-    key, _exp, _proxied = _ta._state._peer_bindings[token]
+    key, _exp, _proxied = _ta._state._peer_bindings[_ta._token_pin_key(token)]
     assert key == "ts:node:you@example.com|phone.tail.ts.net"
     # Same cookie replayed from a different node (different tailnet address,
     # so the whois cache cannot serve the first node's answer) is rejected.
@@ -3146,6 +3814,124 @@ async def test_restart_first_use_repins_verified_peer_cookie(_tailnet_env) -> No
     )
     assert resp2.status == 403
     assert b"device identity mismatch" in resp2.body
+
+
+@pytest.mark.asyncio
+async def test_restart_require_peer_cookie_refuses_unverified_first_use(
+    _tailnet_env,
+) -> None:
+    """After restart, an unbound persistent cookie waits for verified whois;
+    it cannot claim the proxy's loopback identity during a daemon outage."""
+    from kiro_crew.dashboard import token_auth as _ta
+
+    _tailnet_env(None)
+    mw = token_auth_middleware(tailnet_trust=_tailnet_trust())
+    token = generate_token("tsuser", ttl_seconds=300, extra={"require_peer": "1"})
+    mark_consumed(token)
+    # No bind_token_peer call: simulates the post-restart in-memory state.
+    resp = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
+    assert resp.status == 403
+    assert b"tailnet identity unverified" in resp.body
+    assert not _ta._state.has_binding(token)
+
+
+@pytest.mark.asyncio
+async def test_restart_signed_require_peer_cookie_rehydrates_only_for_original_device(
+    _tailnet_env,
+) -> None:
+    """The signed original-device claim, not first arrival, rebuilds the hot pin."""
+    from kiro_crew.dashboard import token_auth as _ta
+
+    expected = "ts:node:you@example.com|phone.tail.ts.net"
+    set_whois = _tailnet_env
+    set_whois(_whois_payload())
+    mw = token_auth_middleware(tailnet_trust=_tailnet_trust())
+    token = generate_token(
+        "tsuser",
+        ttl_seconds=300,
+        peer_key=expected,
+        extra={"require_peer": "1"},
+        register_nonce=False,
+    )
+
+    assert not _ta._state.has_binding(token)
+    response = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
+    assert response.status == 200
+    assert _ta._state._peer_bindings[_ta._token_pin_key(token)][0] == expected
+
+    # Simulate another restart, then let a different but still allowlisted node
+    # arrive first.  It cannot claim the empty in-memory map.
+    _ta._state._peer_bindings.pop(_ta._token_pin_key(token), None)
+    set_whois(_whois_payload(node="other-node.tail.ts.net"))
+    replay = await mw(
+        _peer_request(forwarded="100.64.0.6", cookies={"mc_token_5476": token}),
+        _ok_handler,
+    )
+    assert replay.status == 403
+    assert b"device identity mismatch" in replay.body
+    assert not _ta._state.has_binding(token)
+
+
+@pytest.mark.asyncio
+async def test_restart_legacy_claimless_require_peer_cookie_cannot_claim_device(
+    _tailnet_env,
+) -> None:
+    """Pre-fix cookies must re-scan instead of accepting the first allowed node."""
+    from kiro_crew.dashboard import token_auth as _ta
+
+    _tailnet_env(_whois_payload())
+    mw = token_auth_middleware(tailnet_trust=_tailnet_trust())
+    token = generate_token(
+        "tsuser", ttl_seconds=300, extra={"require_peer": "1"}, register_nonce=False
+    )
+    response = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
+    assert response.status == 403
+    assert b"tailnet session device binding missing" in response.body
+    assert not _ta._state.has_binding(token)
+
+
+@pytest.mark.asyncio
+async def test_claimless_require_peer_link_cannot_enroll_on_mixed_internal_path(
+    _tailnet_env,
+) -> None:
+    """Only the main QR exchange path may turn a claimless link into a session."""
+    from kiro_crew.dashboard import token_auth as _ta
+
+    _tailnet_env(_whois_payload())
+    mw = token_auth_middleware(
+        mixed_internal_paths=frozenset({"/api/spawn"}),
+        tailnet_trust=_tailnet_trust(),
+    )
+    token = generate_token("tsuser", ttl_seconds=300, extra={"require_peer": "1"})
+    request = _peer_request(query={"token": token})
+    request.path = "/api/spawn"
+    response = await mw(request, _ok_handler)
+    assert response.status == 403
+    assert b"tailnet session device binding missing" in response.body
+    assert not response.cookies
+    assert not _ta._state.has_binding(token)
+
+
+@pytest.mark.asyncio
+async def test_signed_login_scope_survives_operator_pin_scope_change(_tailnet_env) -> None:
+    """An issued login-scoped session keeps its signed scope after config changes."""
+    from kiro_crew.dashboard import token_auth as _ta
+
+    expected = "ts:login:you@example.com"
+    _tailnet_env(_whois_payload(node="replacement-phone.tail.ts.net"))
+    # Today's config is node-scoped, but the signed credential was issued with
+    # login scope and therefore remains usable after a phone re-enrolment.
+    mw = token_auth_middleware(tailnet_trust=_tailnet_trust(pin_scope="node"))
+    token = generate_token(
+        "tsuser",
+        ttl_seconds=300,
+        peer_key=expected,
+        extra={"require_peer": "1"},
+        register_nonce=False,
+    )
+    response = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
+    assert response.status == 200
+    assert _ta._state._peer_bindings[_ta._token_pin_key(token)][0] == expected
 
 
 @pytest.mark.asyncio
@@ -3166,7 +3952,10 @@ async def test_restart_repin_covers_internal_mixed_paths(_tailnet_env) -> None:
     req.path = "/api/spawn"
     resp = await mw(req, _ok_handler)
     assert resp.status == 200
-    assert _ta._state._peer_bindings[token][0] == "ts:node:you@example.com|phone.tail.ts.net"
+    assert (
+        _ta._state._peer_bindings[_ta._token_pin_key(token)][0]
+        == "ts:node:you@example.com|phone.tail.ts.net"
+    )
     set_whois(_whois_payload(node="other-node.tail.ts.net"))
     req2 = _peer_request(forwarded="100.64.0.6", cookies={"mc_token_5476": token})
     req2.path = "/api/spawn"
@@ -3189,7 +3978,7 @@ async def test_restart_unbound_cookie_without_peer_keeps_todays_semantics(
     mark_consumed(token)
     resp = await mw(_make_request(cookies={"mc_token_5476": token}), _ok_handler)
     assert resp.status == 200
-    assert token not in _ta._state._peer_bindings
+    assert not _ta._state.has_binding(token)
 
 
 def test_app_token_path_allowed_implicit_ws():

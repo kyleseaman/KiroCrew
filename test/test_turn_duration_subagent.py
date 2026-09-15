@@ -67,6 +67,10 @@ def _mock_sessions(stream_factory) -> MagicMock:
     provider.start = AsyncMock()
     provider.shutdown = AsyncMock()
     provider.context_usage_pct = lambda: 0.0
+    # Read synchronously after every turn; as AsyncMock children they
+    # would hand back coroutines nobody awaits.
+    provider.context_window_tokens = lambda: 0
+    provider.context_used_tokens = lambda: 0
     provider.stream = MagicMock(side_effect=stream_factory)
     sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
     sessions.release = MagicMock()
@@ -155,7 +159,7 @@ async def test_subagent_turn_records_local_wall_clock():
     rec = records[0]
     assert rec["surface"] == "subagent"
     # The fallback fired: a real, positive local measurement, not the literal 0
-    # the provider-only read used to write into every row. Bound it as
+    # a provider-only read would write into every row. Bound it as
     # 0 < duration_ms <= observed rather than with a fixed floor. The lower
     # bound (> 0) proves the clock advanced; the upper bound ties it to a real
     # measurement (a bug writing an arbitrary constant would exceed the window

@@ -257,8 +257,8 @@ class BugRunner(Protocol):
     def run_suite(self, *, src: Path) -> tuple[bool, list[str]]:
         """STAYGREEN: run the full suite (or the documented smoke subset — a
         Target-Profile choice, §8) against ``src``. Returns ``(all_green, failing)``
-        where ``failing`` lists any previously-passing test now failing (exact pytest
-        nodeids when available, so the gate can re-check them on base).
+        where ``failing`` lists every failing test (exact pytest nodeids when
+        available, so the gate can re-check them on base).
 
         OPTIONAL companion (NOT part of this structural protocol so a minimal runner
         still satisfies ``isinstance``): ``run_named_tests(*, src, test_ids) -> set[str]``
@@ -642,12 +642,12 @@ class StubPRRecipe:
         parent_ref: str | None = None,
     ) -> str:
         self.queue_dir.mkdir(parents=True, exist_ok=True)
-        (self.queue_dir / f"{fingerprint}.diff").write_text(diff or "")
+        (self.queue_dir / f"{fingerprint}.diff").write_text(diff or "", encoding="utf-8")
         # `.pr.md` to match the real recipe and the display reader (routes/commit read
         # `<fp>.pr.md`); the stub's copy is never displayed, but keeping the name in step
         # avoids teaching a future maintainer the wrong convention.
         (self.queue_dir / f"{fingerprint}.pr.md").write_text(
-            f"# stub CR: {summary}\n\n{description}\n"
+            f"# stub CR: {summary}\n\n{description}\n", encoding="utf-8"
         )
         return f"QUEUED:{fingerprint}"
 
@@ -708,6 +708,13 @@ class StubProfile(ProfileFieldAliases):
         # carries ``src/<pkg>/__init__.py`` (see driver._run_dry); append a
         # deterministic line so a real diff is produced.
         for init in worktree.glob("src/*/__init__.py"):
-            init.write_text(init.read_text() + f"\n# stub edit {candidate.target} ({tier})\n")
+            # UTF-8 both ways: this rewrites a file in the target repo, and the
+            # platform default would decode it as cp1252/cp936 on Windows and then
+            # write the mojibake back into the tree it is measuring.
+            existing = init.read_text(encoding="utf-8")
+            init.write_text(
+                existing + f"\n# stub edit {candidate.target} ({tier})\n",
+                encoding="utf-8",
+            )
             return True
         return False

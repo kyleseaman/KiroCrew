@@ -38,11 +38,12 @@ from kiro_crew.messaging.renderer import (
     apply_options_cap,
     cap_choices,
     render_options_as_text,
+    split_options_trailer,
 )
 from kiro_crew.messaging.transport import TransportCapabilities
 
 #: channel_type -> the test class below that pins its enforcement.
-PINNED_WIDGET_CHANNELS = {"slack", "discord", "telegram", "teams"}
+PINNED_WIDGET_CHANNELS = {"slack", "discord", "telegram", "teams", "webex"}
 
 
 def _wecom_renderer() -> Any:
@@ -59,13 +60,6 @@ def _weixin_renderer() -> Any:
     return WeixinRenderer(
         object(), "peer", WEIXIN_CAPABILITIES, ctx_store=object(), account_id="acct"
     )
-
-
-def _webex_renderer() -> Any:
-    from kiro_crew.webex.renderer import WebexRenderer
-    from kiro_crew.webex.transport import WEBEX_CAPABILITIES
-
-    return WebexRenderer(object(), "room", WEBEX_CAPABILITIES)
 
 
 def _imessage_renderer() -> Any:
@@ -89,7 +83,6 @@ def _feishu_renderer() -> Any:
 ZERO_WIDGET_RENDERERS: dict[str, Callable[[], Any]] = {
     "wecom": _wecom_renderer,
     "weixin": _weixin_renderer,
-    "webex": _webex_renderer,
     "imessage": _imessage_renderer,
     "feishu": _feishu_renderer,
 }
@@ -202,9 +195,9 @@ class TestSharedHelper:
         assert overflow == ["B", "C"]
 
     def test_overflow_neutralizes_mass_mention_syntax(self) -> None:
-        # Regression (review round 2): overflow lands in the message BODY
-        # where platforms parse mentions — unlike widget labels, which render
-        # as plain text. A prompt-injected choice must not mass-notify.
+        # Overflow lands in the message BODY where platforms parse mentions —
+        # unlike widget labels, which render as plain text. A prompt-injected
+        # choice must not mass-notify.
         from kiro_crew.messaging.renderer import format_overflow
 
         out = format_overflow(["ping @everyone now", "or <!channel> maybe"], start=1)
@@ -214,8 +207,8 @@ class TestSharedHelper:
         assert "everyone" in out and "channel" in out
 
     def test_overflow_redacts_credentials_in_their_DISPLAY_form(self) -> None:
-        # Regression (review round 5): overflow lands in the markdown-parsed
-        # BODY, so a key split by a code span or emphasis is broken to every
+        # Overflow lands in the markdown-parsed BODY, so a key split by a code
+        # span or emphasis is broken to every
         # byte-level scan (the driver's stream redactor included) and WHOLE on
         # screen once the platform drops the delimiters. Slack's widget path
         # already routes choices through the display redactor for exactly this
@@ -241,11 +234,10 @@ class TestSharedHelper:
         assert "IOSFODNN7EXAMPLE" not in out
 
     def test_overflow_redacts_a_spoiler_split_key(self) -> None:
-        # Regression (review round 6): ``||…||`` is Discord's spoiler. The
-        # reader clicks it, the delimiters vanish and the halves join — the
-        # same splitter property as ``**``, but it was missing from the
-        # canonicaliser's delimiter run, so round 5's fix had a hole exactly
-        # one delimiter family wide.
+        # ``||…||`` is Discord's spoiler. The reader clicks it, the delimiters
+        # vanish and the halves join — the same splitter property as ``**``, so
+        # it must be in the canonicaliser's delimiter run or the redaction has a
+        # hole exactly one delimiter family wide.
         from kiro_crew.messaging.renderer import format_overflow
 
         out = format_overflow(["Retry with AKIA||IOSFODNN7EXAMPLE||"], start=0)
@@ -297,6 +289,177 @@ class TestSharedHelper:
 
         out = format_overflow(["Rebase onto main", "Skip the `--force` flag"], start=2)
         assert out == "3. Rebase onto main\n4. Skip the `--force` flag"
+
+
+class TestSplitOptionsTrailer:
+    """The ONE parse of the ``[OPTIONS:]`` marker, both halves and both policies.
+
+    Six channels carried this parse before it was hoisted -- three of them
+    (Discord, Telegram, Teams) identical down to the comment. The reason to pin it
+    here rather than per channel is that a duplicated parse drifts silently: each
+    copy reads correctly in isolation, so nothing goes red when one of them stops
+    agreeing with the others.
+    """
+
+    def test_a_complete_trailer_yields_body_and_choices(self) -> None:
+        body, choices = split_options_trailer("Pick one.\n\n[OPTIONS: A | B | C]")
+        assert body == "Pick one."
+        assert choices == ["A", "B", "C"]
+
+    def test_choices_are_stripped_and_blanks_dropped(self) -> None:
+        _, choices = split_options_trailer("q\n\n[OPTIONS:  A  |  | B ]")
+        assert choices == ["A", "B"]
+
+    def test_no_marker_is_an_untouched_passthrough(self) -> None:
+        text = "Just an answer, no trailer."
+        assert split_options_trailer(text) == (text, [])
+
+    def test_a_matched_but_empty_trailer_still_strips_the_marker(self) -> None:
+        """Otherwise reserved protocol ships as visible text.
+
+        Distinct from the no-match case, which must NOT strip -- the two are only
+        distinguishable by comparing the body, which is why the zero-widget path
+        routes through ``apply_options_cap`` unconditionally rather than branching
+        on an empty choice list.
+        """
+        body, choices = split_options_trailer("Body here.\n\n[OPTIONS: ]")
+        assert body == "Body here."
+        assert choices == []
+
+    def test_a_quoted_marker_mid_answer_cannot_swallow_the_body(self) -> None:
+        """The end-of-buffer anchor is what prevents this."""
+        text = "See [OPTIONS: in the docs] for the list, then decide."
+        assert split_options_trailer(text) == (text, [])
+
+    def test_a_partial_marker_is_kept_by_default(self) -> None:
+        """The BUFFERED reading: cutting the assistant's prose is permanent.
+
+        A sealed reply ending ``see the [OPTIONS section`` must keep its last four
+        words, so the default cannot be the destructive one.
+        """
+        text = "Read the docs, see the [OPTIONS section"
+        assert split_options_trailer(text) == (text, [])
+
+    def test_a_partial_marker_is_hidden_when_asked(self) -> None:
+        """The STREAMING reading: the fragment may be a marker mid-flight."""
+        body, choices = split_options_trailer("Working on it. [OPTIONS: A | B", hide_partial=True)
+        assert body == "Working on it."
+        assert choices == []
+
+    def test_hide_partial_does_not_touch_a_closed_bracket_elsewhere(self) -> None:
+        """Only an UNCLOSED fragment is a fragment.
+
+        ``[OPTIONS: …]`` that failed the end anchor is prose, not a live marker, so
+        the streaming reading must not cut it either.
+        """
+        text = "See [OPTIONS: in the docs] for the list."
+        assert split_options_trailer(text, hide_partial=True) == (text, [])
+
+    def test_hide_partial_keeps_grammar_dead_prose(self) -> None:
+        """A quoted ``[OPTIONS`` that can never become the marker is prose.
+
+        The trailer grammar opens ``[OPTIONS:`` -- once any other byte follows
+        the substring, no later bytes can complete it, so holding it back
+        protects nothing. And the streaming consolation (the next frame
+        re-renders) fails exactly here: when no ``]`` ever arrives, every
+        frame including the sealed one re-trims, so the cut is permanent on
+        the channel. Same reply as the buffered-default pin above; the policy
+        split is about live fragments, not about deleting quoted prose.
+        """
+        text = "Read the docs, see the [OPTIONS section"
+        assert split_options_trailer(text, hide_partial=True) == (text, [])
+
+    def test_hide_partial_keeps_everything_after_a_dead_fragment(self) -> None:
+        """The loss is unbounded: everything from the quote to buffer end went.
+
+        The trim point is wherever the substring sits, so one quoted token
+        positioned early deletes every later paragraph -- located by substring
+        without asking whether it READS as the marker.
+        """
+        text = (
+            "The [OPTIONS grammar is end-anchored.\n\n"
+            "A whole later paragraph of real prose that the reader needs."
+        )
+        assert split_options_trailer(text, hide_partial=True) == (text, [])
+
+    def test_a_bare_opener_at_buffer_end_is_still_hidden(self) -> None:
+        """Boundary control: ``[OPTIONS`` as the final bytes may still become
+        the marker (the ``:`` can be the next byte to arrive), so the
+        streaming surface keeps hiding it."""
+        body, choices = split_options_trailer("Working on it. [OPTIONS", hide_partial=True)
+        assert body == "Working on it."
+        assert choices == []
+
+    def test_the_default_is_the_non_destructive_one(self) -> None:
+        """Pins the DIRECTION of the default, not just its value.
+
+        A caller that forgets to state a policy must degrade toward a cosmetic
+        failure (reserved markup visible for one frame), never toward deleting
+        text nobody can recover.
+        """
+        import inspect
+
+        param = inspect.signature(split_options_trailer).parameters["hide_partial"]
+        assert param.default is False
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+
+
+class TestOnlyOneTrailerParseExists:
+    """Ratchet: no channel may re-derive the trailer parse.
+
+    Greps the tree rather than trusting review. The two allowed sites are the
+    shared helper itself and ``constants.split_trailing_protocol_suffix``, which
+    answers a different question (where does the protocol suffix begin, for a
+    length splitter). ``slack/format.py`` is deliberately NOT in scope: it parses
+    the LINE grammar (``OPTIONS_RE_LINE``, end-of-line, MULTILINE), not the
+    end-of-buffer TRAILER, so converging it would silently stop matching a marker
+    mid-message.
+    """
+
+    _ALLOWED_PARTIAL = {"messaging/renderer.py", "constants.py"}
+
+    def _hits(self, needle: str) -> set[str]:
+        from pathlib import Path
+
+        import kiro_crew as pkg
+
+        root = Path(pkg.__file__).parent
+        found = set()
+        for path in root.rglob("*.py"):
+            if "_vendor" in path.parts or "static" in path.parts:
+                continue
+            if needle in path.read_text(encoding="utf-8"):
+                # ``as_posix``, not ``str``: on Windows the latter yields
+                # ``messaging\renderer.py``, which matches no entry in the
+                # forward-slash allow-lists below -- so the exemptions silently
+                # stop applying and the ratchet reports its own allowed sites as
+                # offenders. A path used as a KEY has to have one spelling.
+                found.add(path.relative_to(root).as_posix())
+        return found
+
+    def test_no_channel_hand_rolls_the_partial_marker_scan(self) -> None:
+        offenders = self._hits('rfind("[OPTIONS")') - self._ALLOWED_PARTIAL
+        assert not offenders, (
+            "these re-derive the unfinished-marker scan instead of passing "
+            f"hide_partial= to messaging.renderer.split_options_trailer: {sorted(offenders)}"
+        )
+
+    def test_only_the_shared_helper_and_slack_split_the_choice_group(self) -> None:
+        # Slack and the dashboard keep their own because their GRAMMAR differs
+        # (OPTIONS_RE_LINE, end-of-line). The dashboard's ``_parse_options``
+        # always re-derived this split; the named-``labels`` spelling merely
+        # makes it visible to this needle.
+        allowed = {"messaging/renderer.py", "slack/format.py", "dashboard/state.py"}
+        offenders = self._hits('group("labels").split("|")') - allowed
+        assert not offenders, (
+            "these re-derive the choice split instead of calling "
+            f"messaging.renderer.split_options_trailer: {sorted(offenders)}"
+        )
+
+    def test_the_ratchet_is_not_vacuous(self) -> None:
+        """A grep that matches nothing would make both checks pass forever."""
+        assert "messaging/renderer.py" in self._hits('rfind("[OPTIONS")')
+        assert "messaging/renderer.py" in self._hits('group("labels").split("|")')
 
 
 class TestRenderOptionsAsText:
@@ -501,9 +664,9 @@ class TestSlackEnforcement:
         assert [b["type"] for b in blocks] == ["actions"]
 
     def test_huge_overflow_is_chunked_not_sliced(self) -> None:
-        # Regression (review round 1): a single [:2900] slice re-created the
-        # silent data loss the cap exists to remove. Every overflow choice
-        # must reach the wire, across as many context blocks as needed.
+        # A single [:2900] slice re-creates the silent data loss the cap exists
+        # to remove. Every overflow choice must reach the wire, across as many
+        # context blocks as needed.
         from kiro_crew.slack.format import build_options_blocks
         from kiro_crew.slack.transport import SLACK_CAPABILITIES
 
@@ -516,10 +679,9 @@ class TestSlackEnforcement:
         assert f"{n + 40}." in joined, "the LAST overflow choice must survive"
 
     def test_pathological_overflow_is_bounded_with_visible_truncation(self) -> None:
-        # Regression (review round 3): unbounded context blocks blow Slack's
-        # 50-block message limit — the API rejects the WHOLE message and every
-        # choice disappears. The block budget is capped and the tail drop is
-        # VISIBLE (counted marker), never silent.
+        # Unbounded context blocks blow Slack's 50-block message limit — the API
+        # rejects the WHOLE message and every choice disappears. The block budget
+        # is capped and the tail drop is VISIBLE (counted marker), never silent.
         from kiro_crew.slack.format import build_options_blocks
         from kiro_crew.slack.transport import SLACK_CAPABILITIES
 
@@ -535,8 +697,8 @@ class TestSlackEnforcement:
         assert any(ch.isdigit() for ch in marker)
 
     def test_single_oversized_choice_truncates_with_visible_marker(self) -> None:
-        # Regression (review round 4): one absurd >2900-char choice was
-        # sliced with no signal. The cut must be visible.
+        # One absurd >2900-char choice must not be sliced with no signal: the
+        # cut has to be visible.
         from kiro_crew.slack.format import build_options_blocks
         from kiro_crew.slack.transport import SLACK_CAPABILITIES
 
@@ -551,9 +713,9 @@ class TestSlackEnforcement:
 
 class TestTelegramEnforcement:
     def test_steer_seal_near_limit_with_overflow_stays_under_transport_cap(self) -> None:
-        # Regression (review round 1): on_steer_consumed ran _rotate_on_length
-        # BEFORE apply_options_cap expanded the body with numbered overflow, so
-        # a near-limit pre-steer answer sealed past the transport cap.
+        # on_steer_consumed must not run _rotate_on_length BEFORE
+        # apply_options_cap expands the body with numbered overflow: in that
+        # order a near-limit pre-steer answer seals past the transport cap.
         from test_telegram import FakeClient
 
         from kiro_crew.messaging.renderer import STEER_CONSUMED, TEXT_CHUNK, OutputEvent
@@ -828,3 +990,98 @@ class TestKeptChoicesAreDisplayRedacted:
         assert kept == [], "a zero-widget channel keeps no choice for a widget"
         assert "1. " in body, "the choice must still reach the user as text"
         assert key not in body and "REDACTED" in body
+
+
+class TestWebexEnforcement:
+    def test_card_actions_cap_at_declared_and_overflow_is_visible(self) -> None:
+        """Drive the REAL render path, not the helper.
+
+        The ratchet exists because a renderer can call the shared cap and then
+        build its widget from the uncapped list, so the only assertion worth
+        making is against what the client was actually asked to send.
+        """
+        from test_webex_renderer import FakeClient
+
+        from kiro_crew.messaging.renderer import DONE, TEXT_CHUNK, OutputEvent
+        from kiro_crew.webex.renderer import WebexRenderer
+        from kiro_crew.webex.transport import WEBEX_CAPABILITIES
+
+        n = WEBEX_CAPABILITIES.max_buttons
+        trailer = " | ".join(f"Choice {i}" for i in range(1, n + 4))
+        cli = FakeClient()
+        # A card is rendered only when its press can be resolved, so the real path
+        # needs the dispatcher's choice store -- the card is the last thing a turn
+        # sends, and a renderer-owned map is gone before any press arrives.
+        r = WebexRenderer(
+            cli,
+            "ROOM",
+            WEBEX_CAPABILITIES,  # type: ignore[arg-type]
+            publish_choices=lambda _nonce, _choices: None,
+        )
+
+        async def _go() -> None:
+            await r.on_turn_start()
+            await r.dispatch(OutputEvent(kind=TEXT_CHUNK, text=f"Pick.\n\n[OPTIONS: {trailer}]"))
+            await r.dispatch(OutputEvent(kind=DONE, stop_reason=""))
+
+        asyncio.run(_go())
+
+        card = next(kw for (_, _, kw) in cli.sent_full if kw.get("attachments"))
+        actions = card["attachments"][0]["content"]["actions"]
+        labels = [a["title"] for a in actions]
+        assert len(labels) == n, "webex card actions were uncapped"
+        assert labels == [f"Choice {i}" for i in range(1, n + 1)]
+        # Overflow is numbered CONTINUING the widget slots, never dropped.
+        final = cli.edits[-1][2]
+        assert f"{n + 1}. Choice {n + 1}" in final
+        assert f"{n + 3}. Choice {n + 3}" in final
+
+    def test_an_email_choice_is_not_defanged_but_a_credential_still_goes(self) -> None:
+        """Both halves of what ``mention_grammars=False`` claims, on the real path.
+
+        Webex parses no broadcast grammar and its allow-list IS email addresses, so
+        a ZWSP after every ``@`` makes an offered address uncopyable — the exact cost
+        the capability was added to avoid. Redaction is NOT capability-gated, so the
+        credential half must survive the same call: this pins that the declaration
+        relaxes the defang alone, on the widget label and the numbered overflow
+        together, since a fix applied to only one is how the two drifted before.
+        """
+        from test_webex_renderer import FakeClient
+
+        from kiro_crew.messaging.renderer import DONE, TEXT_CHUNK, OutputEvent
+        from kiro_crew.webex.renderer import WebexRenderer
+        from kiro_crew.webex.transport import WEBEX_CAPABILITIES
+
+        n = WEBEX_CAPABILITIES.max_buttons
+        # One address on a kept (widget) choice and one past the cap, so the
+        # assertion covers the numbered-overflow sink too.
+        choices = [
+            "ask kyle@example.com",
+            *[f"Choice {i}" for i in range(n)],
+            "AKIAIOSFODNN7EXAMPLE",
+        ]
+        cli = FakeClient()
+        r = WebexRenderer(
+            cli,
+            "ROOM",
+            WEBEX_CAPABILITIES,  # type: ignore[arg-type]
+            publish_choices=lambda _nonce, _choices: None,
+        )
+
+        async def _go() -> None:
+            await r.on_turn_start()
+            await r.dispatch(
+                OutputEvent(kind=TEXT_CHUNK, text=f"Pick.\n\n[OPTIONS: {' | '.join(choices)}]")
+            )
+            await r.dispatch(OutputEvent(kind=DONE, stop_reason=""))
+
+        asyncio.run(_go())
+
+        card = next(kw for (_, _, kw) in cli.sent_full if kw.get("attachments"))
+        labels = [a["title"] for a in card["attachments"][0]["content"]["actions"]]
+        final = cli.edits[-1][2]
+        assert "ask kyle@example.com" in labels, f"the address was defanged: {labels}"
+        assert "​" not in "".join(labels)
+        assert "​" not in final
+        # The credential rides the OVERFLOW half, past the widget cap.
+        assert "AKIAIOSFODNN7EXAMPLE" not in final

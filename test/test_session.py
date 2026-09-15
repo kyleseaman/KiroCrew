@@ -4,19 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew.acp.types import AcpPromptStats
+from conftest import requires_symlinks
+from kiro_crew.acp.runtime import AcpWorkspaceBindingError
+from kiro_crew.acp.types import ACP_BACKEND_KAS, ACP_BACKEND_KIRO, AcpPromptStats
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.messaging.link import ChannelLink
 from kiro_crew.session import (
     _BG_BLIND_RECYCLE_PROMPTS,
     BACKGROUND_KEY,
+    SessionClosingError,
     SessionManager,
 )
 
@@ -26,6 +31,12 @@ def cfg():
     c = KiroCrewConfig()
     c.session.timeout_secs = 2  # short for testing
     return c
+
+
+async def _empty_provider_stream(_command: str):
+    """An empty async iterator for provider methods consumed by ``async for``."""
+    if False:  # pragma: no cover - establishes the async-generator protocol
+        yield None
 
 
 def _mock_provider_factory():
@@ -40,10 +51,26 @@ def _mock_provider_factory():
         # "alive" only by truthiness while leaking an un-awaited coroutine.
         m.is_process_alive = lambda: True
         m.context_usage_pct = lambda: 0.0
+        m.context_window_tokens = lambda: 0
         m.has_active_turn = lambda: False
+        m.runtime_info = lambda: (None, None)
+        m.stream_command = MagicMock(side_effect=_empty_provider_stream)
         return m
 
     return factory
+
+
+def _raw_sid(mgr, key: str):
+    """The stored sid, read straight off the map entry.
+
+    ``SessionMap.get`` additionally requires the transcript ``<sid>.json`` to
+    exist on disk, so it answers None for any synthetic sid — which would make a
+    "was it cleared?" assertion pass whether or not the clear ran. These tests
+    care about the stored pointer, so they read it.
+    """
+    from kiro_crew.session_map import canonical_key
+
+    return (mgr._session_map._data.get(canonical_key(key)) or {}).get("sid")
 
 
 def _alive_provider_factory():
@@ -58,7 +85,10 @@ def _alive_provider_factory():
         m.is_process_alive = lambda: True
         m.is_alive = lambda: True
         m.context_usage_pct = lambda: 0.0
+        m.context_window_tokens = lambda: 0
         m.has_active_turn = lambda: False
+        m.runtime_info = lambda: (None, None)
+        m.stream_command = MagicMock(side_effect=_empty_provider_stream)
         return m
 
     return factory
@@ -565,9 +595,14 @@ class TestWarmPool:
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
         await mgr.start_pool()
         await mgr.get_or_create("chat-1")
+        mgr._session_map.set("dashboard:pending-close", "sid-pending-close")
+        flush_task = mgr._session_map._flush_task
+        assert flush_task is not None
 
         await mgr.close_all()
         assert mgr.count == 0
+        assert flush_task.done()
+        assert mgr._session_map._flush_task is None
 
     @pytest.mark.asyncio
     async def test_start_pool_idempotent(self, cfg):
@@ -965,24 +1000,24 @@ class TestCancelRaceCondition:
         mgr = SessionManager(cfg, provider_factory=factory)
         original_lock = mgr._lock
 
-        class CancelOnSecondLock:
-            """First acquire (fast path) passes through; second (registration) cancels."""
+        class CancelOnThirdLock:
+            """Reservation and fast-path locks pass; registration cancels."""
 
             def __init__(self):
                 self._calls = 0
 
             async def __aenter__(self):
                 self._calls += 1
-                if self._calls >= 2:
+                if self._calls == 3:
                     raise asyncio.CancelledError
                 return await original_lock.__aenter__()
 
             async def __aexit__(self, *a):
-                if self._calls < 2:
+                if self._calls != 3:
                     return await original_lock.__aexit__(*a)
 
         with patch.object(SessionManager, "_dispatch_hard_kill") as mock_kill:
-            mgr._lock = CancelOnSecondLock()
+            mgr._lock = CancelOnThirdLock()
             with pytest.raises(asyncio.CancelledError):
                 await mgr.get_or_create("test-cancel-2")
 
@@ -1211,7 +1246,7 @@ class TestOrphanedDashboardSessions:
 
     @pytest.mark.asyncio
     async def test_expire_idle_reaps_orphaned_dashboard_session(self, cfg):
-        """Dashboard session whose slot no longer exists is reaped immediately."""
+        """Dashboard session whose slot does not exist is reaped immediately."""
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
         await mgr.get_or_create("dashboard:tab1")
         mgr.release("dashboard:tab1")
@@ -2171,8 +2206,10 @@ class TestResetWithPid:
         mock_client._child_pids = {}
         provider._client = mock_client
 
+        # Await points allow unrelated liveness probes in this process. Keep
+        # every mocked probe successful instead of consuming a finite list.
         with (
-            patch("os.kill", side_effect=[None, None]),
+            patch("os.kill", return_value=None),
             patch("os.killpg") as mock_killpg,
             patch("os.getpgid", return_value=12345),
             patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
@@ -2246,6 +2283,7 @@ class TestReloadProviderFactory:
         mgr.release("k1")
         # Put something in warm pool
         mock_pool_p = AsyncMock()
+        mock_pool_p.is_process_alive = lambda: False
         mgr._warm_pool.put_nowait((mock_pool_p, "agent"))
 
         with (
@@ -2318,15 +2356,61 @@ class TestCheckContextUsage:
         await mgr.close_all()
 
     @pytest.mark.asyncio
-    async def test_warning_at_70_pct(self, cfg, caplog):
+    async def test_warning_fires_one_margin_below_the_threshold(self, cfg, caplog):
+        """The warn arm opens exactly at ``threshold - CONTEXT_WARN_MARGIN_PCT``.
+
+        Derived from the constant rather than restating a percentage: the warn
+        level is relative to whatever the operator configured, so a literal here
+        would pin the test to one threshold and go stale the next time either
+        number moves.
+        """
+        from kiro_crew.config.loader import CONTEXT_WARN_MARGIN_PCT
+
         cfg.session.autocompact_pct = 90.0
+        warn_at = 90.0 - CONTEXT_WARN_MARGIN_PCT
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
         provider, _, _ = await mgr.get_or_create("k1")
         mgr.release("k1")
-        provider.context_usage_pct = lambda: 75.0
-        with caplog.at_level(logging.WARNING, logger="kiro_crew.session"):
+        provider.context_usage_pct = lambda: warn_at
+        with (
+            patch("kiro_crew.session.published_autocompact_pct", return_value=90.0),
+            caplog.at_level(logging.WARNING, logger="kiro_crew.session"),
+        ):
             mgr.check_context_usage("k1", provider)
-        assert any("75%" in r.message for r in caplog.records)
+        assert any(
+            f"{warn_at:.0f}%" in r.message for r in caplog.records if r.name == "kiro_crew.session"
+        )
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_no_warning_just_below_the_margin(self, cfg, caplog):
+        """One point under the warn level takes the info arm, not the warn arm.
+
+        Pins the boundary from the other side: without this, a margin widened
+        to cover the whole window would still satisfy the test above.
+        """
+        from kiro_crew.config.loader import CONTEXT_WARN_MARGIN_PCT
+
+        cfg.session.autocompact_pct = 90.0
+        below = 90.0 - CONTEXT_WARN_MARGIN_PCT - 1.0
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        provider.context_usage_pct = lambda: below
+        with (
+            patch("kiro_crew.session.published_autocompact_pct", return_value=90.0),
+            caplog.at_level(logging.WARNING, logger="kiro_crew.session"),
+        ):
+            mgr.check_context_usage("k1", provider)
+        # Scoped to this logger: caplog captures the whole root hierarchy, so an
+        # unrelated library record (asyncio's "Task was destroyed but it is
+        # pending!" fires here on Windows) would otherwise read as a context
+        # warning and fail a test that is only about this arm.
+        assert not [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == "kiro_crew.session"
+        ]
         await mgr.close_all()
 
     @pytest.mark.asyncio
@@ -2358,7 +2442,7 @@ class TestCheckContextUsage:
 
     @pytest.mark.asyncio
     async def test_no_compaction_when_pct_unconfirmed(self, cfg):
-        """#2932 defensive gate: a pct above threshold that no telemetry has
+        """Defensive gate: a pct above threshold that no telemetry has
         confirmed for the CURRENT session binding must NOT trigger compaction
         (compacting an empty just-claimed session, then overflowing)."""
         cfg.session.autocompact_pct = 90.0
@@ -2416,6 +2500,317 @@ class TestDestroy:
         assert not mgr.has_session("k1")
 
     @pytest.mark.asyncio
+    async def test_conditional_destroy_refusal_leaves_session_and_map(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        generation = mgr.session_generation("k1")
+        with patch.object(mgr._session_map, "delete") as mock_delete:
+            destroyed = await mgr.destroy_if("k1", generation, lambda: False)
+
+        assert destroyed is False
+        provider.shutdown.assert_not_awaited()
+        mock_delete.assert_not_called()
+        assert mgr.has_session("k1")
+
+    @pytest.mark.asyncio
+    async def test_conditional_destroy_guard_runs_after_lock_acquisition(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        generation = mgr.session_generation("k1")
+        allowed = True
+        await mgr._lock.acquire()
+        try:
+            destroy_task = asyncio.create_task(mgr.destroy_if("k1", generation, lambda: allowed))
+            await asyncio.sleep(0)
+            allowed = False
+        finally:
+            mgr._lock.release()
+
+        destroyed = await asyncio.wait_for(destroy_task, timeout=1.0)
+
+        assert destroyed is False
+        provider.shutdown.assert_not_awaited()
+        assert mgr.has_session("k1")
+        await mgr.destroy("k1")
+
+    @pytest.mark.asyncio
+    async def test_conditional_destroy_refuses_a_successor_generation(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        original, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        original_generation = mgr.session_generation("k1")
+        await mgr.destroy("k1")
+        successor, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+
+        with patch.object(mgr._session_map, "delete") as mock_delete:
+            destroyed = await mgr.destroy_if("k1", original_generation, lambda: True)
+
+        assert destroyed is False
+        original.shutdown.assert_awaited_once()
+        successor.shutdown.assert_not_awaited()
+        mock_delete.assert_not_called()
+        assert mgr.has_session("k1")
+        await mgr.destroy("k1")
+
+    @pytest.mark.asyncio
+    async def test_conditional_destroy_expected_absence_refuses_new_alias(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        thread_ts = "1785370133.085469"
+        canonical = f"slack:{thread_ts}"
+        generation = mgr.session_generation(canonical)
+        assert generation == 0
+        successor, _, _ = await mgr.get_or_create(thread_ts)
+        mgr.release(thread_ts)
+
+        with patch.object(mgr._session_map, "delete") as mock_delete:
+            destroyed = await mgr.destroy_if(canonical, generation, lambda: True)
+
+        assert destroyed is False
+        successor.shutdown.assert_not_awaited()
+        mock_delete.assert_not_called()
+        assert mgr.has_session(thread_ts)
+        await mgr.destroy(thread_ts)
+
+    @pytest.mark.asyncio
+    async def test_conditional_destroy_refuses_absent_successor_absent_aba(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        thread_ts = "1785370133.085469"
+        canonical = f"slack:{thread_ts}"
+        stale_absence = mgr.session_generation(canonical)
+
+        await mgr.get_or_create(thread_ts)
+        mgr.release(thread_ts)
+        await mgr.remove(thread_ts)
+        assert not mgr.has_session(thread_ts)
+        assert mgr.session_generation(canonical) > stale_absence
+
+        with patch.object(mgr._session_map, "delete") as mock_delete:
+            destroyed = await mgr.destroy_if(canonical, stale_absence, lambda: True)
+
+        assert destroyed is False
+        mock_delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reload_provider_factory_advances_removed_generation(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        stale_generation = mgr.session_generation("k1")
+
+        with patch.object(mgr._session_map, "delete") as mock_delete:
+            await mgr.reload_provider_factory()
+            destroyed = await mgr.destroy_if("k1", stale_generation, lambda: True)
+
+        assert mgr.session_generation("k1") > stale_generation
+        assert destroyed is False
+        provider.shutdown.assert_awaited_once()
+        mock_delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_close_all_advances_removed_generation(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        stale_generation = mgr.session_generation("k1")
+
+        with patch.object(mgr._session_map, "delete") as mock_delete:
+            await mgr.close_all()
+            destroyed = await mgr.destroy_if("k1", stale_generation, lambda: True)
+
+        assert mgr.session_generation("k1") > stale_generation
+        assert destroyed is False
+        mock_delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_conditional_destroy_can_preserve_autocompact_override(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        mgr.set_autocompact_pct("k1", 55.0)
+        generation = mgr.session_generation("k1")
+
+        destroyed = await mgr.destroy_if(
+            "k1",
+            generation,
+            lambda: True,
+            preserve_autocompact_override=True,
+        )
+
+        assert destroyed is True
+        folded = mgr._fold_key("k1")
+        assert mgr._compaction.state.pct_overrides[folded] == 55.0
+
+        # The public unconditional path retains its historical clear behavior.
+        await mgr.destroy("k1")
+        assert folded not in mgr._compaction.state.pct_overrides
+
+    @pytest.mark.asyncio
+    async def test_conditional_destroy_refuses_an_inflight_alias_allocation(self, cfg):
+        start_entered = asyncio.Event()
+        release_start = asyncio.Event()
+        provider = _mock_provider_factory()(session_key="reserved")
+
+        async def blocked_start():
+            start_entered.set()
+            await release_start.wait()
+
+        provider.start = AsyncMock(side_effect=blocked_start)
+        mgr = SessionManager(cfg, provider_factory=lambda *_args, **_kwargs: provider)
+        thread_ts = "1785370133.085469"
+        canonical = f"slack:{thread_ts}"
+        expected_absence = mgr.session_generation(canonical)
+        assert expected_absence == 0
+
+        allocation = asyncio.create_task(mgr.get_or_create(thread_ts))
+        await asyncio.wait_for(start_entered.wait(), timeout=1.0)
+
+        assert mgr.session_generation(canonical) > expected_absence
+        assert thread_ts in mgr.session_keys()
+        with patch.object(mgr._session_map, "delete") as mock_delete:
+            destroyed = await mgr.destroy_if(canonical, expected_absence, lambda: True)
+
+        assert destroyed is False
+        mock_delete.assert_not_called()
+        release_start.set()
+        allocated_provider, _, _ = await asyncio.wait_for(allocation, timeout=1.0)
+        assert allocated_provider is provider
+        mgr.release(thread_ts)
+        await mgr.destroy(thread_ts)
+
+    @pytest.mark.asyncio
+    async def test_failed_allocation_releases_ownership_reservation(self, cfg):
+        provider = _mock_provider_factory()(session_key="reserved")
+        provider.start = AsyncMock(side_effect=RuntimeError("start failed"))
+        mgr = SessionManager(cfg, provider_factory=lambda *_args, **_kwargs: provider)
+        before = mgr.session_generation("failed-key")
+
+        with pytest.raises(RuntimeError, match="start failed"):
+            await mgr.get_or_create("failed-key")
+
+        assert mgr.session_generation("failed-key") > before
+        assert "failed-key" not in mgr.session_keys()
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_allocation_releases_ownership_reservation(self, cfg):
+        start_entered = asyncio.Event()
+        provider = _mock_provider_factory()(session_key="reserved")
+
+        async def blocked_start():
+            start_entered.set()
+            await asyncio.Event().wait()
+
+        provider.start = AsyncMock(side_effect=blocked_start)
+        mgr = SessionManager(cfg, provider_factory=lambda *_args, **_kwargs: provider)
+        before = mgr.session_generation("cancelled-key")
+        allocation = asyncio.create_task(mgr.get_or_create("cancelled-key"))
+        await asyncio.wait_for(start_entered.wait(), timeout=1.0)
+        assert "cancelled-key" in mgr.session_keys()
+
+        allocation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await allocation
+
+        assert mgr.session_generation("cancelled-key") > before
+        assert "cancelled-key" not in mgr.session_keys()
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_successful_reservation_finalizer_has_no_cancellable_await(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        session = mgr._sessions["k1"]
+        impl_entered = asyncio.Event()
+        release_impl = asyncio.Event()
+
+        async def completed_impl(*_args, **_kwargs):
+            await session.semaphore.acquire()
+            impl_entered.set()
+            await release_impl.wait()
+            return provider, False, False
+
+        with patch.object(mgr._allocation_boundary(), "_get_or_create_impl", completed_impl):
+            claim = asyncio.create_task(mgr.get_or_create("k1"))
+            await asyncio.wait_for(impl_entered.wait(), timeout=1.0)
+            release_impl.set()
+            await asyncio.sleep(0)
+
+            assert claim.done()
+            assert claim.cancel() is False
+            claimed_provider, _, _ = claim.result()
+
+        assert claimed_provider is provider
+        assert session.semaphore.locked()
+        assert mgr._allocation_boundary()._allocation_reservations == {}
+        mgr.release("k1")
+        await mgr.destroy("k1")
+
+    @pytest.mark.asyncio
+    async def test_conditional_destroy_refuses_a_busy_current_generation(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        generation = mgr.session_generation("k1")
+
+        with patch.object(mgr._session_map, "delete") as mock_delete:
+            destroyed = await mgr.destroy_if("k1", generation, lambda: True)
+
+        assert destroyed is False
+        provider.shutdown.assert_not_awaited()
+        mock_delete.assert_not_called()
+        assert mgr.has_session("k1")
+        mgr.release("k1")
+        await mgr.destroy("k1")
+
+    @pytest.mark.asyncio
+    async def test_destroy_deletes_map_before_provider_shutdown(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        map_deleted = False
+
+        def delete(*_args, **_kwargs):
+            nonlocal map_deleted
+            map_deleted = True
+
+        async def shutdown():
+            assert map_deleted is True
+
+        provider.shutdown = AsyncMock(side_effect=shutdown)
+        with patch.object(mgr._session_map, "delete", side_effect=delete):
+            await mgr.destroy("k1")
+
+        provider.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_destroy_deletes_map_before_end_metric_can_yield(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        metric_entered = asyncio.Event()
+        release_metric = asyncio.Event()
+
+        async def delayed_metric(*_args, **_kwargs):
+            metric_entered.set()
+            await release_metric.wait()
+
+        with (
+            patch(
+                "kiro_crew.session_lifecycle.record_session_ended",
+                new=AsyncMock(side_effect=delayed_metric),
+            ),
+            patch.object(mgr._session_map, "delete") as mock_delete,
+        ):
+            destroy = asyncio.create_task(mgr.destroy("k1"))
+            await asyncio.wait_for(metric_entered.wait(), timeout=1.0)
+            mock_delete.assert_called_once_with("k1", reason="session_destroyed")
+            release_metric.set()
+            await asyncio.wait_for(destroy, timeout=1.0)
+
+    @pytest.mark.asyncio
     async def test_destroy_unlinks_temp_files_from_the_session_queue(self, cfg, tmp_path):
         img = tmp_path / "img.png"
         img.write_bytes(b"fake")
@@ -2435,6 +2830,16 @@ class TestDestroy:
         mock_delete.assert_called_once_with("nonexistent", reason="session_destroyed")
 
     @pytest.mark.asyncio
+    async def test_unconditional_destroy_is_not_refused_by_a_reservation(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        mgr._allocation_boundary()._allocation_reservations["k1"] = {object()}
+
+        with patch.object(mgr._session_map, "delete") as mock_delete:
+            await mgr.destroy("k1")
+
+        mock_delete.assert_called_once_with("k1", reason="session_destroyed")
+
+    @pytest.mark.asyncio
     async def test_destroy_shutdown_exception_still_deletes_map(self, cfg):
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
         provider, _, _ = await mgr.get_or_create("k1")
@@ -2445,6 +2850,71 @@ class TestDestroy:
                 await mgr.destroy("k1")
         # finally block still runs
         mock_delete.assert_called_once_with("k1", reason="session_destroyed")
+
+
+class TestReplaySuppression:
+    """``replay=False`` is what makes discarding a conversation actually stick.
+
+    Clearing the sid stops the provider resuming its own conversation — and "the
+    provider has no history" is exactly the condition that makes the next cold
+    start rebuild one from ``conversation_log``. So the two mechanisms work
+    against each other, and the caller who wanted a fresh conversation is handed
+    a reconstruction of the old one. Measured on one app-owned session, that
+    replay was 80,359 characters, 76% of the first turn's injected context.
+    """
+
+    @pytest.mark.asyncio
+    async def test_default_does_not_suppress(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        await mgr.discard_conversation("k1")
+        assert (
+            mgr.consume_replay_suppression("k1") is False
+        ), "the default must leave every existing caller's behaviour alone"
+
+    @pytest.mark.asyncio
+    async def test_replay_false_suppresses_exactly_once(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        await mgr.discard_conversation("k1", replay=False)
+
+        assert mgr.consume_replay_suppression("k1") is True
+        assert mgr.consume_replay_suppression("k1") is False, (
+            "one-shot: a later cold start (idle expiry, gateway restart) must "
+            "re-anchor rather than stay silently amnesiac"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_later_replay_true_reset_clears_a_pending_suppression(self, cfg):
+        """Two resets in a row must not leave the first one's intent standing."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        await mgr.discard_conversation("k1", replay=False)
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        await mgr.discard_conversation("k1")
+
+        assert mgr.consume_replay_suppression("k1") is False
+
+    @pytest.mark.asyncio
+    async def test_teardown_does_not_leave_a_suppression_for_a_reused_key(self, cfg):
+        """A slot key outlives the slot that held it, and keys ARE reused.
+
+        A leaked flag would starve the NEXT holder of that key of its re-anchor —
+        so the teardown paths clear it alongside the compaction cooldown they
+        already clear, rather than leaving it to age out.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        await mgr.discard_conversation("k1", replay=False)
+
+        await mgr.remove("k1")
+
+        assert mgr.consume_replay_suppression("k1") is False
 
 
 class TestDiscardConversation:
@@ -2472,6 +2942,123 @@ class TestDiscardConversation:
         assert not mgr.has_session("k1")
 
     @pytest.mark.asyncio
+    async def test_skip_if_busy_refuses_while_a_turn_holds_the_semaphore(self, cfg):
+        """The guard reads the SEMAPHORE, which is why it has to live here.
+
+        ``get_or_create`` leaves the semaphore held until ``release``, and the
+        provider reports ``has_active_turn() is False`` throughout — a turn that
+        holds the semaphore without a prompt in flight yet. So a CALLER probing
+        the provider and then calling this would see "idle", tear the session
+        down, and take the provider away from a turn that had already been
+        admitted. Refusing here, under the lock that pops the session, is what
+        closes that window.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        # The blind spot, made explicit: the provider says idle while busy.
+        assert provider.has_active_turn() is False
+
+        discarded = await mgr.discard_conversation("k1", replay=False, skip_if_busy=True)
+
+        assert discarded is False
+        provider.shutdown.assert_not_awaited()
+        assert mgr.has_session("k1"), "the refusal must leave the session intact"
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_changes_nothing_at_all(self, cfg):
+        """Not a partial teardown: the replay flag must not move either, or the
+        caller's retry would find suppression already consumed."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+
+        assert await mgr.discard_conversation("k1", replay=False, skip_if_busy=True) is False
+
+        assert mgr.consume_replay_suppression("k1") is False
+
+    @pytest.mark.asyncio
+    async def test_skip_if_busy_proceeds_once_the_turn_releases(self, cfg):
+        """The refusal is a wait, not a cancellation."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        assert await mgr.discard_conversation("k1", replay=False, skip_if_busy=True) is False
+
+        mgr.release("k1")
+        discarded = await mgr.discard_conversation("k1", replay=False, skip_if_busy=True)
+
+        assert discarded is True
+        provider.shutdown.assert_awaited_once()
+        assert mgr.consume_replay_suppression("k1") is True
+
+    @pytest.mark.asyncio
+    async def test_the_default_still_tears_down_a_busy_session(self, cfg):
+        """``skip_if_busy`` defaults False, so every pre-existing caller — the
+        poisoned-conversation escalation among them — keeps its behaviour."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+
+        discarded = await mgr.discard_conversation("k1")
+
+        assert discarded is True
+        provider.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_successor_mapped_during_shutdown_keeps_its_sid(self, cfg):
+        """The sid clear must not outlive the pop.
+
+        Ordered deterministically rather than by timing: the successor is mapped
+        from inside ``provider.shutdown``, which is precisely the await the
+        teardown suspends on. That is the whole window the bug needs — pop, then
+        a concurrent channel turn creates and maps a new session under the same
+        key, then a clear deferred past the shutdown wipes the NEW session's
+        pointer. Clearing in the same tick as the pop closes it.
+
+        Observed on the RAW entry, not through ``SessionMap.get``: that getter
+        additionally requires ``<sid>.json`` to exist on disk, so for a synthetic
+        sid it answers None whether or not the clear ran — which would make this
+        assertion pass with the bug present.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        mgr._session_map.set("k1", "original-sid")
+
+        async def _map_a_successor_while_shutting_down():
+            mgr._session_map.set("k1", "successor-sid")
+
+        provider.shutdown = AsyncMock(side_effect=_map_a_successor_while_shutting_down)
+
+        await mgr.discard_conversation("k1", replay=False)
+
+        provider.shutdown.assert_awaited_once()
+        assert _raw_sid(mgr, "k1") == "successor-sid", (
+            "the successor session's sid was erased by a clear deferred past the " "shutdown await"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_sid_is_still_cleared_with_no_successor(self, cfg):
+        """Scope pin: the clear still happens — it just happens earlier."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        mgr._session_map.set("k1", "original-sid")
+
+        await mgr.discard_conversation("k1", replay=False)
+
+        assert _raw_sid(mgr, "k1") == ""
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_does_not_clear_the_sid(self, cfg):
+        """``skip_if_busy`` refusing must leave the mapping alone too — the clear
+        sits after the early return, not before it."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr._session_map.set("k1", "original-sid")
+
+        assert await mgr.discard_conversation("k1", replay=False, skip_if_busy=True) is False
+
+        assert _raw_sid(mgr, "k1") == "original-sid"
+
+    @pytest.mark.asyncio
     async def test_discard_conversation_unlinks_temp_files_from_the_session_queue(
         self, cfg, tmp_path
     ):
@@ -2487,7 +3074,7 @@ class TestDiscardConversation:
 
     @pytest.mark.asyncio
     async def test_discard_preserves_slack_linkage(self, cfg):
-        """Regression for the poisoned-conversation escalation: a Slack-linked
+        """The poisoned-conversation discard keeps Slack linkage: a Slack-linked
         session that discards its rejected conversation must keep its thread
         binding, or the recovered answer is not mirrored and later inbound
         replies fork a new conversation."""
@@ -2519,69 +3106,8 @@ class TestDiscardConversation:
         mock_clear.assert_called_once_with("k1")
 
 
-class TestContextInfo:
-    """Tests for context_info() and _resolve_agent_model()."""
-
-    @pytest.mark.asyncio
-    async def test_context_info_basic(self, cfg):
-        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
-        await mgr.get_or_create("dashboard:slot0")
-        mgr.release("dashboard:slot0")
-        mgr._sessions["dashboard:slot0"].prompt_count = 5
-
-        info = mgr.context_info()
-        assert len(info) == 1
-        entry = info[0]
-        assert entry["key"] == "dashboard:slot0"
-        assert entry["name"] == "Chat (slot0)"
-        assert entry["prompts"] == 5
-        assert entry["context_pct"] == 0.0
-        await mgr.close_all()
-
-    @pytest.mark.asyncio
-    async def test_context_info_background_key_name(self, cfg):
-        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
-        await mgr.start_pool()
-        info = mgr.context_info()
-        bg_entry = next(e for e in info if e["key"] == BACKGROUND_KEY)
-        assert "Background" in bg_entry["name"]
-        await mgr.close_all()
-
-    @pytest.mark.asyncio
-    async def test_context_info_non_dashboard_key(self, cfg):
-        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
-        await mgr.get_or_create("slack:thread123")
-        mgr.release("slack:thread123")
-        info = mgr.context_info()
-        entry = next(e for e in info if e["key"] == "slack:thread123")
-        assert entry["name"] == "slack:thread123"
-        await mgr.close_all()
-
-    @pytest.mark.asyncio
-    async def test_context_info_with_acp_provider(self, cfg):
-        """AcpProvider path extracts model and agent from client."""
-        from unittest.mock import MagicMock
-
-        from kiro_crew.providers.acp import AcpProvider
-        from kiro_crew.session import _Session
-
-        mock_provider = MagicMock(spec=AcpProvider)
-        mock_provider.context_usage_pct = MagicMock(return_value=45.0)
-        mock_provider.shutdown = AsyncMock()
-        mock_provider.client = MagicMock()
-        mock_provider.client._model = "sonnet-4"
-        mock_provider.client._agent = "kirocrew"
-        mock_provider.client._session_id = None
-
-        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
-        mgr._sessions["k1"] = _Session(provider=mock_provider, prompt_count=3)
-
-        info = mgr.context_info()
-        entry = info[0]
-        assert entry["model"] == "sonnet-4"
-        assert entry["agent"] == "kirocrew"
-        assert entry["context_pct"] == 45.0
-        await mgr.close_all()
+class TestResolveAgentModelResolution:
+    """Tests for _resolve_agent_model()."""
 
     def test_resolve_agent_model_cache_miss_returns_auto(self, cfg):
         # Clear cache if exists
@@ -2608,8 +3134,7 @@ class TestContextInfo:
 
         ``~/.kiro/agents`` is shared with other tools; an ACP-style
         ``{"id": ...}`` here would be CACHED and then handed to
-        ``/api/sessions/context`` (the dashboard calls ``.replace()`` on it) and
-        to the pooled-model comparison in ``claim_pooled``. This method is
+        the pooled-model comparison in ``claim_pooled``. This method is
         annotated ``-> str`` and must honour that.
         """
         import json
@@ -2625,6 +3150,68 @@ class TestContextInfo:
             result = SessionManager._resolve_agent_model("foreign")
         assert result == "auto"
         assert isinstance(result, str)
+
+    def test_resolve_agent_model_refuses_an_oversized_spec(self, tmp_path, monkeypatch):
+        """The scan reads through the hardened, size-capped reader.
+
+        ``~/.kiro/agents`` is user-writable and shared with kiro-cli, so an
+        oversized "agent config" there must be refused rather than slurped into
+        memory — and this resolution is CACHED and reused on every later
+        lookup, so it is not a rare corner.
+
+        Exercised with a LOWERED cap rather than a real 50 MB fixture; the
+        property is that the cap is consulted, not its value. Paired with the
+        A-side below so the refusal cannot pass by breaking every read.
+        """
+        import json
+
+        from kiro_crew import hooks
+
+        if hasattr(SessionManager, "_agent_model_cache"):
+            SessionManager._agent_model_cache.clear()
+        monkeypatch.setattr(hooks, "MAX_FILE_BYTES", 256)
+        (tmp_path / "big.json").write_text(
+            json.dumps({"name": "big", "model": "pinned-by-oversized", "pad": "x" * 1024})
+        )
+
+        with patch("kiro_crew.agent.KIRO_AGENTS_DIR", tmp_path):
+            assert SessionManager._resolve_agent_model("big") == "auto"
+
+    def test_resolve_agent_model_still_reads_a_spec_under_the_same_cap(self, tmp_path, monkeypatch):
+        """A-side of the cap test above: a normal spec still resolves."""
+        import json
+
+        from kiro_crew import hooks
+
+        if hasattr(SessionManager, "_agent_model_cache"):
+            SessionManager._agent_model_cache.clear()
+        monkeypatch.setattr(hooks, "MAX_FILE_BYTES", 256)
+        (tmp_path / "small.json").write_text(
+            json.dumps({"name": "small", "model": "pinned-by-small"})
+        )
+
+        with patch("kiro_crew.agent.KIRO_AGENTS_DIR", tmp_path):
+            assert SessionManager._resolve_agent_model("small") == "pinned-by-small"
+
+    @requires_symlinks
+    def test_resolve_agent_model_refuses_a_link_to_a_sensitive_target(self, tmp_path, monkeypatch):
+        """A spec that is a symlink resolving onto a sensitive target is refused,
+        so the model is not resolved out of whatever the link names."""
+        import json
+
+        from kiro_crew import agent_discovery
+
+        if hasattr(SessionManager, "_agent_model_cache"):
+            SessionManager._agent_model_cache.clear()
+        target = tmp_path / "protected.json"
+        target.write_text(json.dumps({"model": "leaked-value"}))
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "linked.json").symlink_to(target)
+        monkeypatch.setattr(agent_discovery, "is_sensitive_path", lambda p: str(target) in str(p))
+
+        with patch("kiro_crew.agent.KIRO_AGENTS_DIR", agents):
+            assert SessionManager._resolve_agent_model("linked") == "auto"
 
 
 class TestWarmPoolInternals:
@@ -2971,9 +3558,13 @@ class TestCleanupLoop:
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
 
         sweep_threads: list[str] = []
+        sweep_homes: list[object] = []
 
-        def _fake_sweep() -> int:
+        def _fake_sweep(*, data_home=None) -> int:
+            # The deps hand the sweep the data home the manager resolved on ITS
+            # thread (the pool thread must not resolve it itself); record it too.
             sweep_threads.append(threading.current_thread().name)
+            sweep_homes.append(data_home)
             return 3
 
         with (
@@ -2994,15 +3585,26 @@ class TestCleanupLoop:
             with caplog.at_level(logging.INFO, logger="kiro_crew.session"):
                 await mgr._cleanup_loop()
 
-        # Verify: sweep was called (production wiring)
-        mock_sweep.assert_called_once()
-        # Verify the offload: ran on a maintenance-executor worker thread,
-        # not the event loop thread (run_in_executor path).
+        # Verify: sweep was called (production wiring). At least once, not
+        # exactly once: the loop now also dispatches one reclaim pass at START
+        # (a host whose runtime tmpfs is out of inodes cannot spawn at all, so
+        # that pass must not wait out an interval), so a run can legitimately
+        # record the boot pass, the tick pass, or both.
+        assert mock_sweep.call_count >= 1
+        # Verify the offload: EVERY call ran on a maintenance-executor worker
+        # thread, not the event loop thread (run_in_executor path).
         assert sweep_threads, "sweep never executed"
-        assert sweep_threads[0] != threading.main_thread().name
+        assert all(name != threading.main_thread().name for name in sweep_threads)
         assert sweep_threads[0].startswith("mc-maint")
+        # The home reached the pool thread pre-resolved and pinned: a sweep that
+        # resolved config_dir() for itself, after the queuing test's pin was gone,
+        # walked the operator's real ~/.kiro/crew (third side-effect audit).
+        assert sweep_homes and all(
+            h is not None and Path(h).resolve() == Path(os.environ["KIROCREW_HOME"]).resolve()
+            for h in sweep_homes
+        ), sweep_homes
         # Verify: non-zero return produces the info log
-        assert "removed 3 stale sandbox launchers" in caplog.text
+        assert "removed 3 stale sandbox artifacts" in caplog.text
         await mgr.close_all()
 
 
@@ -3078,12 +3680,6 @@ class TestSlackLinkHelpers:
         assert mgr.find_key_by_sid("sid-abc") == "k1"
         assert mgr.find_key_by_sid("unknown") is None
 
-    def test_delete_session_map_entry(self, cfg):
-        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
-        mgr._session_map.set("k1", "sid-abc")
-        mgr.delete_session_map_entry("k1")
-        assert mgr.find_key_by_sid("sid-abc") is None
-
 
 class TestGetPid:
     """Tests for get_pid."""
@@ -3113,22 +3709,26 @@ class TestGetPid:
         assert mgr.get_pid("nonexistent") is None
 
 
-class TestIsProviderAliveFallback:
-    """Test is_provider_alive fallback to is_alive when no is_process_alive."""
+class TestIsProviderAliveProcessVerdict:
+    """Test is_provider_alive reads the provider's process-level verdict.
+
+    The is_alive fallback for a provider that does not override
+    ``is_process_alive`` lives in the LLMProvider ABC default, not here —
+    it is pinned by the ABC contract tests in
+    ``test_session_provider_liveness.py``.
+    """
 
     @pytest.mark.asyncio
-    async def test_fallback_to_is_alive(self, cfg):
+    async def test_returns_the_process_liveness_verdict(self, cfg):
         from unittest.mock import MagicMock
 
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
         provider, _, _ = await mgr.get_or_create("k1")
         mgr.release("k1")
-        # Remove is_process_alive so it falls back
-        if hasattr(provider, "is_process_alive"):
-            del provider.is_process_alive
-        provider.is_alive = MagicMock(return_value=True)
-        result = await mgr.is_provider_alive("k1")
-        assert result is True
+        provider.is_process_alive = MagicMock(return_value=True)
+        assert await mgr.is_provider_alive("k1") is True
+        provider.is_process_alive = MagicMock(return_value=False)
+        assert await mgr.is_provider_alive("k1") is False
         await mgr.close_all()
 
     @pytest.mark.asyncio
@@ -3298,7 +3898,7 @@ class TestClaudeBackendCompaction:
 
     @pytest.mark.asyncio
     async def test_check_context_usage_triggers_for_claude(self, cfg):
-        """Autocompact threshold must apply to claude — no longer skipped."""
+        """Autocompact threshold must apply to claude."""
         cfg.session.autocompact_pct = 20.0
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
         provider, _, _ = await mgr.get_or_create("k1")
@@ -3374,6 +3974,7 @@ class TestClaudeBackendCompaction:
         # already registered a fresh replacement under the same key.
         replacement_provider = AsyncMock()
         replacement_provider.shutdown = AsyncMock()
+        replacement_provider.is_process_alive = lambda: True
         replacement = _Session(
             provider=replacement_provider, first_turn=FirstTurnState.NOTHING_ARMED
         )
@@ -3565,7 +4166,7 @@ class TestKiroInPlaceCompaction:
 
     @pytest.mark.asyncio
     async def test_inplace_never_uses_commands_execute(self, cfg):
-        """Regression for the 2026-07-23 production failure: /compact sent
+        """Sending /compact
         via the string form of _kiro.dev/commands/execute makes kiro-cli
         2.14.0 exit rc=0. The auto-compact path must use the prompt
         transport (stream_command), never send_command."""
@@ -3626,7 +4227,7 @@ class TestKiroInPlaceCompaction:
 
     @pytest.mark.asyncio
     async def test_failure_recycle_never_yields_semaphore_to_queued_turn(self, cfg):
-        """Regression (production 2026-08-05): the failure recycle must not
+        """The failure recycle must not
         open a window in which a queued turn is dispatched into a session that
         is still compacting.
 
@@ -3962,8 +4563,7 @@ class TestCloseAllPersistence:
         with patch.object(mgr._session_map, "set") as mock_set:
             await mgr.close_all()
         # provider= is now persisted so the next-startup detect_provider_switch
-        # doesn't see a missing label and falsely fire an acp/cc switch
-        # (review round 1 #24).
+        # doesn't see a missing label and falsely fire an acp/cc switch.
         mock_set.assert_called_once_with(
             "dashboard:slot0",
             "sid-persist-test",
@@ -4111,7 +4711,7 @@ class TestGetOrCreatePoolClaim:
 
     @pytest.mark.asyncio
     async def test_pool_claim_resets_stale_context_and_skips_compaction(self, cfg):
-        """#2932 end-to-end: a pooled provider carrying a previous session's
+        """End-to-end: a pooled provider carrying a previous session's
         context stats must not hand them to the claiming session. The claim
         path calls client.rekey(), whose reset makes the first turn-end
         check_context_usage read 0%/unknown instead of firing compaction on
@@ -4344,30 +4944,6 @@ class TestBackgroundSession:
         await mgr.close_all()
 
 
-class TestContextInfoBasic:
-    @pytest.mark.asyncio
-    async def test_returns_session_info(self, cfg):
-        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
-        await mgr.get_or_create("dashboard:slot0")
-        mgr.release("dashboard:slot0")
-        info = mgr.context_info()
-        assert len(info) >= 1
-        slot_info = [i for i in info if i["key"] == "dashboard:slot0"]
-        assert len(slot_info) == 1
-        assert slot_info[0]["context_pct"] == 0.0
-        assert "Chat" in slot_info[0]["name"]
-        await mgr.close_all()
-
-    @pytest.mark.asyncio
-    async def test_background_session_name(self, cfg):
-        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
-        await mgr._ensure_background()
-        info = mgr.context_info()
-        bg_info = [i for i in info if i["key"] == BACKGROUND_KEY]
-        assert len(bg_info) == 1
-        assert "Background" in bg_info[0]["name"]
-
-
 class TestCleanupLoopResilience:
     """Tests that _cleanup_loop survives _expire_idle exceptions."""
 
@@ -4382,8 +4958,8 @@ class TestCleanupLoopResilience:
         # The loop sleeps via ``asyncio.wait_for(shutdown_event.wait(), timeout=interval)``
         # (interval >= 60s). We shrink only THAT call to a tiny real timeout so
         # the wait actually runs: it returns immediately once shutdown_event is
-        # set, and otherwise times out in ~1ms. Previously this raised
-        # TimeoutError WITHOUT awaiting the wait(), which turned the loop into an
+        # set, and otherwise times out in ~1ms. Raising
+        # TimeoutError WITHOUT awaiting the wait() would turn the loop into an
         # unbounded busy-spin — if _expire_idle's shutdown_event.set() landed on
         # a cross-loop-rebound event (after an earlier asyncio test in the same
         # process), the top-of-loop is_set() check could miss it and the test
@@ -4462,8 +5038,8 @@ class TestCleanupLoopResilience:
 
 
 class TestGetBgSessionRecycle:
-    """get_bg_session() recycles a healthy-but-stale _bg runtime only when it
-    has zero active sessions."""
+    """get_bg_session() displaces a healthy-but-stale _bg runtime, killing it
+    when idle and parking it to drain when its handles are still live."""
 
     @pytest.mark.asyncio
     async def test_recycles_stale_idle_runtime(self, cfg):
@@ -4471,7 +5047,7 @@ class TestGetBgSessionRecycle:
 
         stale = AsyncMock()
         stale.is_alive = lambda: True
-        stale.has_active_sessions = lambda: False
+        stale.has_active_or_initializing_sessions = lambda: False
         stale._is_stale = AsyncMock(return_value="age")
         stale.kill = AsyncMock()
         stale.pid = 111
@@ -4493,33 +5069,486 @@ class TestGetBgSessionRecycle:
         await mgr.close_all()
 
     @pytest.mark.asyncio
-    async def test_does_not_recycle_stale_runtime_with_active_sessions(self, cfg):
+    async def test_parks_a_stale_runtime_that_still_has_active_sessions(self, cfg):
+        """A runtime that never goes idle must still be bounded.
+
+        The old policy only recycled during a zero-session window and merely
+        logged otherwise, so under sustained background load the age/RSS caps
+        were never enforced. Now the retiree is detached from the slot — its
+        in-flight work finishes untouched — and new callers get a fresh process.
+        Staleness is probed with ``_is_stale()`` (age OR RSS), not the age-only
+        ``_stale_by_age()``, because RSS is the growth mode that was observed.
+        """
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
 
         stale = AsyncMock()
         stale.is_alive = lambda: True
-        stale.has_active_sessions = lambda: True
-        stale._stale_by_age = lambda: True  # drives the deferral log
-        stale._is_stale = AsyncMock(return_value="age")  # must NOT be consulted
+        stale.has_active_or_initializing_sessions = lambda: True
+        # Inside the age cap; stale by RSS.
+        stale._is_stale = AsyncMock(return_value="rss")
         stale.kill = AsyncMock()
         stale.pid = 222
-        stale._session_queues = {"s": object()}
-        sentinel = object()
-        stale.create_session = AsyncMock(return_value=sentinel)
+        stale.create_session = AsyncMock(return_value=object())
         mgr._bg_runtime = stale
 
-        # A live+reused runtime must not trigger a respawn.
+        rt2 = AsyncMock()
+        rt2.spawn = AsyncMock()
+        rt2.is_alive = lambda: True
+        sentinel = object()
+        rt2.create_session = AsyncMock(return_value=sentinel)
+
+        with patch("kiro_crew.acp.runtime.AcpRuntime", side_effect=[rt2]):
+            result = await mgr.get_bg_session()
+
+        stale._is_stale.assert_awaited_once()
+        stale.kill.assert_not_awaited()  # live handles → parked, not killed
+        stale.create_session.assert_not_awaited()  # and never serves again
+        assert stale in mgr._draining_bg_runtimes
+        assert result is sentinel
+        mgr._draining_bg_runtimes = []
+        await mgr.close_all()
+
+
+class TestGetBgSessionBackendSwitch:
+    """The _bg runtime spawns under the CONFIGURED ``agent.acp_backend``, and a
+    cached runtime spawned under a different backend is recycled once idle —
+    otherwise background work (chat titles, suggestions, consolidation) keeps
+    running the previous backend indefinitely."""
+
+    @staticmethod
+    def _fresh_runtime():
+        rt = AsyncMock()
+        rt.spawn = AsyncMock()
+        rt.is_alive = lambda: True
+        rt.create_session = AsyncMock(return_value=object())
+        return rt
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("backend", [ACP_BACKEND_KIRO, ACP_BACKEND_KAS])
+    async def test_runtime_spawns_under_the_configured_backend(self, cfg, backend):
+        cfg.agent.acp_backend = backend
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        rt = self._fresh_runtime()
+
+        with patch("kiro_crew.acp.runtime.AcpRuntime", return_value=rt) as ctor:
+            result = await mgr.get_bg_session()
+
+        assert ctor.call_args.kwargs["acp_backend"] == backend
+        assert result is rt.create_session.return_value
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_recycles_an_idle_runtime_spawned_under_a_different_backend(self, cfg):
+        cfg.agent.acp_backend = ACP_BACKEND_KAS
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+
+        stranded = AsyncMock()
+        stranded.is_alive = lambda: True
+        stranded.has_active_sessions = lambda: False
+        stranded.has_active_or_initializing_sessions = lambda: False
+        stranded.acp_backend = ACP_BACKEND_KIRO  # spawned before the switch
+        stranded._is_stale = AsyncMock(return_value=None)  # must NOT be consulted
+        stranded.kill = AsyncMock()
+        stranded.pid = 333
+        mgr._bg_runtime = stranded
+
+        rt2 = self._fresh_runtime()
+        with patch("kiro_crew.acp.runtime.AcpRuntime", return_value=rt2) as ctor:
+            result = await mgr.get_bg_session()
+
+        stranded.kill.assert_awaited_once()  # mismatched + idle → recycled
+        stranded._is_stale.assert_not_awaited()  # mismatch outranks staleness
+        assert ctor.call_args.kwargs["acp_backend"] == ACP_BACKEND_KAS
+        assert result is rt2.create_session.return_value
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_a_busy_mismatched_runtime_is_parked_and_never_serves_a_new_caller(self, cfg):
+        """A post-switch caller must never create_session() on the old-backend
+        runtime — under sustained load a busy runtime never reaches a
+        zero-session window, so waiting for one would let the switch never
+        take effect. Its in-flight handles are not killed either."""
+        cfg.agent.acp_backend = ACP_BACKEND_KAS
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+
+        busy = AsyncMock()
+        busy.is_alive = lambda: True
+        busy.has_active_sessions = lambda: True
+        busy.has_active_or_initializing_sessions = lambda: True
+        busy.acp_backend = ACP_BACKEND_KIRO  # spawned before the switch
+        busy.kill = AsyncMock()
+        busy.create_session = AsyncMock()
+        busy.pid = 335
+        mgr._bg_runtime = busy
+
+        rt2 = self._fresh_runtime()
+        with patch("kiro_crew.acp.runtime.AcpRuntime", return_value=rt2) as ctor:
+            result = await mgr.get_bg_session()
+
+        busy.kill.assert_not_awaited()  # live handles are never killed
+        busy.create_session.assert_not_awaited()  # new work goes to the new runtime
+        assert busy in mgr._draining_bg_runtimes
+        assert ctor.call_args.kwargs["acp_backend"] == ACP_BACKEND_KAS
+        assert result is rt2.create_session.return_value
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_a_parked_runtime_is_reaped_once_its_handles_drain(self, cfg):
+        cfg.agent.acp_backend = ACP_BACKEND_KAS
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+
+        drained = AsyncMock()
+        drained.is_alive = lambda: True
+        drained.has_active_or_initializing_sessions = lambda: False
+        drained.kill = AsyncMock()
+        mgr._draining_bg_runtimes = [drained]
+
+        still_busy = AsyncMock()
+        still_busy.is_alive = lambda: True
+        still_busy.has_active_or_initializing_sessions = lambda: True
+        still_busy.kill = AsyncMock()
+        mgr._draining_bg_runtimes.append(still_busy)
+
+        rt = self._fresh_runtime()
+        with patch("kiro_crew.acp.runtime.AcpRuntime", return_value=rt):
+            await mgr.get_bg_session()
+
+        drained.kill.assert_awaited_once()  # drained → reaped
+        still_busy.kill.assert_not_awaited()  # busy → stays parked
+        assert mgr._draining_bg_runtimes == [still_busy]
+        mgr._draining_bg_runtimes = []
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_reap_keeps_the_runtime_parked(self, cfg):
+        """Dropping a parked runtime whose kill failed would orphan a possibly
+        live process outside every sweep; keeping it parked retries the kill
+        on the next pass."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+
+        stuck = AsyncMock()
+        stuck.is_alive = lambda: True
+        stuck.has_active_or_initializing_sessions = lambda: False
+        stuck.kill = AsyncMock(side_effect=RuntimeError("boom"))
+        mgr._draining_bg_runtimes = [stuck]
+
+        async with mgr._bg_runtime_lock:
+            await mgr._reap_drained_bg_runtimes_locked()
+
+        assert mgr._draining_bg_runtimes == [stuck]
+        mgr._draining_bg_runtimes = []
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_matching_backend_is_reused_not_recycled(self, cfg):
+        cfg.agent.acp_backend = ACP_BACKEND_KAS
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+
+        cached = AsyncMock()
+        cached.is_alive = lambda: True
+        cached.has_active_sessions = lambda: False
+        cached.acp_backend = ACP_BACKEND_KAS
+        cached._is_stale = AsyncMock(return_value=None)
+        cached.kill = AsyncMock()
+        cached.pid = 334
+        sentinel = object()
+        cached.create_session = AsyncMock(return_value=sentinel)
+        mgr._bg_runtime = cached
+
         with patch(
             "kiro_crew.acp.runtime.AcpRuntime",
-            side_effect=AssertionError("should not respawn a live runtime"),
+            side_effect=AssertionError("should not respawn a matching runtime"),
         ):
             result = await mgr.get_bg_session()
 
-        stale.kill.assert_not_awaited()  # active sessions → recycle deferred
-        # The active-session path uses the cheap _stale_by_age(), NOT the
-        # offloaded _is_stale() probe.
-        stale._is_stale.assert_not_awaited()
+        cached.kill.assert_not_awaited()
         assert result is sentinel
+        await mgr.close_all()
+
+
+class TestRetireStaleBackendBgRuntime:
+    """A backend switch retires the cached _bg runtime only once its live
+    handles drain — killing it mid-turn would abort an in-flight title
+    generation belonging to a caller unrelated to the switch."""
+
+    @staticmethod
+    def _runtime(*, backend, busy):
+        rt = AsyncMock()
+        rt.acp_backend = backend
+        rt.has_active_or_initializing_sessions = lambda: busy
+        rt.kill = AsyncMock()
+        rt.pid = 444
+        return rt
+
+    @pytest.mark.asyncio
+    async def test_idle_mismatched_runtime_is_retired(self, cfg):
+        cfg.agent.acp_backend = ACP_BACKEND_KAS
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        rt = self._runtime(backend=ACP_BACKEND_KIRO, busy=False)
+        mgr._bg_runtime = rt
+
+        await mgr._retire_stale_backend_bg_runtime()
+
+        rt.kill.assert_awaited_once()
+        assert mgr._bg_runtime is None
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_a_live_handle_is_never_killed_by_a_backend_switch(self, cfg):
+        """The busy runtime is parked to drain — its slot is freed so new work
+        runs under the configured backend, but its in-flight handles finish."""
+        cfg.agent.acp_backend = ACP_BACKEND_KAS
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        rt = self._runtime(backend=ACP_BACKEND_KIRO, busy=True)
+        mgr._bg_runtime = rt
+
+        await mgr._retire_stale_backend_bg_runtime()
+
+        rt.kill.assert_not_awaited()
+        assert mgr._bg_runtime is None
+        assert rt in mgr._draining_bg_runtimes
+        mgr._draining_bg_runtimes = []
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_matching_backend_is_left_alone(self, cfg):
+        cfg.agent.acp_backend = ACP_BACKEND_KAS
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        rt = self._runtime(backend=ACP_BACKEND_KAS, busy=False)
+        mgr._bg_runtime = rt
+
+        await mgr._retire_stale_backend_bg_runtime()
+
+        rt.kill.assert_not_awaited()
+        assert mgr._bg_runtime is rt
+        mgr._bg_runtime = None
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_fails_closed_on_a_holder_without_a_string_backend(self, cfg):
+        """A holder that does not declare a string acp_backend (a test double,
+        a future holder) is left running rather than recycled on a backend it
+        may never have had."""
+        cfg.agent.acp_backend = ACP_BACKEND_KAS
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        rt = self._runtime(backend=object(), busy=False)
+        mgr._bg_runtime = rt
+
+        await mgr._retire_stale_backend_bg_runtime()
+
+        rt.kill.assert_not_awaited()
+        assert mgr._bg_runtime is rt
+        mgr._bg_runtime = None
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_kill_parks_the_runtime_for_the_reaper(self, cfg):
+        """Dropping the reference after a failed kill would orphan a live
+        process outside every sweep; parking it retries the kill later while
+        keeping its PID shielded."""
+        cfg.agent.acp_backend = ACP_BACKEND_KAS
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        rt = self._runtime(backend=ACP_BACKEND_KIRO, busy=False)
+        rt.kill = AsyncMock(side_effect=RuntimeError("boom"))
+        mgr._bg_runtime = rt
+
+        await mgr._retire_stale_backend_bg_runtime()
+
+        assert mgr._bg_runtime is None
+        assert rt in mgr._draining_bg_runtimes
+        mgr._draining_bg_runtimes = []
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_refresh_defaults_triggers_the_retirement(self, cfg):
+        """refresh_defaults() re-reads config, so any invocation of it (and any
+        future agent.acp_backend edit surface routed through it) must also run
+        the retirement check."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+
+        with (
+            patch.object(mgr, "start_pool", AsyncMock()),
+            patch.object(mgr, "_retire_stale_backend_bg_runtime", AsyncMock()) as retire,
+            patch("kiro_crew.session.build_provider_factory", return_value=MagicMock()),
+            patch("kiro_crew.session.KiroCrewConfig.load", return_value=cfg),
+        ):
+            await mgr.refresh_defaults()
+
+        retire.assert_awaited_once()
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_identity_sweep_incomplete_while_a_parked_runtime_drains(self, cfg):
+        """A parked runtime still runs under the previous account, so the
+        identity baseline must not advance past it (advancing would record the
+        switch as handled and no later turn would re-sweep); once its handles
+        drain it is reaped and completeness is restored."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        parked = AsyncMock()
+        parked.uses_kiro_identity_store = True
+        parked.is_alive = lambda: True
+        parked.has_active_or_initializing_sessions = lambda: True
+        parked.kill = AsyncMock()
+        mgr._draining_bg_runtimes = [parked]
+
+        assert await mgr._retire_kiro_bg_runtime() is False
+        parked.kill.assert_not_awaited()
+
+        parked.has_active_or_initializing_sessions = lambda: False
+        assert await mgr._retire_kiro_bg_runtime() is True
+        parked.kill.assert_awaited_once()
+        assert mgr._draining_bg_runtimes == []
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_periodic_hook_reaps_a_drained_parked_runtime(self, cfg):
+        """The watchdog hook is the backstop for an idle gateway where no
+        background call, refresh, or identity sweep ever runs the other reap
+        triggers — without it a drained parked runtime sits shielded from the
+        orphan sweep indefinitely."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        assert any(h.name == "bg_drain_reap" for h in mgr._watchdog._hooks)
+
+        drained = AsyncMock()
+        drained.is_alive = lambda: True
+        drained.has_active_or_initializing_sessions = lambda: False
+        drained.kill = AsyncMock()
+        mgr._draining_bg_runtimes = [drained]
+
+        await mgr._bg_drain_reap_hook()
+
+        drained.kill.assert_awaited_once()
+        assert mgr._draining_bg_runtimes == []
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_close_all_kills_the_slot_and_every_parked_runtime(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        slot = AsyncMock()
+        slot.kill = AsyncMock()
+        parked = AsyncMock()
+        parked.kill = AsyncMock()
+        mgr._bg_runtime = slot
+        mgr._draining_bg_runtimes = [parked]
+
+        await mgr.close_all()
+
+        slot.kill.assert_awaited_once()
+        parked.kill.assert_awaited_once()
+        assert mgr._bg_runtime is None
+        assert mgr._draining_bg_runtimes == []
+
+    @pytest.mark.asyncio
+    async def test_get_bg_session_refuses_while_closing(self, cfg):
+        """A runtime spawned or parked after close_all's locked detach would
+        leak until the next-startup orphan reaper. The error is the typed
+        SessionClosingError so shutdown-aware handlers classify it."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        mgr._closing = True
+
+        with pytest.raises(SessionClosingError):
+            await mgr.get_bg_session()
+
+        mgr._closing = False
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_retire_helper_does_not_park_while_closing(self, cfg):
+        """refresh_defaults (or the provider path) racing close_all must not
+        append to a draining list the shutdown sweep has already cleared."""
+        cfg.agent.acp_backend = ACP_BACKEND_KAS
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        rt = self._runtime(backend=ACP_BACKEND_KIRO, busy=True)
+        mgr._bg_runtime = rt
+        mgr._closing = True
+
+        await mgr._retire_stale_backend_bg_runtime()
+
+        assert mgr._draining_bg_runtimes == []
+        assert mgr._bg_runtime is rt  # left for close_all's own detach
+        mgr._closing = False
+        mgr._bg_runtime = None
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_backend_never_displaces_a_cached_runtime(self, cfg):
+        """An unreadable probe must not assert a backend it did not read: a
+        correctly-configured KAS runtime survives a config edge instead of
+        being invisibly recycled onto kiro."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+
+        class _Boom:
+            @property
+            def acp_backend(self):
+                raise RuntimeError("config exploded")
+
+        from types import SimpleNamespace
+
+        mgr._cfg = SimpleNamespace(agent=_Boom())
+        rt = self._runtime(backend=ACP_BACKEND_KAS, busy=False)
+        mgr._bg_runtime = rt
+
+        await mgr._retire_stale_backend_bg_runtime()
+
+        rt.kill.assert_not_awaited()
+        assert mgr._bg_runtime is rt
+        assert mgr._draining_bg_runtimes == []
+        mgr._bg_runtime = None
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_backend_moving_under_the_lock_falls_back_to_the_provider_path(self, cfg):
+        """If the config moves to a backend the runtime cannot serve between
+        dispatch and the lock, the caller must not get a runtime constructed
+        under a backend it cannot classify — it is served through the
+        provider-backed path instead."""
+        cfg.agent.acp_backend = "claude"  # non-runtime; assigned directly, loader normalizes
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider_handle = object()
+
+        with (
+            # Dispatch saw a runtime-capable backend...
+            patch.object(mgr, "_bg_backend_supports_runtime", lambda: True),
+            # ...but the in-lock revalidation reads the moved config and must
+            # divert to the provider path without constructing a runtime.
+            patch.object(
+                mgr, "_provider_backed_bg_session", AsyncMock(return_value=provider_handle)
+            ),
+            patch(
+                "kiro_crew.acp.runtime.AcpRuntime",
+                side_effect=AssertionError("must not construct a runtime for a moved backend"),
+            ),
+        ):
+            result = await mgr.get_bg_session()
+
+        assert result is provider_handle
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_ensure_background_does_not_register_a_provider_while_closing(self, cfg):
+        """A provider whose start spans close_all's session snapshot must be
+        torn down, not registered — a session registered after the snapshot
+        escapes graceful cleanup."""
+        started = AsyncMock()
+
+        def _factory(*a, **k):
+            return started
+
+        mgr = SessionManager(cfg, provider_factory=_factory)
+
+        real_start = started.start
+
+        async def _start_then_close():
+            mgr._closing = True
+            await real_start()
+
+        started.start = _start_then_close
+
+        await mgr._ensure_background()
+
+        assert BACKGROUND_KEY not in mgr._sessions
+        started.shutdown.assert_awaited_once()
+        mgr._closing = False
         await mgr.close_all()
 
 
@@ -4611,6 +5640,33 @@ class TestOpenTaskSession:
         await mgr.release_subagent_runtime(parent)
         await mgr.close_all()
 
+    @pytest.mark.asyncio
+    async def test_macos_workspace_mismatch_uses_dedicated_provider(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        runtime = MagicMock()
+        runtime.create_session = AsyncMock(
+            side_effect=AcpWorkspaceBindingError("exact workspace required")
+        )
+        mgr._get_or_bootstrap_run_runtime = AsyncMock(return_value=runtime)
+        dedicated = MagicMock()
+        mgr.get_or_create = AsyncMock(return_value=(dedicated, True, False))
+
+        result = await mgr.open_task_session(
+            "taskrunner:run3:runtime",
+            "taskrunner:run3:task0",
+            agent="kirocrew",
+            cwd="/repo/packages/app",
+            approval_policy="auto",
+        )
+
+        assert result == (dedicated, True, False)
+        mgr.get_or_create.assert_awaited_once_with(
+            "taskrunner:run3:task0",
+            agent="kirocrew",
+            approval_policy="auto",
+            cwd="/repo/packages/app",
+        )
+
 
 class TestLoadRecoveryHistoryReplay:
     """F2 load-recovery Phase 2: when a provider signals it fell back to a FRESH
@@ -4647,12 +5703,180 @@ class TestLoadRecoveryHistoryReplay:
         assert sess.provider_switch_replay is False
         await mgr.close_all()
 
+    @pytest.mark.asyncio
+    async def test_replay_marker_survives_reads_until_prompt_acknowledges_it(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=self._factory(True))
+        await mgr.get_or_create("thread1")
+
+        assert mgr.provider_switch_replay_pending("thread1") is True
+        assert mgr.provider_switch_replay_pending("thread1") is True
+        assert mgr.consume_provider_switch_replay("thread1") is True
+        assert mgr.provider_switch_replay_pending("thread1") is False
+        assert mgr.consume_provider_switch_replay("thread1") is False
+        assert mgr.mark_provider_switch_replay("thread1") is True
+        assert mgr.provider_switch_replay_pending("thread1") is True
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_non_acp_provider_switch_replay_settles_without_sid_promotion(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("thread1")
+        session = next(iter(mgr._sessions.values()))
+        session.provider_switch_replay = True
+
+        assert mgr.commit_provider_switch_replay_sid("thread1") is True
+        assert session.provider_switch_replay is False
+        assert mgr.provider_switch_replay_pending("thread1") is False
+
+        mgr.release("thread1")
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_pending_replay_preserves_prior_sid_until_commit(
+        self, cfg, monkeypatch, tmp_path
+    ):
+        from kiro_crew.acp.types import PROVIDER_LABEL_DEFAULT
+        from kiro_crew.providers.acp import AcpProvider
+
+        shutdown_started = asyncio.Event()
+        release_shutdown = asyncio.Event()
+
+        async def concrete_shutdown():
+            shutdown_started.set()
+            await release_shutdown.wait()
+
+        def factory(session_key=None, agent=None, channel_id=None, **kwargs):
+            provider = object.__new__(AcpProvider)
+            provider._private_memory = False
+            provider._private_memory_session_key = session_key
+            provider._private_memory_prepared = False
+            provider._client = MagicMock()
+            provider._client._session_id = "fresh-replayed-sid"
+            provider._client._work_dir = "/new-workspace"
+            provider._client._pid = None
+            provider._client.backend = ACP_BACKEND_KIRO
+            provider._client.resumed = False
+            provider._client.set_resume_session_id = MagicMock()
+            provider._history_replay_needed = True
+            provider._defer_replay_sid_promotion = True
+            provider.start = AsyncMock()
+            provider.shutdown = AsyncMock(side_effect=concrete_shutdown)
+            provider.context_usage_pct = MagicMock(return_value=0.0)
+            return provider
+
+        native_sessions = tmp_path / "native-sessions"
+        native_sessions.mkdir()
+        (native_sessions / "old-full-history-sid.json").write_text("{}", encoding="utf-8")
+        (native_sessions / "old-full-history-sid.jsonl").write_text(
+            '{"role":"user","content":"prior history"}\n',
+            encoding="utf-8",
+        )
+        (native_sessions / "fresh-replayed-sid.json").write_text("{}", encoding="utf-8")
+        (native_sessions / "fresh-replayed-sid.jsonl").write_text(
+            '{"role":"user","content":"replayed history"}\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "kiro_crew.session_map._kiro_sessions_dir",
+            lambda: native_sessions,
+        )
+
+        mgr = SessionManager(cfg, provider_factory=factory)
+        mgr._session_map.set(
+            "thread1",
+            "old-full-history-sid",
+            provider=PROVIDER_LABEL_DEFAULT,
+            cwd="/old-workspace",
+        )
+
+        await mgr.get_or_create("thread1")
+
+        assert mgr._session_map.get("thread1") == "old-full-history-sid"
+        assert mgr.provider_switch_replay_pending("thread1") is True
+
+        # close_all flushes SessionMap before provider shutdown. Hold it at that
+        # boundary and create a new manager, exactly as an update restart can.
+        close_task = asyncio.create_task(mgr.close_all())
+        await asyncio.wait_for(shutdown_started.wait(), timeout=1.0)
+        resumed_mgr = SessionManager(cfg, provider_factory=factory)
+        assert resumed_mgr._session_map.get("thread1") == "old-full-history-sid"
+        release_shutdown.set()
+        await close_task
+
+        await resumed_mgr.get_or_create("thread1")
+        assert resumed_mgr.provider_switch_replay_pending("thread1") is True
+        assert resumed_mgr._session_map.get("thread1") == "old-full-history-sid"
+        assert resumed_mgr.commit_provider_switch_replay_sid("thread1") is True
+        assert resumed_mgr.provider_switch_replay_pending("thread1") is False
+        assert resumed_mgr._session_map.get("thread1") == "fresh-replayed-sid"
+        await resumed_mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_generic_load_recovery_promotes_fresh_sid_immediately(
+        self, cfg, monkeypatch, tmp_path
+    ):
+        from kiro_crew.acp.types import PROVIDER_LABEL_DEFAULT
+        from kiro_crew.providers.acp import AcpProvider
+
+        def factory(session_key=None, agent=None, channel_id=None, **kwargs):
+            provider = object.__new__(AcpProvider)
+            provider._private_memory = False
+            provider._private_memory_session_key = session_key
+            provider._private_memory_prepared = False
+            provider._client = MagicMock()
+            provider._client._session_id = "fresh-recovery-sid"
+            provider._client._work_dir = "/new-workspace"
+            provider._client._pid = None
+            provider._client.backend = ACP_BACKEND_KIRO
+            provider._client.resumed = False
+            provider._client.set_resume_session_id = MagicMock()
+            provider._history_replay_needed = True
+            provider._defer_replay_sid_promotion = False
+            provider.start = AsyncMock()
+            provider.shutdown = AsyncMock()
+            provider.context_usage_pct = MagicMock(return_value=0.0)
+            return provider
+
+        native_sessions = tmp_path / "native-sessions"
+        native_sessions.mkdir()
+        for sid, content in (
+            ("old-full-history-sid", "prior history"),
+            ("fresh-recovery-sid", "replayed history"),
+        ):
+            (native_sessions / f"{sid}.json").write_text("{}", encoding="utf-8")
+            (native_sessions / f"{sid}.jsonl").write_text(
+                f'{{"role":"user","content":"{content}"}}\n',
+                encoding="utf-8",
+            )
+        monkeypatch.setattr(
+            "kiro_crew.session_map._kiro_sessions_dir",
+            lambda: native_sessions,
+        )
+
+        mgr = SessionManager(cfg, provider_factory=factory)
+        mgr._session_map.set(
+            "thread1",
+            "old-full-history-sid",
+            provider=PROVIDER_LABEL_DEFAULT,
+            cwd="/old-workspace",
+        )
+
+        await mgr.get_or_create("thread1")
+
+        assert mgr.provider_switch_replay_pending("thread1") is True
+        assert mgr._session_map.get("thread1") == "fresh-recovery-sid"
+        await mgr.close_all()
+
+        reloaded_mgr = SessionManager(cfg, provider_factory=factory)
+        assert reloaded_mgr._session_map.get("thread1") == "fresh-recovery-sid"
+        await reloaded_mgr.close_all()
+
 
 class TestIneffectiveCompactionCooldown:
     """A compaction that completes but frees no meaningful headroom keeps the
     failure cooldown instead of clearing it — otherwise every "successful"
     no-progress attempt re-triggers on the next turn end and each retry pays
-    another model-generated summarization (#4687)."""
+    another model-generated summarization."""
 
     @staticmethod
     def _inplace_factory(pct_after: float):
@@ -4708,7 +5932,7 @@ class TestIneffectiveCompactionCooldown:
     async def test_unknown_post_compaction_pct_defers_verdict(self, cfg):
         """kiro-cli's mid-turn terminal status resets the stats to 0.0/unknown
         before any post-compaction metadata lands. An unknown reading must not
-        be judged (a 0.0 would read as a huge drop and mask #4687 entirely);
+        be judged (a 0.0 would read as a huge drop and mask the defect entirely);
         the verdict is deferred to the first confirmed reading."""
         mgr = SessionManager(cfg, provider_factory=self._inplace_factory(pct_after=0.0))
         provider, _, _ = await mgr.get_or_create("dashboard:chat-1")

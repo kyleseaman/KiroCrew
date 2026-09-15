@@ -1,6 +1,6 @@
 ---
 name: pod-e2e
-description: "ONLY for developing Kiro Crew itself -- if the project you are working on is anything else, ignore this skill: it drives Kiro Crew's own pod tooling, which does not exist in another repository. Runs end-to-end tests (backend API + frontend Playwright) for a Kiro Crew feature worktree against an ISOLATED throwaway pod instance, without touching the live gateway. Use when asked to e2e-test / smoke-test / verify a Kiro Crew worktree's feature hands-off, run API + browser tests on a pod, or prove a new backend route + UI work together. NOT for testing the live instance, and NOT a general-purpose e2e or smoke-test skill."
+description: "ONLY for developing Kiro Crew itself -- if the project you are working on is anything else, ignore this skill: it drives Kiro Crew's own pod tooling, which does not exist in another repository. Boots a Kiro Crew feature worktree's full stack as an ISOLATED throwaway pod and proves it boots, authenticates and renders (headless Playwright), without touching the live gateway. It does NOT run the worktree's test suite -- run the tests your change touches yourself and let CI own the full suite. Use when asked to e2e-test / smoke-test / verify a Kiro Crew worktree's feature hands-off, drive browser checks on a pod, or prove a new backend route + UI work together. NOT for testing the live instance, and NOT a general-purpose e2e or smoke-test skill."
 triggers: e2e test, smoke test, pod test, verify worktree, test pod, run e2e, end to end
 repo_scope: src/kiro_crew
 ---
@@ -22,9 +22,8 @@ bash <app-skills-dir>/pod-e2e/scripts/pod-e2e.sh <worktree-name> --video
 **Expected success output** — a `POD-E2E SUMMARY` ending like:
 ```
   ✅ auth — GET /api/sessions → 200 with token, 403 without
-  ✅ api-tests — … → exit 0
   ✅ playwright — headless chromium loaded dashboard …
-result:       3 passed, 0 failed
+result:       2 passed, 0 failed
 ARTIFACT_DIR=~/.kirocrew-pods/.e2e-artifacts/<worktree-name>
 ```
 Exit code = number of failed phases (0 = all green). Then **look at the
@@ -38,7 +37,40 @@ kirocrew pod ls          # should be empty (torn down)
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5476/api/sessions   # live plane still alive
 ```
 
-## The interface — `kirocrew pod` CLI
+## The interface — pod tools if you are an agent, the CLI if you are a human
+
+**If you are an agent session, reach for the `pod_up` / `pod_down` / `pod_status`
+/ `pod_ls` MCP tools before a shell.** A pod is a systemd `--user` unit, so every
+pod verb needs the systemd user bus. Whether your shell can reach that bus depends
+on the sandbox your session runs behind: under Kiro Crew's own sandbox it can (see
+`security.md`, "Scoped user-bus locator forward"), but behind an outer sandbox with
+its own user namespace it cannot, and `kirocrew pod up` then fails with
+`Permission denied`. `systemctl --user is-system-running` tells you which case you
+are in. The tools work either way -- the gateway holds the host bus and does the
+systemd part -- so they are the portable choice, and the only one on a host that
+denies you the bus.
+
+```
+pod_up     {"worktree": "<wt>"}   -> {base_url, token, port, ttl}
+pod_status {"worktree": "<wt>"}   -> status + port + health
+pod_ls     {}                     -> every pod active on this host
+pod_down   {"worktree": "<wt>"}   -> stopped, HOME reclaimed
+```
+
+Provisioning is not one of them: a cold venv plus an SPA build is minutes of work,
+and a single blocking tool call for that dies to any timeout with no way to learn
+the outcome. An unbuilt worktree is refused with the CLI's own remedy in the
+message; run `kirocrew pod provision <wt>` or use the Dev Fleet page's Provision
+button, which streams its output.
+
+Everything after step 1 below -- curl against the handle, drive the SPA with
+Playwright, read the screenshots -- is unaffected: those are ordinary loopback
+HTTP, which a sandbox does not block. Only the systemd control path is walled off.
+
+The tools need the Dev Fleet app enabled; a disabled app refuses with
+`app_not_enabled`.
+
+The CLI is the same operations for a human at a terminal:
 
 ```bash
 # 1. bring the pod up, get a handle (JSON: base_url + token + port)
@@ -57,6 +89,8 @@ kirocrew pod down <wt>
 
 Other verbs: `ls` (list running pods) · `status <wt>` · `token <wt>` · `url <wt>`
 · `logs <wt>` · `provision <wt>`. Run `kirocrew pod --help` for the full list.
+`token`, `url`, `logs` and `provision` have no tool of their own yet: `pod_up`
+already returns the token and url, and pod logs stay a human-facing read.
 
 **Isolation guarantees** (enforced by the pod runtime):
 own `KIROCREW_HOME`, own port, **no tunnel** (can't grab the real Slack identity),
@@ -96,23 +130,37 @@ green). Flags:
 | flag | effect |
 |---|---|
 | `--keep` / `--no-stop` | leave the pod running after tests (debug) |
-| `--api-only` | skip the Playwright phase |
-| `--fe-only` | skip the API-test phase |
+| `--api-only` | skip the Playwright phase (leaves a boot + auth check) |
+| `--fe-only` | accepted no-op — no test-suite phase exists to skip |
 | `--video` | record the session at 1080p → `.webm` + `.mp4` (finalization is time-capped) |
+
+**It does not run the worktree's test suite.** There is no pytest phase, on
+purpose: the suite is ~62k tests that need no pod, CI runs it on the merge ref,
+and a full local fan-out on a shared box costs far more than the browser check
+this harness exists for. Run the tests your change actually touches yourself,
+in the worktree (see the `kirocrew-worktree-dev` skill), and let CI own the
+full suite.
 
 ## What each phase does
 
 1. **up** — `kirocrew pod up <wt> --json`. If already active, reuses it (and
    won't stop it on exit). Boots the worktree's own gateway with `--no-crons`,
-   blank-seed DB, isolated HOME.
-2. **health** — polls `base_url/api/health` until 200/401/403 (≤45s). On timeout
-   it dumps logs to `boot-fail.log` and aborts.
+   blank-seed DB, isolated HOME. If this phase fails with `gateway still
+   starting after Ns` in `pod-up.log`, the gateway was alive but slower than
+   the health-wait budget (default 90s): re-run with
+   `KIROCREW_POD_HEALTH_SECS=<higher>` exported — the harness passes its
+   environment through to the `pod up` it spawns.
+2. **health** — polls `kirocrew pod status <wt> --json` until its `health` is
+   200/401/403 (≤60s). Deliberately not a bare `curl base_url/api/health`: a
+   derived port is routinely held by another pod or by the live gateway, every
+   gateway answers that path identically, so a 200 there proves only that
+   *something* is listening. `pod status` reports the pod's OWN health and returns
+   `-2` when the responder is provably somebody else's, which this phase reports
+   as a port conflict naming `PORT=`. On timeout it dumps logs to `boot-fail.log`
+   and aborts.
 3. **auth** — proves auth: `/api/sessions` → 200 with token, 403 without.
    Token comes from `kirocrew pod up --json` output (no manual minting needed).
-4. **API tests** — runs the fixed command `python -m pytest -q` with cwd=the
-   worktree root, the worktree's `.venv` on PATH, and `POD_BASE_URL` +
-   `POD_TOKEN` in env so tests can hit the live pod.
-5. **Playwright** — `pod-playwright.py` (run with a Playwright venv + bundled
+4. **Playwright** — `pod-playwright.py` (run with a Playwright venv + bundled
    chromium) loads `/?token=` headless, asserts the SPA rendered (screenshots
    `fe-smoke.png`), then exec's the optional `PLAYWRIGHT_SPEC` with a live authed
    `page` in scope.
@@ -131,7 +179,7 @@ green). Flags:
      The per-step cap uses `SIGALRM`, so on a platform without it the teardown
      degrades to unbounded and says so in the log (the harness is POSIX-only
      anyway); the phase-level `timeout` still applies.
-6. **collect** — all logs + screenshots land in
+5. **collect** — all logs + screenshots land in
    `~/.kirocrew-pods/.e2e-artifacts/<wt>/`. Per-phase results are appended to
    `verdict.jsonl` **as they are decided** (and `playwright.log` is unbuffered),
    so a stalled or killed run still leaves a readable verdict. The file is
@@ -139,7 +187,7 @@ green). Flags:
    phase — so it can never show a previous run's rows. The rest of the artifact
    dir DOES persist across runs, so check timestamps before trusting an old
    screenshot.
-7. **stop** — `kirocrew pod down <wt>`: stops the service, waits for its process
+6. **stop** — `kirocrew pod down <wt>`: stops the service, waits for its process
    tree to drain, deletes the isolated HOME, and verifies it is gone — a HOME that
    survives fails the command rather than being reported as zero residue. Skipped
    if `--keep` or if
@@ -160,10 +208,10 @@ PLAYWRIGHT_SPEC=".pod-e2e/feature.spec.py" # frontend spec, relative to the mani
 ### Trust model
 
 The **pod** isolates the gateway under test (own `KIROCREW_HOME`, own port,
-no tunnel, resource caps). The **test runner** is not a sandbox: running a
-worktree's tests executes that worktree's code as your user — exactly like
-running `pytest` in the checkout yourself. Only run pod-e2e against branches
-you would be willing to build and test locally.
+no tunnel, resource caps). The **harness** is not a sandbox: it runs the
+worktree's own gateway, and exec's that branch's `PLAYWRIGHT_SPEC`, as your
+user — exactly like building and running the checkout yourself. Only run
+pod-e2e against branches you would be willing to build and run locally.
 
 ### Playwright spec contract
 
@@ -214,12 +262,12 @@ Rules:
   mints the token internally via the CLI — just run the one command above.
 - After it finishes, READ the artifacts in the printed ARTIFACT_DIR:
   verdict.jsonl (per-phase results, written as decided — trust this even if the
-  run was killed), api-tests.log, playwright.log, fe-*.png screenshots (use the
+  run was killed), playwright.log, fe-*.png screenshots (use the
   Read tool on the .png to actually look at the UI), and boot-fail.log if present.
 
 Then return a QA VERDICT, not a raw dump:
   1. Overall: PASS / FAIL / BLOCKED (couldn't even boot the pod).
-  2. Per check (auth / api-tests / playwright): pass|fail + one-line evidence.
+  2. Per check (auth / playwright): pass|fail + one-line evidence.
   3. For each FAIL: triage it — is it (a) a real regression in the feature,
      (b) a flaky/timing issue, or (c) an environment problem (missing venv,
      missing dist, port clash)? Cite the log line or screenshot that proves it.
@@ -284,33 +332,39 @@ QA screenshots and demo videos follow a **review-then-attach** contract:
    the usual frame inspection for overlays -- first-run modals, toasts, theme
    pickers). Never attach media the user has not seen.
 2. **Wait for explicit approval of the media.** A silent user is NOT approval.
-3. **On approval, attach to the PR automatically -- do NOT ask again.**
-   - Copy the approved files into `<worktree>/temp-screenshots/<feature>/`
-     (top-level ephemeral dir, see [its README](../../../../../../../temp-screenshots/README.md)
-     for the full convention; NEVER under `docs/` or `src/kiro_crew/**` --
-     those trees ship in the wheel/sdist and desktop DMG).
-   - Stage `temp-screenshots/<feature>/`, **amend into the PR's single
-     commit**, and force-push with lease (standalone push command naming the
-     feature branch).
-   - Update the PR body with **commit-SHA-pinned** raw URLs:
-     - Images inline: `![alt](https://github.com/<owner>/<repo>/raw/<sha>/temp-screenshots/<feature>/<name>.png)`
-       -- put the 2-3 most telling shots inline, fold the rest into `<details>`.
-     - Videos: GitHub does not inline-play raw blob mp4s -- add a labelled link
-       line instead: `[Demo video (Ns, XMB)](https://github.com/<owner>/<repo>/raw/<sha>/temp-screenshots/<feature>/<name>.mp4)`.
-   - After ANY later amend, re-pin every media URL to the new SHA.
-   - Verify the body update landed (`gh api repos/<o>/<r>/pulls/<n> --jq .body | grep temp-screenshots`).
-4. **Batch to minimize approval resets.** A force-push resets PR approvals --
-   attach media BEFORE asking the user to approve the PR itself, and fold the
-   media amend into any pending code amend rather than pushing twice.
+3. **On approval, attach to the PR automatically -- do NOT ask again.** The media
+   is a GitHub attachment, never a commit: nothing is copied into the worktree,
+   nothing is amended, nothing is pushed.
+   - Write the PR body to a scratch file outside the worktree and reference the
+     approved files by their local paths: `![Settings page, empty state](<ARTIFACT_DIR>/fe-settings.png)`.
+     Put the 2-3 most telling shots inline and fold the rest into `<details>`.
+     A video MUST stand alone in its own paragraph -- `![](<ARTIFACT_DIR>/demo.mp4)`
+     with a blank line above and below -- to render as an inline player; inside a
+     sentence it renders as a link.
+   - Run `gh pr edit <n> --body-file <body> --attach <ARTIFACT_DIR>/fe-settings.png --attach <ARTIFACT_DIR>/demo.mp4`
+     (one `--attach` per file; gh >= 2.99, check `gh --version`). Each referenced
+     path is rewritten in place to a permanent
+     `https://github.com/user-attachments/assets/<uuid>` URL; an attached file the
+     body does not reference is appended at the end. Limits: 10 MB per image/GIF,
+     100 MB per video. `--attach` needs push access to the repository -- a fork
+     contributor without it drags the file into the description in the web UI,
+     which yields the same URL.
+   - Verify the body update landed: `gh api repos/<o>/<r>/pulls/<n> --jq .body | grep -c user-attachments`
+     prints the number of files you attached.
+   - The URL is tied to no commit or branch, so a later amend, force-push, branch
+     deletion or the merge leaves it valid; nothing is ever re-pinned.
+4. **Attach before asking for PR approval.** The evidence goes in as a body edit
+   -- no push, no approval reset -- and it must be in the body before the user is
+   asked to approve the PR, so the approval covers what a reviewer sees.
 
 ### Keep the rest of the tree clean
 
 The e2e suite already writes its logs and screenshots to
 `~/.kirocrew-pods/.e2e-artifacts/<wt>/` -- **outside** the worktree -- by design;
 don't copy those raw logs back into the worktree "to keep them with the branch."
-The only QA output that belongs in the tree is the **committed** media under
-`temp-screenshots/<feature>/` (above). Everything else -- raw `*.log` dumps,
-extra frames, scratch notes, the `.pr-body.md` you fed to `gh pr create` -- stays
+No QA output belongs in the tree: approved media is uploaded from `ARTIFACT_DIR`
+as a PR attachment (above), and everything else -- raw `*.log` dumps, extra
+frames, scratch notes, the `.pr-body.md` you fed to `gh pr create` -- stays
 outside (write it under a `mktemp -d`). Before ending the session,
 `git status --porcelain` must be empty: a dirty tree fail-closes Dev Fleet's
 "Prune merged" (`merged_dirty`) so the merged worktree can't be reaped. See the

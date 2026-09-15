@@ -3,6 +3,22 @@
 Kiro Crew has persistent memory that survives across sessions. It remembers your
 preferences, project context, daily activity, and corrections you teach it.
 
+## Private member context
+
+A member with Memory V2 receives its identity, permanent rules, current briefing,
+private preference/project anchors, and admitted project guides when a conversation
+starts. Unchanged follow-up turns do not resend that complete snapshot. Changes
+refresh it once; a replacement also retires guides removed from the current source
+list. Resume, compaction and a new provider conversation restore it.
+
+Rules, ownership and required source readability are checked on every turn, even
+when no snapshot is resent. Missing declared files or oversized required guides
+stop the turn rather than silently dropping instructions. Failed, cancelled or
+empty attempts do not count as delivery. Native-loaded persona/resources are not
+copied into the initial prompt again when their exact startup content is known.
+Manual, auto and file-matched steering are not promoted to always-on guidance.
+This does not erase text already retained in a conversation or change Global V1.
+
 ## Memory Types
 
 ### Preferences (`preferences.md`)
@@ -32,7 +48,7 @@ Corrections and rules you teach Kiro Crew. Two ways to create:
 
 Lessons have two scopes:
 - **Global** (default): shared across all workspaces
-- **Workspace**: only visible in the current workspace
+- **Repository-scoped**: an optional `repo_scope` path fragment restricts a lesson to sessions whose active project is inside that repository tree
 
 ## Memory Modes
 
@@ -40,9 +56,15 @@ Each session can operate in one of three memory modes:
 
 | Mode | Reads Memory | Writes Memory | Consolidates | Use Case |
 |------|-------------|---------------|-------------|----------|
-| **Persistent** (default) | ✅ | ✅ | ✅ | Normal work |
+| **Persistent** (factory default) | ✅ | ✅ | ✅ | Normal work |
 | **Incognito** | ✅ | ❌ | ❌ | Sensitive tasks — reads context but blocks learn_add and consolidation |
 | **Temporary** | ❌ | ❌ | ❌ | Isolated experiments — no memory interaction at all |
+
+For new dashboard chats, choose the default under **Settings → Chat → Sessions →
+Default Memory Mode**. The choice is stored as
+`dashboard.default_memory_mode`. An explicit Incognito or Temporary choice still
+wins for that chat. App-owned chats, messaging channels, cron jobs, and direct API
+callers keep their own mode selection and do not inherit this dashboard preference.
 
 Set via the dashboard Welcome view (ghost button), the mode icon in the chat
 header, Slack (`!incognito` / `!temporary` prefix), or Telegram (`/incognito` /
@@ -68,12 +90,11 @@ or on the dashboard Overview → Lessons tab.
 
 ## Workspaces
 
-Memory is workspace-scoped. Different workspaces have different preferences,
-projects, and history. Lessons can be global or workspace-specific.
+Markdown memory is workspace-scoped: each workspace stores `memory/preferences.md`, `memory/projects.md`, and `memory/history/{date}.md` beneath its workspace directory. Legacy JSONL lessons are also workspace-local; vector memory defaults to `memory.db` under the Kiro Crew data directory. Lessons are global unless their optional `repo_scope` restricts them to a project tree.
 
 ## Vector Memory
 
-Semantic search over your memory, always on:
+The vector-memory subsystem is always enabled:
 
 - **Semantic memory**: structured key-value store with confidence scoring
 - **Episodic memory**: conversation fragments searchable by meaning
@@ -88,6 +109,24 @@ loads in the background too, so nothing ever waits on it. While the model is
 downloading or loading, memory falls back to keyword search and switches to
 semantic search as soon as the model is ready — no restart needed. Requires
 ~610MB disk for the model and ~700MB RAM once the model is loaded.
+
+The bundled model is `qwen3-embedding:0.6b` (1024 dimensions). `KIROCREW_EMBED_MODEL_URL` overrides `memory.embed_model_url` for the download URL; `KIROCREW_EMBED_MODEL_PATH` or `memory.embed_model_path` selects a local GGUF instead of the bundled model.
+
+## Rebuilding vectors after a model change
+
+In Memory settings, use the warning's link to Embedding Model, then apply the
+model again. Applying the same file is supported. This rebuilds vectors even
+when an earlier apply missed a closed member store. Saved memories are retained;
+keyword search remains available while vectors are rebuilt.
+
+The request survives a gateway restart. Open stores are repaired first. Closed
+or unavailable stores are reported as deferred and handled when opened. A loaded
+model does not mean every store has finished rebuilding. An unknown repair scope
+means some stores could not be checked, not that they are empty or repaired.
+
+Known setup warnings and errors follow the dashboard language. Paths and system
+error details remain exact. Older servers and unknown status codes retain their
+original diagnostic text.
 
 ## Consolidation
 

@@ -1,4 +1,4 @@
-"""Tests for ``atomic_write``'s bytes and owner-only capabilities (issue #1105).
+"""Tests for ``atomic_write``'s bytes and owner-only capabilities.
 
 These two gaps are why a set of hand-rolled temp-write-and-rename sites could
 not adopt the shared helper, and so silently missed the Windows rename retry:
@@ -46,6 +46,47 @@ def test_bytes_content_is_not_newline_translated(tmp_path):
     assert target.read_bytes() == b"\r\n\n\r"
 
 
+@pytest.mark.skipif(not platform_compat.IS_POSIX, reason="descriptor-relative writes are POSIX")
+def test_atomic_write_at_replaces_inside_pinned_directory(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        aw.atomic_write_at(dir_fd, "value.txt", "one", mode=0o600)
+        aw.atomic_write_at(dir_fd, "value.txt", "two", fsync=True, mode=0o600)
+    finally:
+        os.close(dir_fd)
+    assert (root / "value.txt").read_text() == "two"
+
+
+@pytest.mark.skipif(not platform_compat.IS_POSIX, reason="descriptor-relative writes are POSIX")
+def test_atomic_write_at_replaces_symlink_without_touching_target(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep")
+    (root / "value.txt").symlink_to(victim)
+    dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        aw.atomic_write_at(dir_fd, "value.txt", "managed", mode=0o600)
+    finally:
+        os.close(dir_fd)
+    assert victim.read_text() == "keep"
+    assert not (root / "value.txt").is_symlink()
+    assert (root / "value.txt").read_text() == "managed"
+
+
+def test_atomic_write_at_rejects_non_leaf_name(tmp_path):
+    if not platform_compat.IS_POSIX:
+        pytest.skip("descriptor-relative writes are POSIX")
+    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(ValueError, match="one leaf name"):
+            aw.atomic_write_at(dir_fd, "nested/value.txt", "nope")
+    finally:
+        os.close(dir_fd)
+
+
 def test_str_content_still_writes_utf8(tmp_path):
     """The pre-existing text path must be untouched by the bytes addition."""
     target = tmp_path / "notes.txt"
@@ -74,7 +115,7 @@ def test_restrict_to_owner_runs_before_any_content_is_written(tmp_path, monkeypa
     events: list[str] = []
     real_restrict = platform_compat.restrict_to_owner
 
-    def _spy(path):
+    def _spy(path, **_kw):
         events.append("restrict")
         return real_restrict(path)
 
@@ -128,7 +169,7 @@ def test_a_wider_mode_alongside_restrict_to_owner_is_rejected(tmp_path):
 def test_a_failing_lockdown_leaves_no_temp_and_no_target(tmp_path, monkeypatch):
     """Fail-loud: a secret we cannot protect must not be written at all."""
 
-    def _boom(path):
+    def _boom(path, **_kw):
         raise OSError("cannot set DACL")
 
     monkeypatch.setattr(platform_compat, "restrict_to_owner", _boom)
@@ -142,9 +183,9 @@ def test_a_failing_lockdown_leaves_no_temp_and_no_target(tmp_path, monkeypatch):
 
 
 def _failing_restrict(monkeypatch):
-    """Make the owner-only lockdown fail the way a read-only FS or icacls would."""
+    """Make the owner-only lockdown fail the way a read-only FS or a DACL write failure would."""
 
-    def _boom(path):
+    def _boom(path, **_kw):
         raise OSError("cannot set DACL")
 
     monkeypatch.setattr(platform_compat, "restrict_to_owner", _boom)

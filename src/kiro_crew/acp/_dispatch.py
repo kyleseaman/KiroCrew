@@ -19,8 +19,9 @@ import logging
 import math
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
+from kiro_crew import mcp_apps_render, session_directive
 from kiro_crew.acp.types import (
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
@@ -45,6 +46,7 @@ from kiro_crew.acp.types import (
     METHOD_SUBAGENT_LIST_UPDATE,
     OPTION_ALLOW_ALWAYS,
     OPTION_ALLOW_ONCE,
+    STOP_REASON_CONTENT_FILTERED_WIRE,
     TODO_TASKS_MAX,
     TODO_TEXT_MAX,
     TOOL_PURPOSE_KEYS,
@@ -54,7 +56,10 @@ from kiro_crew.acp.types import (
     UPDATE_TOOL_CALL_UPDATE,
     AcpEvent,
     JsonRpcMessage,
+    RefusalInfo,
 )
+from kiro_crew.acp_backends import ACP_BACKENDS_META_IDENTITY
+from kiro_crew.metrics.tool_calls import note_tool_call_started, record_tool_call_finished
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
@@ -119,6 +124,21 @@ def set_mode_params(session_id: str, agent: str) -> dict[str, Any]:
     return {"sessionId": session_id, "modeId": agent}
 
 
+def agent_version_from_init(resp: dict[str, Any]) -> str:
+    """``agentInfo.version`` from an ``initialize`` result, ``""`` when absent.
+
+    Shared by both clients so the two handshakes read the same field the same
+    way: kiro-cli reports ``{"agentInfo": {"name": ..., "version": "2.21.0"}}``.
+    A missing or non-string value reads as unknown rather than raising — the
+    handshake must not fail over a field only a capability gate consults.
+    """
+    info = resp.get("agentInfo") if isinstance(resp, dict) else None
+    if not isinstance(info, dict):
+        return ""
+    version = info.get("version")
+    return version.strip() if isinstance(version, str) else ""
+
+
 def parse_session_modes(resp: dict[str, Any]) -> tuple[list[str], str, bool]:
     """Extract advertised mode ids, current mode id, and whether the backend
     advertised a modes list at all, from a ``session/new`` / ``session/load``
@@ -168,7 +188,20 @@ def set_model_params(session_id: str, model_id: str) -> dict[str, Any]:
 #: right per-session queue — so reporting it would mislabel a load-bearing routing
 #: field as an unhandled discovery on the first frame of every shared-runtime
 #: session.
-_KNOWN_METADATA_KEYS = frozenset({"contextUsagePercentage", "meteringUsage", "sessionId"})
+#:
+#: ``stopReason`` and ``refusal`` are the content-filter envelope read by
+#: :func:`parse_refusal` (``ACP_BACKENDS_STRUCTURED_REFUSAL``).
+_KNOWN_METADATA_KEYS = frozenset(
+    {"contextUsagePercentage", "meteringUsage", "sessionId", "stopReason", "refusal"}
+)
+
+#: Keys of the ``refusal`` object :func:`parse_refusal` consumes. Anything else
+#: the service adds is reported once like any other unconsumed field.
+_KNOWN_REFUSAL_KEYS = frozenset({"category", "explanation", "recommendedModel"})
+
+#: Longest ``explanation`` carried onto the dashboard. The canned text is ~250
+#: chars; the cap is a guard against a provider echoing the prompt back.
+_REFUSAL_EXPLANATION_MAX = 600
 
 #: ``meteringUsage`` entry keys this parser knows, and the one ``unit`` value the
 #: credit sum reads. An entry with any other unit contributes nothing.
@@ -223,8 +256,118 @@ def _log_unrecognized_metadata_fields(params: dict[str, Any]) -> None:
                     _reported_metadata_fields.add(name)
                     novel.append(name)
 
+    refusal = params.get("refusal")
+    if isinstance(refusal, dict):
+        for key, value in refusal.items():
+            name = f"refusal.{key}:{type(value).__name__}"
+            if key in _KNOWN_REFUSAL_KEYS or name in _reported_metadata_fields:
+                continue
+            _reported_metadata_fields.add(name)
+            novel.append(name)
+
     if novel:
         logger.debug("acp metadata: unconsumed field(s) %s", ", ".join(sorted(novel)))
+
+
+def _refusal_str(value: object, limit: int) -> str:
+    """A provider string bound for the dashboard: str-typed, scrubbed, capped.
+
+    EVERY field of the refusal object goes through this, not just the prose
+    one: ``category`` and ``recommendedModel`` are provider-echoed text
+    reaching the same log line and the same card as ``explanation``, and the
+    service's vocabulary being closed is an upstream assumption this side
+    cannot verify. Redaction runs over the FULL value, and only then the cap:
+    any cut before the redactors -- the cap itself, or a "generous" pre-slice --
+    can split a secret so its prefix no longer matches a pattern and reaches
+    the surface raw. A refusal object is a few hundred bytes, so scanning it
+    whole costs nothing.
+    """
+    if not isinstance(value, str):
+        return ""
+    text, _ = redact_exfiltration_urls(value.strip())
+    text, _ = redact_credentials(text)
+    return text[:limit]
+
+
+#: The one JSON-RPC error the Kiro service is observed to send as a content-filter
+#: refusal's terminal: a bare ``-32603 Internal error`` with no ``data``.
+_REFUSAL_TERMINAL_CODE = -32603
+
+
+def error_is_refusal_terminal(error: object, refusal: RefusalInfo | None) -> bool:
+    """True iff *error* is the terminal frame OF a refusal already recorded.
+
+    Two conditions, both required. A refusal must have arrived on metadata this
+    turn -- with none recorded, every error is an ordinary error. And the frame
+    must be the bare ``-32603`` the service sends for that case: code alone,
+    ``data`` empty or absent. Anything else -- a prompt-busy echo, a model
+    rejection, a throttle, any frame carrying provider ``data`` -- keeps its own
+    classification even when it happens to land after a refusal frame, so the
+    retry ladder, the substitute-model path and the prompt-busy reset all still
+    see the failure they exist for. Scoping here rather than at each of the four
+    prompt-terminal readers is what keeps them from drifting apart.
+
+    Logs at WARNING when it answers True: the frame is about to be consumed
+    without reaching ``_raise_acp_error``, and that must be visible in the log
+    even though it is the intended outcome.
+    """
+    if refusal is None or not isinstance(error, dict):
+        return False
+    try:
+        code = int(error.get("code"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    if code != _REFUSAL_TERMINAL_CODE:
+        return False
+    data = error.get("data")
+    if data not in (None, "", {}, []):
+        return False
+    logger.warning(
+        "acp: -32603 error frame consumed as the terminal of a content-filter "
+        "refusal (category=%s); not raised, not retried",
+        refusal.category or "-",
+    )
+    return True
+
+
+def parse_refusal(params: dict[str, Any]) -> RefusalInfo | None:
+    """Read a content-filter refusal off a ``_kiro.dev/metadata`` notification.
+
+    The Kiro service reports a declined turn as ``stopReason: CONTENT_FILTERED``
+    with a ``refusal`` object beside it, on the metadata channel rather than on
+    the terminal. Returns a :class:`RefusalInfo` when EITHER signal is present
+    -- the stop reason alone (an object-less refusal still is one), or a
+    ``refusal`` object alone (a future stop-reason spelling must not hide the
+    reason the service did send) -- and ``None`` for the ordinary per-turn
+    usage frame that carries neither.
+
+    ``explanation`` is provider text that reaches the dashboard, so it passes
+    the same two-pass scrub every other backend-echoed string does. Field values
+    are never logged here: the caller logs only that a refusal was seen.
+    """
+    stop_reason = params.get("stopReason")
+    refusal = params.get("refusal")
+    filtered = isinstance(stop_reason, str) and (
+        stop_reason.strip().upper() == STOP_REASON_CONTENT_FILTERED_WIRE
+    )
+    if not filtered and not isinstance(refusal, dict):
+        return None
+    if not isinstance(refusal, dict):
+        refusal = {}
+    info = RefusalInfo(
+        category=_refusal_str(refusal.get("category"), 64),
+        explanation=_refusal_str(refusal.get("explanation"), _REFUSAL_EXPLANATION_MAX),
+        recommended_model=_refusal_str(refusal.get("recommendedModel"), 128),
+    )
+    # A log line naming the (scrubbed) category is how an operator learns WHICH
+    # filter a fleet keeps tripping, without carrying the explanation (prose)
+    # or the prompt.
+    logger.info(
+        "acp metadata: content-filter refusal (category=%s, recommended_model=%s)",
+        info.category or "-",
+        info.recommended_model or "-",
+    )
+    return info
 
 
 def parse_metadata(params: dict[str, Any]) -> tuple[float | None, float]:
@@ -557,6 +700,77 @@ def parse_text_chunk(update: dict[str, Any]) -> tuple[str | None, bool]:
     return None, False
 
 
+# claude-agent-acp has no out-of-band compaction notification: where kiro-cli
+# sends ``_kiro.dev/compaction/status`` and KAS sends its summarization kinds
+# under ``_meta.kiro``, the Claude adapter reports compaction as PLAIN
+# ``agent_message_chunk`` TEXT, indistinguishable from model prose to any
+# client.  Verbatim from the shipped adapter (``dist/acp-agent.js``, the
+# ``status`` case of its SDK-message switch):
+#
+#   status === "compacting"          -> "Compacting..."
+#   compact_result === "success"     -> "\n\nCompacting completed."
+#   compact_result === "failed"      -> "\n\nCompacting failed{reason}"
+#
+# where ``reason`` is ``": " + compact_error`` or ``"."``.  Recognising these
+# here makes the Claude backend the third producer of EVENT_COMPACTION_STATUS,
+# so every consumer that already handles the kiro-cli and KAS shapes (the
+# dashboard notice + context-meter reset, the messaging drivers, and
+# ``wait_for_compaction``) works on Claude with no per-surface change.
+#
+# The notice TEXT is still forwarded on every path: classifying one of these
+# literals is a guess about bare prose, so a layer that dropped the chunk would
+# turn any wrong guess into deleted model output. Structured consumers get the
+# chunk flagged ``AcpEvent.control_notice`` instead, which lets them show it
+# without counting it as the turn's own answer.
+#
+# Only ``compact_result`` carries a terminal, and per the adapter's own comment
+# the SDK sends it for MANUAL ``/compact`` only: an AUTOMATIC mid-turn
+# compaction takes the adapter's ``compact_boundary`` case, which emits a
+# ``usage_update`` and no text at all.  So an auto-compaction produces a
+# ``started`` with no terminal, and callers must settle it at turn end rather
+# than waiting for one (see ``AcpClient._dispatch_events``).
+_CLAUDE_COMPACTION_STARTED_MARKER = "Compacting..."
+_CLAUDE_COMPACTION_COMPLETED_MARKER = "Compacting completed."
+_CLAUDE_COMPACTION_FAILED_MARKER = "Compacting failed"
+
+
+def parse_claude_compaction_notice(chunk: str) -> tuple[str, str] | None:
+    """Classify a claude-agent-acp compaction notice chunk.
+
+    Returns ``(status_type, detail)`` with ``status_type`` in
+    ``started``/``completed``/``failed`` — the same vocabulary kiro-cli's
+    ``_kiro.dev/compaction/status`` and KAS's summarization kinds already use —
+    or ``None`` when *chunk* is not one of the adapter's notices.
+
+    Matched on the STRIPPED chunk (the adapter prefixes the two terminals with
+    ``\\n\\n``), and every arm is anchored to a WHOLE chunk.  ``started`` and
+    ``completed`` are exact equality; ``failed`` accepts only the two shapes the
+    adapter actually emits — bare ``Compacting failed.`` or
+    ``Compacting failed: <reason>`` — rather than any chunk merely STARTING with
+    the marker.  Anchoring is the point, and it has to hold on all three arms: a
+    model that opens a real answer with "Compacting failed because…" would
+    otherwise be reclassified as a control notice and have its output erased
+    from the transcript.
+
+    The returned detail is NOT redacted: it is backend-echoed text, so callers
+    that surface it must pass it through their own redaction the same way they
+    already do for the kiro-cli/KAS compaction summaries.
+    """
+    text = chunk.strip()
+    if not text:
+        return None
+    if text == _CLAUDE_COMPACTION_STARTED_MARKER:
+        return "started", ""
+    if text == _CLAUDE_COMPACTION_COMPLETED_MARKER:
+        return "completed", ""
+    if text in (_CLAUDE_COMPACTION_FAILED_MARKER, f"{_CLAUDE_COMPACTION_FAILED_MARKER}."):
+        return "failed", ""
+    reason_prefix = f"{_CLAUDE_COMPACTION_FAILED_MARKER}: "
+    if text.startswith(reason_prefix):
+        return "failed", text[len(reason_prefix) :].strip().rstrip(".")
+    return None
+
+
 _ACP_SHELL_KIND = "execute"
 
 
@@ -564,11 +778,16 @@ def reject_option_id(params: dict) -> str | None:
     """The least-destructive reject optionId a permission request advertises.
 
     Used when auto-answering a ``session/request_permission`` for a session
-    this client never registered (a backend-internal subagent). Prefer the
-    request's own ``reject_once``-kind option; fall back to a legacy id that
-    names reject. ``None`` means the caller must answer with the ``cancelled``
-    outcome instead — kiro-cli maps that to cancelling the child's turn, which
-    is strictly worse than a per-tool reject, so this is the last resort.
+    this client never registered (a backend-internal subagent), and by
+    :meth:`AcpClient.reject_tool` for a user's explicit deny. Prefer the
+    request's own ``reject_once``-kind option; fall back to a ``behavior``
+    that names deny, then to a legacy id that names reject. ``None`` means
+    the caller must answer with the ``cancelled`` outcome instead — kiro-cli
+    maps that to cancelling the TURN, which auto-denies every later tool call
+    in it without prompting, so recognition here is deliberately
+    broad: any deny-shaped option beats the cancelled fallback. What it must
+    never do is pick an ALLOW option, so every branch matches deny-naming
+    values exactly rather than by substring.
     """
     raw = params.get("options")
     if not isinstance(raw, list):
@@ -579,11 +798,35 @@ def reject_option_id(params: dict) -> str | None:
             opt_id = opt.get("optionId") or opt.get("id")
             if opt.get("kind") == want_kind and isinstance(opt_id, str) and opt_id:
                 return opt_id
-    # Legacy kiro payloads omit `kind` — match well-known reject ids only, so
-    # an allow option can never be picked by accident.
+    # Adapters that speak `behavior` instead of `kind`: an exact deny/reject
+    # behavior is unambiguous whatever the id is called. Same vocabulary as
+    # build_permission_event's branch (_DENY_BEHAVIORS) by construction.
+    # An option carrying a VALID spec `kind` is classified by that kind alone:
+    # a contradictory {kind:"allow_once", behavior:"deny"} must never be
+    # selected as a reject — answering with an allow optionId APPROVES the
+    # tool, the exact inversion this function exists to prevent.
     for opt in options:
         opt_id = opt.get("optionId") or opt.get("id")
-        if isinstance(opt_id, str) and opt_id in ("reject_once", "reject_always", "reject"):
+        if opt.get("kind") in _SPEC_OPTION_KINDS:
+            continue
+        behavior = opt.get("behavior")
+        if (
+            isinstance(behavior, str)
+            and behavior.lower() in _DENY_BEHAVIORS
+            and isinstance(opt_id, str)
+            and opt_id
+        ):
+            return opt_id
+    # Legacy payloads omit `kind` and `behavior` — match well-known deny ids
+    # only (exact, lowercased), so an allow option can never be picked by
+    # accident. Derived from _LEGACY_OPTION_KIND so this list and the event
+    # builder's classification cannot drift apart. Same kind-wins precedence
+    # as the behavior branch above.
+    for opt in options:
+        opt_id = opt.get("optionId") or opt.get("id")
+        if opt.get("kind") in _SPEC_OPTION_KINDS:
+            continue
+        if isinstance(opt_id, str) and opt_id.lower() in _DENY_OPTION_IDS:
             return opt_id
     return None
 
@@ -602,20 +845,129 @@ _LEGACY_OPTION_KIND: dict[str, str] = {
     OPTION_ALLOW_ALWAYS: "allow_always",
     "reject_once": "reject_once",
     "reject_always": "reject_always",
+    # Deny-naming ids without a `kind`: recognising them is what keeps a user
+    # denial on the per-tool reject path. Missing them drops reject_tool onto
+    # the `cancelled` outcome, which kiro-cli treats as cancelling the TURN —
+    # auto-denying every later tool call in it unprompted.
+    "reject": "reject_once",
+    "deny": "reject_once",
+    "deny_once": "reject_once",
+    "decline": "reject_once",
+    "deny_always": "reject_always",
 }
+
+#: The four ACP-spec permission-option kinds. An option carrying one of these
+#: is classified by its kind ALONE — later deny-recognition branches
+#: (behavior, legacy id) must not override it, or a contradictory
+#: {kind:"allow_once", behavior:"deny"} could be answered as a reject with an
+#: ALLOW optionId, approving the tool the caller meant to deny.
+_SPEC_OPTION_KINDS = frozenset({"allow_once", "allow_always", "reject_once", "reject_always"})
+
+#: `behavior` values that mark an option as a deny, for adapters that speak
+#: behavior instead of kind (behavior:"deny" appears as the selection RESULT in
+#: claude-agent-acp; recognising it on an advertised option is defensive).
+#: Exact-match only — an allow option must never be classified as a reject.
+_DENY_BEHAVIORS = frozenset({"deny", "reject"})
+
+#: Deny-naming option ids, DERIVED from the one table above so the auto-answer
+#: path (`reject_option_id`) and the event builder (`build_permission_event`)
+#: cannot drift on the vocabulary.
+_DENY_OPTION_IDS: frozenset[str] = frozenset(
+    k for k, v in _LEGACY_OPTION_KIND.items() if v in ("reject_once", "reject_always")
+)
+
+
+#: The marker key Kiro Crew's own gate extension puts in a harness confirm dialog.
+#:
+#: A harness with no permission gate of its own is gated by an extension Kiro Crew
+#: loads into it (``agent_sdk.backends.Routing.VERIFIED_GATE_EXTENSION``). That
+#: extension can only raise the harness's generic confirm dialog, which the adapter
+#: forwards as a ``session/request_permission`` whose ``toolCall`` describes the
+#: DIALOG -- ``kind: "other"``, a ``rawInput`` of ``{method, title, message}`` -- and
+#: not the tool call behind it. So the extension writes the tool call into the
+#: dialog's message as a JSON envelope under this marker, and the builder below
+#: reads it back out. Keyed on the marker, not on a backend id: the envelope is a
+#: wire contract between two pieces of Kiro Crew's own code, and any harness whose
+#: gate is one of these extensions speaks it.
+GATE_ENVELOPE_MARKER = "kiro-crew-gate"
+
+
+def gate_envelope(tool_call: dict[str, Any], nonce: str | None) -> dict[str, Any] | None:
+    """The tool call a gate-extension confirm dialog is asking about, or ``None``.
+
+    Returns ``{"toolCallId", "title", "kind", "input", "truncated"}`` when
+    *tool_call* is the adapter's rendering of Kiro Crew's own dialog: ``rawInput.method``
+    is ``confirm``, ``rawInput.message`` parses as a JSON object carrying
+    :data:`GATE_ENVELOPE_MARKER`, its ``nonce`` is the one this session issued,
+    and its ``tool`` is the dialog's own title. Anything else -- another
+    extension's dialog, a native tool-call permission, a message that is not the
+    envelope -- is ``None`` and the frame is read exactly as before.
+
+    *nonce* is the per-session value the driver put in the harness child's
+    environment for the extension to echo, and ``None`` means this session runs
+    no gate extension at all. Both checks exist for the same reason: on every
+    harness a permission frame's ``rawInput`` IS the model's tool arguments, so a
+    marker alone would let a model on any backend call any tool with
+    ``{method: "confirm", message: "<envelope>"}`` and have the gate judge the
+    benign call it described while the real one ran. A session without a gate
+    extension therefore never consults the envelope, and one with it accepts
+    only the envelope its own extension could have written. The title check
+    closes the smaller gap on the gated harness itself: another extension relaying
+    model text into a dialog controls that text, not the tool the harness names.
+
+    The ``tool`` and ``kind`` fields are authored by the extension from the
+    harness's own event, so they carry the same provenance the harness's own
+    ``tool_call`` frame would; ``input`` is the tool's arguments, model-influenced
+    like every tool input, and is treated as such downstream.
+    """
+    if not isinstance(nonce, str) or not nonce:
+        return None
+    raw_input = tool_call.get("rawInput")
+    if not isinstance(raw_input, dict) or raw_input.get("method") != "confirm":
+        return None
+    message = raw_input.get("message")
+    if not isinstance(message, str) or GATE_ENVELOPE_MARKER not in message:
+        return None
+    try:
+        body = json.loads(message)
+    except ValueError:
+        return None
+    if not isinstance(body, dict) or body.get(GATE_ENVELOPE_MARKER) != 1:
+        return None
+    if body.get("nonce") != nonce:
+        return None
+    tool = body.get("tool")
+    if not isinstance(tool, str) or not tool or raw_input.get("title") != tool:
+        return None
+    kind = body.get("kind")
+    tool_call_id = body.get("toolCallId")
+    return {
+        "toolCallId": tool_call_id if isinstance(tool_call_id, str) and tool_call_id else "",
+        "title": tool,
+        "kind": kind if isinstance(kind, str) else "other",
+        "input": body.get("input"),
+        "truncated": body.get("truncated") is True,
+    }
 
 
 def build_permission_event(
     msg: JsonRpcMessage,
     *,
     tool_input_cache: dict[str, str] | None = None,
+    tool_input_redacted_cache: dict[str, bool] | None = None,
     shell_cache: dict[str, bool] | None = None,
     raw_params_cache: dict[str, dict] | None = None,
     mcp_server_name_cache: dict[str, str] | None = None,
     tool_name_cache: dict[str, str] | None = None,
     cache_scope: str = "",
+    diff_path_cache: dict[str, str] | None = None,
+    gate_envelope_nonce: str | None = None,
 ) -> tuple[AcpEvent, dict[str, str] | None]:
     """Build an ``EVENT_PERMISSION_REQUEST`` from a ``session/request_permission``.
+
+    ``gate_envelope_nonce`` is set only by a caller whose session runs Kiro Crew's
+    gate extension (``Routing.VERIFIED_GATE_EXTENSION``); see :func:`gate_envelope`
+    for what it unlocks and why the default consults nothing.
 
     Single source of truth shared by ``AcpClient`` and ``AcpSessionHandle`` so
     the two transports cannot drift on the kiro/claude permission payload shape:
@@ -639,6 +991,19 @@ def build_permission_event(
     params = msg.params or {}
     tool_call = params.get("toolCall", {})
     tool_call = tool_call if isinstance(tool_call, dict) else {}
+    # A gate-extension dialog describes the DIALOG; the tool call it asks about is
+    # in its envelope. Substitute that description for the frame's own so the rest
+    # of this builder reads the real tool name, kind, id and arguments. The
+    # envelope's id is the harness's own toolCallId for the call, so the caches
+    # below are consulted under the same key the preceding ``tool_call`` frame wrote.
+    envelope = gate_envelope(tool_call, gate_envelope_nonce)
+    if envelope is not None:
+        tool_call = {
+            "toolCallId": envelope["toolCallId"] or tool_call.get("toolCallId", ""),
+            "title": envelope["title"],
+            "kind": envelope["kind"],
+            "input": envelope["input"],
+        }
     title = _redact(tool_call.get("title", "unknown"))
     # The ACP toolCall carries a `kind` ("execute" for Bash, "read"/"edit"/…).
     # Carry it onto the event as display/telemetry metadata only — the is_shell
@@ -646,7 +1011,7 @@ def build_permission_event(
     tool_kind = tool_call.get("kind", "")
 
     # ACP spec uses optionId/name + kind ("allow_once"|"allow_always"|
-    # "reject_once"|"reject_always"); kiro-cli historically uses id/label with id
+    # "reject_once"|"reject_always"); kiro-cli uses id/label with id
     # values "allow_once"/"allow_always". Accept both shapes and remember the
     # actual optionIds keyed by kind so approve/reject can echo the exact id.
     options: list[dict[str, str]] = []
@@ -669,6 +1034,14 @@ def build_permission_event(
         options.append({"id": opt_id, "label": opt_label})
         if not opt_kind:
             opt_kind = _LEGACY_OPTION_KIND.get(opt_id.lower(), "")
+        if not opt_kind:
+            # Adapters that speak `behavior` instead of `kind`: an exact deny
+            # behavior classifies the option as a per-tool reject whatever the
+            # id is called, keeping a user denial off the turn-cancelling
+            # `cancelled` fallback.
+            behavior = o.get("behavior")
+            if isinstance(behavior, str) and behavior.lower() in _DENY_BEHAVIORS:
+                opt_kind = "reject_once"
         if opt_kind:
             kind_to_id.setdefault(opt_kind, opt_id)
     if not options:
@@ -683,8 +1056,11 @@ def build_permission_event(
     # reject option (for a clean reject) was advertised. claude-agent-acp offers
     # a {kind:"reject_once", optionId:"reject"} whose selection yields
     # behavior:"deny" — far better than a "cancelled" outcome, which the adapter
-    # turns into a cryptic "Tool use aborted". kiro-cli advertises no reject
-    # option, so reject_tool falls back to "cancelled" (a clean rejection there).
+    # turns into a cryptic "Tool use aborted". A payload advertising no
+    # deny-shaped option at all leaves reject_tool on the "cancelled" fallback,
+    # which kiro-cli maps to cancelling the TURN — auto-denying every later
+    # tool call in it; that is why recognition above is deliberately
+    # broad and why both fallback sites log a warning.
     any_allow = kind_to_id.get("allow_once") or kind_to_id.get("allow_always")
     any_reject = kind_to_id.get("reject_once") or kind_to_id.get("reject_always")
     recorded: dict[str, str] | None = None
@@ -709,13 +1085,29 @@ def build_permission_event(
     # re-prompt) still find their entry.
     _ck = f"{cache_scope}|{tool_call_id}" if cache_scope else tool_call_id
     tool_input = ""
+    tool_input_redacted = False
     if tool_call_id and tool_input_cache is not None and _ck in tool_input_cache:
-        tool_input = tool_input_cache.pop(_ck)
+        # Retain the rendered input for same-call permission re-prompts.  A
+        # non-shell rawInput may legally be a string/list rather than a dict;
+        # consuming this cache made the repeat look argument-free and promoted
+        # it to durable mcp__server__tool trust.  Per-turn clear() remains the
+        # lifecycle boundary, matching the provenance caches below.
+        tool_input = tool_input_cache.get(_ck, "")
+        # A cache written by an older/minimal caller may not have the matching
+        # provenance map (or may be missing just this key).  The rendered input
+        # is still safe to show, but its completeness is unknown: fail closed
+        # for durable trust rather than treating unknown provenance as proof
+        # that no bytes were redacted.  Ordinary allow-once remains available.
+        tool_input_redacted = (
+            tool_input_redacted_cache.get(_ck, True)
+            if tool_input_redacted_cache is not None
+            else True
+        )
     if not tool_input:
         raw_input = tool_call.get("input") or tool_call.get("params")
         if raw_input:
             tool_input = (
-                json.dumps(raw_input, indent=2)
+                _dumps_degraded(raw_input, indent=2)
                 if isinstance(raw_input, (dict, list))
                 else str(raw_input)
             )
@@ -723,7 +1115,9 @@ def build_permission_event(
             # by the tool_call parser; on a cache miss this fallback reads raw
             # LLM-influenced input that surfaces on the dashboard permission UI,
             # so scrub exfil URLs + credentials before it leaves this function.
-            tool_input = redact_text(tool_input)
+            safe_tool_input = redact_text(tool_input)
+            tool_input_redacted = safe_tool_input != tool_input
+            tool_input = safe_tool_input
 
     # Resolve the canonical shell signal. SECURITY (deny-by-default): the ONLY
     # trusted source is the value cached from the preceding tool_call (keyed by
@@ -734,9 +1128,14 @@ def build_permission_event(
     # is_shell stays False and the length cap is enforced. Use .get() (not
     # .pop()): a later tool_call_update refinement reads this same cache, so
     # popping here would make it wrongly report is_shell=False.
-    cached_shell = (
-        shell_cache.get(_ck) if (shell_cache is not None and tool_call_id) else None
-    )
+    cached_shell = shell_cache.get(_ck) if (shell_cache is not None and tool_call_id) else None
+    if cached_shell is None and envelope is not None:
+        # The envelope's kind is the gate extension's own rendering of the
+        # harness's tool name -- Kiro Crew's code reading the harness's event, the
+        # same provenance the cached ``tool_call`` kind has. It is NOT the frame's
+        # own agent-influenced ``kind``, which the deny-by-default rule above is
+        # about; that field described the dialog and was discarded.
+        cached_shell = is_shell_kind(envelope["kind"])
     is_shell = bool(cached_shell)
     if cached_shell is None and tool_input:
         logger.info(
@@ -768,6 +1167,53 @@ def build_permission_event(
         _inline = tool_call.get("input") or tool_call.get("params")
         if isinstance(_inline, dict):
             _resolved_raw_params = _inline
+            # Trusted when they came out of the gate envelope, and only then: the
+            # extension read them off the harness's own tool_call event, which is
+            # the same source the cache above is filled from. An inline dict on an
+            # ordinary permission frame stays untrusted, as before. A TRUNCATED
+            # envelope keeps its params -- the keys the path checks read survive
+            # the cut -- but earns no durable trust, since a value was not seen
+            # whole.
+            _raw_params_trusted = envelope is not None and not envelope["truncated"]
+
+    # Trusted MCP server + tool identity recovered from the preceding tool_call
+    # (the permission payload carries no _meta). .get() (not .pop()) mirrors the
+    # is_shell cache: a later tool_call_update for the same id re-reads it; the
+    # per-turn dispatch .clear() handles cleanup. Empty on a miss (fail-closed
+    # for the app-own-server auto-approve). The tool name lets the app-own-server
+    # auto-approve govern the canonical mcp__<server>__<tool> on the permission
+    # path.
+    _cached_server = (
+        mcp_server_name_cache.get(_ck)
+        if (mcp_server_name_cache is not None and tool_call_id)
+        else None
+    )
+    _cached_tool = (
+        tool_name_cache.get(_ck) if (tool_name_cache is not None and tool_call_id) else None
+    )
+    _mcp_server_name = _cached_server or ""
+    _tool_name = _cached_tool or ""
+    # Explicit identity-provenance flag (mirrors _raw_params_trusted): True iff
+    # BOTH cache reads above actually HIT — a written entry may legitimately be
+    # "" for a non-MCP tool, so the hit is distinguished from a miss by the
+    # None default, never by the value. Deliberately derived from the reads
+    # themselves, not from cache availability or non-emptiness: a future
+    # inline fallback populating the identity fields from the permission
+    # payload would leave this False and fail closed in
+    # AcpEvent.child_mcp_identity_trusted.
+    _mcp_identity_trusted = _cached_server is not None and _cached_tool is not None
+
+    # The path the preceding tool_call's diff CONTENT BLOCK named, cached by the
+    # same scoped toolCallId as the params. An edit backend may stream trusted
+    # ``rawInput`` with no path key at all and name the target only in the
+    # ``{"type": "diff", "path": ...}`` block; without this the permission
+    # event's target set is empty and the edit gate (llm_helpers.
+    # _edit_target_denial) would have nothing to judge. Same .get() lifecycle
+    # as the sibling caches; "" on a miss, which that gate treats as "no
+    # proven target" and denies.
+    _diff_path = (
+        (diff_path_cache.get(_ck) or "") if (diff_path_cache is not None and tool_call_id) else ""
+    )
 
     event = AcpEvent(
         kind=EVENT_PERMISSION_REQUEST,
@@ -778,28 +1224,14 @@ def build_permission_event(
         shell_classified=cached_shell is not None,
         options=options,
         tool_input=tool_input,
+        tool_input_redacted=tool_input_redacted,
         tool_call_id=tool_call_id,
         raw_tool_params=_resolved_raw_params,
         is_shell=is_shell,
-        # Trusted MCP server identity recovered from the preceding tool_call
-        # (the permission payload carries no _meta). .get() (not .pop()) mirrors
-        # the is_shell cache: a later tool_call_update for the same id re-reads
-        # it; the per-turn dispatch .clear() handles cleanup. Empty on a miss
-        # (fail-closed for the app-own-server auto-approve).
-        mcp_server_name=(
-            mcp_server_name_cache.get(_ck, "")
-            if (mcp_server_name_cache is not None and tool_call_id)
-            else ""
-        ),
-        # Trusted tool identity recovered from the preceding tool_call, mirroring
-        # mcp_server_name above. Lets the app-own-server auto-approve govern the
-        # canonical mcp__<server>__<tool> on the permission path (no _meta here).
-        # Empty on a miss (fail-closed: no trusted tool name → no auto-approve).
-        tool_name=(
-            tool_name_cache.get(_ck, "")
-            if (tool_name_cache is not None and tool_call_id)
-            else ""
-        ),
+        mcp_server_name=_mcp_server_name,
+        tool_name=_tool_name,
+        mcp_identity_trusted=_mcp_identity_trusted,
+        diff_path=_diff_path,
     )
     return event, recorded
 
@@ -812,11 +1244,22 @@ def _build_tool_call_event(
     mcp_server_name_cache: dict[str, str] | None = None,
     tool_name_cache: dict[str, str] | None = None,
     cache_scope: str = "",
+    tool_input_redacted_cache: dict[str, bool] | None = None,
+    diff_path_cache: dict[str, str] | None = None,
 ) -> AcpEvent:
     """Build an ``EVENT_TOOL_CALL`` from a ``tool_call`` update (with redaction)."""
     title = update.get("title", "unknown")
+    _wire_title = title if isinstance(title, str) and title != "unknown" else ""
     kind = update.get("kind", "unknown")
-    raw_input = update.get("rawInput") or update.get("input") or update.get("params")
+    # First PRESENT key, not first truthy one: an explicit empty ``rawInput``
+    # (``reset_conversation({})``, ``resource_status({})``) is a real argument
+    # set, and the out-of-band directive claim digests it. An ``or`` chain
+    # collapsed ``{}`` to None, so a no-argument directive recorded no digest
+    # and its parked record was never claimed.
+    raw_input = next(
+        (update[k] for k in ("rawInput", "input", "params") if update.get(k) is not None),
+        None,
+    )
     purpose = extract_tool_purpose(raw_input)
     tool_call_id = update.get("toolCallId", "")
     # ORIGIN-BOUND cache key (see build_permission_event): entries written
@@ -826,7 +1269,12 @@ def _build_tool_call_event(
     # permission_request — which carries only a truncated title — can recover
     # them for governance enforcement (raw_tool_params). Mirrors AcpClient's
     # _tool_call_params. shell_cache/tool_input_cache below serve display/is_shell.
-    if tool_call_id and raw_params_cache is not None and isinstance(raw_input, dict):
+    # Truthy-gated on purpose, unlike the event's own ``raw_tool_params`` below:
+    # this cache is the permission event's TRUSTED params source, and an empty
+    # dict here would earn ``raw_params_trusted`` for a call whose arguments the
+    # refinement has not streamed yet (claude-agent-acp sends ``{}`` first). The
+    # directive digest reads the event field, not this cache.
+    if tool_call_id and raw_params_cache is not None and isinstance(raw_input, dict) and raw_input:
         raw_params_cache[_ck] = raw_input
     # Capture the shell signal from the RAW kind (before redaction) so a later
     # permission_request (which carries no kind) can inherit it via shell_cache.
@@ -835,8 +1283,16 @@ def _build_tool_call_event(
     # False would let the later permission event read it as a RESOLVED non-shell
     # classification (shell_classified) and skip the low-fidelity downgrade
     # without any classification having actually happened.
-    _kind_resolved = isinstance(update.get("kind"), str) and bool(update.get("kind"))
-    is_shell = is_shell_kind(kind)
+    # Two independent channels answer "is this a command?", and a harness sends one or
+    # the other: an ACP ``kind`` of execute, or its own ``_meta`` naming its builtin
+    # shell. Either counts as RESOLVED, because both are harness-authored -- so a frame
+    # carrying only the meta channel is classified rather than left unknown, and the
+    # permission event that inherits it is not downgraded for a missing ``kind``.
+    _meta_shell = meta_builtin_shell(update)
+    _kind_resolved = (
+        isinstance(update.get("kind"), str) and bool(update.get("kind"))
+    ) or _meta_shell
+    is_shell = is_shell_kind(kind) or _meta_shell
     if tool_call_id and shell_cache is not None and _kind_resolved:
         shell_cache[_ck] = is_shell
     # Capture the TRUSTED MCP server identity (_meta.kiro.mcpServerName) so the
@@ -848,6 +1304,16 @@ def _build_tool_call_event(
     _mcp_server_name = _kiro_mcp_server_name(update)
     if tool_call_id and mcp_server_name_cache is not None:
         mcp_server_name_cache[_ck] = _mcp_server_name
+    # Round-trip clock for kirocrew.tool.call.duration. Placed after the trusted
+    # MCP identity is resolved so an MCP call is classified by its transport
+    # rather than by the kind it reported; the terminal status is stamped in
+    # _build_tool_result_event. Keyed by the SAME origin scope as the caches
+    # above, because one runtime hosts many sessions and a backend-assigned
+    # toolCallId is unique only within one of them. Idempotent per scoped id, so
+    # the tool_call_update refinements that follow cannot restart the clock.
+    note_tool_call_started(
+        tool_call_id, kind=kind, mcp_server_name=_mcp_server_name, scope=cache_scope
+    )
     # Same lifecycle for the trusted tool name (_meta.kiro.toolName) so the
     # permission event can reconstruct the canonical mcp__<server>__<tool> for
     # per-tool governance in the app-own-server auto-approve.
@@ -858,7 +1324,7 @@ def _build_tool_call_event(
     input_str = ""
     if tool_call_id and raw_input:
         input_str = (
-            json.dumps(raw_input, indent=2)
+            _dumps_degraded(raw_input, indent=2)
             if isinstance(raw_input, (dict, list))
             else str(raw_input)
         )
@@ -881,18 +1347,30 @@ def _build_tool_call_event(
                     input_str = diff_str
                     found_diff = True
                 break
+    # Cache the content block's path for the permission event (see
+    # build_permission_event). Written only when a diff block NAMED a path, so
+    # a later frame without one cannot clobber a real target with "".
+    if tool_call_id and _diff_path and diff_path_cache is not None:
+        diff_path_cache[_ck] = _diff_path
     # Fallback when no diff content block was present: derive from the edit
     # args themselves (strReplace pair, create/insert content). Gated on the
     # EDIT kind — "content"-shaped args exist on many non-edit tools, and a
     # derived diff would corrupt their input display.
-    if not found_diff and (kind == "edit" or (isinstance(raw_input, dict) and raw_input.get("command") == "strReplace")):
+    if not found_diff and (
+        kind == "edit" or (isinstance(raw_input, dict) and raw_input.get("command") == "strReplace")
+    ):
         diff_str = derive_edit_diff(raw_input)
         if diff_str:
             input_str = diff_str
+    input_redacted = False
     if input_str:
-        input_str = _redact(input_str)
+        safe_input = _redact(input_str)
+        input_redacted = safe_input != input_str
+        input_str = safe_input
     if tool_call_id and input_str and tool_input_cache is not None:
         tool_input_cache[_ck] = input_str
+        if tool_input_redacted_cache is not None:
+            tool_input_redacted_cache[_ck] = input_redacted
     if purpose:
         purpose = _redact(purpose)
     title = select_tool_title(title, raw_input, kind, is_shell=is_shell) or ""
@@ -903,15 +1381,22 @@ def _build_tool_call_event(
     return AcpEvent(
         kind=EVENT_TOOL_CALL,
         title=title,
+        wire_title=_wire_title,
         tool_kind=kind,
         tool_purpose=purpose,
         tool_input=input_str,
+        tool_input_redacted=input_redacted,
         tool_call_id=tool_call_id,
         raw_tool_params=raw_input if isinstance(raw_input, dict) else None,
         is_shell=is_shell,
         # Trusted identity from _meta.kiro (NOT the LLM-authored title).
         tool_name=_tool_name,
         mcp_server_name=_mcp_server_name,
+        # The pair above comes exclusively from the _kiro_* extractors over the
+        # frame's _meta.kiro (non-model-authored) — the trusted tool_call path.
+        # Earned only when an identity pair was actually extracted: a frame
+        # with no _meta.kiro populates nothing, so it asserts no provenance.
+        mcp_identity_trusted=bool(_mcp_server_name and _tool_name),
         diff_old_text=_diff_old_text,
         diff_path=_diff_path,
     )
@@ -948,29 +1433,311 @@ def _mcp_content_text(payload: dict[str, Any]) -> str | None:
     return "\n".join(parts)
 
 
-def _build_tool_result_event(update: dict[str, Any]) -> AcpEvent | None:
+#: Stands in for a payload the JSON encoder refuses at any dispatch-path encode
+#: (see :func:`_dumps_degraded`). Visible in the
+#: transcript on purpose: the user can see that detail is missing, which is the
+#: whole difference between this and dropping the field.
+UNSERIALISABLE_SIBLING_VALUE = "[[value omitted: nested too deeply to serialise]]"
+
+
+def _dumps_degraded(payload: Any, **kwargs: Any) -> str:
+    """``json.dumps`` that degrades to readable text instead of raising.
+
+    Every encode on the dispatch path serialises a payload whose shape the agent
+    backend chooses, so the encoder can always be pushed past its ceiling:
+    ``json.dumps`` raises ``RecursionError`` on a sufficiently nested structure
+    -- a ``RuntimeError``, which the ``(TypeError, ValueError)`` arm that guards
+    one of these sites does not catch and the others do not guard at all, so the
+    raise escapes frame rendering and aborts the whole agent turn. The intended
+    cost of an unrenderable frame is that ONE frame, degraded visibly, never the
+    turn. Every encode on this path gets the same refusal posture.
+
+    A ``TypeError``/``ValueError`` refusal degrades to ``str(payload)`` -- the
+    payload still has a repr, and this preserves byte-identically the arm that
+    :func:`_build_tool_refinement_event` already carried. A ``RecursionError``
+    refusal cannot count on that (``repr`` recurses too, just with a different
+    ceiling than the encoder's), so it degrades to the
+    :data:`UNSERIALISABLE_SIBLING_VALUE` placeholder, and the ``str`` fallback
+    keeps its own arm for the payload that is both deep and unencodable.
+    """
+    try:
+        return json.dumps(payload, **kwargs)
+    except (TypeError, ValueError):
+        try:
+            return str(payload)
+        except RecursionError:
+            return UNSERIALISABLE_SIBLING_VALUE
+    except RecursionError:
+        return UNSERIALISABLE_SIBLING_VALUE
+
+
+# ACP tool-call ``content`` entry types this parser understands: ``content``
+# wraps a ContentBlock, ``diff`` becomes a unified diff in the tool_call
+# builder above, ``terminal`` is a live-terminal handle that carries no text,
+# and ``text`` is the tolerated BARE ContentBlock form accepted by
+# :func:`tool_call_content_text`.
+_KNOWN_TOOL_CONTENT_TYPES = frozenset({"content", "diff", "terminal", "text"})
+
+# ContentBlock ``type`` values a WRAPPED ``{"type": "content"}`` entry can carry.
+# Only ``text`` renders here; the other four legitimately carry no text for this
+# parser, so they must stay SILENT or the diagnostic fires on healthy frames.
+#
+# Needed because a known OUTER type is not evidence the entry is renderable: the
+# wrapper is what this parser understands, and the block inside it is a second
+# place the shape can be wrong. `resource_link` is spelled as the protocol spells
+# it -- snake, matching the wire values the ACP tests use.
+#
+# An allowlist, so a block type added to the protocol later reports as a shape
+# until this set learns it. That is the safe direction: such an entry renders no
+# text either way, so the warning describes a real empty render rather than
+# suppressing one.
+_KNOWN_CONTENT_BLOCK_TYPES = frozenset({"text", "image", "audio", "resource", "resource_link"})
+
+# Distinguishes "no ``content`` key" from ``"content": null``. A plain
+# ``.get("content")`` collapses them, and they are not the same report: the first
+# is a wrapper carrying no claim, the second is a backend explicitly asserting a
+# null block.
+_INNER_ABSENT = object()
+
+# Bounds for the unrenderable-shape diagnostic below. Both exist because the
+# frame is unbounded backend input and the warning it feeds is RETAINED in the
+# log ring `/api/logs` serves, so an oversized one is held in memory rather than
+# scrolling away.
+_MAX_SHAPE_DIAGNOSTIC = 4000
+_MAX_SHAPE_KEYS = 20
+
+
+def tool_call_content_text(entry: Any) -> str | None:
+    """Text of one ACP tool-call ``content`` entry, or None if it carries none.
+
+    ACP's canonical entry WRAPS the ContentBlock:
+    ``{"type": "content", "content": {"type": "text", "text": ...}}``. Real
+    backends also send the ContentBlock BARE -- ``{"type": "text", "text": ...}``
+    -- and that form is unambiguous, so it is read as if it had been wrapped.
+    Rejecting it drops every entry of the frame, so the dashboard has nothing
+    to render and falls through to "No input or output captured for this tool
+    call." while the backend believes it reported the result.
+    """
+    if not isinstance(entry, dict):
+        return None
+    inner = entry.get("content")
+    if not isinstance(inner, dict) and entry.get("type") == "text":
+        # Bare ContentBlock: the entry IS the block it should have wrapped.
+        inner = entry
+    if not isinstance(inner, dict) or inner.get("type") != "text":
+        return None
+    text = inner.get("text")
+    return str(text) if text else None
+
+
+def redacted_tool_id(tool_use_id: Any) -> str:
+    """A frame's ``toolCallId``, made safe to put in a log line.
+
+    Three hazards, all from the same fact -- the id is whatever JSON the backend
+    sent, not a validated string:
+
+    * ``str()`` first because it need not BE a string. A numeric ``toolCallId``
+      reaches :func:`redact_text`'s regexes as an int and raises ``TypeError``,
+      which would abort the active turn from inside a diagnostic warning -- a
+      logging path must never be able to kill the thing it is reporting on.
+    * Redact before bounding, never the reverse: a cut taken first can split a
+      credential into fragments no pattern matches. Same ordering as the tool
+      output join below.
+    * Bound it, because the id is unbounded input and this warning is retained in
+      the log ring ``/api/logs`` serves. 200 chars keeps a real id (they are
+      short) while refusing a frame that pads it to megabytes.
+
+    The caller still formats the result with ``%r`` -- bounding does not
+    neutralise a newline, so escaping stays the caller's job.
+    """
+    return redact_text(str(tool_use_id))[:200]
+
+
+def _rendered_shape_type(value: Any) -> str:
+    """A frame-supplied ``type`` made safe to put in the shape diagnostic.
+
+    A string renders by ``repr`` -- the type NAME is the diagnostic. Anything else
+    renders by CLASS, because ``repr()`` of a dict or list prints its nested
+    values, so ``{"type": {"token": "..."}}`` would emit exactly what the
+    diagnostic promises to withhold.
+    """
+    return repr(value) if isinstance(value, str) else f"<{type(value).__name__}>"
+
+
+def _rendered_key_names(entry: dict[Any, Any]) -> list[str]:
+    """Key NAMES of one entry, capped structurally.
+
+    The cap drops WHOLE names and appends a count of the rest, rather than cutting
+    through one -- a cut could halve a credential-shaped key name ahead of
+    redaction.
+    """
+    names = sorted(str(k) for k in entry)
+    shown = names[:_MAX_SHAPE_KEYS]
+    if len(names) > _MAX_SHAPE_KEYS:
+        shown.append(f"+{len(names) - _MAX_SHAPE_KEYS} more")
+    return shown
+
+
+def unrenderable_content_shapes(blocks: Any) -> str:
+    """Shapes of ``content`` entries this parser cannot render text from.
+
+    Empty string for a frame whose every entry is a known ACP entry type --
+    including the ones that legitimately carry no text, such as an image
+    ContentBlock -- so a working backend never triggers the caller's warning.
+
+    Checked at BOTH levels. A known outer ``type`` is not evidence the entry is
+    renderable: ``{"type": "content"}`` is a wrapper, and a malformed block inside
+    it produces the same silent blank as an unknown entry. The line drawn is what
+    the backend CLAIMED -- a wrapper whose ``content`` key is absent asserts no
+    block and stays silent, while a ``content`` that is present but not a readable
+    block is reported: not a dict, or carrying a ``type`` outside
+    :data:`_KNOWN_CONTENT_BLOCK_TYPES`.
+
+    Renders TYPE values and KEY names. It does NOT render any other value, at
+    either level, and enforcing that takes one non-obvious step: ``type`` is
+    frame-supplied and need not be a string, and ``repr()`` of a dict or list
+    prints its nested VALUES -- so ``{"type": {"token": "..."}}`` would emit the
+    very thing this function withholds. A non-string ``type`` is therefore
+    rendered by CLASS (``type=<dict>``), never by repr. See
+    :func:`_rendered_shape_type`, which both levels share.
+
+    The caller writes the result into a warning that lands in the log ring
+    ``/api/logs`` serves, which persists beyond the transcript's own redaction, so
+    the redaction happens here rather than at each caller -- that keeps the two
+    drop sites from diverging.
+
+    Shapes are collected RAW and :func:`redact_text` runs ONCE over their JOIN,
+    never per shape, with the single text bound applied AFTER that. Same ordering
+    as ``_build_tool_result_event``'s output and for the same reason: redacting
+    fragment-by-fragment lets a credential that straddles two entries survive as
+    two halves that no single pattern matches, and cutting before redacting can
+    split one the same way.
+
+    Bounded THREE ways, because ``blocks`` is unbounded backend input and a final
+    ``[:4000]`` alone still builds the whole list and join first -- a near-limit
+    frame of unrecognised entries could allocate its way to an OOM before the cut
+    ever ran:
+
+    * entries stop being collected once the running length passes the budget;
+    * each entry renders at most ``_MAX_SHAPE_KEYS`` key names, plus a count of
+      the rest -- a STRUCTURAL truncation that drops whole names rather than
+      cutting through one, so it cannot halve a credential ahead of redaction;
+    * the redacted join is bounded once at the end.
+    """
+    if not isinstance(blocks, list):
+        return ""
+    shapes: list[str] = []
+    budget = _MAX_SHAPE_DIAGNOSTIC
+    for entry in blocks:
+        if budget <= 0:
+            break
+        if not isinstance(entry, dict):
+            shape = type(entry).__name__
+        else:
+            entry_type = entry.get("type")
+            if isinstance(entry_type, str) and entry_type in _KNOWN_TOOL_CONTENT_TYPES:
+                if entry_type != "content":
+                    continue
+                # A known WRAPPER is not a renderable entry. The block inside it is
+                # a second place the shape can be wrong, and the failure looks
+                # identical from the dashboard: `{"type": "content", "content":
+                # {"kind": "text", ...}}` -- `kind` where the reader wants `type` --
+                # renders nothing and, checked only at the outer level, said nothing
+                # either. That is the same undiagnosable blank this function exists
+                # to eliminate, one level down.
+                inner = entry.get("content", _INNER_ABSENT)
+                if inner is _INNER_ABSENT:
+                    # No block ASSERTED at all. Silent, deliberately: this is the
+                    # bare wrapper `_KNOWN_TOOL_CONTENT_TYPES` documents as
+                    # understood, and warning here would fire on a backend that
+                    # sends a wrapper before it has a block to put in it. The line
+                    # this draws is "the backend claimed a block and got it wrong"
+                    # (reported) versus "the backend did not claim one" (silent).
+                    continue
+                if not isinstance(inner, dict):
+                    shape = f"type='content' inner=<{type(inner).__name__}>"
+                else:
+                    inner_type = inner.get("type")
+                    if isinstance(inner_type, str) and inner_type in _KNOWN_CONTENT_BLOCK_TYPES:
+                        continue
+                    shape = (
+                        f"type='content' inner_type={_rendered_shape_type(inner_type)} "
+                        f"inner_keys={_rendered_key_names(inner)}"
+                    )
+            else:
+                shape = (
+                    f"type={_rendered_shape_type(entry_type)} " f"keys={_rendered_key_names(entry)}"
+                )
+        shapes.append(shape)
+        budget -= len(shape) + 2
+    return redact_text("; ".join(shapes))[:_MAX_SHAPE_DIAGNOSTIC] if shapes else ""
+
+
+def log_unrenderable_content(log: logging.Logger, tool_use_id: Any, content: Any) -> None:
+    """Emit the "this tool shows no output" warning, once, for both drop sites.
+
+    The two tool-result parsers (:func:`_build_tool_result_event` here and
+    ``AcpClient._extract_tool_call_update``) reach the same dead end, and this PR
+    exists because their leniency had drifted apart. Shipping the warning as two
+    copies would recreate exactly that: the message, the redaction, the ``%r``
+    escaping and the shape call all have to stay identical, and nothing but
+    convention would keep them so.
+
+    ``log`` is passed in rather than taken from this module so each parser's
+    records still carry ITS OWN logger name -- callers filter on that.
+    """
+    shapes = unrenderable_content_shapes(content)
+    if not shapes:
+        return
+    log.warning(
+        "tool_call_update %r: no content entry could be rendered, so this tool "
+        "shows no output at all. Unrecognised entry shapes: %s. ACP expects "
+        "{'type': 'content', 'content': {'type': 'text', 'text': ...}}; a bare "
+        "{'type': 'text', 'text': ...} block is also read. Shapes only -- entry "
+        "VALUES are withheld from this log.",
+        redacted_tool_id(tool_use_id),
+        shapes,
+    )
+
+
+def _build_tool_result_event(update: dict[str, Any], cache_scope: str = "") -> AcpEvent | None:
     """Build an ``EVENT_TOOL_RESULT`` from a ``tool_call_update`` carrying output.
 
-    Two output shapes: ``content[].content.text`` blocks (stream mid-turn), or
-    ``rawOutput.items[]`` (``Text`` / ``Json.stdout``) on ``status=completed``.
-    Returns None when the update carries no output (refinement-only updates are
+    Three output shapes: ``content[].content.text`` blocks (stream mid-turn),
+    ``rawOutput.items[]`` (``Text`` / ``Json.stdout``) on ``status=completed``,
+    and -- since ``rawOutput`` is unstructured passthrough rather than a
+    contract -- any other non-empty ``rawOutput`` object, serialised. Returns
+    None when the update carries no output at all (refinement-only updates are
     handled by :func:`_build_tool_refinement_event`).
+
+    ``cache_scope`` is the emitting session's origin scope, forwarded only so the
+    duration histogram closes the same registry entry its start opened.
     """
     tool_use_id = update.get("toolCallId", "")
     if not tool_use_id:
         return None
+    # Before the output parsing below, which returns None for an output-less
+    # update: a tool that completed with no output is still a completed
+    # round-trip. A non-terminal status is a no-op here, so a mid-stream update
+    # leaves the clock running for the real completion.
+    record_tool_call_finished(tool_use_id, status=update.get("status"), scope=cache_scope)
+    # Parts are collected RAW and redaction runs once over their JOIN, before
+    # the single 8000-char bound. Both orderings matter: bounding first can
+    # split a credential at a cut into fragments no redaction regex matches,
+    # and redacting per part would blind the multi-line PEM pattern
+    # (``BEGIN ... [\s\S]*? END``) to a key whose header and footer arrive in
+    # DIFFERENT parts — only the combined text shows such a secret whole. The
+    # former per-part 4000 cut is deliberately gone: applied before redaction
+    # it IS this defect class, and it cannot be reconstructed afterwards, so
+    # the final head cut is the one bound.
     output_parts: list[str] = []
     # Path 1: content blocks (mid-stream).
     content = update.get("content")
     if isinstance(content, list):
         for block in content:
-            if not isinstance(block, dict):
-                continue
-            inner = block.get("content")
-            if isinstance(inner, dict) and inner.get("type") == "text":
-                text = inner.get("text", "")
-                if text:
-                    output_parts.append(str(text)[:4000])
+            text = tool_call_content_text(block)
+            if text:
+                output_parts.append(text)
     # Path 2: rawOutput (status=completed) fallback.
     if not output_parts:
         raw_output = update.get("rawOutput")
@@ -981,21 +1748,61 @@ def _build_tool_result_event(update: dict[str, Any]) -> AcpEvent | None:
                     if not isinstance(item, dict):
                         continue
                     if "Text" in item and item.get("Text"):
-                        output_parts.append(str(item["Text"])[:4000])
+                        output_parts.append(str(item["Text"]))
                         continue
                     j = item.get("Json")
                     if isinstance(j, dict):
                         if "stdout" in j and j.get("stdout"):
-                            output_parts.append(str(j["stdout"])[:4000])
+                            output_parts.append(str(j["stdout"]))
                         else:
                             _mcp_text = _mcp_content_text(j)
                             if _mcp_text is not None:
-                                output_parts.append(_mcp_text[:4000])
+                                output_parts.append(_mcp_text)
                             else:
-                                output_parts.append(json.dumps(j, default=str)[:4000])
+                                output_parts.append(_dumps_degraded(j, default=str))
+            # Path 3: an object that is not that envelope at all. ``rawOutput``
+            # is unstructured passthrough, so ``items[]`` is ONE producer's
+            # private wrapper rather than a contract, and an object Crew does
+            # not recognise is not evidence the tool produced no output.
+            # Treating it as absent returns None from this builder, which drops
+            # the whole EVENT_TOOL_RESULT -- the event that writes both
+            # ``meta["output"]`` and ``meta["done"]`` for the pill. The Output
+            # tab is lost outright; ``done`` survives only if assistant text
+            # follows the tool group, because chat_runner's EVENT_TEXT_CHUNK
+            # handler then sweeps unmarked tool rows done. Serialise it instead,
+            # which is already the policy one level in: an unrecognised ``Json``
+            # envelope is dumped rather than dropped (above), and
+            # ``parse_todo_snapshot`` likewise accepts a bare-dict ``rawOutput``.
+            # Gated on the ABSENCE of ``items`` so no ``items[]`` envelope
+            # changes here, including one that legitimately yields nothing. No
+            # ``not output_parts`` test is needed: this whole branch already runs
+            # only when Path 1 found nothing, which is what keeps a content block
+            # winning over the raw envelope.
+            if raw_output and "items" not in raw_output:
+                output_parts.append(_dumps_degraded(raw_output, default=str))
     if not output_parts:
+        log_unrenderable_content(logger, tool_use_id, content)
         return None
-    final_output = _redact("\n".join(output_parts)[:8000])
+    joined = "\n".join(output_parts)
+    _redacted = _redact(joined)
+    final_output = _redacted[: session_directive.MAX_TOOL_RESULT_CHARS]
+    # Both session-directive sentinels are TAIL-anchored, and this cut runs AFTER
+    # redaction -- which can grow the text, since a credential is replaced by a
+    # longer placeholder. So a producer bounding its own length cannot guarantee
+    # the marker survives here; re-attach it when the cut removed it, exactly as
+    # the App render marker below is re-injected at this same seam.
+    final_output = session_directive.preserve_tail_marker(_redacted, final_output)
+    # An MCP App render marker lives at offset 0 of its own text part, but the
+    # 8000-char join cut is applied to the CONCATENATION of all parts: when the
+    # marker part is preceded by other (up to 4000-char) parts, its offset in
+    # the joined string can exceed 8000 and the slice drops it, so
+    # ``mcp_apps_render.find_marker`` never sees it and the app never mounts.
+    # If the pre-slice text carried a marker that the slice removed, re-inject
+    # it at offset 0 so it stays under any cut and remains detectable. The
+    # marker is a fixed control token, not sensitive, so it needs no redaction.
+    marker_match = mcp_apps_render.MARKER_RE.search(joined)
+    if marker_match and mcp_apps_render.find_marker(final_output) is None:
+        final_output = f"{marker_match.group(0)} {final_output}"
     return AcpEvent(
         kind=EVENT_TOOL_RESULT,
         tool_call_id=tool_use_id,
@@ -1004,41 +1811,177 @@ def _build_tool_result_event(update: dict[str, Any]) -> AcpEvent | None:
     )
 
 
-def _kiro_tool_name(update: dict[str, Any]) -> str:
-    """The real tool name from ``_meta.kiro.toolName``, or "" when absent.
+class _MetaIdentityChannel(NamedTuple):
+    """Where one harness puts the ``(server, tool)`` identity of a tool call.
 
-    The user-visible ``title`` is LLM-authored prose ("Creating task list: …"),
-    so it cannot be used to identify a tool. Only this ``_meta`` channel is
-    stable.
+    A TABLE rather than a per-backend branch, because this is a property of the
+    harness's wire format and not of Crew's control flow: a reader consults every
+    channel and takes the first that answers, so a new harness is one row and no call
+    site learns its name.
+
+    ``nested`` is the sub-object the fields sit under, or ``None`` when they sit
+    directly on the harness's own ``_meta`` block.
+
+    ``strips_server_prefix`` records a harness that spells its tool name as
+    ``<server><sep><tool>``. The deny set and the canonical ``mcp__<server>__<tool>``
+    name both spell the BARE tool, so the prefix is removed here rather than at each
+    comparison -- one place where the two spellings are reconciled.
+    """
+
+    key: str
+    server_field: str
+    tool_field: str
+    nested: str | None = None
+    strips_server_prefix: str = ""
+    #: The ``(server, tool)`` pair, as this channel spells it, that names the harness's
+    #: OWN shell rather than a served MCP tool. A harness that models its builtins as
+    #: extensions reports one under the same fields an MCP call uses, so without this the
+    #: server field reads as "an MCP server served this" on a shell command. Matching it
+    #: means two things at once: the call is a shell command, and it has no MCP server.
+    builtin_shell: tuple[str, str] | None = None
+
+
+#: Harness ``_meta`` channels that carry a trusted tool identity, in read order.
+#:
+#: TRUST CLASS: every entry is HARNESS-emitted, not model-authored -- the same class as
+#: kiro-cli's own ``_meta.kiro``. The harness resolves which server and tool it is about
+#: to run and states it; the model cannot reach these fields, which is exactly why the
+#: user-visible ``title`` (LLM prose) cannot be used for identity and these can.
+#:
+#: kiro-cli sets its pair ONLY for MCP-served calls (``kiro_tool_identity_meta`` in the
+#: engine), and goose sets ``extensionName`` only when an extension served the call, so
+#: in both cases a non-empty server is the discriminator "this was served by MCP" that a
+#: security gate needs to tell a genuine MCP tool from a shell command whose stdout the
+#: model authored.
+_MCP_IDENTITY_META_CHANNELS: tuple[_MetaIdentityChannel, ...] = (
+    _MetaIdentityChannel(
+        key="kiro",
+        server_field="mcpServerName",
+        tool_field="toolName",
+        # Read for identity on kiro-cli and kas alike. Which backends the fail-closed
+        # refusal covers is not this table's question: that is ``ACP_BACKENDS_META_IDENTITY``
+        # in the vocabulary module, and the coverage pin measures each member through
+        # these readers rather than through a per-row claim.
+    ),
+    # goose 1.50.1: ``_meta.goose.toolCall.{extensionName,toolName}``, captured live in
+    # ``test/fixtures/acp_frames/goose/mcp-stdio-mount-live.jsonl``. Its ``toolName`` is
+    # the fused ``<extension>__<tool>`` form it also puts in the title, so the extension
+    # prefix is stripped to leave the bare tool the deny set spells.
+    _MetaIdentityChannel(
+        key="goose",
+        server_field="extensionName",
+        tool_field="toolName",
+        nested="toolCall",
+        strips_server_prefix="__",
+        # goose serves its builtin shell from the ``developer`` extension, captured live
+        # in ``test/fixtures/acp_frames/goose/turn-live.jsonl``. It is the harness's own
+        # tool, not one of Crew's MCP servers, and on the branch Crew selects the frame
+        # carries no ``kind`` -- so this pair is the only thing on the wire that says
+        # "this is a command".
+        builtin_shell=("developer", "shell"),
+    ),
+)
+
+
+def _meta_identity_full(update: dict[str, Any]) -> tuple[str, str, bool]:
+    """``(server, tool, builtin_shell)`` from the first meta channel that answers.
+
+    ``("", "", False)`` when none does. Both identity halves come from ONE channel:
+    mixing a server from one harness's block with a tool name from another's would be an
+    identity no harness asserted.
+
+    A pair matching that channel's :attr:`_MetaIdentityChannel.builtin_shell` is reported
+    with an EMPTY server, because the harness named its own extension there and Crew's
+    consumers read a non-empty server as "an MCP server served this call". Returning the
+    name would make the harness's shell look MCP-served, which is the inverse of what the
+    frame says.
     """
     meta = update.get("_meta")
     if not isinstance(meta, dict):
-        return ""
-    kiro = meta.get("kiro")
-    if not isinstance(kiro, dict):
-        return ""
-    name = kiro.get("toolName")
-    return name if isinstance(name, str) else ""
+        return "", "", False
+    for channel in _MCP_IDENTITY_META_CHANNELS:
+        block = meta.get(channel.key)
+        if not isinstance(block, dict):
+            continue
+        if channel.nested is not None:
+            block = block.get(channel.nested)
+            if not isinstance(block, dict):
+                continue
+        server = block.get(channel.server_field)
+        tool = block.get(channel.tool_field)
+        if not isinstance(tool, str):
+            tool = ""
+        if not isinstance(server, str):
+            server = ""
+        # Matched on the RAW pair, before any prefix reduction: the pair is what the
+        # harness wrote, and the reduction below is Crew's own normalization of a fused
+        # MCP tool name.
+        if channel.builtin_shell is not None and (server, tool) == channel.builtin_shell:
+            return "", tool, True
+        if channel.strips_server_prefix and server and tool:
+            prefix = f"{server}{channel.strips_server_prefix}"
+            if tool.startswith(prefix):
+                tool = tool[len(prefix) :]
+        if server or tool:
+            return server, tool, False
+    return "", "", False
+
+
+def _meta_identity(update: dict[str, Any]) -> tuple[str, str]:
+    """``(server, tool)`` from the first meta channel that answers, else ``("", "")``."""
+    server, tool, _ = _meta_identity_full(update)
+    return server, tool
+
+
+def meta_builtin_server_names() -> frozenset[str]:
+    """The ``server`` half of every channel's builtin-shell pair.
+
+    A harness that models its builtins as extensions names one under the same field an
+    MCP call fills, so these are the identities that are NOT foreign to a session even
+    though Crew never placed them on its server array: they are the harness's own.
+    """
+    return frozenset(
+        channel.builtin_shell[0]
+        for channel in _MCP_IDENTITY_META_CHANNELS
+        if channel.builtin_shell is not None
+    )
+
+
+def meta_builtin_shell(update: dict[str, Any]) -> bool:
+    """True when a harness's own ``_meta`` channel says this call is ITS shell.
+
+    The trusted answer to "is this a command?" on a harness that sends no ACP ``kind``.
+    Same trust class as the identity it sits beside: harness-resolved and unreachable by
+    the model, unlike the ``title`` (a formatter's or the model's prose) and unlike
+    ``rawInput`` (the model's own argument map, copied before the harness parses it).
+    """
+    return _meta_identity_full(update)[2]
+
+
+def _kiro_tool_name(update: dict[str, Any]) -> str:
+    """The real tool name from a harness's own ``_meta`` identity channel, or "".
+
+    The user-visible ``title`` is LLM-authored prose ("Creating task list: …"), so it
+    identifies nothing. Only a ``_meta`` channel is stable, and
+    :data:`_MCP_IDENTITY_META_CHANNELS` holds the ones that exist.
+
+    The ``kiro`` in the name reads as the QUESTION this answers ("what tool is this?")
+    rather than as the harness: every channel in that table is consulted here.
+    """
+    return _meta_identity(update)[1]
 
 
 def _kiro_mcp_server_name(update: dict[str, Any]) -> str:
-    """The MCP server name from ``_meta.kiro.mcpServerName``, or "" for
+    """The MCP server name from a harness's own ``_meta`` identity channel, or "" for
     built-in/shell tools.
 
-    kiro-cli sets this ONLY for MCP-served tool calls (see
-    ``kiro_tool_identity_meta`` in the engine), so a non-empty value is the
-    trusted discriminator "this tool call was served by an MCP server" — the
-    signal a security gate needs to tell a genuine MCP directive tool from a
-    shell command whose stdout the model authored.
+    A non-empty value is the trusted discriminator "this tool call was served by an MCP
+    server" — the signal a security gate needs to tell a genuine MCP directive tool from
+    a shell command whose stdout the model authored. Every channel in
+    :data:`_MCP_IDENTITY_META_CHANNELS` sets it only for a served call, so the emptiness
+    carries the same meaning on each.
     """
-    meta = update.get("_meta")
-    if not isinstance(meta, dict):
-        return ""
-    kiro = meta.get("kiro")
-    if not isinstance(kiro, dict):
-        return ""
-    name = kiro.get("mcpServerName")
-    return name if isinstance(name, str) else ""
+    return _meta_identity(update)[0]
 
 
 def _todo_payload(raw_output: Any) -> dict[str, Any] | None:
@@ -1122,6 +2065,8 @@ def _build_tool_refinement_event(
     shell_cache: dict[str, bool] | None = None,
     raw_params_cache: dict[str, dict] | None = None,
     cache_scope: str = "",
+    tool_input_redacted_cache: dict[str, bool] | None = None,
+    diff_path_cache: dict[str, str] | None = None,
 ) -> AcpEvent | None:
     """Build an ``EVENT_TOOL_CALL_UPDATE`` (refined title/kind/input) for a tool.
 
@@ -1142,10 +2087,10 @@ def _build_tool_refinement_event(
         return None
     input_str = ""
     if isinstance(raw_input, (dict, list)) and raw_input:
-        try:
-            input_str = json.dumps(raw_input, indent=2)
-        except (TypeError, ValueError):
-            input_str = str(raw_input)
+        # _dumps_degraded keeps this site's pre-existing (TypeError, ValueError)
+        # -> str(raw_input) degrade and adds the RecursionError arm that the
+        # old except list here missed (RecursionError is a RuntimeError).
+        input_str = _dumps_degraded(raw_input, indent=2)
     elif isinstance(raw_input, str):
         input_str = raw_input
     content_blocks = update.get("content", [])
@@ -1163,10 +2108,19 @@ def _build_tool_refinement_event(
                 if diff_str:
                     input_str = diff_str
                 break
+    # Same diff-block path cache as the initial tool_call (the refinement is
+    # where claude-agent-acp first carries the content block).
+    if _diff_path and diff_path_cache is not None:
+        diff_path_cache[_rk] = _diff_path
+    input_redacted = False
     if input_str:
-        input_str = _redact(input_str)
+        safe_input = _redact(input_str)
+        input_redacted = safe_input != input_str
+        input_str = safe_input
         if tool_input_cache is not None:
             tool_input_cache[_rk] = input_str
+            if tool_input_redacted_cache is not None:
+                tool_input_redacted_cache[_rk] = input_redacted
     # The refinement's rawInput is the COMPLETE params object — cache it for
     # the permission event's structured-params (path/arg scope) checks, same
     # as the initial tool_call does. Without this, a backend whose initial
@@ -1206,9 +2160,11 @@ def _build_tool_refinement_event(
     return AcpEvent(
         kind=EVENT_TOOL_CALL_UPDATE,
         title=title_str,
+        wire_title=title if isinstance(title, str) else "",
         tool_kind=kind_str,
         tool_purpose=purpose,
         tool_input=input_str,
+        tool_input_redacted=input_redacted,
         tool_call_id=tool_use_id,
         raw_tool_params=raw_input if isinstance(raw_input, dict) else None,
         is_shell=is_shell,
@@ -1226,6 +2182,8 @@ def parse_session_update(
     mcp_server_name_cache: dict[str, str] | None = None,
     tool_name_cache: dict[str, str] | None = None,
     cache_scope: str = "",
+    tool_input_redacted_cache: dict[str, bool] | None = None,
+    diff_path_cache: dict[str, str] | None = None,
 ) -> list[AcpEvent]:
     """Parse one ``session/update`` inner ``update`` dict into ``AcpEvent``s.
 
@@ -1262,16 +2220,23 @@ def parse_session_update(
                 mcp_server_name_cache,
                 tool_name_cache,
                 cache_scope=cache_scope,
+                tool_input_redacted_cache=tool_input_redacted_cache,
+                diff_path_cache=diff_path_cache,
             )
         )
         return events
     if kind == UPDATE_TOOL_CALL_UPDATE:
-        result = _build_tool_result_event(update)
+        result = _build_tool_result_event(update, cache_scope)
         if result is not None:
             events.append(result)
         refine = _build_tool_refinement_event(
-            update, tool_input_cache, shell_cache, raw_params_cache,
+            update,
+            tool_input_cache,
+            shell_cache,
+            raw_params_cache,
             cache_scope=cache_scope,
+            tool_input_redacted_cache=tool_input_redacted_cache,
+            diff_path_cache=diff_path_cache,
         )
         if refine is not None:
             events.append(refine)
@@ -1331,6 +2296,73 @@ def parse_usage_update(update: dict[str, Any]) -> tuple[int | float | None, int 
     return _token_count(used), _token_count(size)
 
 
+def parse_usage_cost(update: dict[str, Any]) -> float | None:
+    """Parse a ``usage_update``'s session-cumulative cost into a validated float.
+
+    The claude-agent-acp adapter reports billing as ``cost: {amount, currency}``
+    on ``usage_update`` (session-cumulative). kiro-cli never sends the key, so
+    the kiro path always reads None here. Same defensive posture as
+    ``parse_usage_update`` (the other consumer of this frame): the value comes
+    straight from the agent process, so a malformed shape (non-dict cost,
+    str/list/bool amount, NaN/Infinity, negative) must degrade to "absent",
+    never raise inside the prompt-turn dispatch path. Both consumers store
+    the result in USD-denominated fields, so a present ``currency`` other
+    than exact ``"USD"`` (ISO 4217 uppercase; an absent currency is accepted
+    for adapters that omit it) also degrades the whole cost to absent rather
+    than mislabeling a non-USD amount as USD. Flat-primary with a nested
+    ``update.usage.cost`` fallback, mirroring ``parse_usage_update``.
+    """
+    if not isinstance(update, dict):
+        return None
+    cost = update.get("cost")
+    if cost is None:
+        nested = update.get("usage")
+        if isinstance(nested, dict):
+            cost = nested.get("cost")
+    if not isinstance(cost, dict):
+        return None
+    currency = cost.get("currency")
+    if currency is not None and currency != "USD":
+        logger.debug("acp usage cost: non-USD currency %s, dropping cost", repr(currency)[:40])
+        return None
+    amount = _token_count(cost.get("amount"))
+    if amount is None or amount < 0:
+        return None
+    return float(amount)
+
+
+def parse_prompt_token_usage(result: Any) -> tuple[int, int, int, int] | None:
+    """Parse a PromptResponse's turn-scoped token counts.
+
+    The claude-agent-acp adapter reports per-turn token counts on the prompt
+    RESPONSE (``inputTokens`` / ``outputTokens`` / ``cachedReadTokens`` /
+    ``cachedWriteTokens``); kiro-cli's response carries only ``stopReason``.
+    Returns ``(input, output, cache_read, cache_write)`` with each field
+    validated via ``_token_count`` (bool excluded, finite) plus non-negative,
+    coerced to int; an absent or malformed field reads 0. Returns None when
+    NONE of the four keys is present, so the kiro path never touches the
+    per-turn stats (harness parity: byte-identical behavior for a backend
+    that sends no token counts). Flat-primary with a nested ``result.usage``
+    fallback, mirroring ``parse_usage_update``'s dual-shape read.
+    """
+    if not isinstance(result, dict):
+        return None
+    nested = result.get("usage")
+    nested = nested if isinstance(nested, dict) else {}
+    keys = ("inputTokens", "outputTokens", "cachedReadTokens", "cachedWriteTokens")
+    if not any(k in result or k in nested for k in keys):
+        return None
+
+    def _count(key: str) -> int:
+        value = result.get(key, nested.get(key))
+        n = _token_count(value)
+        if n is None or n < 0:
+            return 0
+        return int(n)
+
+    return _count(keys[0]), _count(keys[1]), _count(keys[2]), _count(keys[3])
+
+
 # Re-export the method names so callers can use a single import site for the
 # kiro handshake (mode/model) requests alongside the param builders.
 __all__ = [
@@ -1339,13 +2371,23 @@ __all__ = [
     "set_model_params",
     "parse_metadata",
     "classify_notification",
+    "GATE_ENVELOPE_MARKER",
     "build_permission_event",
+    "gate_envelope",
     "parse_session_update",
     "parse_usage_update",
+    "parse_usage_cost",
+    "parse_prompt_token_usage",
     "parse_text_chunk",
+    "parse_claude_compaction_notice",
     "make_unified_diff",
     "select_tool_title",
     "is_shell_kind",
+    "meta_builtin_shell",
+    "meta_builtin_server_names",
+    # Re-exported from the vocabulary module for the ~1 ACP-layer consumer, the way the
+    # backend ids at the top of this module already are.
+    "ACP_BACKENDS_META_IDENTITY",
     "redact_text",
     "METHOD_SET_MODE",
     "METHOD_SET_MODEL",

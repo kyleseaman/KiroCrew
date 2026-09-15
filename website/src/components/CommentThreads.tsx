@@ -19,6 +19,10 @@ import { api } from '../api/client'
 import MarkdownRenderer from './MarkdownRenderer'
 import type { PullRequestComment, PullRequestSource } from '../types'
 import { platformShortcut } from '../utils/platform'
+import { OWNER_SETTINGS_TARGET, pullRequestErrorDetails } from '../utils/pullRequestErrors'
+import { SettingsLink } from './SettingsLink'
+import ErrorNotice from './ErrorNotice'
+import { sourceProviderCapabilities } from '../utils/sourceProviderMeta'
 import { timeAgo } from '../utils/timeAgo'
 
 import { i18nT } from '../i18n/t'
@@ -143,11 +147,13 @@ function ThreadComment(
  *  submit would throw away what the user typed the moment the provider refused,
  *  and leave the error with nowhere to appear. */
 function ReplyBox({
-  onSubmit, pending, error, label = 'Reply',
+  onSubmit, pending, error, errorAction, label = 'Reply',
 }: {
   onSubmit: (body: string) => Promise<unknown>
   pending: boolean
   error: string | null
+  /** Recovery affordance rendered beside the error (e.g. a settings link). */
+  errorAction?: React.ReactNode
   label?: string
 }) {
   const ime = useImeGuard()
@@ -222,9 +228,24 @@ function ReplyBox({
         >
           {i18nT('components.commentThreads.cancel')}
         </button>
-        {error && <span className="text-[12px] text-danger">{error}</span>}
+        {error && (
+          <span className="inline-flex items-center gap-1 text-[12px]">
+            {/* No hand-off: the reply/comment textarea draft above is unsaved. */}
+            <ErrorNotice variant="inline" testId="comment-reply-error" message={error} />
+            {errorAction && <> {errorAction}</>}
+          </span>
+        )}
       </div>
     </div>
+  )
+}
+
+/** The owner-not-configured recovery link, shared by every refusal surface here. */
+function OwnerSettingsLink() {
+  return (
+    <SettingsLink {...OWNER_SETTINGS_TARGET}>
+      {i18nT('components.pullRequestPanel.open_slack_settings')}
+    </SettingsLink>
   )
 }
 
@@ -271,7 +292,14 @@ export default function CommentThreads(
 
   const resolvedCount = threads.filter((t) => t.resolved).length
   const visible = showResolved ? threads : threads.filter((t) => !t.resolved)
-  const writable = src.provider === 'github'
+  // Which write affordances this provider's gateway plugin can actually serve.
+  // Previously a single `src.provider === 'github'` boolean, which made every
+  // non-GitHub provider read-only by construction — including one a downstream
+  // edition registers. The built-in flags reproduce that exactly (GitHub: both;
+  // GitLab: neither, hence the read-only notice below on a merge request).
+  const capabilities = sourceProviderCapabilities(src.provider)
+  const canResolve = capabilities.resolveThreads
+  const canComment = capabilities.comment
 
   return (
     <div className="flex flex-col gap-3">
@@ -332,7 +360,7 @@ export default function CommentThreads(
               )}
               {/* Resolve is only offered on real threads: standalone comments and
                   review summaries have nothing to resolve. */}
-              {writable && t.threadId && (
+              {canResolve && t.threadId && (
                 <button
                   type="button"
                   onClick={() => setResolved.mutate({
@@ -352,12 +380,22 @@ export default function CommentThreads(
                   reads as "the click did nothing" rather than "the provider said
                   no". Scoped to the thread that failed, not every rendered one. */}
               {setResolved.isError
-                && setResolved.variables?.threadId === t.threadId && (
-                <span className="text-[11.5px] text-danger">
-                  {(setResolved.error as Error | null)?.message
-                    || i18nT('components.commentThreads.could_not_change_the_thread_s_state')}
-                </span>
-              )}
+                && setResolved.variables?.threadId === t.threadId && (() => {
+                  const resolveErr = pullRequestErrorDetails(setResolved.error)
+                  return (
+                    <span className="inline-flex items-center gap-1 text-[11.5px]">
+                      {/* No hand-off: this thread's ReplyBox may hold an unsaved reply draft
+                          (its open/text state is local to ReplyBox, invisible from here). */}
+                      <ErrorNotice
+                        variant="inline"
+                        testId="comment-thread-resolve-error"
+                        message={resolveErr.message
+                          || i18nT('components.commentThreads.could_not_change_the_thread_s_state')}
+                      />
+                      {resolveErr.ownerNotConfigured && <> <OwnerSettingsLink /></>}
+                    </span>
+                  )
+                })()}
             </div>
 
             <div className="flex flex-col gap-2.5 px-2.5 py-2">
@@ -365,14 +403,21 @@ export default function CommentThreads(
               {t.replies.map((r) => (
                 <ThreadComment key={r.id} c={r} reply onAddToChat={onAddToChat} />
               ))}
-              {writable && t.threadId && (
+              {canResolve && t.threadId && (
                 <ReplyBox
                   onSubmit={(body) => reply.mutateAsync({ threadId: t.threadId, body })}
                   pending={reply.isPending
                     && reply.variables?.threadId === t.threadId}
-                  error={reply.variables?.threadId === t.threadId
-                    ? (reply.error as Error | null)?.message ?? null
+                  // `|| null` collapses an empty derived message to null on
+                  // purpose — ReplyBox renders errors with a falsy guard, so
+                  // '' and null are the same "nothing to show".
+                  error={reply.isError && reply.variables?.threadId === t.threadId
+                    ? pullRequestErrorDetails(reply.error).message || null
                     : null}
+                  errorAction={reply.isError && reply.variables?.threadId === t.threadId
+                    && pullRequestErrorDetails(reply.error).ownerNotConfigured
+                    ? <OwnerSettingsLink />
+                    : undefined}
                 />
               )}
             </div>
@@ -381,17 +426,20 @@ export default function CommentThreads(
       </ul>
 
       {/* A comment that answers nobody's line still needs somewhere to go. */}
-      {writable && (
+      {canComment && (
         <div className="border-t border-border pt-2.5">
           <ReplyBox
             label={i18nT('components.commentThreads.comment_on_this_pull_request')}
             onSubmit={(body) => comment.mutateAsync(body)}
             pending={comment.isPending}
-            error={(comment.error as Error | null)?.message ?? null}
+            error={comment.isError ? pullRequestErrorDetails(comment.error).message || null : null}
+            errorAction={comment.isError && pullRequestErrorDetails(comment.error).ownerNotConfigured
+              ? <OwnerSettingsLink />
+              : undefined}
           />
         </div>
       )}
-      {!writable && (
+      {!canResolve && !canComment && (
         <div className="text-[12px] text-muted italic">
           {i18nT('components.commentThreads.replying_is_github_only_for_now_open_the_merge_r')}
         </div>

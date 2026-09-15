@@ -8,6 +8,7 @@ test_context_trace's temp-shard fixture and drives the REAL reader over
 synthetic rows.
 """
 
+import ast
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -314,5 +315,41 @@ class TestWriteSiteStamping:
         assert 'app=getattr(slot, "_app", "") or ""' in src
 
     def test_subagent_completion_stamps_the_dispatching_app(self):
-        src = (self._ROOT / "src/kiro_crew/subagent.py").read_text(encoding="utf-8")
-        assert 'app=info.app or ""' in src
+        src = (self._ROOT / "src/kiro_crew/subagent_manager/run.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "persist_token_record_async"
+        ]
+        assert len(calls) == 1
+        app_arg = next(keyword.value for keyword in calls[0].keywords if keyword.arg == "app")
+        expected = ast.parse('info.app or ""', mode="eval").body
+        assert ast.dump(app_arg, include_attributes=False) == ast.dump(
+            expected, include_attributes=False
+        )
+
+
+class TestExtremeTimestamps:
+    """Local-time conversion is guarded, not only parsing.
+
+    ``fromisoformat`` happily parses a year-1 stamp, and it is ``timestamp()``
+    / ``astimezone()`` that then raise ``ValueError`` on the local-time
+    conversion. A corrupt row must be excluded, never a 500.
+    """
+
+    def test_parse_row_ts_answers_none_for_a_year_one_stamp(self):
+        assert usage_mod._parse_row_ts("0001-01-01T00:00:00") is None
+
+    def test_parse_row_day_answers_none_for_a_year_one_stamp(self):
+        assert usage_mod._parse_row_day("0001-01-01T00:00:00") is None
+
+    def test_reader_skips_an_extreme_row_instead_of_raising(self, _isolated_shards):
+        _write(
+            _isolated_shards,
+            [_row("chat-1", ts="0001-01-01T00:00:00"), _row("chat-1")],
+        )
+        turns = slot_turn_usage("chat-1")
+        assert len(turns) == 1

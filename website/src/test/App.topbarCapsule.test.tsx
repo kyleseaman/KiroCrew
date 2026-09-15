@@ -11,10 +11,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { act, screen, fireEvent } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 import { safeSetItem } from '../utils/safeStorage'
+import { setDesktopUpdateAvailable } from '../store/dashboardSlice'
 
 vi.mock('../pages/ChatPage', () => ({ default: () => <div data-testid="chat-page">ChatPage</div> }))
 vi.mock('../pages/SystemPage', () => ({ default: () => null }))
-vi.mock('../pages/AgentsPage', () => ({ default: () => null }))
 vi.mock('../pages/ProjectsPage', () => ({ default: () => null }))
 vi.mock('../pages/LogsPage', () => ({ default: () => null }))
 vi.mock('../pages/KiroCrewAgentsPage', () => ({ default: () => null }))
@@ -60,7 +60,7 @@ Object.defineProperty(window, 'matchMedia', {
     removeEventListener: vi.fn(),
   })),
 })
-globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} } as any
+globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} } as unknown as typeof ResizeObserver
 
 import App from '../App'
 
@@ -103,10 +103,54 @@ describe('App top bar — readout capsule collapse', () => {
   })
 })
 
+describe('App top bar — update pill shifts the collapse-ladder budget', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    setWindowWidth(1400)
+  })
+
+  it('puts tb-has-update on the actions group exactly while an update exists', async () => {
+    // The class is what arms the shifted @container rungs in index.css: the
+    // update pill is a non-shrinking sibling of the ladder, so while it is
+    // mounted the group's fixed content is wider by the pill's footprint and
+    // every rung must fire earlier. Class and pill must move together — a class
+    // without the pill evicts readouts for nothing, a pill without the class is
+    // the two-line clipped-wrap defect this guards against — and the two
+    // conditions are computed independently (App.tsx vs UpdatePill.tsx), so the
+    // pill's own mount is asserted alongside the class at every step.
+    const { container, store } = renderWithProviders(<App />, { route: '/chat' })
+    await screen.findByLabelText('Gateway connected')
+    const group = container.querySelector('.tb-right') as HTMLElement
+    expect(group).toBeTruthy()
+    expect(group.classList.contains('tb-has-update')).toBe(false)
+    expect(screen.queryByTestId('update-pill')).toBeNull()
+
+    act(() => { store.dispatch(setDesktopUpdateAvailable(true)) })
+    expect(group.classList.contains('tb-has-update')).toBe(true)
+    expect(await screen.findByTestId('update-pill')).toBeTruthy()
+
+    act(() => { store.dispatch(setDesktopUpdateAvailable(false)) })
+    expect(group.classList.contains('tb-has-update')).toBe(false)
+    expect(screen.queryByTestId('update-pill')).toBeNull()
+  })
+
+  it('keeps the nowrap backstop on the capsule segments', async () => {
+    // The other half of the fix: if the group is ever narrower than its
+    // contents (a locale wider than the measured budget, the dev-only
+    // pseudolocale), a squeezed built-in segment must clip at the group's
+    // edge, never wrap into two lines that the capsule's fixed h-7 crops.
+    // The class lives on the shared `seg` string, so one rendered segment
+    // pins them all.
+    renderWithProviders(<App />, { route: '/chat' })
+    const metrics = await screen.findByLabelText('System metrics')
+    expect(metrics.className).toContain('whitespace-nowrap')
+  })
+})
+
 describe('App shell — macOS fullscreen class', () => {
   it('toggles mac-fullscreen on the root grid from the electron bridge', async () => {
     let fsCallback: ((fs: boolean) => void) | undefined
-    ;(window as any).electronAPI = {
+    ;(window as { electronAPI?: { onFullScreenChanged?: (cb: (fs: boolean) => void) => () => void } }).electronAPI = {
       onFullScreenChanged: (cb: (fs: boolean) => void) => { fsCallback = cb; return () => { fsCallback = undefined } },
     }
     const { container } = renderWithProviders(<App />, { route: '/chat' })
@@ -121,6 +165,6 @@ describe('App shell — macOS fullscreen class', () => {
 
     act(() => fsCallback?.(false))
     expect(root.classList.contains('mac-fullscreen')).toBe(false)
-    delete (window as any).electronAPI
+    delete (window as { electronAPI?: { onFullScreenChanged?: (cb: (fs: boolean) => void) => () => void } }).electronAPI
   })
 })

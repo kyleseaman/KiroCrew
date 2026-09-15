@@ -106,15 +106,24 @@ class _FakeEventDispatcherHandler:
 
 
 class _FakeWSClient:
-    """Stub for lark.ws.Client -- start() blocks on an event, stop() sets it."""
+    """Stub for lark.ws.Client with the SDK's module-global loop behavior."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.constructed_thread_id = threading.get_ident()
+        self.constructed_loop = asyncio.get_event_loop()
         self._stop_event = threading.Event()
+        self._started_event = threading.Event()
         self.started = False
         self.stopped = False
+        self.started_loop: asyncio.AbstractEventLoop | None = None
 
     def start(self) -> None:
         self.started = True
+        ws_client_mod = sys.modules["lark_oapi.ws.client"]
+        self.started_loop = ws_client_mod.loop  # type: ignore[attr-defined]
+        self._started_event.set()
+        if self.started_loop is not None and self.started_loop.is_running():
+            raise RuntimeError("This event loop is already running")
         self._stop_event.wait(timeout=2.0)
 
     def stop(self) -> None:
@@ -129,6 +138,44 @@ class _FakeWSClientRaising(_FakeWSClient):
         self.stopped = True
         self._stop_event.set()
         raise RuntimeError("ws stop boom")
+
+
+class _FakeWSClientWithoutStop:
+    """Model lark-oapi 1.7.x: module loop, async disconnect, no stop()."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.constructed_thread_id = threading.get_ident()
+        self.constructed_loop = asyncio.get_event_loop()
+        self._auto_reconnect = True
+        self._started_event = threading.Event()
+        self.started = False
+        self.disconnected = False
+        self.started_loop: asyncio.AbstractEventLoop | None = None
+        self._waiter: asyncio.Future[None] | None = None
+
+    def start(self) -> None:
+        self.started = True
+        ws_client_mod = sys.modules["lark_oapi.ws.client"]
+        self.started_loop = ws_client_mod.loop  # type: ignore[attr-defined]
+        self._started_event.set()
+        if self.started_loop is None:
+            raise RuntimeError("SDK event loop was not configured")
+        if self.started_loop.is_running():
+            raise RuntimeError("This event loop is already running")
+        self._waiter = self.started_loop.create_future()
+        self.started_loop.run_until_complete(self._waiter)
+
+    async def _disconnect(self) -> None:
+        self.disconnected = True
+        if self._waiter is not None and not self._waiter.done():
+            self._waiter.set_result(None)
+
+
+class _FakeWSClientInitRaising:
+    """Fail during SDK construction after the receiver loop is installed."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("ws init boom")
 
 
 class _FakeWS:
@@ -198,7 +245,13 @@ def _fake_lark_sdk():
     lark_mod.Client = _FakeRestClient  # type: ignore[attr-defined]
     lark_mod.LogLevel = _FakeLogLevel  # type: ignore[attr-defined]
     lark_mod.EventDispatcherHandler = _FakeEventDispatcherHandler  # type: ignore[attr-defined]
-    lark_mod.ws = _FakeWS  # type: ignore[attr-defined]
+
+    ws_mod = types.ModuleType("lark_oapi.ws")
+    ws_mod.Client = _FakeWSClient  # type: ignore[attr-defined]
+    ws_client_mod = types.ModuleType("lark_oapi.ws.client")
+    ws_client_mod.loop = None  # type: ignore[attr-defined]
+    ws_mod.client = ws_client_mod  # type: ignore[attr-defined]
+    lark_mod.ws = ws_mod  # type: ignore[attr-defined]
 
     im_v1_mod = types.ModuleType("lark_oapi.api.im.v1")
     im_v1_mod.ReplyMessageRequest = _FakeReplyMessageRequest  # type: ignore[attr-defined]
@@ -208,11 +261,20 @@ def _fake_lark_sdk():
     im_mod = types.ModuleType("lark_oapi.api.im")
 
     originals = {}
-    keys = ["lark_oapi", "lark_oapi.api", "lark_oapi.api.im", "lark_oapi.api.im.v1"]
+    keys = [
+        "lark_oapi",
+        "lark_oapi.ws",
+        "lark_oapi.ws.client",
+        "lark_oapi.api",
+        "lark_oapi.api.im",
+        "lark_oapi.api.im.v1",
+    ]
     for k in keys:
         originals[k] = sys.modules.get(k)
 
     sys.modules["lark_oapi"] = lark_mod
+    sys.modules["lark_oapi.ws"] = ws_mod
+    sys.modules["lark_oapi.ws.client"] = ws_client_mod
     sys.modules["lark_oapi.api"] = api_mod
     sys.modules["lark_oapi.api.im"] = im_mod
     sys.modules["lark_oapi.api.im.v1"] = im_v1_mod
@@ -698,6 +760,141 @@ class TestHandleReceiveV1:
 
 
 # ---------------------------------------------------------------------------
+# Tests: _handle_receive_v1 drop logging
+# ---------------------------------------------------------------------------
+
+
+class TestHandleReceiveV1DropLogging:
+    """Every silent-drop branch must emit a log line naming the reason.
+
+    Without a log line a dropped inbound message leaves no trace anywhere --
+    nothing in gateway.log, nothing in the SEL audit log -- making a
+    delivered-and-ignored message indistinguishable from a dead WebSocket. Each
+    drop logs at INFO with its reason (and message_id where one is known), so
+    diagnosis is a one-minute read rather than an hours-long elimination.
+    """
+
+    def _make_client(self):
+        from kiro_crew.feishu.client import LarkClient
+
+        received: list[Any] = []
+
+        async def handler(inbound: Any) -> None:
+            received.append(inbound)
+
+        client = LarkClient(app_id="a", app_secret="s", on_message=handler)
+        return client, received
+
+    def test_missing_event_logs(self, caplog: Any) -> None:
+        client, received = self._make_client()
+
+        class Data:
+            event = None
+
+        with caplog.at_level("INFO", logger="kiro_crew.feishu.client"):
+            client._handle_receive_v1(Data())
+
+        assert received == []
+        assert any("no event" in r.message for r in caplog.records)
+
+    def test_missing_message_logs(self, caplog: Any) -> None:
+        client, received = self._make_client()
+
+        class Event:
+            message = None
+
+        class Data:
+            event = Event()
+
+        with caplog.at_level("INFO", logger="kiro_crew.feishu.client"):
+            client._handle_receive_v1(Data())
+
+        assert received == []
+        assert any("no message" in r.message for r in caplog.records)
+
+    def test_missing_message_id_logs(self, caplog: Any) -> None:
+        client, received = self._make_client()
+        data = _make_event(message_id="")
+
+        with caplog.at_level("INFO", logger="kiro_crew.feishu.client"):
+            client._handle_receive_v1(data)
+
+        assert received == []
+        assert any("no message_id" in r.message for r in caplog.records)
+
+    def test_non_text_message_type_logs_type_and_id(self, caplog: Any) -> None:
+        client, received = self._make_client()
+        data = _make_event(message_id="img-1", message_type="image")
+
+        with caplog.at_level("INFO", logger="kiro_crew.feishu.client"):
+            client._handle_receive_v1(data)
+
+        assert received == []
+        drop = next((r for r in caplog.records if "unsupported message_type" in r.message), None)
+        assert drop is not None
+        # The offending type and the message_id are both in the rendered line.
+        assert "image" in drop.getMessage()
+        assert "img-1" in drop.getMessage()
+
+    def test_missing_open_id_logs(self, caplog: Any) -> None:
+        client, received = self._make_client()
+        data = _make_event(message_id="no-sender", open_id="")
+
+        with caplog.at_level("INFO", logger="kiro_crew.feishu.client"):
+            client._handle_receive_v1(data)
+
+        assert received == []
+        assert any("open_id" in r.message for r in caplog.records)
+
+    def test_invalid_json_logs(self, caplog: Any) -> None:
+        client, received = self._make_client()
+        data = _make_event(message_id="bad-json", content="not-json{{{")
+
+        with caplog.at_level("INFO", logger="kiro_crew.feishu.client"):
+            client._handle_receive_v1(data)
+
+        assert received == []
+        assert any("not valid JSON" in r.message for r in caplog.records)
+
+    def test_mention_only_body_logs(self, caplog: Any) -> None:
+        client, received = self._make_client()
+        data = _make_event(
+            message_id="ws-only",
+            content=json.dumps({"text": "@_user_1   "}),
+        )
+
+        with caplog.at_level("INFO", logger="kiro_crew.feishu.client"):
+            client._handle_receive_v1(data)
+
+        assert received == []
+        assert any("mention-only" in r.message for r in caplog.records)
+
+    def test_empty_resolved_text_logs(self, caplog: Any, monkeypatch: Any) -> None:
+        """The empty-resolved-text guard also logs its drop.
+
+        Reaching this branch organically is hard -- any non-mention text keeps
+        the resolved text non-empty, and a mention-only body drops one guard
+        earlier. It is a defensive guard, so we drive it directly by forcing
+        ``_resolve_mentions`` to return whitespace for a body that clears the
+        mention-only check.
+        """
+        import kiro_crew.feishu.client as client_mod
+
+        client, received = self._make_client()
+        monkeypatch.setattr(client_mod, "_resolve_mentions", lambda raw, mentions: "   ")
+        data = _make_event(
+            message_id="empty-resolved",
+            content=json.dumps({"text": "real words here"}),
+        )
+
+        with caplog.at_level("INFO", logger="kiro_crew.feishu.client"):
+            client._handle_receive_v1(data)
+
+        assert received == []
+        assert any("resolved text is empty" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
 # Tests: start()
 # ---------------------------------------------------------------------------
 
@@ -721,6 +918,138 @@ class TestStart:
         client._ws_client.stop()
         client._thread.join(timeout=1.0)
         assert not client._thread.is_alive()
+
+    @pytest.mark.asyncio
+    async def test_start_rebinds_sdk_loop_to_receiver_thread(self) -> None:
+        """The SDK must not drive the gateway's already-running event loop."""
+        from kiro_crew.feishu.client import LarkClient
+
+        gateway_loop = asyncio.get_running_loop()
+        gateway_thread_id = threading.get_ident()
+        ws_client_mod = sys.modules["lark_oapi.ws.client"]
+        ws_client_mod.loop = gateway_loop  # type: ignore[attr-defined]
+
+        client = LarkClient(app_id="a", app_secret="s")
+        await client.start()
+        await asyncio.wait_for(
+            asyncio.to_thread(client._ws_client._started_event.wait),
+            timeout=1.0,
+        )
+
+        assert client._thread.is_alive()
+        assert client._ws_client.constructed_thread_id == client._thread.ident
+        assert client._ws_client.constructed_thread_id != gateway_thread_id
+        assert client._ws_client.constructed_loop is client._ws_loop
+        assert client._ws_client.started_loop is client._ws_loop
+        assert client._ws_client.started_loop is not gateway_loop
+
+        await client.close()
+        client._thread.join(timeout=1.0)
+        assert not client._thread.is_alive()
+
+    @pytest.mark.asyncio
+    async def test_start_propagates_sdk_constructor_failure(self) -> None:
+        """A constructor failure is reported and leaves no receiver loop alive."""
+        from kiro_crew.feishu.client import LarkClient
+
+        lark_mod = sys.modules["lark_oapi"]
+        original_client = lark_mod.ws.Client  # type: ignore[attr-defined]
+        lark_mod.ws.Client = _FakeWSClientInitRaising  # type: ignore[attr-defined]
+        try:
+            client = LarkClient(app_id="a", app_secret="s")
+            with pytest.raises(RuntimeError, match="initialization failed"):
+                await client.start()
+            client._thread.join(timeout=1.0)
+
+            assert client._ws_client is None
+            assert client._ws_loop is None
+            assert not client._thread.is_alive()
+        finally:
+            lark_mod.ws.Client = original_client  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Tests: health transitions (on_state_change)
+# ---------------------------------------------------------------------------
+
+
+class TestHealthTransitions:
+    """The Settings badge is driven by these transitions, so they are contract.
+
+    Without them a rejected app id/secret leaves the badge reading "connected"
+    forever: lark-oapi exposes no connect event, and the only evidence of a
+    refusal is the receiver thread ending seconds after start().
+    """
+
+    @pytest.mark.asyncio
+    async def test_start_reports_healthy_then_close_reports_down(self) -> None:
+        from kiro_crew.feishu.client import LarkClient
+
+        client = LarkClient(app_id="a", app_secret="s")
+        seen: list[tuple[bool, str]] = []
+        client.on_state_change = lambda ok, why: seen.append((ok, why))
+
+        await client.start()
+        assert seen[0] == (True, "")
+
+        await client.close()
+        client._thread.join(timeout=1.0)
+        # An intentional shutdown is "not connected" with NO reason: nothing
+        # failed, and inventing one would show a false error in Settings.
+        assert seen[-1] == (False, "")
+
+    @pytest.mark.asyncio
+    async def test_receiver_exit_reports_the_reason(self) -> None:
+        """A receiver that returns on its own is the bad-credential signal."""
+        from kiro_crew.feishu.client import LarkClient
+
+        client = LarkClient(app_id="a", app_secret="s")
+        seen: list[tuple[bool, str]] = []
+        client.on_state_change = lambda ok, why: seen.append((ok, why))
+
+        await client.start()
+        # End the receive loop WITHOUT going through client.close(), so
+        # `_closed` stays False — exactly the shape lark produces for a refused
+        # app: ws.start() returns on its own while the channel still believes it
+        # is running. Driving the stub directly keeps this deterministic rather
+        # than racing its internal timeout.
+        client._ws_client.stop()
+        client._thread.join(timeout=5.0)
+        assert not client._thread.is_alive()
+
+        assert seen[0] == (True, "")
+        assert seen[-1][0] is False
+        assert "receiver stopped" in seen[-1][1]
+
+    def test_transitions_are_deduped_but_the_first_always_publishes(self) -> None:
+        from kiro_crew.feishu.client import LarkClient
+
+        client = LarkClient(app_id="a", app_secret="s")
+        seen: list[tuple[bool, str]] = []
+        client.on_state_change = lambda ok, why: seen.append((ok, why))
+
+        client._notify_state(False, "")
+        client._notify_state(False, "")
+        assert seen == [(False, "")], "the first report publishes even if unhealthy"
+
+        client._notify_state(False, "first reason")
+        client._notify_state(False, "first reason")
+        # A repeat must not overwrite the FIRST reason with an identical later
+        # one, and must not spam the observer.
+        assert seen == [(False, ""), (False, "first reason")]
+
+    def test_an_observer_that_raises_cannot_break_the_receiver(self) -> None:
+        from kiro_crew.feishu.client import LarkClient
+
+        client = LarkClient(app_id="a", app_secret="s")
+
+        def _boom(ok: bool, why: str) -> None:
+            raise RuntimeError("observer blew up")
+
+        client.on_state_change = _boom
+        # Swallowed: the badge is a side channel, and losing it must never take
+        # the channel down with it.
+        client._notify_state(True, "")
 
 
 # ---------------------------------------------------------------------------
@@ -746,6 +1075,31 @@ class TestClose:
         # Thread should exit since stop() sets the event
         client._thread.join(timeout=1.0)
         assert not client._thread.is_alive()
+
+    @pytest.mark.asyncio
+    async def test_close_supports_sdk_without_public_stop(self) -> None:
+        """lark-oapi 1.7.x closes through _disconnect on its worker loop."""
+        from kiro_crew.feishu.client import LarkClient
+
+        lark_mod = sys.modules["lark_oapi"]
+        original_client = lark_mod.ws.Client  # type: ignore[attr-defined]
+        lark_mod.ws.Client = _FakeWSClientWithoutStop  # type: ignore[attr-defined]
+        try:
+            client = LarkClient(app_id="a", app_secret="s")
+            await client.start()
+            await asyncio.wait_for(
+                asyncio.to_thread(client._ws_client._started_event.wait),
+                timeout=1.0,
+            )
+
+            await client.close()
+            client._thread.join(timeout=1.0)
+
+            assert client._ws_client.disconnected is True
+            assert client._ws_client._auto_reconnect is False
+            assert not client._thread.is_alive()
+        finally:
+            lark_mod.ws.Client = original_client  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_ws_stop_is_offloaded_off_the_event_loop_thread(self) -> None:

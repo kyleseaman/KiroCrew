@@ -204,7 +204,9 @@ class TestSaveThresholds:
             monkeypatch, tmp_path, {"soft_threshold_pct": 60, "hard_threshold_pct": 85}
         )
         assert resp.status == 200
-        assert json.loads(resp.body)["restart_required"] is True
+        # The dispatcher reads both thresholds at point of use, so the next turn
+        # already compares against the saved pair.
+        assert json.loads(resp.body)["restart_required"] is False
         data = json.loads(cfg_path.read_text(encoding="utf-8"))
         assert data["teams"]["soft_threshold_pct"] == 60
         assert data["teams"]["hard_threshold_pct"] == 85
@@ -356,6 +358,37 @@ class TestSaveCredentialVerification:
         assert data["teams"]["app_id"] == "app-1"
         # The secret is env-only: config.json must never hold it.
         assert "app_password" not in data["teams"]
+
+    def test_env_write_failure_restores_prior_config(self, monkeypatch, tmp_path: Path) -> None:
+        """A failed .env credential write must roll config.json back.
+
+        Config metadata is written BEFORE the .env credential. If the .env write
+        then fails, the new app_id would otherwise be left paired with the OLD
+        password on disk (a broken pair that fails Teams auth on restart). The
+        handler snapshots config before writing and restores it on .env failure,
+        so the persisted pair stays consistent (old app_id + old password).
+        """
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(
+            json.dumps({"teams": {"app_id": "app-original", "tenant_id": "t-1"}}),
+            encoding="utf-8",
+        )
+
+        def _boom(_updates):
+            raise OSError("disk full writing .env")
+
+        monkeypatch.setattr(mod, "_write_env_updates", _boom)
+
+        with pytest.raises(OSError):
+            _save(
+                monkeypatch,
+                tmp_path,
+                {"app_id": "app-new", "app_password": "new-secret", "tenant_id": "t-1"},
+            )
+
+        # config.json restored to the pre-save app_id, not left with "app-new".
+        restored = json.loads(cfg_path.read_text(encoding="utf-8"))
+        assert restored["teams"]["app_id"] == "app-original"
 
     def test_a_pasted_secret_is_verified_against_the_stored_app_id(
         self, monkeypatch, tmp_path: Path

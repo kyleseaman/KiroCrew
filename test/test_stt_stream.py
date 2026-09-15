@@ -11,7 +11,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from kiro_crew import platform_compat as pc
+from kiro_crew import stt
 from kiro_crew.config.loader import KiroCrewConfig, SttConfig
 
 # Upper bound for _wait_for_operation. Generous because it only ever elapses on
@@ -85,7 +85,17 @@ class TestGuards:
             assert resp.status == 503
 
     @pytest.mark.asyncio
-    async def test_rejects_when_provider_is_whisper(self, monkeypatch):
+    async def test_rejects_a_provider_that_cannot_stream(self, monkeypatch):
+        """A provider outside ``_STREAMING_PROVIDERS`` is refused, not half-served.
+
+        The handler's provider checks are a chain ending in the AWS branch, so a
+        value with no streaming implementation of its own does not fail: it falls
+        through to Transcribe, which is the one provider that bills. The guard is
+        what makes that unreachable. ``whisper`` stands in for such a value because
+        it is a retired name a hand-edited or legacy ``config.json`` can still hold;
+        ``KiroCrewConfig.load`` degrades it to ``local``, which is exactly why the
+        socket needs its own gate rather than trusting the loaded value.
+        """
         monkeypatch.setattr(
             "kiro_crew.dashboard.stt_stream.KiroCrewConfig.load",
             classmethod(lambda cls: _cfg(provider="whisper")),
@@ -94,6 +104,18 @@ class TestGuards:
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get("/api/ws/stt")
             assert resp.status == 503
+
+    def test_the_default_provider_can_stream(self):
+        """Whatever ships as the default must be admitted by this endpoint.
+
+        Streaming is also on by default, so a default provider missing from
+        ``_STREAMING_PROVIDERS`` would 503 every microphone press on a fresh
+        install, with the settings panel showing voice input as ready.
+        """
+        from kiro_crew.dashboard import stt_stream
+
+        assert SttConfig().provider in stt_stream._STREAMING_PROVIDERS
+        assert SttConfig().streaming is True
 
     @pytest.mark.asyncio
     async def test_rejects_when_stt_disabled(self, monkeypatch):
@@ -165,9 +187,11 @@ class TestGuards:
     async def test_rejects_when_concurrent_cap_reached(self, monkeypatch):
         """New connections rejected with 503 once active sessions hit the cap.
 
-        Regression: without a cap, a single user opening many tabs (or an
-        attacker past origin) multiplies Transcribe cost and can exhaust
-        the account concurrent-stream quota.
+        The cap covers all three providers, for two different reasons: on
+        ``transcribe`` a single user opening many tabs (or an attacker past origin)
+        multiplies cost and can exhaust the account's concurrent-stream quota, and
+        on the free on-device providers each session still buffers its whole
+        utterance and serialises its decodes onto one resident model.
         """
         monkeypatch.setattr(
             "kiro_crew.dashboard.stt_stream.KiroCrewConfig.load",
@@ -189,11 +213,27 @@ class TestAppleStreamingSession:
     coverage here rather than being assumed shared.
     """
 
-    def _install(self, monkeypatch, *, session=None, start_error="", feed_ok=True):
-        """Point the endpoint at the apple provider with a stubbed helper session."""
+    def _install(
+        self,
+        monkeypatch,
+        *,
+        session=None,
+        start_error="",
+        feed_ok=True,
+        avail=None,
+        language_code="auto",
+    ):
+        """Point the endpoint at the apple provider with a stubbed helper session.
+
+        *avail* is what the double reports from ``availability()``, which the error
+        path consults to name a start failure. It defaults to a capable host so the
+        cases that never fail to start do not depend on the runner's OS.
+        """
+        from kiro_crew import apple_speech as real_apple_speech
+
         monkeypatch.setattr(
             "kiro_crew.dashboard.stt_stream.KiroCrewConfig.load",
-            classmethod(lambda cls: _cfg(provider="apple")),
+            classmethod(lambda cls: _cfg(provider="apple", language_code=language_code)),
         )
         monkeypatch.setattr("kiro_crew.dashboard.stt_stream.check_origin", lambda r, require: True)
 
@@ -228,6 +268,8 @@ class TestAppleStreamingSession:
         fake_module = SimpleNamespace(
             StreamingSession=session or FakeSession,
             STREAM_SAMPLE_RATE_HZ=16000,
+            Availability=real_apple_speech.Availability,
+            availability=lambda: avail or real_apple_speech.Availability(True),
         )
         # BOTH, deliberately. `_run_apple_session` does `from kiro_crew import
         # apple_speech`, which resolves the ATTRIBUTE on the already-imported
@@ -239,6 +281,24 @@ class TestAppleStreamingSession:
         return events, fed
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("language", "expected_locale"),
+        [("auto", "en-US"), ("en-US", "en-US"), ("zh-CN", "zh-CN")],
+    )
+    async def test_stream_uses_effective_locale(self, monkeypatch, language, expected_locale):
+        self._install(monkeypatch, language_code=language)
+        from kiro_crew import apple_speech
+
+        factory = MagicMock(wraps=apple_speech.StreamingSession)
+        monkeypatch.setattr(apple_speech, "StreamingSession", factory)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert await asyncio.wait_for(ws.receive_json(), timeout=5) == {"type": "ready"}
+            await ws.send_json({"type": "stop"})
+            await ws.close()
+        assert factory.call_args.kwargs["locale"] == expected_locale
+
+    @pytest.mark.asyncio
     async def test_duration_cap_fires_for_a_client_that_sends_nothing(self, monkeypatch):
         """Regression: the cap MUST run on a dedicated task, not per-message.
 
@@ -246,6 +306,10 @@ class TestAppleStreamingSession:
         heartbeat ping/pong internally, so a message-driven deadline never
         evaluates for an idle-but-alive client — leaking the helper process, an OS
         speech session, and one of `_MAX_CONCURRENT_SESSIONS` slots indefinitely.
+
+        The frame is pinned whole, `code` included: the dashboard renders `message`
+        verbatim into a 12-language UI, so the code is the part a localised string
+        can key off and an uncoded frame can only ever be shown in English.
         """
         self._install(monkeypatch)
         monkeypatch.setattr("kiro_crew.dashboard.stt_stream._MAX_STREAM_DURATION_SECS", 0.05)
@@ -254,7 +318,11 @@ class TestAppleStreamingSession:
             assert (await ws.receive_json()) == {"type": "ready"}
             # Deliberately send NO audio — only the deadline task can end this.
             msg = await ws.receive_json()
-            assert msg == {"type": "error", "message": "max stream duration exceeded"}
+            assert msg == {
+                "type": "error",
+                "message": "max stream duration exceeded",
+                "code": "stt_max_duration_exceeded",
+            }
             await ws.close()
 
     @pytest.mark.asyncio
@@ -328,6 +396,10 @@ class TestAppleStreamingSession:
         The helper stops producing results after emitting `error`, so dropping the
         event leaves the client on a live socket that will never transcribe again —
         indistinguishable from a silent microphone.
+
+        The helper's own prose is forwarded for an operator reading the log, and the
+        code is what the localised UI renders: a mid-session helper death is a
+        session failure the user can only retry, not an availability problem.
         """
         events, _ = self._install(monkeypatch)
         async with TestClient(TestServer(_make_app())) as client:
@@ -337,6 +409,7 @@ class TestAppleStreamingSession:
             msg = await ws.receive_json()
             assert msg["type"] == "error"
             assert "result stream failed" in msg["message"]
+            assert msg["code"] == "stt_session_failed"
             await ws.close()
 
     @pytest.mark.asyncio
@@ -356,16 +429,94 @@ class TestAppleStreamingSession:
             msg = await ws.receive_json()
             assert msg["type"] == "error"
             assert "stopped" in msg["message"]
+            assert msg["code"] == "stt_session_failed"
 
     @pytest.mark.asyncio
     async def test_helper_start_failure_surfaces_and_closes(self, monkeypatch):
-        self._install(monkeypatch, start_error="the Xcode Command Line Tools are required")
+        """A session that never starts reports WHY in a form the UI can localise.
+
+        `start()` answers in prose, and "install the Xcode Command Line Tools" is
+        both the most likely cause and the only one with a user-actionable fix, so
+        collapsing it into a generic failure code would throw away the one thing
+        worth telling this user. The code is the availability probe's own, which is
+        what the settings panel already renders for the same condition.
+        """
+        from kiro_crew import apple_speech
+
+        self._install(
+            monkeypatch,
+            start_error="the Xcode Command Line Tools are required",
+            avail=apple_speech.Availability(False, "no toolchain", needs_toolchain=True),
+        )
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
             msg = await ws.receive_json()
             assert msg["type"] == "error"
             assert "Command Line Tools" in msg["message"]
+            assert msg["code"] == "stt_apple_needs_toolchain"
             await ws.close()
+
+    @pytest.mark.asyncio
+    async def test_start_failure_on_a_capable_host_is_a_session_failure(self, monkeypatch):
+        """The mirror: a host that CAN run the framework but still failed to start.
+
+        A helper that would not build, a sandbox that is unavailable or a readiness
+        timeout are none of them availability problems, so reporting one of the
+        availability codes would send the user to install something they already
+        have.
+        """
+        self._install(monkeypatch, start_error="streaming helper did not become ready")
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            msg = await ws.receive_json()
+            assert msg["type"] == "error"
+            assert msg["code"] == "stt_session_failed"
+            await ws.close()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_start_still_closes_the_session(self, monkeypatch):
+        """`await session.start()` runs BEFORE the teardown `finally` exists.
+
+        A cancellation landing there (client gone, gateway shutdown) therefore
+        has no caller-side owner: without the call-site guard, the helper
+        session — and the sandbox launcher it may hold — is never closed, and
+        the `stt_stream_start` already emitted gets no matching end audit. The
+        guard must close the session, balance the trail, and re-raise.
+        """
+        started = asyncio.Event()
+        closed: list[bool] = []
+        outcomes: list[str] = []
+
+        class HangingSession:
+            def __init__(self, **kwargs):
+                pass
+
+            async def start(self):
+                started.set()
+                await asyncio.sleep(60)
+                return ""
+
+            async def close(self):
+                closed.append(True)
+
+        self._install(monkeypatch, session=HangingSession)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.stt_stream._emit_end_audit",
+            lambda caller, *, outcome: outcomes.append(outcome),
+        )
+        from kiro_crew.dashboard import stt_stream
+
+        task = asyncio.create_task(
+            stt_stream._run_apple_session(
+                MagicMock(), _cfg(provider="apple"), MagicMock(), "test-caller"
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert closed == [True]
+        assert outcomes == ["error"]
 
 
 @pytest.fixture()
@@ -413,12 +564,12 @@ class TestStreamLifecycle:
     def _require_amazon_transcribe(self):
         pytest.importorskip("amazon_transcribe")
 
-    def _install_stubs(self, monkeypatch, *, fail_start=False):
+    def _install_stubs(self, monkeypatch, *, fail_start=False, language_code="auto"):
         from amazon_transcribe.handlers import TranscriptResultStreamHandler
 
         monkeypatch.setattr(
             "kiro_crew.dashboard.stt_stream.KiroCrewConfig.load",
-            classmethod(lambda cls: _cfg()),
+            classmethod(lambda cls: _cfg(language_code=language_code)),
         )
         monkeypatch.setattr("kiro_crew.dashboard.stt_stream.check_origin", lambda r, require: True)
 
@@ -455,8 +606,12 @@ class TestStreamLifecycle:
         return client, input_stream
 
     @pytest.mark.asyncio
-    async def test_ready_then_stop(self, monkeypatch):
-        _, input_stream = self._install_stubs(monkeypatch)
+    @pytest.mark.parametrize(
+        ("language", "expected_locale"),
+        [("auto", "en-US"), ("en-US", "en-US"), ("zh-CN", "zh-CN")],
+    )
+    async def test_ready_then_stop(self, monkeypatch, language, expected_locale):
+        transcribe_client, input_stream = self._install_stubs(monkeypatch, language_code=language)
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
             msg = await ws.receive_json()
@@ -466,6 +621,10 @@ class TestStreamLifecycle:
             await ws.close()
         input_stream.send_audio_event.assert_awaited()
         input_stream.end_stream.assert_awaited()
+        assert (
+            transcribe_client.start_stream_transcription.call_args.kwargs["language_code"]
+            == expected_locale
+        )
 
     @pytest.mark.asyncio
     async def test_start_failure_emits_error(self, monkeypatch):
@@ -506,6 +665,10 @@ class TestStreamLifecycle:
         ``TranscribeStreamingClient = None``; the handler must still send a
         friendly WS error, close cleanly, and emit the matching end SEL audit.
         Covers the partial-install / stale-env recovery path.
+
+        The frame carries the availability probe's own missing-extra code rather
+        than a socket-specific one, so the socket and the settings panel name the
+        same condition and one localised string serves both.
         """
         monkeypatch.setattr(
             "kiro_crew.dashboard.stt_stream.KiroCrewConfig.load",
@@ -520,7 +683,11 @@ class TestStreamLifecycle:
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
             msg = await ws.receive_json()
-            assert msg == {"type": "error", "message": "amazon-transcribe not installed"}
+            assert msg == {
+                "type": "error",
+                "message": "amazon-transcribe not installed",
+                "code": stt.CODE_EXTRA_MISSING,
+            }
             await ws.close()
         # Wait for the end audit instead of assuming the handler already ran:
         # the error frame / client close is not a barrier for it.
@@ -630,6 +797,9 @@ class TestStreamLifecycle:
         Regression: the deadline must fire on a dedicated task, not on
         per-message checks. An idle-but-alive client (heartbeat pings
         only) must still be torn down after the cap.
+
+        The cap's frame carries the same code as the other two providers': one
+        condition, one localised string, whichever provider the user is on.
         """
         _, input_stream = self._install_stubs(monkeypatch)
         monkeypatch.setattr("kiro_crew.dashboard.stt_stream._MAX_STREAM_DURATION_SECS", 0.05)
@@ -638,9 +808,75 @@ class TestStreamLifecycle:
             assert (await ws.receive_json()) == {"type": "ready"}
             # Do NOT send any audio — rely purely on the deadline task.
             msg = await ws.receive_json()
-            assert msg == {"type": "error", "message": "max stream duration exceeded"}
+            assert msg == {
+                "type": "error",
+                "message": "max stream duration exceeded",
+                "code": "stt_max_duration_exceeded",
+            }
             await ws.close()
         input_stream.end_stream.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_consent_refusal_reaches_the_client_and_is_audited(self, monkeypatch):
+        """No recorded grant means no socket, reported over the same error channel.
+
+        Streaming Transcribe bills per audio-second, so the refusal happens before
+        the client is constructed and before any audio is read. It carries its own
+        code because the fix is an operator action in Settings, not the retry a
+        generic session failure invites, and the audit records ``refused`` rather
+        than ``error`` so an operator can tell a denied request from a broken one.
+        """
+        self._install_stubs(monkeypatch)
+
+        async def _refuse(service, *, profile, region):
+            return False, "AWS Transcribe needs your consent for profile default"
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.stt_stream.aws_consent.authorize", _refuse, raising=True
+        )
+        calls: list[dict] = []
+        fake_sel = MagicMock()
+        fake_sel.log_api_access = lambda **kw: calls.append(kw)
+        monkeypatch.setattr("kiro_crew.dashboard.stt_stream.sel", lambda: fake_sel)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            msg = await ws.receive_json()
+            assert msg["type"] == "error"
+            assert "consent" in msg["message"]
+            assert msg["code"] == "stt_consent_required"
+            await ws.close()
+        await _wait_for_operation(calls, "stt_stream_end")
+        end = next(c for c in calls if c["operation"] == "stt_stream_end")
+        assert end["outcome"] == "refused"
+
+    @pytest.mark.asyncio
+    async def test_cap_teardown_is_audited_as_a_timeout(self, monkeypatch):
+        """A cap-driven teardown must be distinguishable from a clean stop.
+
+        This is the branch where it matters most: a session held open to the cap on
+        the metered provider is billed audio, so an operator reading the trail needs
+        to see which sessions ended that way. Inferring it from the deadline task's
+        own state cannot answer it, because the cap's ``ws.close()`` is what ends the
+        read loop, so the cleanup runs while that task is still awaiting the peer's
+        acknowledgement and reads as not-yet-done.
+        """
+        _, input_stream = self._install_stubs(monkeypatch)
+        monkeypatch.setattr("kiro_crew.dashboard.stt_stream._MAX_STREAM_DURATION_SECS", 0.05)
+        outcomes: list[str] = []
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.stt_stream._emit_end_audit",
+            lambda caller, *, outcome: outcomes.append(outcome),
+        )
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await ws.receive_json()) == {"type": "ready"}
+            await ws.receive_json()
+            await ws.close()
+        for _ in range(int(_AUDIT_WAIT_TIMEOUT_SECS / 0.02)):
+            if outcomes:
+                break
+            await asyncio.sleep(0.02)
+        assert outcomes == ["timeout"], outcomes
 
     @pytest.mark.asyncio
     async def test_oversized_text_frame_closes_connection(self, monkeypatch):
@@ -655,13 +891,23 @@ class TestStreamLifecycle:
 
 
 class TestConfig:
-    def test_streaming_defaults_false(self):
-        cfg = SttConfig()
-        assert cfg.streaming is False
+    def test_streaming_defaults_true(self):
+        """Streaming is on out of the box, on every provider.
 
-    def test_streaming_respects_value(self):
-        cfg = SttConfig(streaming=True)
-        assert cfg.streaming is True
+        Recognition is local and free by default, so there is no per-word cost to
+        opt into, and words appearing while the user is still speaking is what makes
+        dictation feel like dictation. Turning it off is the opt-in now: it buys less
+        CPU on the on-device providers and fewer API calls on ``transcribe``.
+        """
+        assert SttConfig().streaming is True
+
+    def test_streaming_respects_an_explicit_opt_out(self):
+        """The field is honoured, not just defaulted.
+
+        Pinned at ``False``, the value that DIFFERS from the default: asserting the
+        default's own value here would hold even if the field stopped being read.
+        """
+        assert SttConfig(streaming=False).streaming is False
 
 
 class TestConfigPutRoundTrip:
@@ -669,6 +915,12 @@ class TestConfigPutRoundTrip:
 
     @pytest.mark.asyncio
     async def test_put_persists_streaming(self, tmp_path, monkeypatch):
+        """A saved ``streaming`` choice reaches disk and survives a fresh load.
+
+        Written as an opt-OUT, the value that differs from the default: PUTting
+        ``True`` would leave every assertion here true even if the handler dropped
+        the field entirely, since a fresh load would answer ``True`` on its own.
+        """
         # KIROCREW_HOME redirects both config_dir() and config_path() in a
         # way that survives the `from ... import config_path` idiom used by
         # the handler, unlike monkeypatching a module-level name.
@@ -681,11 +933,11 @@ class TestConfigPutRoundTrip:
 
         async with TestClient(TestServer(app)) as client:
             resp = await client.put(
-                "/api/config/stt", json={"streaming": True, "provider": "transcribe"}
+                "/api/config/stt", json={"streaming": False, "provider": "transcribe"}
             )
             assert resp.status == 200
             data = await resp.json()
-            assert data["streaming"] is True
+            assert data["streaming"] is False
             assert data["provider"] == "transcribe"
             # Assert it persisted to disk (survives a fresh load).
             cfg_file = tmp_path / "config.json"
@@ -693,19 +945,23 @@ class TestConfigPutRoundTrip:
             import json as _json
 
             on_disk = _json.loads(cfg_file.read_text(encoding="utf-8"))
-            assert on_disk["stt"]["streaming"] is True
+            assert on_disk["stt"]["streaming"] is False
             # Assert KiroCrewConfig.load() correctly deserializes — guards
             # against field-name mismatches that would silently break at runtime.
             reloaded = KiroCrewConfig.load()
-            assert reloaded.stt.streaming is True
+            assert reloaded.stt.streaming is False
 
     @pytest.mark.asyncio
     async def test_put_rejects_non_boolean_streaming(self, tmp_path, monkeypatch):
         """Non-boolean ``streaming`` values must be ignored, not coerced.
 
-        Regression: ``bool("false") is True`` silently enabled streaming
-        when the client sent a string. The handler now checks
-        ``isinstance(body["streaming"], bool)`` and drops anything else.
+        ``bool()`` of a JSON string is the trap: ``bool("false")`` is ``True`` and
+        ``bool("")`` is ``False``, so a coercing handler moves the setting on input
+        that expressed no choice. With streaming on by default the damage runs both
+        ways (a falsy non-bool would silently turn dictation's live text off, and a
+        truthy one would turn it back on under a user who opted out), so both
+        directions are pinned here. ``isinstance(body["streaming"], bool)`` is what
+        keeps the stored value where the user left it.
         """
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
         from kiro_crew.dashboard import handlers
@@ -714,30 +970,31 @@ class TestConfigPutRoundTrip:
         app.router.add_put("/api/config/stt", handlers.api_stt_config)
 
         async with TestClient(TestServer(app)) as client:
-            # "false" string: old bug would coerce to True. Must stay False.
+            # Falsy non-bools, against the default-on setting: none may switch it off.
+            for value in ("false", "", 0):
+                resp = await client.put(
+                    "/api/config/stt",
+                    json={"streaming": value, "provider": "transcribe"},
+                )
+                assert resp.status == 200
+                assert (await resp.json())["streaming"] is True, value
+
+            # A real opt-out, so the truthy non-bools below have something to undo.
             resp = await client.put(
                 "/api/config/stt",
-                json={"streaming": "false", "provider": "transcribe"},
+                json={"streaming": False, "provider": "transcribe"},
             )
             assert resp.status == 200
             assert (await resp.json())["streaming"] is False
 
-            # "true" string: the test that would have caught the bug if
-            # default had been True. Must also be ignored (non-bool type).
-            resp = await client.put(
-                "/api/config/stt",
-                json={"streaming": "true", "provider": "transcribe"},
-            )
-            assert resp.status == 200
-            assert (await resp.json())["streaming"] is False
-
-            # Int 1 (truthy): same rule — reject, don't coerce.
-            resp = await client.put(
-                "/api/config/stt",
-                json={"streaming": 1, "provider": "transcribe"},
-            )
-            assert resp.status == 200
-            assert (await resp.json())["streaming"] is False
+            # Truthy non-bools must not switch it back on.
+            for value in ("true", 1, "yes"):
+                resp = await client.put(
+                    "/api/config/stt",
+                    json={"streaming": value, "provider": "transcribe"},
+                )
+                assert resp.status == 200
+                assert (await resp.json())["streaming"] is False, value
 
     @pytest.mark.asyncio
     async def test_get_exposes_transcribe_fields_for_ui(self, tmp_path, monkeypatch):
@@ -836,7 +1093,13 @@ class TestSttLanguageCodes:
 
 
 class TestDefensiveGuards:
-    """Regression tests for review-bot rev 2 findings (posts #9, #10)."""
+    """Failures in the machinery AROUND the stream must not change its outcome.
+
+    Every case here breaks something the handler only uses in passing (the audit
+    log, the AWS client constructor, the socket's own ``close()``) and asserts the
+    handler still reaches the answer it was going to give: the intended status code,
+    a closed WebSocket, and a balanced audit trail.
+    """
 
     @pytest.fixture(autouse=True)
     def _consented(self, transcribe_consented):
@@ -846,9 +1109,9 @@ class TestDefensiveGuards:
     async def test_guard_audit_sel_failure_preserves_status_code(self, monkeypatch):
         """If sel() raises on a guard rejection, client must still get 403/503, not 500.
 
-        Regression for review-bot post #9: unwrapped sel().log_api_access() on
-        the origin/availability/concurrency guards would propagate and mask
-        the intended HTTPForbidden/HTTPServiceUnavailable.
+        An unwrapped ``sel().log_api_access()`` on the origin, availability or
+        concurrency guards would propagate and mask the intended
+        HTTPForbidden/HTTPServiceUnavailable.
         """
         monkeypatch.setattr(
             "kiro_crew.dashboard.stt_stream.KiroCrewConfig.load",
@@ -870,9 +1133,10 @@ class TestDefensiveGuards:
     async def test_client_construction_failure_closes_ws_and_emits_end_audit(self, monkeypatch):
         """If TranscribeStreamingClient() raises, WS must close and end audit emit.
 
-        Regression for review-bot post #10: unwrapped resolver/client construction
-        would leak a prepare()d WebSocket and leave an unmatched
-        stt_stream_start in the audit trail.
+        Unwrapped resolver/client construction (an invalid profile, a bad region)
+        would leak a prepare()d WebSocket and leave an unmatched stt_stream_start in
+        the audit trail. The frame's code says "the session failed", not "something
+        is missing": there is nothing for the user to install.
         """
         pytest.importorskip("amazon_transcribe")
         monkeypatch.setattr(
@@ -896,7 +1160,11 @@ class TestDefensiveGuards:
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
             msg = await ws.receive_json()
-            assert msg == {"type": "error", "message": "failed to create transcription client"}
+            assert msg == {
+                "type": "error",
+                "message": "failed to create transcription client",
+                "code": "stt_session_failed",
+            }
             await ws.close()
         # Wait for the end audit instead of assuming the handler already ran:
         # the error frame / client close is not a barrier for it.
@@ -912,9 +1180,11 @@ class TestDefensiveGuards:
     async def test_start_audit_sel_failure_closes_ws_and_emits_end_audit(self, monkeypatch):
         """If the stt_stream_start sel call raises, WS must close and end audit emit.
 
-        Regression for review-bot post #13: unwrapped sel().log_api_access() for
-        stt_stream_start would propagate after ws.prepare() sent the 101
-        upgrade, leaking the WebSocket and leaving an unmatched start event.
+        An unwrapped ``sel().log_api_access()`` for stt_stream_start would propagate
+        after ws.prepare() sent the 101 upgrade, leaking the WebSocket and leaving an
+        unmatched start event. This frame precedes the provider branch, so it is the
+        one error frame every provider can produce, and it carries a code for the
+        same reason theirs do.
         """
         monkeypatch.setattr(
             "kiro_crew.dashboard.stt_stream.KiroCrewConfig.load",
@@ -937,7 +1207,11 @@ class TestDefensiveGuards:
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
             msg = await ws.receive_json()
-            assert msg == {"type": "error", "message": "audit subsystem unavailable"}
+            assert msg == {
+                "type": "error",
+                "message": "audit subsystem unavailable",
+                "code": "stt_session_failed",
+            }
             await ws.close()
         # Wait for the end audit instead of assuming the handler already ran:
         # the error frame / client close is not a barrier for it.
@@ -953,9 +1227,9 @@ class TestDefensiveGuards:
     async def test_cleanup_ws_close_failure_still_emits_end_audit(self, monkeypatch):
         """If the cleanup ws.close() raises on broken transport, end audit still fires.
 
-        Regression for review-bot post #18: unwrapped await ws.close() on the
-        normal cleanup path would skip _emit_end_audit when the transport
-        is broken, leaving an unmatched stt_stream_start in the audit trail.
+        An unwrapped ``await ws.close()`` on the normal cleanup path would skip
+        _emit_end_audit when the transport is broken, leaving an unmatched
+        stt_stream_start in the audit trail.
         """
         pytest.importorskip("amazon_transcribe")
         from amazon_transcribe.handlers import TranscriptResultStreamHandler
@@ -1017,345 +1291,986 @@ class TestDefensiveGuards:
         ), f"both start and end audit events required; got {ops}"
 
 
-class TestSttProviderGating:
-    """`mlx` is only offered on Apple Silicon, and the check must see through
-    Rosetta 2 (KiroCrew's bundled Python reports ``x86_64`` even on arm64)."""
+class _FakeLocalSession:
+    """Scripted stand-in for ``stt.LocalSession``: no recogniser, no model, no audio.
 
-    def test_is_apple_silicon_false_off_darwin(self, monkeypatch):
-        from kiro_crew.dashboard.handlers import core
+    Mirrors the real object's contract rather than a convenient subset of it, since
+    the transport reads all of it: ``pending_download()`` is asked BEFORE
+    ``prepare()`` (a first-run notice cannot wait for the transfer it describes),
+    ``feed()`` answers with a list per chunk, ``ended`` latches only when the SESSION
+    is over (`finish`/`cancel`, never a detector final -- a session spans many
+    utterances), ``has_pending_audio`` reports whether a tail is still worth decoding,
+    and ``finish()`` stands for the full-buffer decode.
+    """
 
-        monkeypatch.setattr("platform.system", lambda: "Linux")
-        monkeypatch.setattr("platform.machine", lambda: "x86_64")
-        assert core._is_apple_silicon() is False
+    def __init__(
+        self,
+        *,
+        pending=None,
+        pending_load=False,
+        prepare_events=(),
+        feed_events=(),
+        final_text="",
+        final_event=None,
+        prepare_gate=None,
+    ):
+        self.kwargs: dict = {}
+        self.fed: list[bytes] = []
+        self.prepared = False
+        #: Counted, not just flagged: the refusal path starts a detached
+        #: transfer, so a test needs to see that prepare was entered even
+        #: though the socket closed before it returned.
+        self.prepare_calls = 0
+        self.finished = False
+        self.cancelled = False
+        self._pending = pending
+        #: Whether ``prepare()`` will block loading the model, so the transport
+        #: announces the load with a ``preparing`` status frame first. Defaults off
+        #: so the ordinary "model already resident" path stays a plain ``ready``.
+        self._pending_load = pending_load
+        self._prepare_events = list(prepare_events)
+        self._feed_events = [list(batch) for batch in feed_events]
+        self._final_text = final_text
+        #: What ``finish()`` answers when it is not a plain final. The real session
+        #: returns an ``error`` event when the whole-buffer decode FAILED, which is a
+        #: different outcome from the empty final a silent room produces.
+        self._final_event = final_event
+        self._prepare_gate = prepare_gate
+        self._ended = False
+        #: True once audio has been fed that no final has covered. Reset by a final,
+        #: exactly as the real session drops a finalised utterance's buffer.
+        self._pending_audio = False
 
-    def test_is_apple_silicon_true_native_arm64(self, monkeypatch):
-        from kiro_crew.dashboard.handlers import core
+    @property
+    def ended(self) -> bool:
+        return self._ended
 
-        monkeypatch.setattr("platform.system", lambda: "Darwin")
-        monkeypatch.setattr("platform.machine", lambda: "arm64")
-        assert core._is_apple_silicon() is True
+    @property
+    def has_pending_audio(self) -> bool:
+        return self._pending_audio
 
-    def test_is_apple_silicon_true_under_rosetta(self, monkeypatch):
-        """Darwin + ``x86_64`` interpreter, but ``hw.optional.arm64`` == 1."""
-        from kiro_crew.dashboard.handlers import core
+    def pending_download(self):
+        return self._pending
 
-        monkeypatch.setattr("platform.system", lambda: "Darwin")
-        monkeypatch.setattr("platform.machine", lambda: "x86_64")
+    def pending_load(self) -> bool:
+        return self._pending_load
 
-        def fake_run(*_a, **_kw):
-            return SimpleNamespace(stdout="1\n")
+    async def prepare(self) -> list:
+        self.prepare_calls += 1
+        if self._prepare_gate is not None:
+            await self._prepare_gate.wait()
+        self.prepared = True
+        return list(self._prepare_events)
 
-        monkeypatch.setattr("subprocess.run", fake_run)
-        assert core._is_apple_silicon() is True
+    async def feed(self, raw_int16: bytes, *, allow_partial=True) -> list:
+        self.fed.append(raw_int16)
+        self._pending_audio = True
+        events = self._feed_events.pop(0) if self._feed_events else []
+        if any(event.kind == stt.KIND_FINAL for event in events):
+            # Finalises the utterance and re-arms. Deliberately does NOT set
+            # `_ended`: the session continues, which is what the continuous
+            # consumer needs.
+            self._pending_audio = False
+        return events
 
-    def test_is_apple_silicon_false_on_intel_mac(self, monkeypatch):
-        """Darwin + ``x86_64``; sysctl key absent/0 on a true Intel Mac."""
-        from kiro_crew.dashboard.handlers import core
+    async def finish(self):
+        self.finished = True
+        self._ended = True
+        self._pending_audio = False
+        if self._final_event is not None:
+            return self._final_event
+        return stt.SttEvent(stt.KIND_FINAL, text=self._final_text)
 
-        monkeypatch.setattr("platform.system", lambda: "Darwin")
-        monkeypatch.setattr("platform.machine", lambda: "x86_64")
+    def cancel(self) -> None:
+        self.cancelled = True
+        self._ended = True
 
-        def fake_run(*_a, **_kw):
-            return SimpleNamespace(stdout="")
+    def stop_partials(self) -> None:
+        pass
 
-        monkeypatch.setattr("subprocess.run", fake_run)
-        assert core._is_apple_silicon() is False
 
-    def test_providers_include_mlx_on_apple_silicon(self, monkeypatch):
-        from kiro_crew import apple_speech
-        from kiro_crew.dashboard.handlers import core
+class _RecordingWS:
+    """Minimal ``WebSocketResponse`` stand-in for driving a session function directly.
 
-        monkeypatch.setattr(core, "_is_apple_silicon", lambda: True)
-        # `apple` has its own gate (macOS 26 + Swift toolchain); pin it off here so
-        # this test measures only the Apple-Silicon gate.
+    For the cases whose subject is a client that has ALREADY gone away: a real test
+    client cannot be made to fail a send at a chosen moment, so a socket-level
+    version of those tests would be asserting on the scheduler instead of on the
+    handler. ``send_fails_after`` raises the error aiohttp raises for a peer that
+    reset the connection, and sets *gone* so the fake session can let its download
+    finish at that exact point.
+    """
+
+    def __init__(self, *, send_fails_after=None, gone=None):
+        self.sent: list[dict] = []
+        self.closed = False
+        self._send_fails_after = send_fails_after
+        self._gone = gone
+
+    async def send_json(self, data) -> None:
+        if self._send_fails_after is not None and len(self.sent) >= self._send_fails_after:
+            if self._gone is not None:
+                self._gone.set()
+            raise ConnectionResetError("transport gone")
+        self.sent.append(data)
+
+    async def close(self) -> None:
+        self.closed = True
+
+    def __aiter__(self):
+        raise AssertionError("the read loop must not be reached on this path")
+
+
+class TestLocalStreamingSession:
+    """The default provider's own WebSocket path (``_run_local_session``).
+
+    It reuses the endpoint, the frame shapes and the endpointer, and adds the one
+    frame the other two providers never send: a ``status`` report around the
+    one-time model download. The lifecycle code is its own, so the invariants the
+    other branches already guard need their own coverage here rather than being
+    assumed shared.
+    """
+
+    def _install(self, monkeypatch, session, **cfg_kwargs):
+        """Point the endpoint at ``local`` with *session* standing in for the recogniser."""
         monkeypatch.setattr(
-            apple_speech, "availability", lambda: apple_speech.Availability(False, "pinned off")
+            "kiro_crew.dashboard.stt_stream.KiroCrewConfig.load",
+            classmethod(lambda cls: _cfg(provider="local", **cfg_kwargs)),
         )
-        # `parakeet` is gated the same way as `mlx` (Apple-Silicon-only), so both
-        # are present here.
-        assert core._stt_providers() == ["whisper", "mlx", "parakeet", "transcribe"]
+        monkeypatch.setattr("kiro_crew.dashboard.stt_stream.check_origin", lambda r, require: True)
 
-    def test_stt_providers_calls_is_apple_silicon_exactly_once(self, monkeypatch):
-        """`parakeet` reuses the `mlx` gate's already-computed Apple-Silicon
-        result rather than re-probing. Off Apple Silicon (e.g. under Rosetta),
-        `_is_apple_silicon()` shells out to `sysctl` synchronously, and
-        `_stt_providers()` runs on the dashboard's event loop (GET/PUT
-        /api/config/stt) -- a second call would double that blocking cost on
-        every request."""
-        from kiro_crew import apple_speech
-        from kiro_crew.dashboard.handlers import core
+        def _factory(**kwargs):
+            session.kwargs = kwargs
+            return session
 
-        calls = []
+        monkeypatch.setattr(stt, "LocalSession", _factory)
+        return session
 
-        def fake_is_apple_silicon():
-            calls.append(1)
+    def _record_end_audits(self, monkeypatch) -> list[str]:
+        """Collect every ``stt_stream_end`` outcome, in order.
+
+        Patched at the emitter rather than at ``sel()`` because the assertion is a
+        COUNT: one end per exit and no more, which a stub that also receives the
+        start and rejection events cannot state as plainly.
+        """
+        outcomes: list[str] = []
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.stt_stream._emit_end_audit",
+            lambda caller, *, outcome: outcomes.append(outcome),
+        )
+        return outcomes
+
+    @pytest.mark.asyncio
+    async def test_pcm_and_stop_are_read_while_a_partial_is_still_decoding(self, monkeypatch):
+        from kiro_crew.dashboard import stt_stream
+
+        decoding = asyncio.Event()
+        stopped = asyncio.Event()
+        allow_partials: list[bool] = []
+        frames = [bytes([n, 1]) * 16 for n in range(4)]
+
+        class SlowSession(_FakeLocalSession):
+            async def feed(self, raw_int16, *, allow_partial=True):
+                allow_partials.append(allow_partial)
+                if not self.fed:
+                    decoding.set()
+                    await asyncio.wait_for(stopped.wait(), timeout=5)
+                return await super().feed(raw_int16, allow_partial=allow_partial)
+
+        class BufferedWS(_RecordingWS):
+            async def __aiter__(self):
+                yield SimpleNamespace(type=web.WSMsgType.BINARY, data=frames[0])
+                await asyncio.wait_for(decoding.wait(), timeout=5)
+                for frame in frames[1:]:
+                    yield SimpleNamespace(type=web.WSMsgType.BINARY, data=frame)
+                stopped.set()
+                yield SimpleNamespace(type=web.WSMsgType.TEXT, data='{"type":"stop"}')
+                raise AssertionError("stop must end the input reader")
+
+        session = self._install(monkeypatch, SlowSession(final_text="all four frames"))
+        outcomes = self._record_end_audits(monkeypatch)
+        ws = BufferedWS()
+        await asyncio.wait_for(
+            stt_stream._run_local_session(ws, _cfg(provider="local"), MagicMock(), "test"),
+            timeout=10,
+        )
+        assert session.fed == frames, "stop discarded buffered audio"
+        assert allow_partials == [True, False, False, False]
+        assert ws.sent[-1] == {"type": "final", "text": "all four frames"}
+        assert outcomes == ["ok"]
+
+    @pytest.mark.asyncio
+    async def test_an_overflowing_pcm_backlog_reports_one_error(self, monkeypatch):
+        from kiro_crew.dashboard import stt_stream
+
+        monkeypatch.setattr(stt_stream, "_MAX_LOCAL_BUFFER_BYTES", 2)
+        session = self._install(monkeypatch, _FakeLocalSession())
+        outcomes = self._record_end_audits(monkeypatch)
+
+        class OverflowWS(_RecordingWS):
+            async def __aiter__(self):
+                yield SimpleNamespace(type=web.WSMsgType.BINARY, data=b"\x00\x01" * 2)
+
+        ws = OverflowWS()
+        await asyncio.wait_for(
+            stt_stream._run_local_session(ws, _cfg(provider="local"), MagicMock(), "test"),
+            timeout=5,
+        )
+        assert [frame["type"] for frame in ws.sent] == ["ready", "error"]
+        assert ws.sent[-1]["code"] == stt_stream._CODE_SESSION_FAILED
+        assert session.fed == [] and session.cancelled
+        assert outcomes == ["error"]
+
+    @pytest.mark.asyncio
+    async def test_cancelling_the_transport_never_starts_a_final_decode(self, monkeypatch):
+        from kiro_crew.dashboard import stt_stream
+
+        decoding = asyncio.Event()
+        release = asyncio.Event()
+
+        class SlowSession(_FakeLocalSession):
+            async def feed(self, raw_int16, *, allow_partial=True):
+                self._pending_audio = True
+                decoding.set()
+                await asyncio.wait_for(release.wait(), timeout=5)
+                return []
+
+        class OpenWS(_RecordingWS):
+            async def __aiter__(self):
+                yield SimpleNamespace(type=web.WSMsgType.BINARY, data=b"\x00\x01")
+                await asyncio.wait_for(release.wait(), timeout=5)
+
+        session = self._install(monkeypatch, SlowSession())
+        outcomes = self._record_end_audits(monkeypatch)
+        ws = OpenWS()
+        task = asyncio.create_task(
+            stt_stream._run_local_session(ws, _cfg(provider="local"), MagicMock(), "test")
+        )
+        try:
+            await asyncio.wait_for(decoding.wait(), timeout=5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5)
+            assert session.cancelled and not session.finished
+            assert ws.closed and outcomes == ["error"]
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("buffered_seconds", [40, 60])
+    async def test_readiness_burst_fits_the_backend_inbox(self, monkeypatch, buffered_seconds):
+        from kiro_crew.dashboard import stt_stream
+
+        session = self._install(monkeypatch, _FakeLocalSession(final_text="complete capture"))
+        outcomes = self._record_end_audits(monkeypatch)
+        # The worklet flushes 100 ms frames in one turn when model readiness
+        # arrives; the receiver must admit that burst before inference catches up.
+        frame = b"\x00\x01" * (stt_stream.STREAM_SAMPLE_RATE_HZ // 10)
+        frames = [frame] * (buffered_seconds * 10)
+
+        class BurstWS(_RecordingWS):
+            async def __aiter__(self):
+                for audio in frames:
+                    yield SimpleNamespace(type=web.WSMsgType.BINARY, data=audio)
+                yield SimpleNamespace(type=web.WSMsgType.TEXT, data='{"type":"stop"}')
+
+        ws = BurstWS()
+        await asyncio.wait_for(
+            stt_stream._run_local_session(ws, _cfg(provider="local"), MagicMock(), "test"),
+            timeout=5,
+        )
+        assert session.fed == frames
+        assert session.finished
+        assert [message["type"] for message in ws.sent] == ["ready", "final"]
+        assert ws.sent[1] == {"type": "final", "text": "complete capture"}
+        assert outcomes == ["ok"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("phase", ["partial", "final"])
+    async def test_stop_budget_covers_the_active_partial_and_the_final(self, monkeypatch, phase):
+        from kiro_crew.dashboard import stt_stream
+
+        cfg = _cfg(provider="local", timeout_secs=22)
+        budget_started = asyncio.Event()
+        budget_expired = asyncio.Event()
+        decoding = asyncio.Event()
+        interrupted = asyncio.Event()
+        release = asyncio.Event()
+        original_sleep = asyncio.sleep
+
+        async def controlled_sleep(delay):
+            if delay == cfg.stt.timeout_secs:
+                budget_started.set()
+                await asyncio.wait_for(budget_expired.wait(), timeout=5)
+            else:
+                await original_sleep(delay)
+
+        monkeypatch.setattr(stt_stream.asyncio, "sleep", controlled_sleep)
+
+        async def blocked_decode():
+            decoding.set()
+            try:
+                await asyncio.wait_for(release.wait(), timeout=5)
+            finally:
+                interrupted.set()
+
+        class SlowSession(_FakeLocalSession):
+            async def feed(self, raw_int16, *, allow_partial=True):
+                events = await super().feed(raw_int16, allow_partial=allow_partial)
+                if phase == "partial":
+                    await blocked_decode()
+                return events
+
+            async def finish(self):
+                self.finished = True
+                await blocked_decode()
+                return stt.SttEvent(stt.KIND_FINAL, text="too late")
+
+        class StopWS(_RecordingWS):
+            async def __aiter__(self):
+                yield SimpleNamespace(type=web.WSMsgType.BINARY, data=b"\x00\x01")
+                if phase == "partial":
+                    await asyncio.wait_for(decoding.wait(), timeout=5)
+                yield SimpleNamespace(type=web.WSMsgType.TEXT, data='{"type":"stop"}')
+
+        session = self._install(monkeypatch, SlowSession())
+        outcomes = self._record_end_audits(monkeypatch)
+        ws = StopWS()
+        task = asyncio.create_task(stt_stream._run_local_session(ws, cfg, MagicMock(), "test"))
+        try:
+            await asyncio.wait_for(budget_started.wait(), timeout=5)
+            await asyncio.wait_for(decoding.wait(), timeout=5)
+            budget_expired.set()
+            await asyncio.wait_for(task, timeout=5)
+            assert interrupted.is_set() and session.cancelled
+            assert session.finished is (phase == "final")
+            assert ws.sent[0] == {"type": "ready", "final_timeout_ms": 42_000}
+            assert [message["type"] for message in ws.sent] == ["ready", "error"]
+            assert ws.sent[1]["code"] == stt.CODE_DECODE_FAILED
+            assert ws.closed and outcomes == ["timeout"]
+        finally:
+            release.set()
+            budget_expired.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_an_empty_final_retracts_the_partial_without_semantic_endpointing(
+        self, monkeypatch
+    ):
+        from kiro_crew.dashboard import stt_stream
+
+        self._install(
+            monkeypatch,
+            _FakeLocalSession(
+                feed_events=[
+                    [stt.SttEvent(stt.KIND_PARTIAL, text="caption hallucination")],
+                    [stt.SttEvent(stt.KIND_FINAL, text="")],
+                ]
+            ),
+        )
+        endpoint = SimpleNamespace(
+            note_partial=MagicMock(),
+            note_final=MagicMock(),
+            note_audio_final=MagicMock(),
+            aclose=AsyncMock(),
+        )
+        monkeypatch.setattr(stt_stream, "_build_endpointer", lambda *_args, **_kwargs: endpoint)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await ws.receive_json())["type"] == "ready"
+            await ws.send_bytes(b"\x00\x01")
+            assert (await asyncio.wait_for(ws.receive_json(), timeout=5))["type"] == "partial"
+            await ws.send_bytes(b"\x00\x01")
+            assert await asyncio.wait_for(ws.receive_json(), timeout=5) == {
+                "type": "final",
+                "text": "",
+            }
+            await ws.send_json({"type": "stop"})
+            await ws.close()
+        endpoint.note_final.assert_not_called()
+        endpoint.note_audio_final.assert_called_once_with("")
+
+    @pytest.mark.asyncio
+    async def test_local_relays_a_partial_then_a_final(self, monkeypatch):
+        """The default provider streams behind the same socket as the paid one.
+
+        The frontend cannot tell the three providers apart, so this branch has to
+        produce the same ``ready`` / ``partial`` / ``final`` frames from a completely
+        different recogniser. The session's config also has to reach it: a language
+        or silence window that stops being threaded through leaves recognition
+        working and every setting inert.
+        """
+        session = self._install(
+            monkeypatch,
+            _FakeLocalSession(
+                feed_events=[
+                    [stt.SttEvent(stt.KIND_PARTIAL, text="hello")],
+                    [stt.SttEvent(stt.KIND_FINAL, text="hello world")],
+                ]
+            ),
+            language_code="fr-FR",
+            silence_ms=900,
+        )
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await ws.receive_json())["type"] == "ready"
+            await ws.send_bytes(b"\x00\x01" * 16)
+            assert (await ws.receive_json()) == {"type": "partial", "text": "hello"}
+            await ws.send_bytes(b"\x00\x01" * 16)
+            assert (await ws.receive_json()) == {"type": "final", "text": "hello world"}
+            await ws.close()
+        # `fr-FR` reduced to the bare language whisper names, not passed through.
+        assert session.kwargs["language"] == "fr"
+        assert session.kwargs["silence_ms"] == 900
+        # The final already went out, so teardown must ABANDON the audio rather than
+        # spend a second full-buffer decode on the one shared model.
+        assert session.cancelled is True
+        assert session.finished is False
+
+    @pytest.mark.asyncio
+    async def test_a_stop_frame_yields_the_full_buffer_decode(self, monkeypatch):
+        """A user who stops the recording keeps ONE decode of everything heard.
+
+        The partials are fast approximations of successive phrases; the text the
+        user keeps is a single decode of the whole utterance, so the transcript has
+        the context the model would have had if it had never been streamed. Skipping
+        ``finish()`` here would hand them the last partial instead.
+        """
+        session = self._install(monkeypatch, _FakeLocalSession(final_text="the whole utterance"))
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await ws.receive_json())["type"] == "ready"
+            await ws.send_bytes(b"\x00\x01" * 16)
+            await ws.send_str('{"type":"stop"}')
+            assert (await ws.receive_json()) == {
+                "type": "final",
+                "text": "the whole utterance",
+            }
+            await ws.close()
+        assert session.finished is True
+
+    @pytest.mark.asyncio
+    async def test_a_failed_final_decode_reaches_the_client_before_the_close(self, monkeypatch):
+        """The teardown decode is the LAST thing a session does, so its failure must
+        make it out ahead of the close.
+
+        A dropped empty final and a failed decode can look identical from here:
+        the socket closed with no frame at all, and the client cleared the partial it
+        was showing. The frame carries the code because the browser renders localised
+        text; the audit records ``error`` because a session that died must not be
+        filed as one that finished.
+        """
+        outcomes = self._record_end_audits(monkeypatch)
+        session = self._install(
+            monkeypatch,
+            _FakeLocalSession(
+                final_event=stt.SttEvent(
+                    stt.KIND_ERROR,
+                    text=stt.DECODE_FAILED_ADVISORY,
+                    code=stt.CODE_DECODE_FAILED,
+                )
+            ),
+        )
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await ws.receive_json())["type"] == "ready"
+            await ws.send_bytes(b"\x00\x01" * 16)
+            await ws.send_str('{"type":"stop"}')
+            assert (await ws.receive_json()) == {
+                "type": "error",
+                "message": stt.DECODE_FAILED_ADVISORY,
+                "code": stt.CODE_DECODE_FAILED,
+            }
+            await ws.close()
+        assert session.finished is True
+        # Waited on rather than asserted straight after the context exits: neither
+        # receiving the frame nor leaving `TestClient` orders this after the handler's
+        # remaining steps.
+        for _ in range(200):
+            if outcomes:
+                break
+            await asyncio.sleep(0.01)
+        assert outcomes == ["error"]
+
+    @pytest.mark.asyncio
+    async def test_the_vad_ending_an_utterance_emits_final_not_endpoint(self, monkeypatch):
+        """The recogniser deciding the speaker stopped is NOT permission to submit.
+
+        ``endpoint`` means "this request looks complete, you may auto-submit" and
+        stays governed by ``stt.endpointing`` (off here, as it is by default). The
+        detector finalising an utterance is a different event with a different
+        consequence: emitting ``endpoint`` for it would auto-send the message box on
+        every pause long enough to end a phrase.
+        """
+        self._install(
+            monkeypatch,
+            _FakeLocalSession(
+                feed_events=[
+                    [stt.SttEvent(stt.KIND_FINAL, text="ship it")],
+                    [stt.SttEvent(stt.KIND_PARTIAL, text="and again")],
+                ]
+            ),
+        )
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await ws.receive_json())["type"] == "ready"
+            await ws.send_bytes(b"\x00\x01" * 16)
+            assert (await ws.receive_json()) == {"type": "final", "text": "ship it"}
+            # The session stays OPEN across the final, so what proves no `endpoint`
+            # frame followed is that the next frame is the next utterance's partial.
+            # Closing here instead would have ended the Meetings app's transcription
+            # on the speaker's first pause.
+            await ws.send_bytes(b"\x00\x01" * 16)
+            assert (await ws.receive_json()) == {"type": "partial", "text": "and again"}
+            await ws.close()
+
+    @pytest.mark.asyncio
+    async def test_a_first_run_refuses_rather_than_capturing_speech_it_will_lose(self, monkeypatch):
+        """A first run cannot stream, so it must say so instead of listening.
+
+        Waiting for the model here looked reasonable and lost words: the client caps
+        its pre-``ready`` buffer at a few seconds and releases the microphone when
+        ``ready`` does not arrive, so everything said during a 148 MB fetch was
+        captured and then discarded. The socket therefore announces the size, starts
+        the transfer in the background so the NEXT attempt works, and refuses with a
+        machine-readable code.
+        """
+        model = stt.resolve_model("base")
+        gate = asyncio.Event()
+        session = self._install(monkeypatch, _FakeLocalSession(pending=model, prepare_gate=gate))
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await ws.receive_json()) == {
+                "type": "status",
+                "stage": "downloading",
+                "downloaded_bytes": 0,
+                "total_bytes": model.size_bytes,
+                "code": "stt_model_missing",
+            }
+            assert (await ws.receive_json()) == {
+                "type": "error",
+                "message": "speech model is still downloading",
+                "code": "stt_model_missing",
+            }
+            # No `ready`, so the client never opens the microphone.
+            await ws.close()
+        # The transfer was still kicked off, which is the whole point of refusing
+        # rather than failing: the model lands on disk for the next attempt.
+        gate.set()
+        await asyncio.sleep(0)
+        assert session.prepare_calls >= 1
+
+    @pytest.mark.asyncio
+    async def test_no_status_frames_when_the_model_is_already_present(self, monkeypatch):
+        """``stage="ready"`` is sent only when a transfer actually ran.
+
+        It tells the panel to stop polling for byte progress and drop the download
+        notice, so sending it unconditionally would have every ordinary session
+        announce the end of a transfer that never happened.
+        """
+        self._install(monkeypatch, _FakeLocalSession(pending=None))
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await ws.receive_json())["type"] == "ready"
+            await ws.send_str('{"type":"stop"}')
+            await ws.close()
+
+    @pytest.mark.asyncio
+    async def test_a_preparing_status_frame_precedes_ready_when_the_model_must_load(
+        self, monkeypatch
+    ):
+        """A present-but-not-resident model gets a ``preparing`` frame before ``ready``.
+
+        Loading the model into memory is otherwise silent on this path:
+        ``pending_download`` is None so no download ``status`` goes out, and nothing
+        else does until ``ready`` after the load finishes. On a slow host that load
+        outruns the client's pre-``ready`` buffer and the mic releases with the socket
+        having sent nothing either way — the hung-mic report. The ``preparing`` frame
+        is the signal that the load is under way, so it must arrive BEFORE ``ready``.
+        """
+        self._install(monkeypatch, _FakeLocalSession(pending=None, pending_load=True))
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            first = await ws.receive_json()
+            assert first["type"] == "status"
+            assert first["stage"] == stt.STAGE_PREPARING
+            assert (await ws.receive_json())["type"] == "ready"
+            await ws.send_str('{"type":"stop"}')
+            await ws.close()
+
+    @pytest.mark.asyncio
+    async def test_no_preparing_frame_when_the_model_is_already_resident(self, monkeypatch):
+        """A resident model loads nothing, so it goes straight to ``ready``.
+
+        ``pending_load`` is False when the shared engine already holds this model, so
+        the announce is skipped: sending ``preparing`` there would flash a load
+        indicator for a session that never loads.
+        """
+        self._install(monkeypatch, _FakeLocalSession(pending=None, pending_load=False))
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await ws.receive_json())["type"] == "ready"
+            await ws.send_str('{"type":"stop"}')
+            await ws.close()
+
+    @pytest.mark.asyncio
+    async def test_download_progress_is_republished_while_the_transfer_runs(self, monkeypatch):
+        """One status frame is not enough: the byte count must keep arriving.
+
+        The consumer arms a 20s stall watchdog on the last frame it received and
+        RECONNECTS when it fires, so a single frame at the start of a 148 MB fetch
+        would have the client tear the socket down and restart the transfer, forever.
+        """
+        from kiro_crew.dashboard import stt_stream
+
+        model = stt.resolve_model("base")
+        gate = asyncio.Event()
+        reads = {"n": 0}
+
+        class _Store:
+            @property
+            def status(self):
+                # Advances on every read, and releases prepare() once three reads
+                # have happened, so the loop count is fixed by this test rather than
+                # by how long a real transfer takes.
+                reads["n"] += 1
+                if reads["n"] >= 3:
+                    gate.set()
+                return {
+                    "step": "downloading",
+                    "downloaded_bytes": reads["n"] * 1_000_000,
+                    "total_bytes": model.size_bytes,
+                }
+
+        monkeypatch.setattr(stt, "model_store", lambda: _Store())
+        # 0, not a shortened interval: the cadence is not what is under test, and a
+        # real one would trade wall clock for nothing.
+        monkeypatch.setattr(stt_stream, "_MODEL_PROGRESS_INTERVAL_SECS", 0)
+
+        sent: list[dict] = []
+
+        async def _send(frame):
+            sent.append(frame)
             return True
 
-        monkeypatch.setattr(core, "_is_apple_silicon", fake_is_apple_silicon)
-        monkeypatch.setattr(
-            apple_speech, "availability", lambda: apple_speech.Availability(False, "pinned off")
-        )
-        core._stt_providers()
-        assert len(calls) == 1
+        async def _prepare():
+            await gate.wait()
+            return []
 
-    def test_providers_exclude_mlx_off_apple_silicon(self, monkeypatch):
-        from kiro_crew import apple_speech
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr(core, "_is_apple_silicon", lambda: False)
-        monkeypatch.setattr(
-            apple_speech, "availability", lambda: apple_speech.Availability(False, "pinned off")
-        )
-        providers = core._stt_providers()
-        assert "mlx" not in providers
-        assert providers == ["whisper", "transcribe"]
-
-    def test_providers_include_apple_when_supported(self, monkeypatch):
-        """`apple` is advertised only where SpeechAnalyzer can actually run."""
-        from kiro_crew import apple_speech
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr(core, "_is_apple_silicon", lambda: True)
-        monkeypatch.setattr(apple_speech, "availability", lambda: apple_speech.Availability(True))
-        assert core._stt_providers() == ["whisper", "mlx", "apple", "parakeet", "transcribe"]
-
-    def test_providers_exclude_apple_when_toolchain_missing(self, monkeypatch):
-        """A host that could run the framework but has no Swift toolchain must not be
-        offered the option — picking it would fail at transcription time."""
-        from kiro_crew import apple_speech
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr(core, "_is_apple_silicon", lambda: True)
-        monkeypatch.setattr(
-            apple_speech,
-            "availability",
-            lambda: apple_speech.Availability(False, "no toolchain", needs_toolchain=True),
-        )
-        assert "apple" not in core._stt_providers()
-
-    def test_mlx_prereqs_empty_when_brew_present(self, monkeypatch):
-        """The Install button installs pipx/mlx-whisper, so with brew present
-        and ffmpeg on PATH there are no manual prereqs to surface."""
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr(core, "_is_apple_silicon", lambda: True)
-        monkeypatch.setattr(core, "ensure_ffmpeg_in_path", lambda: None)
-        monkeypatch.setattr(core, "find_brew", lambda: "/opt/homebrew/bin/brew")
-        monkeypatch.setattr(core.shutil, "which", lambda _n: "/opt/homebrew/bin/ffmpeg")
-        assert core._stt_prereq_commands("mlx") == []
-
-    def test_mlx_prereqs_empty_when_brew_off_path(self, monkeypatch):
-        """Homebrew installed but NOT on PATH must not be reported missing.
-
-        A GUI-launched gateway (desktop app / launchd) inherits
-        ``/usr/bin:/bin:/usr/sbin:/sbin``, so ``shutil.which("brew")`` returns
-        None on a machine that has Homebrew. Resolution goes through
-        ``find_brew``, which probes the install prefixes directly — otherwise the
-        UI tells a Homebrew user to install Homebrew.
-        """
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr(core, "_is_apple_silicon", lambda: True)
-        monkeypatch.setattr(core, "ensure_ffmpeg_in_path", lambda: None)
-        monkeypatch.setattr(
-            "shutil.which",
-            lambda name, **_kw: "/opt/homebrew/bin/ffmpeg" if name == "ffmpeg" else None,
-        )
-        monkeypatch.setattr("os.path.isfile", lambda p: p == "/opt/homebrew/bin/brew")
-        monkeypatch.setattr("os.access", lambda p, _mode: p == "/opt/homebrew/bin/brew")
-        assert core._stt_prereq_commands("mlx") == []
-
-    def test_mlx_prereqs_only_homebrew_when_brew_absent(self, monkeypatch):
-        """Homebrew is the one thing the Install button can't bootstrap."""
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr(core, "_is_apple_silicon", lambda: True)
-        monkeypatch.setattr(core, "ensure_ffmpeg_in_path", lambda: None)
-        monkeypatch.setattr(core, "find_brew", lambda: None)
-        cmds = core._stt_prereq_commands("mlx")
-        assert len(cmds) == 1
-        assert "brew" in cmds[0] and "install.sh" in cmds[0]
-        # Must NOT duplicate what the Install button already does.
-        assert not any("pipx install mlx-whisper" in c for c in cmds)
-
-    def test_mlx_prereqs_empty_off_apple_silicon(self, monkeypatch):
-        from kiro_crew.dashboard.handlers import core
-
-        monkeypatch.setattr(core, "_is_apple_silicon", lambda: False)
-        monkeypatch.setattr(core, "ensure_ffmpeg_in_path", lambda: None)
-        assert core._stt_prereq_commands("mlx") == []
-
-
-class TestSttInstallScriptPath:
-    """The install script must find Homebrew from a GUI-launched gateway.
-
-    ``bash -c`` is neither a login nor an interactive shell, so the user's
-    ``brew shellenv`` line never runs and the script only gets the inherited
-    PATH — which for a desktop-app gateway is ``/usr/bin:/bin:/usr/sbin:/sbin``.
-    Without a PATH prelude the first ``command -v brew`` check fails and the
-    whole install aborts with "ERROR: Homebrew required" on a machine that has it.
-
-    The two tests below that RUN a shell are POSIX-only. On Windows ``bash``
-    resolves to ``C:\\Windows\\System32\\bash.exe`` — the WSL launcher stub, which
-    exits 1 with "Windows Subsystem for Linux has no installed distributions"
-    rather than running the script. That is the same alias-stub hazard
-    ``platform_compat.find_python_interpreter`` guards against for Python, and it
-    makes the assertion measure the runner's WSL state instead of the prelude.
-    Only the shell-executing tests are skipped; the string assertions below run
-    everywhere, and Homebrew does not exist on Windows so the prelude's dirs are
-    inert there anyway.
-    """
-
-    @pytest.mark.parametrize("provider", ["mlx", "whisper"])
-    def test_script_prepends_brew_prefixes(self, provider):
-        from kiro_crew.dashboard.handlers import core
-
-        script = core._build_stt_install_script(provider)
-        assert "/opt/homebrew/bin" in script  # Apple Silicon prefix
-        assert "brew shellenv" in script
-        # The prelude must run BEFORE the brew probe that gates the install.
-        assert script.index("/opt/homebrew/bin") < script.index("command -v brew")
-
-    @pytest.mark.skipif(pc.IS_WINDOWS, reason="bash resolves to the WSL launcher stub")
-    @pytest.mark.parametrize("provider", ["mlx", "whisper"])
-    def test_script_is_valid_shell(self, provider, tmp_path):
-        """Guard the f-string-composed prelude against a syntax regression."""
-        import subprocess
-
-        from kiro_crew.dashboard.handlers import core
-
-        p = tmp_path / "install.sh"
-        p.write_text(core._build_stt_install_script(provider), encoding="utf-8")
-        assert subprocess.run(["bash", "-n", str(p)]).returncode == 0
-
-    @pytest.mark.skipif(pc.IS_WINDOWS, reason="bash resolves to the WSL launcher stub")
-    def test_prelude_finds_brew_under_launchd_path(self, tmp_path):
-        """End-to-end: the prelude alone recovers brew from a stripped PATH."""
-        import subprocess
-
-        from kiro_crew.dashboard.handlers import core
-
-        fake_prefix = tmp_path / "opt" / "homebrew" / "bin"
-        fake_prefix.mkdir(parents=True)
-        brew = fake_prefix / "brew"
-        brew.write_text("#!/bin/sh\necho 'export PATH=\"$PATH\"'\n", encoding="utf-8")
-        brew.chmod(0o755)
-
-        prelude = core._stt_install_path_prelude().replace("/opt/homebrew/bin", str(fake_prefix))
-        script = prelude + "\ncommand -v brew >/dev/null && echo FOUND || echo MISSING\n"
-        out = subprocess.run(
-            ["bash", "-c", script],
-            capture_output=True,
-            text=True,
-            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(tmp_path)},
-        )
-        assert "FOUND" in out.stdout
-
-
-class TestSttInstallScriptWheels:
-    """The pip fallback must never drop into a source build.
-
-    openai-whisper is a pure-Python sdist, but numpy / numba / llvmlite / torch /
-    triton / tiktoken ship compiled wheels. On a host whose glibc is older than the
-    wheel's tag (Amazon Linux 2 = glibc 2.26, so manylinux_2_17 is the ceiling while
-    current numpy publishes manylinux_2_28) pip falls back to the source tarball and
-    the failure surfaces as a compiler error naming numpy — "GCC >= 9.3",
-    "metadata-generation-failed" — which reads as a numpy bug rather than the
-    wheel-compatibility problem it is.
-    """
-
-    def _pip_section(self):
-        """Return (full script, the pip-fallback section only).
-
-        Scoped deliberately: the brew branch above also mentions
-        ``openai-whisper``, so a whole-script index() would measure the wrong
-        occurrence and the ordering assertions would silently pass.
-        """
-        from kiro_crew.dashboard.handlers import core
-
-        script = core._build_stt_install_script("whisper")
-        marker = "# Fallback: pip install"
-        assert marker in script, "pip fallback section not found"
-        return script, script[script.index(marker) :]
-
-    def _pip_commands(self, section):
-        """Real pip invocations: continuations joined, comments dropped.
-
-        Each command is truncated at its ``||`` recovery clause — the CPU-torch
-        step's fallback ``echo`` mentions openai-whisper, and counting that as an
-        install target would inflate the command list.
-        """
-        joined = section.replace("\\\n", " ")
-        cmds = []
-        for ln in joined.splitlines():
-            stripped = ln.strip()
-            if stripped.startswith("#") or "pip install" not in stripped:
-                continue
-            cmds.append(" ".join(stripped.split()).split("||")[0].strip())
-        return cmds
-
-    def test_compiled_deps_are_wheel_only(self):
-        """Every pip install of the whisper stack constrains source builds."""
-        script, section = self._pip_section()
-        cmds = self._pip_commands(section)
-        assert cmds, "expected at least one pip install command"
-        for cmd in cmds:
-            assert "--only-binary" in cmd, f"unconstrained pip install: {cmd}"
-        # The named set must cover the deps that actually compile.
-        for pkg in ("numpy", "numba", "llvmlite", "torch", "triton", "tiktoken", "regex"):
-            assert pkg in section, f"{pkg} missing from the wheel-only set"
-
-    def test_no_hardcoded_version_ceiling(self):
-        """Wheel-only is the mechanism; a pinned cap would rot.
-
-        ``--only-binary`` drops sdists from the candidate set, so pip backtracks
-        to the newest release that HAS a compatible wheel on its own (glibc 2.26:
-        numpy 2.5.1 -> 2.2.6 manylinux_2_17). Pinning a ceiling instead would go
-        stale as hosts and wheel tags move, and would hold back a modern host.
-        """
-        _, section = self._pip_section()
-        whisper = [c for c in self._pip_commands(section) if "openai-whisper" in c]
-        assert len(whisper) == 1, f"expected one whisper install, got {len(whisper)}"
-        assert "numpy<" not in section, "no hardcoded numpy ceiling"
-        assert "numpy==" not in section, "no hardcoded numpy pin"
-
-    def test_cpu_torch_installed_first_when_no_gpu(self):
-        """A GPU-less Linux host must not pull ~2.5 GB of CUDA wheels."""
-        _, section = self._pip_section()
-        assert "nvidia-smi" in section, "GPU probe missing"
-        assert "download.pytorch.org/whl/cpu" in section
-        # --extra-index-url only ADDS a source; pip would still prefer the
-        # higher-versioned CUDA build, so the CPU index must be the ONLY index.
-        assert "--extra-index-url https://download.pytorch.org/whl/cpu" not in section
-        # torch has to land before the whisper resolve, or it is already satisfied
-        # by the CUDA build and the CPU step is a no-op.
-        assert section.index("download.pytorch.org/whl/cpu") < section.index(
-            "Installing openai-whisper"
-        )
-
-    def test_cpu_torch_failure_is_not_fatal(self):
-        """An unreachable CPU index must not fail an otherwise-fine install."""
-        _, section = self._pip_section()
-        tail = section[
-            section.index("download.pytorch.org/whl/cpu") : section.index(
-                "Installing openai-whisper"
+        task = asyncio.create_task(_prepare())
+        # Bounded, because the regression this guards against does not fail, it
+        # STOPS: a loop that publishes once and then waits leaves prepare() gated
+        # forever, and an unbounded await would report that as a hung suite rather
+        # than as this assertion. Only ever elapses on that regression.
+        try:
+            relayed = await asyncio.wait_for(
+                stt_stream._relay_download_progress(task, _send),
+                timeout=_AUDIT_WAIT_TIMEOUT_SECS,
             )
-        ]
-        # The CPU-torch step recovers with `|| echo`, never `exit 1`.
-        assert "|| echo" in tail
-        assert "exit 1" not in tail
+        except asyncio.TimeoutError:
+            raise AssertionError(
+                f"progress stopped being republished after {len(sent)} frame(s)"
+            ) from None
+        assert relayed == []
 
-    def test_pip_path_still_targets_system_python(self):
-        """Regression guard on a deliberate design choice, not an accident.
+        assert len(sent) >= 2, sent
+        counts = [frame["downloaded_bytes"] for frame in sent]
+        # Sorted AND distinct, i.e. strictly growing: a repeated count would leave
+        # the panel's progress bar frozen while the transfer ran.
+        assert counts == sorted(counts) and len(set(counts)) == len(counts), counts
+        assert all(frame["stage"] == "downloading" for frame in sent), sent
+        assert all(frame["total_bytes"] == model.size_bytes for frame in sent), sent
 
-        ``--user`` lands in ``~/.local/bin``, which ``transcribe._find_whisper``
-        probes explicitly via ``_WHISPER_SEARCH_PATHS`` (``_python3_bin_dir``
-        returns the interpreter's OWN prefix bin, not the --user target, so it is
-        not what covers this). Redirecting the install into the gateway's venv
-        would make the binary undiscoverable at runtime, and ``--user`` is
-        rejected outright inside a virtualenv.
+    @pytest.mark.asyncio
+    async def test_a_failed_progress_send_stops_reporting_not_the_transfer(self, monkeypatch):
+        """A peer that went away must not cost the bytes already on the wire.
+
+        The transfer is what the NEXT attempt inherits, so abandoning it when the
+        client disappears turns a resumable first run into one that starts from zero
+        every time. Reporting stops, the download does not.
         """
-        script, section = self._pip_section()
-        for cmd in self._pip_commands(section):
-            assert "--user" in cmd, f"pip install must stay a --user install: {cmd}"
-        assert "sys.executable" not in script
+        from kiro_crew.dashboard import stt_stream
+
+        gate = asyncio.Event()
+        finished: list[bool] = []
+
+        class _Store:
+            @property
+            def status(self):
+                gate.set()
+                return {"step": "downloading", "downloaded_bytes": 1, "total_bytes": 2}
+
+        monkeypatch.setattr(stt, "model_store", lambda: _Store())
+        monkeypatch.setattr(stt_stream, "_MODEL_PROGRESS_INTERVAL_SECS", 0)
+
+        sent: list[dict] = []
+
+        async def _send(frame):
+            sent.append(frame)
+            return False
+
+        async def _prepare():
+            await gate.wait()
+            finished.append(True)
+            return []
+
+        task = asyncio.create_task(_prepare())
+        assert await stt_stream._relay_download_progress(task, _send) == []
+        assert len(sent) == 1, sent
+        assert finished == [True]
+
+    @pytest.mark.asyncio
+    async def test_an_unavailable_recogniser_keeps_its_own_code(self, monkeypatch):
+        """The stt package's availability codes travel through unremapped.
+
+        The settings panel already renders a localised string for each of them, and
+        the actions differ ("install the extra", "no wheel for this platform"), so
+        collapsing them into a transport-level code here would send the user to fix
+        the wrong thing.
+        """
+        outcomes = self._record_end_audits(monkeypatch)
+        self._install(
+            monkeypatch,
+            _FakeLocalSession(
+                prepare_events=[
+                    stt.SttEvent(
+                        stt.KIND_ERROR,
+                        text="local speech needs the voice extra",
+                        code=stt.CODE_EXTRA_MISSING,
+                    )
+                ]
+            ),
+        )
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await ws.receive_json()) == {
+                "type": "error",
+                "message": "local speech needs the voice extra",
+                "code": stt.CODE_EXTRA_MISSING,
+            }
+            await ws.close()
+        assert outcomes == ["error"], outcomes
+
+    @pytest.mark.asyncio
+    async def test_a_clean_stop_emits_exactly_one_start_and_one_end(self, monkeypatch):
+        """The pairing this file exists for, on the branch that is now the default."""
+        self._install(monkeypatch, _FakeLocalSession())
+        calls: list[dict] = []
+        fake_sel = MagicMock()
+        fake_sel.log_api_access = lambda **kw: calls.append(kw)
+        monkeypatch.setattr("kiro_crew.dashboard.stt_stream.sel", lambda: fake_sel)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await ws.receive_json())["type"] == "ready"
+            await ws.send_str('{"type":"stop"}')
+            await ws.close()
+        await _wait_for_operation(calls, "stt_stream_end")
+        ops = [c["operation"] for c in calls]
+        assert ops.count("stt_stream_start") == 1, ops
+        assert ops.count("stt_stream_end") == 1, ops
+        end = next(c for c in calls if c["operation"] == "stt_stream_end")
+        assert end["outcome"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_a_download_that_outruns_the_ceiling_is_audited_once(self, monkeypatch):
+        """Giving up on a slow transfer is an exit path, so it owes an end audit.
+
+        Only this socket gives up: the fetch is shielded and LEFT RUNNING, because
+        cancelling it releases the model store's transfer lock while its worker
+        thread is still writing the staging file, and the next session would then
+        start a second write to that same path. The bytes land on disk for the next
+        attempt, which is also why the frame says "still downloading" rather than
+        reporting a failure.
+        """
+        from kiro_crew.dashboard import stt_stream
+
+        outcomes = self._record_end_audits(monkeypatch)
+        gate = asyncio.Event()
+        session = self._install(
+            monkeypatch,
+            _FakeLocalSession(pending=stt.resolve_model("base"), prepare_gate=gate),
+        )
+        # 0 rather than a shortened ceiling: the wait itself is not under test, and
+        # `wait_for` treats a non-positive timeout as "already expired".
+        monkeypatch.setattr(stt_stream, "_MAX_MODEL_PREPARE_SECS", 0)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await ws.receive_json())["stage"] == "downloading"
+            assert (await ws.receive_json()) == {
+                "type": "error",
+                "message": "speech model is still downloading",
+                "code": "stt_model_missing",
+            }
+            await ws.close()
+        assert outcomes == ["error"], outcomes
+        # The transfer was abandoned by this socket, not cancelled: released now, it
+        # still runs to completion.
+        gate.set()
+        for _ in range(100):
+            if session.prepared:
+                break
+            await asyncio.sleep(0)
+        assert session.prepared is True
+
+    @pytest.mark.asyncio
+    async def test_a_client_that_disconnects_mid_download_is_audited_once(self, monkeypatch):
+        """A closed tab during a first-run fetch still balances the trail.
+
+        This exit is reached with no read loop ever entered and no session teardown
+        in scope, so it is the one most likely to be missing its end audit, and an
+        unmatched ``stt_stream_start`` is indistinguishable in the trail from a
+        session that is still open.
+        """
+        from kiro_crew.dashboard import stt_stream
+
+        outcomes = self._record_end_audits(monkeypatch)
+        model = stt.resolve_model("base")
+
+        class _Store:
+            """A transfer in flight, so the loop has progress worth republishing."""
+
+            status = {"step": "downloading", "downloaded_bytes": 1, "total_bytes": model.size_bytes}
+
+        monkeypatch.setattr(stt, "model_store", lambda: _Store())
+        monkeypatch.setattr(stt_stream, "_MODEL_PROGRESS_INTERVAL_SECS", 0)
+        gone = asyncio.Event()
+        session = _FakeLocalSession(pending=model, prepare_gate=gone)
+        monkeypatch.setattr(stt, "LocalSession", lambda **kwargs: session)
+        # Accepts the opening notice, then fails the way aiohttp fails for a peer
+        # that reset the connection, which is also the point the transfer is let
+        # finish: the download must outlive the client that asked for it.
+        ws = _RecordingWS(send_fails_after=1, gone=gone)
+
+        await stt_stream._run_local_session(ws, _cfg(provider="local"), MagicMock(), "test-caller")
+
+        assert outcomes == ["error"], outcomes
+        assert ws.closed is True
+        assert session.cancelled is True
+        # STARTED, not finished: the fetch is detached on purpose so it outlives the
+        # socket that asked for it, which is what makes the next attempt find the
+        # weights on disk. Waiting for it here would assert the opposite property.
+        #
+        # The yield is required, not incidental: `create_task` only schedules, so
+        # without giving the loop a turn the count is still zero and the assertion
+        # would read as "the transfer was never started".
+        await asyncio.sleep(0)
+        assert session.prepare_calls >= 1
+        gone.set()
+        await asyncio.sleep(0)
+        assert session.prepared is True, "the detached transfer must still complete"
+
+    @pytest.mark.asyncio
+    async def test_a_session_that_cannot_be_built_still_emits_the_end_audit(self, monkeypatch):
+        """Constructing the session is the first thing that imports the recogniser.
+
+        So a broken optional dependency raises before any teardown exists, while
+        ``stt_stream_start`` has already been logged. Nothing has been created at
+        that point, which makes the end audit the whole of the cleanup, and without
+        it the trail shows a voice session that never ended.
+        """
+        from kiro_crew.dashboard import stt_stream
+
+        outcomes = self._record_end_audits(monkeypatch)
+
+        def _boom(**kwargs):
+            raise ImportError("numpy is not installed correctly")
+
+        monkeypatch.setattr(stt, "LocalSession", _boom)
+        with pytest.raises(ImportError):
+            await stt_stream._run_local_session(
+                _RecordingWS(), _cfg(provider="local"), MagicMock(), "test-caller"
+            )
+        assert outcomes == ["error"], outcomes
+
+    @pytest.mark.asyncio
+    async def test_a_failing_decode_reports_a_code_and_is_audited_once(self, monkeypatch):
+        """A recogniser that raises mid-session is an exit path like any other.
+
+        The client is told the session failed rather than being left on a live socket
+        that has silently stopped transcribing, and the trail gets its one matching
+        end. Sending nothing here is the failure mode a silent microphone is
+        indistinguishable from.
+        """
+        outcomes = self._record_end_audits(monkeypatch)
+
+        class _Exploding(_FakeLocalSession):
+            async def feed(self, raw_int16, *, allow_partial=True):
+                raise RuntimeError("decode blew up")
+
+        self._install(monkeypatch, _Exploding())
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await ws.receive_json())["type"] == "ready"
+            await ws.send_bytes(b"\x00\x01" * 16)
+            assert (await ws.receive_json()) == {
+                "type": "error",
+                "message": "transcription failed",
+                "code": "stt_session_failed",
+            }
+            await ws.close()
+        assert outcomes == ["error"], outcomes
+
+    @pytest.mark.asyncio
+    async def test_cap_teardown_is_audited_as_a_timeout(self, monkeypatch):
+        """The duration cap applies here too, and must not read as a clean stop.
+
+        Nothing is metered on this provider, but an abandoned session still
+        accumulates buffered audio and holds one of `_MAX_CONCURRENT_SESSIONS` slots,
+        so an operator diagnosing "dictation says it is busy" needs the trail to name
+        the sessions the cap ended. Each branch claims the cause itself rather than
+        inferring it from the deadline task's state, because the cap's own
+        `ws.close()` is what ends the read loop: the cleanup runs while that task is
+        still awaiting the peer and reads as not-yet-done.
+        """
+        outcomes = self._record_end_audits(monkeypatch)
+        self._install(monkeypatch, _FakeLocalSession())
+        monkeypatch.setattr("kiro_crew.dashboard.stt_stream._MAX_STREAM_DURATION_SECS", 0.05)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await ws.receive_json())["type"] == "ready"
+            # Deliberately send NO audio: only the deadline task can end this.
+            assert (await ws.receive_json()) == {
+                "type": "error",
+                "message": "max stream duration exceeded",
+                "code": "stt_max_duration_exceeded",
+            }
+            await ws.close()
+        assert outcomes == ["timeout"], outcomes
+
+    @pytest.mark.asyncio
+    async def test_no_progress_frame_while_the_store_reports_no_transfer(self, monkeypatch):
+        """Only a running transfer is republished, not whatever the store last said.
+
+        Between ``prepare()`` being called and the store entering its downloading
+        step, and again once a transfer has failed, the byte counts are zeros. Sending
+        those would leave the panel rendering a progress bar for a transfer that is
+        not moving, at the republication cadence, for as long as the wait lasts.
+        """
+        from kiro_crew.dashboard import stt_stream
+
+        gate = asyncio.Event()
+
+        class _Store:
+            @property
+            def status(self):
+                gate.set()
+                return {"step": "failed", "downloaded_bytes": 0, "total_bytes": 0}
+
+        monkeypatch.setattr(stt, "model_store", lambda: _Store())
+        monkeypatch.setattr(stt_stream, "_MODEL_PROGRESS_INTERVAL_SECS", 0)
+
+        sent: list[dict] = []
+
+        async def _send(frame):
+            sent.append(frame)
+            return True
+
+        async def _prepare():
+            await gate.wait()
+            return []
+
+        task = asyncio.create_task(_prepare())
+        assert await stt_stream._relay_download_progress(task, _send) == []
+        assert sent == []

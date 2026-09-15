@@ -6,26 +6,36 @@ import logging
 import threading
 import unicodedata
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew.dashboard import chat_title
 from kiro_crew.dashboard.chat_title import (
+    _TITLE_LINE_BUDGET,
+    _TITLE_LINE_MIN_KEEP,
     _TITLE_MAX_ATTACHMENT_FILES,
     _TITLE_MAX_ATTACHMENT_PATH_LENGTH,
     _TITLE_SOURCE_SCAN_LIMIT,
     _TITLE_TEXT_LIMIT,
+    _TITLE_TRUNCATION_MARKER,
+    _TITLE_TRUNCATION_NOTE,
+    _build_refresh_prompt,
     _build_title_prompt,
     _looks_like_prose,
     _message_attachment_paths,
     _title_text,
+    _validate_title_reply,
 )
+from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 
 
 def test_prompt_isolates_and_delimits_transcript():
     """The title prompt must instruct the model to name ONLY the delimited
     transcript and ignore residual session history — the shared _bg session
-    retains a sibling session's context between recycles, which previously
+    retains a sibling session's context between recycles, which
     bled into titles."""
     msgs = [
         {"role": "user", "content": "Update the doc refs to bullseye Set a goal"},
@@ -95,8 +105,8 @@ def test_prompt_strips_non_image_attachment_before_truncation():
 def test_prompt_substitutes_attachment_name_from_metadata():
     """The NAME survives; the directory path does not.
 
-    Previously the marker and path were replaced by a bare space, so an
-    attachment-only or attachment-dominated message lost its topic entirely and
+    A bare space in place of the marker and path leaves an
+    attachment-only or attachment-dominated message with no topic, so
     the titling model answered SKIP. The basename is the topic, so it is kept --
     the full path is still stripped.
     """
@@ -612,3 +622,391 @@ def test_reveal_prefixes_never_split_a_combining_mark():
         # The character that comes next must not be a mark belonging to the
         # last character we just revealed.
         assert not unicodedata.combining(title[len(p)])
+
+
+# --- Per-line excerpt bounding (_bounded_prompt_line) ------------------------
+#
+# A blind slice at the per-line budget lands mid-word, and the titling model
+# reads that ragged edge as corrupted input and reports it instead of naming the
+# topic. Every assertion below is paired with a break-arm named in its comment;
+# one mutation cannot validate several assertions, because an assertion whose
+# expected value happens to coincide with the mutant's output stays inert while
+# the arm still fails the test.
+
+# 7 chars, so index _TITLE_LINE_BUDGET of a repeat lands INSIDE a word (200 =
+# 28*7 + 4). A blind slice therefore ends "abcd" and the trim is observable.
+_MIDWORD_UNIT = "abcdef "
+
+
+def _head_of(prompt: str) -> str:
+    """The instruction section — everything before the transcript delimiter."""
+    return prompt.split("===== CONVERSATION TO NAME =====", 1)[0]
+
+
+def _transcript_of(prompt: str) -> str:
+    return prompt.split("===== CONVERSATION TO NAME =====", 1)[1].split(
+        "===== END CONVERSATION =====", 1
+    )[0]
+
+
+def _excerpt_of(prompt: str) -> str:
+    """The lone user line's text, with the ``user: `` role prefix removed."""
+    lines = [ln for ln in _transcript_of(prompt).splitlines() if ln.strip()]
+    assert len(lines) == 1, f"expected one transcript line, got {lines!r}"
+    return lines[0].split("user: ", 1)[1]
+
+
+def test_overlong_excerpt_is_marked_as_shortened():
+    """The excerpt must announce that it was shortened, so the ragged tail reads
+    as a deliberate bound rather than damaged input.
+
+    Break-arm: append "" instead of _TITLE_TRUNCATION_MARKER -> excerpt no
+    longer ends with the marker.
+    """
+    content = _MIDWORD_UNIT * 40
+    prompt = _build_title_prompt([{"role": "user", "content": content}])
+    assert prompt is not None
+    assert _excerpt_of(prompt).endswith(_TITLE_TRUNCATION_MARKER)
+
+
+def test_overlong_excerpt_is_cut_on_a_word_boundary():
+    """The cut must land where the source had whitespace, never mid-word.
+
+    Asserted against the SOURCE rather than by eyeballing the tail: the kept
+    text is a prefix of the content and the very next source character is a
+    space, which is what "did not split a word" means.
+
+    Break-arm: drop the rfind trim (blind slice) -> the kept text ends "abcd"
+    and content[200] is "e", not a space.
+    """
+    content = _MIDWORD_UNIT * 40
+    prompt = _build_title_prompt([{"role": "user", "content": content}])
+    assert prompt is not None
+    kept = _excerpt_of(prompt).removesuffix(_TITLE_TRUNCATION_MARKER)
+    assert content.startswith(kept)
+    assert content[len(kept)] == " ", f"cut split a word: ...{kept[-12:]!r}"
+
+
+def test_excerpt_within_budget_is_passed_through_byte_for_byte():
+    """Content that fits the budget must not pay for the guard at all — no trim,
+    no marker, not one byte different.
+
+    Break-arm: drop the fits-the-budget early return -> the marker is appended
+    to a line that was never shortened.
+    """
+    content = "cron instruction messages in the chat session"
+    prompt = _build_title_prompt([{"role": "user", "content": content}])
+    assert prompt is not None
+    assert _excerpt_of(prompt) == content
+
+
+def test_truncation_note_is_absent_when_nothing_was_shortened():
+    """The note explains a marker. With no marker in the transcript there is
+    nothing to explain, and a short conversation must not pay ~30 words of
+    prompt for a bound it never hit.
+
+    Break-arm: report truncated=True on the pass-through path -> the note
+    appears for a 44-char message.
+    """
+    prompt = _build_title_prompt(
+        [{"role": "user", "content": "cron instruction messages in the chat session"}]
+    )
+    assert prompt is not None
+    assert _TITLE_TRUNCATION_NOTE.strip() not in prompt
+
+
+def test_truncation_note_accompanies_a_shortened_line():
+    """The marker is inert on its own — the imperative not to remark on the
+    shortening is what suppresses the narration this guard exists to prevent.
+
+    Break-arm: pass "" for the truncation slot in _build_title_prompt -> the
+    transcript carries a marker the instructions never explain.
+    """
+    prompt = _build_title_prompt([{"role": "user", "content": _MIDWORD_UNIT * 40}])
+    assert prompt is not None
+    assert _TITLE_TRUNCATION_NOTE.strip() in prompt
+
+
+def test_truncation_note_sits_outside_the_delimited_transcript():
+    """Same posture as the language directive: the imperative lives in the
+    instruction section, so a message that quotes it cannot restate it as data.
+    The marker itself has to be inside, adjacent to the line it describes, but a
+    forged marker is inert — it claims a whole line was shortened.
+
+    Break-arm: move the {truncation} slot after {transcript} in the template ->
+    the note lands inside the delimiters.
+    """
+    prompt = _build_title_prompt([{"role": "user", "content": _MIDWORD_UNIT * 40}])
+    assert prompt is not None
+    note = _TITLE_TRUNCATION_NOTE.strip()
+    assert (note in _head_of(prompt), note in _transcript_of(prompt)) == (True, False)
+
+
+def test_excerpt_without_any_whitespace_stays_bounded():
+    """A 200+ char run with no whitespace (a URL, a base64 blob, CJK) has no
+    boundary to trim to. It must still be bounded — the guard must not become an
+    unbounded line.
+
+    Break-arm: drop the content[:_TITLE_LINE_BUDGET] slice -> the whole 400-char
+    run reaches the prompt.
+    """
+    prompt = _build_title_prompt([{"role": "user", "content": "x" * 400}])
+    assert prompt is not None
+    assert len(_excerpt_of(prompt)) <= _TITLE_LINE_BUDGET + len(_TITLE_TRUNCATION_MARKER)
+
+
+def test_excerpt_without_any_whitespace_still_spends_the_budget():
+    """Having no boundary to trim to must cost nothing: the full budget is still
+    handed to the model. Bounding it harder would starve the titler of topic to
+    avoid a ragged edge inside a token that has no words to split.
+
+    Break-arm: slice to _TITLE_LINE_BUDGET // 4 -> 50 chars survive, not 200.
+    """
+    prompt = _build_title_prompt([{"role": "user", "content": "x" * 400}])
+    assert prompt is not None
+    kept = _excerpt_of(prompt).removesuffix(_TITLE_TRUNCATION_MARKER)
+    assert len(kept) == _TITLE_LINE_BUDGET
+
+
+def test_a_boundary_below_the_floor_is_refused():
+    """One early space followed by one enormous token: honouring that boundary
+    would discard 198 of 200 usable characters to avoid a ragged edge inside a
+    token with no word boundaries. The floor refuses it and keeps the slice.
+
+    Break-arm: accept any boundary (>= 0 instead of >= _TITLE_LINE_MIN_KEEP) ->
+    the excerpt collapses to "a".
+    """
+    prompt = _build_title_prompt([{"role": "user", "content": "a " + "y" * 400}])
+    assert prompt is not None
+    kept = _excerpt_of(prompt).removesuffix(_TITLE_TRUNCATION_MARKER)
+    assert len(kept) == _TITLE_LINE_BUDGET
+    assert _TITLE_LINE_MIN_KEEP == _TITLE_LINE_BUDGET // 2  # floor is the stated half
+
+
+def test_refresh_prompt_also_explains_a_shortened_line():
+    """_prompt_lines is shared, so the refresh path shortens lines too and needs
+    the same instruction. Wired per builder, so it needs its own coverage.
+
+    Break-arm: pass "" for the truncation slot in _build_refresh_prompt -> the
+    refresh transcript carries a marker its instructions never explain, while
+    the initial prompt stays correct.
+    """
+    prompt = _build_refresh_prompt(
+        [{"role": "user", "content": _MIDWORD_UNIT * 40}], "Old title"
+    )
+    assert prompt is not None
+    assert _excerpt_of(prompt).endswith(_TITLE_TRUNCATION_MARKER)
+    assert _TITLE_TRUNCATION_NOTE.strip() in _head_of(prompt)
+
+
+def test_refresh_note_precedes_the_keep_contract():
+    """The note is additive: the refresh prompt's KEEP escape hatch must still
+    be stated, and stated AFTER the data-framing the note joins, so the reply
+    contract remains the last thing before the transcript.
+
+    Break-arm: move the {truncation} slot after the KEEP block -> the ordering
+    flips and the note interposes between the contract and the transcript.
+    """
+    prompt = _build_refresh_prompt(
+        [{"role": "user", "content": _MIDWORD_UNIT * 40}], "Old title"
+    )
+    assert prompt is not None
+    head = _head_of(prompt)
+    assert head.index(_TITLE_TRUNCATION_NOTE.strip()) < head.index("exactly KEEP")
+
+
+class TestSlotTitleRouteRefusalCodes:
+    """The generate-title and rename routes carry machine-readable `code`
+    fields beside their unchanged error prose, on the same contract the
+    error-code worklist drives across the dashboard."""
+
+    def _make_app(self, state: MagicMock) -> web.Application:
+        app = web.Application()
+        app["state"] = state
+        app.router.add_post(
+            "/api/chat/slots/{slot}/generate-title",
+            chat_title.api_chat_slot_generate_title,
+        )
+        app.router.add_patch("/api/chat/slots/{slot}/title", chat_title.api_chat_slot_rename)
+        return app
+
+    @pytest.mark.asyncio
+    async def test_generate_title_unknown_slot_returns_404_with_code(self):
+        state = MagicMock(spec=DashboardState)
+        state._slots = {}
+        async with TestClient(TestServer(self._make_app(state))) as client:
+            resp = await client.post("/api/chat/slots/missing/generate-title")
+            assert resp.status == 404
+            body = await resp.json()
+            assert body["error"] == "not found"
+            assert body["code"] == "slot_not_found"
+
+    @pytest.mark.asyncio
+    async def test_rename_unknown_slot_returns_404_with_code(self):
+        state = MagicMock(spec=DashboardState)
+        state._slots = {}
+        async with TestClient(TestServer(self._make_app(state))) as client:
+            resp = await client.patch("/api/chat/slots/missing/title", json={"title": "New name"})
+            assert resp.status == 404
+            body = await resp.json()
+            assert body["error"] == "not found"
+            assert body["code"] == "slot_not_found"
+
+    @pytest.mark.asyncio
+    async def test_rename_unparseable_body_returns_400_with_code(self):
+        slot = _ChatSlot("s")
+        state = MagicMock(spec=DashboardState)
+        state._slots = {"s": slot}
+        async with TestClient(TestServer(self._make_app(state))) as client:
+            resp = await client.patch(
+                "/api/chat/slots/s/title",
+                data="{not json",
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status == 400
+            body = await resp.json()
+            assert body["error"] == "invalid JSON"
+            assert body["code"] == "invalid_json"
+
+    @pytest.mark.asyncio
+    async def test_rename_non_object_body_returns_400_with_code(self):
+        slot = _ChatSlot("s")
+        state = MagicMock(spec=DashboardState)
+        state._slots = {"s": slot}
+        async with TestClient(TestServer(self._make_app(state))) as client:
+            resp = await client.patch("/api/chat/slots/s/title", json=["title"])
+            assert resp.status == 400
+            body = await resp.json()
+            assert body["error"] == "invalid JSON"
+            assert body["code"] == "body_not_object"
+
+    @pytest.mark.asyncio
+    async def test_rename_blank_title_returns_400_with_code(self):
+        slot = _ChatSlot("s")
+        state = MagicMock(spec=DashboardState)
+        state._slots = {"s": slot}
+        async with TestClient(TestServer(self._make_app(state))) as client:
+            resp = await client.patch("/api/chat/slots/s/title", json={"title": "   "})
+            assert resp.status == 400
+            body = await resp.json()
+            assert body["error"] == "title required"
+            assert body["code"] == "title_required"
+
+
+# --- Non-title replies must yield no title ----------------------------------
+# Three reply shapes the validator must reject: SKIP followed by a reason
+# (multi-line and one-line), KEEP on the initial titling path, and a short
+# Korean refusal. Korean strings are written as \u escapes to keep the source
+# ASCII; the runtime values are the Hangul sentences.
+
+# "haedang lingkeue jeopgeunhal su eopseumnida" -- "I cannot access that link"
+_KO_REFUSAL_SHORT = "\ud574\ub2f9 \ub9c1\ud06c\uc5d0 \uc811\uadfc\ud560 \uc218 \uc5c6\uc2b5\ub2c8\ub2e4"
+# "joesonghajiman ... eopseumnida" -- "Sorry, I cannot open the external link,
+# so I cannot tell what the conversation is about"
+_KO_REFUSAL_LONG = (
+    "\uc8c4\uc1a1\ud558\uc9c0\ub9cc \uc678\ubd80 \ub9c1\ud06c\ub97c \uc5f4 \uc218 "
+    "\uc5c6\uc5b4\uc11c \ub300\ud654\uc758 \uc8fc\uc81c\ub97c \ud30c\uc545\ud560 "
+    "\uc218 \uc5c6\uc2b5\ub2c8\ub2e4"
+)
+# "joesonghajiman lingkeuleul yeol su eopseoyo" -- the same apology refusal in
+# the informal-polite register ("-yo" ending).
+_KO_REFUSAL_INFORMAL = (
+    "\uc8c4\uc1a1\ud558\uc9c0\ub9cc \ub9c1\ud06c\ub97c \uc5f4 \uc218 \uc5c6\uc5b4\uc694"
+)
+# "joesonghajiman lingkeuleul yeol su eopseum" -- apology opener with a
+# plain-form ending, pinning the opener branch independently of the endings.
+_KO_REFUSAL_OPENER_ONLY = (
+    "\uc8c4\uc1a1\ud558\uc9c0\ub9cc \ub9c1\ud06c\ub97c \uc5f4 \uc218 \uc5c6\uc74c"
+)
+# "lingkeuleul yeol su eopseoyo" -- informal-polite refusal with no apology,
+# pinning the "-yo" ending branch independently of the opener.
+_KO_REFUSAL_YO_ONLY = "\ub9c1\ud06c\ub97c \uc5f4 \uc218 \uc5c6\uc5b4\uc694"
+# "peuraibeosi paeneol beogeu sujeong" -- "PrivacyPanel bug fix", a legitimate
+# short Korean title (noun phrase: no sentence-final conjugation, no apology).
+_KO_REAL_TITLE = "\ud504\ub77c\uc774\ubc84\uc2dc \ud328\ub110 \ubc84\uadf8 \uc218\uc815"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # Multi-line: a reply reduces to its first line, so the
+        # verdict-plus-reason shape collapses to the bare control word.
+        "SKIP\n\nThe conversation is incomplete and does not establish a clear topic.",
+        "SKIP\nToo vague to name.",
+        # One-line: verdict plus reason on a single line, in any casing --
+        # a lowercased echo carrying a reason is still a verdict.
+        "SKIP - the topic is not clear yet",
+        "SKIP (too vague)",
+        "SKIP: greetings only",
+        "skip - too vague to name",
+        "Skip: greetings only",
+        "keep - the title still fits",
+        # Exact-match forms that must keep working.
+        "SKIP",
+        "skip",
+        "SKIP.",
+    ],
+)
+def test_skip_with_reason_yields_no_title(reply):
+    assert _validate_title_reply(reply) == ""
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # The module's own refresh prompt teaches KEEP, so an initial reply
+        # of KEEP is a confused model, not a session named "KEEP".
+        "KEEP",
+        "keep",
+        "KEEP\n\nThe current title still fits the conversation.",
+        "KEEP - the title still fits",
+    ],
+)
+def test_keep_is_a_control_word_on_the_initial_path(reply):
+    assert _validate_title_reply(reply) == ""
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        _KO_REFUSAL_SHORT,
+        _KO_REFUSAL_LONG,
+        _KO_REFUSAL_INFORMAL,
+        _KO_REFUSAL_OPENER_ONLY,
+        _KO_REFUSAL_YO_ONLY,
+    ],
+)
+def test_korean_refusal_yields_no_title(reply):
+    # Hangul is spaced, so the word ceiling never fires on a SHORT refusal,
+    # and the English-only openers never match one. The sentence shape
+    # (final "-nida"/"-yo" conjugation, "joesong" apology opener) must; the
+    # opener-only and ending-only fixtures pin each branch independently.
+    assert _looks_like_prose(reply)
+    assert _validate_title_reply(reply) == ""
+
+
+@pytest.mark.parametrize(
+    "reply,expected",
+    [
+        # Real titles that OPEN with a control word must survive: a plain
+        # following word or an identifier joiner separates a title from a
+        # verdict-plus-reason, and the prompt tells the model to keep
+        # identifiers verbatim.
+        ("Keep alive timer bug", "Keep alive timer bug"),
+        ("Skip list benchmark", "Skip list benchmark"),
+        ("SKIPPED frames in reveal", "SKIPPED frames in reveal"),
+        ("SKIP and KEEP handling", "SKIP and KEEP handling"),
+        ("SKIP_TESTS env var flag", "SKIP_TESTS env var flag"),
+        ("KEEP-ALIVE header bug", "KEEP-ALIVE header bug"),
+        ("SKIP.md parser fix", "SKIP.md parser fix"),
+        # A title followed by an unasked-for explanation keeps its first line,
+        # mirroring messaging/auto_title.clean_title.
+        ("Fix login bug\n\nThis names the session's main topic.", "Fix login bug"),
+        # A reply opening with a blank line keeps its title.
+        ("\nFix login bug", "Fix login bug"),
+        # A legitimate short Korean title is not a refusal.
+        (_KO_REAL_TITLE, _KO_REAL_TITLE),
+    ],
+)
+def test_legitimate_titles_survive_the_new_checks(reply, expected):
+    assert _validate_title_reply(reply) == expected

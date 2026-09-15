@@ -17,6 +17,7 @@ avoids ``@pytest_asyncio.fixture`` by convention.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -146,10 +147,14 @@ def test_snapshot_shape_and_defaults(home: Path):
         "enabled",
         "pinned",
         "lock_reason",
+        # Discriminates a shipped rule from one contributed through the
+        # ``denied_rules`` seam; see test_denied_rule_seam.py.
+        "source",
     }
     assert b["enabled"] is True
     assert b["pinned"] is False
     assert b["lock_reason"] is None
+    assert b["source"] == "builtin"
     assert snap["effective_count"] == _CATALOG_N
 
 
@@ -217,12 +222,17 @@ def test_snapshot_disable_all_string_false_is_not_truthy(home: Path, config_file
 
 
 def test_snapshot_marks_floor_rules_locked_and_forced_on(home: Path, config_file: Path):
-    # Every git-publish rule is floor-enforced: forced enabled and lock-flagged,
-    # even when its id was persisted into disabled_ids by an older build.
+    # Only the git-publish rules whose coverage is the UNGATED anti-obfuscation
+    # branch are floor-enforced: forced enabled and lock-flagged, even when the id
+    # was persisted into disabled_ids by an older build. The rest of the category
+    # is gated on the per-rule enable state and renders freely toggleable.
+    from kiro_crew.security import floor_enforced_builtin_command_ids
+
     rid = _a_floor_id()
     _seed(config_file, {"disabled_ids": [rid]})
     snap = build_denied_commands_snapshot()
-    floor_rules = [b for b in snap["builtins"] if b["category"] == "git-publish"]
+    floor_ids = floor_enforced_builtin_command_ids()
+    floor_rules = [b for b in snap["builtins"] if b["id"] in floor_ids]
     assert len(floor_rules) == _floor_n() > 0
     for b in floor_rules:
         assert b["enabled"] is True
@@ -246,17 +256,22 @@ def test_floor_lock_reason_wins_over_policy(home: Path):
 
 
 def test_floor_ids_are_derived_from_the_category():
-    # Guard: the accessor derives from the catalog category, so a newly added
-    # git-publish rule is locked without a code change. A hand-maintained id
-    # list would fail this the moment the catalog gains one.
+    # Guard: the accessor reports ONLY the rules whose coverage is an ungated
+    # branch of the floor. The rest of the git-publish category is now gated on
+    # the per-rule enable state, so reporting the whole category would lock rows
+    # whose toggle actually works — the inverse of the no-op this accessor exists
+    # to prevent. Brace expansion is the ungated one: it is caught by
+    # ``_AMBIGUOUS_EXPANSION_RE`` inside the unverifiable-glue check, which no
+    # opt-out may reach.
     from kiro_crew.security import (
         BUILTIN_DENIED_RULES,
         floor_enforced_builtin_command_ids,
     )
 
-    expected = {r.id for r in BUILTIN_DENIED_RULES if r.category == "git-publish"}
-    assert expected, "catalog must carry git-publish rules"
-    assert floor_enforced_builtin_command_ids() == expected
+    floor = floor_enforced_builtin_command_ids()
+    assert floor == {"git-publish-push-brace-expansion-refspec"}
+    git_publish = {r.id for r in BUILTIN_DENIED_RULES if r.category == "git-publish"}
+    assert floor < git_publish, "floor ids must be a strict subset of the category"
 
 
 # ── GET ──
@@ -619,11 +634,67 @@ async def test_non_object_json_body_is_400_not_500(home: Path, mock_sel):
 async def test_user_add_redos_pattern_is_400(home: Path, mock_sel):
     # A catastrophic-backtracking regex must be rejected at add-time — it would
     # otherwise freeze the event loop when the gate runs it synchronously.
+    from kiro_crew.security import _DANGEROUS_AWS_FLAG_RUN, _LINEARIZED_AWS_FLAG_RUN
+
     async with _client() as client:
         resp = await client.post("/api/security/denied-commands/user", json={"pattern": "(a+)+$"})
         assert resp.status == 400
         body = await resp.json()
         assert "unsafe" in body["error"].lower()
+        # No flag-run fragment in the pattern, so no fragment hint either — the
+        # hint must name the actual trigger, not decorate every rejection.
+        assert _DANGEROUS_AWS_FLAG_RUN not in body["error"]
+        assert _LINEARIZED_AWS_FLAG_RUN not in body["error"]
+    assert mock_sel.log_api_access.call_args.kwargs["outcome"] == "denied"
+
+
+@pytest.mark.asyncio
+async def test_user_add_wrapped_builtin_fragment_rejection_names_the_trigger(
+    home: Path, mock_sel
+):
+    # A user who copies a built-in pattern and tweaks it embeds the flag-run
+    # fragment verbatim; the fragment is exempt from the backtracking check only
+    # as part of a complete built-in, so the tweaked copy is rejected. The
+    # rejection must name the fragment so the dead end is self-explanatory
+    # instead of a generic "unsafe regex".
+    from kiro_crew.security import _DANGEROUS_AWS_FLAG_RUN, _LINEARIZED_AWS_FLAG_RUN
+
+    async with _client() as client:
+        for fragment in (_DANGEROUS_AWS_FLAG_RUN, _LINEARIZED_AWS_FLAG_RUN):
+            pattern = "aws s3" + fragment + r" rm .*my-bucket"
+            resp = await client.post(
+                "/api/security/denied-commands/user", json={"pattern": pattern}
+            )
+            assert resp.status == 400
+            body = await resp.json()
+            assert "unsafe" in body["error"].lower()
+            assert fragment in body["error"], body["error"]
+    assert mock_sel.log_api_access.call_args.kwargs["outcome"] == "denied"
+
+
+@pytest.mark.asyncio
+async def test_user_add_fragment_hint_withheld_when_not_the_trigger(home: Path, mock_sel):
+    # The hint says "remove or rewrite that fragment" — advice that must be
+    # TRUE before it is given. A pattern that embeds the fragment but also
+    # carries its own catastrophic quantifier stays rejected after the fragment
+    # is removed, so hinting at the fragment would send the user to an
+    # identical 400. The hint is gated on the fragment-scrubbed residue
+    # actually passing.
+    from kiro_crew.security import _DANGEROUS_AWS_FLAG_RUN, _LINEARIZED_AWS_FLAG_RUN
+
+    async with _client() as client:
+        for pattern in (
+            "(x+)+" + _DANGEROUS_AWS_FLAG_RUN,  # own nested quantifier
+            "a|b" + _DANGEROUS_AWS_FLAG_RUN,  # own top-level alternation
+        ):
+            resp = await client.post(
+                "/api/security/denied-commands/user", json={"pattern": pattern}
+            )
+            assert resp.status == 400
+            body = await resp.json()
+            assert "unsafe" in body["error"].lower()
+            assert _DANGEROUS_AWS_FLAG_RUN not in body["error"], body["error"]
+            assert _LINEARIZED_AWS_FLAG_RUN not in body["error"], body["error"]
     assert mock_sel.log_api_access.call_args.kwargs["outcome"] == "denied"
 
 
@@ -807,8 +878,8 @@ async def test_api_security_stats_uses_effective_count(home: Path, config_file: 
     body = json.loads(resp.body.decode("utf-8"))
     assert body["denied_commands"] == _CATALOG_N - 1
     # The remaining counts are DERIVED from the controls they describe
-    # (security_posture), not literals — this used to assert a hardcoded 5 while
-    # the real number had grown to 16. Assert the derivation, not a magic number;
+    # (security_posture), not literals — a hardcoded 5 would drift as controls
+    # are added; the real number is 16. Assert the derivation, not a magic number;
     # test_security_posture pins the per-control derivation itself.
     from kiro_crew.security_posture import build_posture_snapshot
 
@@ -828,3 +899,103 @@ def test_enforce_denied_commands_settable_key_removed():
     from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
 
     assert "agent.enforce_denied_commands" not in _EDITABLE_CONFIG
+
+
+# ── keystone lockdown ──
+#
+# Regression: the keystone ``denied_commands.json`` lives in
+# ``_SENSITIVE_HOME_DIRS`` and is the user-editable opt-out of the agent's own
+# security ceiling. The agent process must NEVER leave it world-readable, even
+# briefly. On Windows ``chmod_safe`` is a documented no-op and would leave the
+# file under the inherited parent DACL; the writer routes through
+# ``atomic_write(restrict_to_owner=True)`` so the lockdown is applied to the
+# temp file before any content reaches it.
+
+
+async def _run_write_denied_state(home: Path, config_file: Path, mutate):
+    """Run ``_write_denied_state`` synchronously enough to assert on the file.
+
+    The helper is ``async`` and runs the read-modify-write in the default
+    thread executor. Driving the event loop here is enough to surface the
+    after-write lockdown without going through the full aiohttp app.
+    """
+    from kiro_crew.dashboard.handlers.security import _write_denied_state
+
+    return await _write_denied_state(mutate)
+
+
+def test_write_denied_state_lands_owner_only_on_posix(
+    home: Path, config_file: Path
+) -> None:
+    """``_write_denied_state`` finishes with mode 0o600 on POSIX.
+
+    Pins the observable contract: the keystone file the next hook read will
+    open is owner-only. Skipped on Windows; a DACL assertion needs a Windows
+    fixture and is more invasive than the regression it catches.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX-only behavior")
+
+    import asyncio
+
+    def _noop(denied: dict) -> None:
+        denied.setdefault("disabled_ids", [])
+
+    asyncio.run(_run_write_denied_state(home, config_file, _noop))
+
+    mode = config_file.stat().st_mode & 0o777
+    assert mode == 0o600, (
+        f"keystone denied_commands.json must be owner-only; got mode={mode:o}"
+    )
+
+
+def test_write_denied_state_does_not_fall_back_to_chmod_safe(
+    home: Path, config_file: Path
+) -> None:
+    """``_write_denied_state`` does not call ``chmod_safe`` on the keystone.
+
+    ``chmod_safe`` is a no-op on Windows; if a future refactor folds the
+    lockdown back to ``chmod_safe``, the Windows keystone silently reverts to
+    the inherited parent DACL. The helper is allowed to call ``chmod_safe``
+    elsewhere (e.g. for the temp file's pre-write mode), but the audit
+    pin is on the keystone path itself, which is what this test patches.
+    """
+    import kiro_crew.atomic_write as atomic_write_mod
+
+    captured: dict = {}
+
+    def _spy(path, *args, **kwargs):
+        if Path(str(path)).resolve() == config_file.resolve():
+            captured["called"] = True
+        # No-op: don't run real atomic_write (which would apply a real
+        # owner-only lockdown on Windows and may fail in the test sandbox).
+        # The audit pin is on routing, not on the lockdown step itself.
+
+    import asyncio
+
+    def _noop(denied: dict) -> None:
+        denied.setdefault("disabled_ids", [])
+
+    with patch.object(atomic_write_mod, "atomic_write", side_effect=_spy):
+        asyncio.run(_run_write_denied_state(home, config_file, _noop))
+
+    assert captured.get("called"), (
+        "_write_denied_state must route the keystone write through atomic_write"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_lockdown_publishes_no_denied_commands(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """restrict_to_owner runs on the temp; a failure must not leave the keystone file."""
+    monkeypatch.setattr(
+        "kiro_crew.atomic_write.platform_compat.restrict_to_owner",
+        lambda path: (_ for _ in ()).throw(OSError("icacls: transient failure")),
+    )
+    from kiro_crew.dashboard.handlers.security import _write_denied_state
+
+    with pytest.raises(OSError, match="icacls"):
+        await _write_denied_state(lambda d: d.update({"disable_all": True}))
+    assert not (home / "denied_commands.json").exists()
+    assert not list(home.glob("*.tmp"))

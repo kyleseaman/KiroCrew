@@ -12,7 +12,7 @@ Each test class reproduces one audited failure scenario:
    (a few huge messages), instead of growing without bound.
 5. ``delete_session`` uses ``unlink(missing_ok=True)`` and tolerates a
    concurrent removal instead of raising ``FileNotFoundError``.
-6. One-line metadata rewrites no longer ``fsync`` while holding the lock,
+6. One-line metadata rewrites do not ``fsync`` while holding the lock,
    shrinking the critical section every other writer contends on.
 """
 
@@ -656,8 +656,8 @@ class TestTabIdIndexInvalidation:
         self, tmp_path: Path
     ) -> None:
         """A session opened under an existing tab_id AFTER the chain was first
-        read must be linked in. Previously the append didn't invalidate the
-        cached index, so the second session's messages vanished from
+        read must be linked in. An append that does not invalidate the
+        cached index makes the second session's messages vanish from
         ``recent_chained``.
         """
         log = ConversationLog(base_dir=tmp_path)
@@ -693,8 +693,8 @@ class TestTabIdIndexInvalidation:
 
     def test_no_permanent_negative_sentinel(self, tmp_path: Path) -> None:
         """A chained read for a tab_id with no dashboard siblings must not poison
-        the cache: a sibling created afterwards is still discovered (the removed
-        ``[]`` sentinel used to suppress every future rebuild)."""
+        the cache: a sibling created afterwards is still discovered (a cached
+        ``[]`` sentinel would suppress every future rebuild)."""
         log = ConversationLog(base_dir=tmp_path)
         # slack-style key with a tab_id that the dashboard_chat-* glob misses,
         # so the first rebuild finds no entry for tab_id S.
@@ -796,10 +796,13 @@ class TestConsolidationOffsetAfterRotation:
         retained count and is stored verbatim (data-integrity failure).
         """
         log = ConversationLog(base_dir=tmp_path)
-        # ~11 KiB bodies: 100 messages stay under the 2 MiB cap, but appending
-        # ~200 more blows it and triggers a REAL rotation whose retained tail is
-        # still far larger than the offset=100 snapshot below.
-        body = "x" * (11 * 1024)
+        # Bodies sized off the byte cap so 100 messages stay under it while
+        # appending ~200 more blows it and triggers a REAL rotation whose
+        # retained tail is still far larger than the offset=100 snapshot below.
+        # The divisor keeps a full ``_SESSION_KEEP_LINES`` tail inside the cap;
+        # deriving it rather than hardcoding a KiB figure is what stops a change
+        # to the cap from silently leaving this test green without rotating.
+        body = "x" * (_SESSION_MAX_BYTES // (_SESSION_KEEP_LINES + 50))
         for i in range(100):
             log.append("k", "user", f"{i}:{body}")
         # Consolidator snapshots BEFORE the slow LLM call.
@@ -911,7 +914,10 @@ class TestConsolidationOffsetAfterRotation:
         atomic snapshot captures both from the SAME state so the generation it
         returns always matches the offset it returns.
         """
-        body = "x" * (11 * 1024)
+        # Sized off the byte cap for the same reason as
+        # ``test_offset_reset_when_rotation_retains_ge_offset``: the race this
+        # demonstrates only exists if the second batch really rotates.
+        body = "x" * (_SESSION_MAX_BYTES // (_SESSION_KEEP_LINES + 50))
         log = ConversationLog(base_dir=tmp_path)
         for i in range(100):
             log.append("k", "user", f"{i}:{body}")
@@ -981,6 +987,46 @@ class TestRotateOversizedFewLines:
         for i in range(20):
             log.append("k", "user", f"m{i}")
         assert len(log._read_messages("k")) == 20
+
+    def test_rotation_declines_when_archiving_the_dropped_lines_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Archiving is a PRECONDITION of the rewrite, not a side effect.
+
+        The rewrite is what removes the leading lines, and until the archive
+        write lands the transcript is their only copy — so an unwritable archive
+        directory must leave the transcript intact rather than being logged and
+        rewritten past. An oversized file is recoverable; a dropped row is not.
+        """
+        from kiro_crew import history as history_mod
+
+        def _oversized(key: str) -> Path:
+            log = ConversationLog(base_dir=tmp_path / key)
+            chunk = _SESSION_MAX_BYTES // 4
+            for i in range(6):  # over the cap, under the line cap
+                log.append(key, "user", f"{i}" * chunk)
+            return log
+
+        real_archive = history_mod._archive_lines
+
+        def _failing_archive(*_a: object, **_kw: object) -> None:
+            raise OSError("archive directory is unwritable")
+
+        monkeypatch.setattr(history_mod, "_archive_lines", _failing_archive)
+        log_fail = _oversized("archive-fails")
+        msgs = log_fail._read_messages("archive-fails")
+        assert len(msgs) == 6, "rotation dropped rows it had nowhere to archive"
+        assert msgs[0]["content"].startswith("0"), "the oldest row was deleted"
+
+        # Positive control: with a working archive the SAME fixture does rotate,
+        # so the decline above is attributable to the archive failure and not to
+        # rotation having had nothing to do.
+        monkeypatch.setattr(history_mod, "_archive_lines", real_archive)
+        log_ok = _oversized("archive-succeeds")
+        assert len(log_ok._read_messages("archive-succeeds")) < 6, (
+            "the fixture does not rotate even with a healthy archive, so the "
+            "decline above proves nothing"
+        )
 
 
 # ── Bug 5: delete_session unlink(missing_ok=True) ─────────────────────────────
@@ -1235,6 +1281,7 @@ class TestOnLoopCallersOffload:
 
         state = MagicMock()
         state.conversation_log = log
+        state._slots = {}
         state.push_slots_update = MagicMock()
         state.push_refresh = MagicMock()
         monkeypatch.setattr(
@@ -1481,7 +1528,7 @@ class TestDashboardSaveHoldsLock:
         The very NEXT save (window and disk both unchanged) then matches that
         cache and takes the O(window) fast path. If the fast path returns EMPTY
         foreign lines, the rebuilt ``meta + frozen + window`` payload drops the
-        previously-preserved append — a cron/workflow result followed by two
+        already-preserved append — a cron/workflow result followed by two
         dashboard saves silently loses the transcript line.
 
         Reproduces the sequence save -> foreign-append -> save -> save -> save
@@ -1568,7 +1615,7 @@ class TestDashboardSaveHoldsLock:
         """Pin the LEGACY id-less fallback: the narrowed, timestamp-first
         foreign-append identity (GPT 5.6 HIGH + arbiter long-term item 2).
 
-        Since the ``meta.mid`` tier landed (#5152), this ladder is the fallback
+        Since the ``meta.mid`` tier landed, this ladder is the fallback
         for disk lines that carry NO stable id — pre-id transcripts and writers
         that persist id-less durable copies. Every disk line and window entry
         here is deliberately id-less, so the input must reproduce the pre-id
@@ -1666,12 +1713,11 @@ class TestDashboardSaveHoldsLock:
 
 
 class TestForeignFoldMidIdentity:
-    """Pin the ``meta.mid`` tier (pass 0) of the save-side foreign-merge fold
-    (#5152, the save-side slice of the #381 successor identity).
+    """Pin the ``meta.mid`` tier (pass 0) of the save-side foreign-merge fold.
 
     Every window append mints a stable per-message id (``meta.mid``), a save
     persists it, and the durable-copy writers (workflow/cron injectors, CLI)
-    carry the window row's id onto their copy — so since #5133 the id is on
+    carry the window row's id onto their copy — so the id is on
     BOTH sides of the fold's comparison. Pass 0 uses it: an id match IS the
     same message (folded silently, never archived); an id-carrying disk line
     whose id matches NO window entry is foreign regardless of body equality
@@ -1726,7 +1772,7 @@ class TestForeignFoldMidIdentity:
         row) folds in pass 0 with an EMPTY ``dedup_dropped``: the ids matching
         exactly makes it unambiguous, so it must not be routed to the
         ``foreign-dedup`` archive the way the id-less fresh-ts tiebreak is
-        (issue #5152 consequence 1 — archive churn on every injection+save).
+        (consequence 1 — archive churn on every injection+save).
         """
         _prefix, foreign, dedup_dropped = self._fold(
             tmp_path,
@@ -1761,7 +1807,7 @@ class TestForeignFoldMidIdentity:
     ):
         """Two identical-content rows with DISTINCT ids resolve exactly: the
         window row's copy (same id) folds silently, the genuinely distinct row
-        (different id) is preserved as foreign (issue #5152 consequence 2 — the
+        (different id) is preserved as foreign (consequence 2 — the
         residual ambiguity the count-bounded tiebreak could only bound).
         """
         import json
@@ -2003,6 +2049,63 @@ class TestForeignFoldMidIdentity:
         )
         assert foreign == [], "the stale persisted copy must fold, window wins"
         assert dedup_dropped == [], "an id+ts corroborated fold is silent"
+
+    def test_id_match_corroborated_by_a_preserved_image_folds(self, tmp_path, monkeypatch):
+        """Same id, fresh ts, bodies differing ONLY in an image destination the
+        durable copy preserved (the window entry's own rewrite failed open because
+        the agent's scratch file was already gone): pass 0 folds it. Without the
+        image allowance the id match has no corroboration, the line falls through
+        the id-less tiers, and the transcript keeps two copies of one message,
+        one naming a dead file.
+        """
+        import json
+
+        from kiro_crew.chat_attachments import attachments_dir
+        from kiro_crew.dashboard.chat_persistence import _frozen_prefix_and_foreign_appends
+        from kiro_crew.dashboard.chat_utils import _history_key_for
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = self._make_state(tmp_path)
+        slot = state.get_or_create_slot("imgfold")
+        path = state.conversation_log._path(_history_key_for(slot.key))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stored = attachments_dir(path.parent, path.stem) / "0123456789abcdef-shot.png"
+        scratch = tmp_path / "scratch" / "shot.png"  # never created: it is gone
+        disk_entries = [
+            {
+                "role": "assistant",
+                "content": f"see ![shot]({stored})",
+                "ts": "TY",
+                "meta": {"mid": "m-img"},
+            }
+        ]
+        lines = [json.dumps({"_type": "metadata", "created": "2026-01-01T00:00:00Z"})]
+        lines.extend(json.dumps(e) for e in disk_entries)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        slot._frozen_prefix_cache = None
+        window_entries = [
+            {
+                "role": "assistant",
+                "content": f"see ![shot]({scratch})",
+                "ts": "TZ",
+                "meta": {"mid": "m-img"},
+            }
+        ]
+
+        _prefix, foreign, dedup_dropped = _frozen_prefix_and_foreign_appends(
+            slot, path, 0, window_entries
+        )
+        assert foreign == [], "the preserved-image durable copy must fold into the window"
+        assert dedup_dropped == []
+
+        # The allowance is for preserved images only: a same-id line whose TEXT
+        # differs is still uncorroborated and still preserved.
+        slot._frozen_prefix_cache = None
+        window_entries[0]["content"] = f"look ![shot]({scratch})"
+        _prefix, foreign, _dropped = _frozen_prefix_and_foreign_appends(
+            slot, path, 0, window_entries
+        )
+        assert len(foreign) == 1
 
 
 class TestBestEffortSaveMarksDirty:

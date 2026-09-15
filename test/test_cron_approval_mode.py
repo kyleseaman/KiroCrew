@@ -52,6 +52,7 @@ class TestCronApprovalModeGateway:
         gw.sessions = MagicMock()
         gw.sessions.get_pid = MagicMock(return_value=None)
         gw.ctx_builder = MagicMock()
+        gw.ctx_builder.conversation_log.get_metadata_status.return_value = ({}, True)
         gw.slack = MagicMock()
         gw.conv_log = None
         gw.dashboard_state = None
@@ -456,6 +457,7 @@ class TestCronSubagentInjection:
         gw.sessions = MagicMock()
         gw.sessions.get_pid = MagicMock(return_value=None)
         gw.ctx_builder = MagicMock()
+        gw.ctx_builder.conversation_log.get_metadata_status.return_value = ({}, True)
         gw.slack = None
         gw.conv_log = None
         gw.dashboard_state = None
@@ -770,7 +772,7 @@ class TestNoCronsFlag:
 
         with patch("kiro_crew.cli_server.config_path") as mock_cp, patch(
             "kiro_crew.cli_server.KiroCrewConfig"
-        ) as mock_cfg_cls, patch("kiro_crew.cli_chat._ensure_config_key"), patch(
+        ) as mock_cfg_cls, patch(
             "kiro_crew.cli_server.run_gateway", new_callable=AsyncMock
         ) as mock_run:
             mock_cp.return_value.exists.return_value = True

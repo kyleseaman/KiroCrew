@@ -66,6 +66,39 @@ describe('ToolCallLine simplifiedToolNames', () => {
     renderWithProviders(<ToolCallLine message={msg} running={false} />, { store })
     expect(screen.getByText('Running: echo hello')).toBeTruthy()
   })
+
+  it('substitutes a derived summary for a flood-length purpose-less shell label', () => {
+    // No purpose + simplified ON: pickToolLabel falls back to the raw command,
+    // and a multi-line heredoc label is substituted with a command digest. The
+    // collapsed row's CSS truncate bounds VISIBILITY; this bounds MEANING.
+    localStorage.setItem(LS_KEY, JSON.stringify({ simplifiedToolNames: true }))
+    const heredoc = "cat > /tmp/desc.md <<'EOF'\n### Notes\nbody line one\nbody line two\nEOF"
+    const msg = toolMsg({ content: `🔧 Running: ${heredoc}`, meta: { tool_call_id: 'tc_3' } })
+    const store = createTestStore({
+      chat: {
+        messages: [msg],
+        toolLog: [{ type: 'tool', text: heredoc, tool_call_id: 'tc_3', output: 'ok', ts: 1 }],
+        slotRunning: false,
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<ToolCallLine message={msg} running={false} />, { store })
+    expect(screen.getByText('Running: cat → /tmp/desc.md')).toBeTruthy()
+    expect(screen.queryByText(/body line two/)).toBeNull()
+  })
+
+  it('leaves a short raw shell label untouched in simplified mode', () => {
+    localStorage.setItem(LS_KEY, JSON.stringify({ simplifiedToolNames: true }))
+    const msg = toolMsg({ content: '🔧 Running: git status', meta: { tool_call_id: 'tc_5' } })
+    const store = createTestStore({
+      chat: {
+        messages: [msg],
+        toolLog: [{ type: 'tool', text: 'git status', tool_call_id: 'tc_5', output: 'clean', ts: 1 }],
+        slotRunning: false,
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<ToolCallLine message={msg} running={false} />, { store })
+    expect(screen.getByText('Running: git status')).toBeTruthy()
+  })
 })
 
 describe('ToolCallLine inline expansion', () => {
@@ -305,7 +338,7 @@ describe('ToolCallLine inline expansion', () => {
 
 describe('ToolCallLine file-open icon', () => {
   beforeEach(() => {
-    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: true, status: 200 })) as any
+    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: true, status: 200 })) as unknown as typeof fetch
   })
 
   function fileMsg(overrides: Partial<ChatMessage> = {}): ChatMessage {
@@ -318,7 +351,7 @@ describe('ToolCallLine file-open icon', () => {
         messages: [fileMsg()],
         toolLog: [{ type: 'tool', text: 'Read /etc/hosts', purpose: 'Read a file', tool_call_id: 'tc_file', input, output: 'ok', ts: 1 }],
         slotRunning: false,
-      } as any,
+      } as unknown as ChatState,
     })
   }
 
@@ -370,7 +403,7 @@ describe('ToolCallLine file-open icon', () => {
   })
 
   it('does not render the icon when the file does not exist (HEAD 404)', async () => {
-    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: false, status: 404 })) as any
+    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: false, status: 404 })) as unknown as typeof fetch
     const store = fileStore('{"path":"/etc/hosts"}')
     renderWithProviders(<ToolCallLine message={fileMsg()} running={false} onFileOpen={vi.fn()} />, { store })
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
@@ -430,6 +463,8 @@ describe('ToolCallLine entrance reveal', () => {
  *  reads as a slide. */
 describe('ToolCallLine row slide', () => {
   it('keeps the shell status line mounted while it collapses, then drops it', async () => {
+    // `ts: 1` puts the command far past the appearance threshold, so the line
+    // is up from the first paint.
     const msg = toolMsg({ meta: { tool_call_id: 'tc_slide_exit' } })
     const store = createTestStore({
       chat: {
@@ -451,6 +486,7 @@ describe('ToolCallLine row slide', () => {
     expect(screen.getByText(/Running ·/)).toBeTruthy()
     // …and gone once the collapse finishes.
     await waitFor(() => expect(screen.queryByText(/Running ·/)).toBeNull())
+    expect(screen.queryByTestId('shell-activity')).toBeNull()
   })
 
   it('grows a first-appearance row from zero height and releases it afterwards', async () => {
@@ -669,6 +705,40 @@ describe('ToolCallLine auto-denied detection', () => {
       chat: {
         messages: [pill, perm, denySibling],
         toolLog: [{ type: 'tool', text: 'rm file', tool_call_id: 'tc_userreject', ts: 1 }],
+        slotRunning: false,
+      } as unknown as ChatState,
+    })
+    const { container } = renderWithProviders(<ToolCallLine message={pill} running={false} />, { store })
+    expect(container.querySelector('.text-danger')).toBeTruthy()
+    expect(container.querySelector('.text-warn')).toBeFalsy()
+  })
+
+  // The backend persists the RAW decision token into `meta.resolved`, so a
+  // deny-once reaches this component as `rejected_once`. An equality match on
+  // `'rejected'` fails one-sidedly here: the row stops counting as a user
+  // rejection and falls through to the auto-deny branch, painting the most
+  // deliberate denial a human can make as a security-policy block. That is not
+  // reachable from the live WS frame (which re-broadcasts a plain `rejected`),
+  // only from RELOADED history — which is why a store seeded like the server's
+  // persisted state is the shape that catches it.
+  it('reject-once (resolved rejected_once) stays red, not amber auto-denied', () => {
+    const pill = toolMsg({ meta: { tool_call_id: 'tc_denyonce' } })
+    const denySibling: ChatMessage = {
+      role: 'tool',
+      content: '🚫 Running: rm file (rejected — this call only)',
+      cls: 'msg msg-tool',
+      meta: { tool_call_id: 'tc_denyonce' },
+    }
+    const perm: ChatMessage = {
+      role: 'permission',
+      content: 'Running: rm file',
+      cls: '',
+      meta: { tool_call_id: 'tc_denyonce', resolved: 'rejected_once' },
+    }
+    const store = createTestStore({
+      chat: {
+        messages: [pill, perm, denySibling],
+        toolLog: [{ type: 'tool', text: 'rm file', tool_call_id: 'tc_denyonce', ts: 1 }],
         slotRunning: false,
       } as unknown as ChatState,
     })

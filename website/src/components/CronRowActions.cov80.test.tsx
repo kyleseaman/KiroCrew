@@ -82,7 +82,7 @@ describe('CronRowActions', () => {
     await waitFor(() => expect(spies.onToggleEnabled).toHaveBeenCalledTimes(1))
   })
 
-  it('the result row is disabled with no result, and says Continue session with a slot', async () => {
+  it('the result row is disabled with no result, and says Go to Chat with a slot', async () => {
     const { unmount } = render(
       <CronRowActions
         job={job()}
@@ -104,7 +104,7 @@ describe('CronRowActions', () => {
     unmount()
 
     const spies = setup({ has_slot: true })
-    fireEvent.click(await screen.findByText('Continue session'))
+    fireEvent.click(await screen.findByText('Go to Chat'))
     await waitFor(() => expect(spies.onOpenInChat).toHaveBeenCalledTimes(1))
   })
 
@@ -139,6 +139,22 @@ describe('CronRowActions', () => {
     await openMoveSubmenu()
     fireEvent.click(screen.getByText('Ungrouped'))
     await waitFor(() => expect(spies.onMove).toHaveBeenCalledWith(''))
+  })
+
+  it('picking the folder the job is already in is a no-op (no API round-trip)', async () => {
+    const spies = setup({ folder_id: 'f1' })
+    await openMoveSubmenu()
+    fireEvent.click(screen.getByText('zzq-alpha'))
+    await waitFor(() => expect(screen.queryByText('zzq-alpha')).toBeNull())
+    expect(spies.onMove).not.toHaveBeenCalled()
+  })
+
+  it('picking Ungrouped while the job is already ungrouped is a no-op', async () => {
+    const spies = setup()
+    await openMoveSubmenu()
+    fireEvent.click(screen.getByText('Ungrouped'))
+    await waitFor(() => expect(screen.queryByText('Ungrouped')).toBeNull())
+    expect(spies.onMove).not.toHaveBeenCalled()
   })
 
   it('New folder in the submenu moves the job into what it created', async () => {

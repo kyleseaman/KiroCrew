@@ -18,6 +18,13 @@
     "Reviews GitHub pull requests; needs an authenticated `gh` CLI on the gateway host"
   ],
   "defaultEnabled": false,
+  "platform": {
+    "os": [
+      "macos",
+      "linux",
+      "windows"
+    ]
+  },
   "skills": [
     "skills/sage-review",
     "skills/learn-from-sage"
@@ -46,5 +53,14 @@
   "heroImage": "/app-assets/code-review-sage/hero-light.svg",
   "heroImageDark": "/app-assets/code-review-sage/hero-dark.svg",
   "heroImageDetail": "/app-assets/code-review-sage/hero-detail-light.svg",
-  "heroImageDetailDark": "/app-assets/code-review-sage/hero-detail-dark.svg"
+  "heroImageDetailDark": "/app-assets/code-review-sage/hero-detail-dark.svg",
+  "useCases": [
+    "Review one or many GitHub pull requests by risk, inspect focused findings, and stage only the comments worth publishing."
+  ],
+  "configuration": [
+    "Install and authenticate the gh CLI on the gateway host, add a repository, then choose the review model, reasoning effort, and concurrency in Settings."
+  ],
+  "screenshots": [
+    "/app-assets/code-review-sage/screenshot-main.png"
+  ]
 }

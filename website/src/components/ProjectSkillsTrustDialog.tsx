@@ -4,6 +4,7 @@ import { Loader2, ShieldAlert } from 'lucide-react'
 
 import { api } from '../api/client'
 import { i18nT } from '../i18n/t'
+import { capabilitiesVars } from './destinationVars'
 import Modal from './Modal'
 import { Btn } from './ui'
 
@@ -121,7 +122,7 @@ export default function ProjectSkillsTrustDialog({
           {i18nT('components.projectSkillsTrust.body', { skill: skillLeaf })}
         </p>
         {reviewedPath && (
-          <code className="block break-all rounded bg-panel px-2 py-1.5 text-[12px] text-muted">
+          <code className="block break-all rounded bg-card px-2 py-1.5 text-[12px] text-muted">
             {reviewedPath}
           </code>
         )}
@@ -132,7 +133,7 @@ export default function ProjectSkillsTrustDialog({
           {i18nT('components.projectSkillsTrust.decline_consequence')}
         </p>
         <p className="text-muted">
-          {i18nT('components.projectSkillsTrust.withdraw_hint')}
+          {i18nT('components.projectSkillsTrust.withdraw_hint', capabilitiesVars('skills'))}
         </p>
         {error && (
           <p role="alert" className="text-warn">

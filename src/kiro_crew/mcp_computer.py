@@ -17,10 +17,15 @@ auditing happen IN THE GATEWAY (``computer_use/tools.py`` →
   ``hooks._governance_denial`` — the PreToolUse gate — is fail-**OPEN** by
   deliberate repo policy (a governance glitch must not wedge every tool call on
   every surface), so it cannot be the sole authorization point for a surface that
-  can read a password field's ``AXValue``. The authoritative gate
-  (``gate.require_computer_use``) fails CLOSED and needs the OS-resolved app
-  identity and the addressed element's role — which only the gateway-side tool
-  body has.
+  can read a password field's ``AXValue``. The fail-CLOSED gate is the keystone
+  primary enable, read at the top of ``computer_use/tools.py``'s ordered
+  chokepoint: a keystone that is missing, unreadable or disabled refuses the call
+  outright. ``gate.require_computer_use`` is audit-only — it unconditionally
+  permits and records the call, retained as the one place a future edition can
+  reintroduce a decision without touching every call site — and the refusals
+  downstream of the enable (the operator's target policy, the element and pointer
+  shape checks) need the OS-resolved app identity and the addressed element's
+  role, which only the gateway-side tool body has.
 * **Governance and the audit trail live where the platform context is composed.**
   The ceiling, the profile store and the SEL trust root are all gateway state.
 * **No native code in this process.** This module imports no ctypes, loads no
@@ -38,15 +43,32 @@ deliberately NOT used: it walks ``/proc`` ancestors over
 ``session_pid_<pid>.txt``, which ``mcp_core`` itself documents as
 "agent-writable and therefore forgeable".
 
-**An unresolved key is NOT a refusal.** It is forwarded empty and the call proceeds.
+**An unresolved key is NOT a refusal.** The call proceeds, carrying the
+per-process ``UNRESOLVED_SESSION_PREFIX`` placeholder rather than a guessed
+identity — and rather than the empty string, which would alias every unresolved
+session onto one ``SnapshotIndex`` slot (see that constant for the aliasing bug).
 Neither accepted source exists for a GUI-launched kiro-cli on macOS —
-``KIROCREW_SESSION_KEY`` is injected only by the ACP spawn path
-(``acp/client.py``) and ``KIROCREW_HOST_PID`` only by the Linux sandbox launcher
-(``sandbox.py``) — so gating on identity made the feature unusable on its only
-supported platform. The unattended-surface rule was removed by product decision;
-"we cannot name the session" must not become "you may not drive the desktop". What
-is lost is audit ATTRIBUTION, not a control: the trail records an empty key, which
-is honest, where the lenient walk would have recorded a forgeable one.
+``KIROCREW_SESSION_KEY`` reaches a child only from a launcher that already knows
+which session it spawns for (the ACP spawn path in ``acp/client.py``, the
+script-cron launcher in ``cron_script.py``) and ``KIROCREW_HOST_PID`` only from the
+Linux sandbox launcher (``sandbox.py``), and a GUI launch has neither above it — so
+gating on identity made the feature unusable on its only supported platform. The
+unattended-surface rule was removed by product decision; "we cannot name the
+session" must not become "you may not drive the desktop". What is lost is audit
+ATTRIBUTION, not a control: the trail records that the session could not be named,
+which is honest, where the lenient walk would have recorded a forgeable name.
+
+**The placeholder travels in the request BODY only, never in ``X-Session-Key``.**
+The header is an identity CLAIM: on the AF_UNIX leg the gateway kernel-verifies it
+(``token_auth._verify_unix_peer``) against the session its peer-pid ancestry
+resolves to, and denies on mismatch as the impersonation case. The placeholder
+names no session, so declaring it is a claim the gateway must reject whenever the
+ancestry walk does recover a real key, which on macOS it does for every shim a
+dashboard-launched kiro-cli spawns, so every Computer Use call is refused. A
+shim that could not name itself therefore sends NO header, which the gateway
+already treats as "nothing session-scoped is claimed, nothing to verify", and
+keeps the placeholder in the body for ``SnapshotIndex`` namespacing. A
+strictly-resolved key is still declared and still verified.
 
 Tool visibility follows the keystone primary enable: ``tools/list`` returns ``[]``
 while computer use is off, so a disabled feature is invisible to the model rather
@@ -106,14 +128,14 @@ from kiro_crew.computer_use.types import (
     TOOL_TYPE_TEXT,
 )
 from kiro_crew.loopback_http import loopback_urlopen
+from kiro_crew.mcp_caller import current_tenant_nonce
 from kiro_crew.mcp_core import (
-    _api_base,
     _http_error_body,
     _internal_secret,
-    _invalidate_api_base,
-    _resolve_api_port,
-    _resolve_session_key_strict,
+    _replay_target,
+    _resolve_api_target,
     _session_key_header_error,
+    require_strict_session_key,
 )
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
 from kiro_crew.validation import MCP_COMPUTER_SCHEMAS, ValidationError, validate_tool_args
@@ -137,7 +159,7 @@ INVOKE_TIMEOUT_SECS = 90.0
 
 # Refusals this shim produces on its own. Everything else is the gateway's text.
 # NOTE: there is deliberately NO identity refusal here — an unresolvable session
-# key proceeds with an empty identity. See the strict-resolver comment in
+# key proceeds under the placeholder below. See the strict-resolver comment in
 # ``_call_tool_inner``.
 ERR_GATEWAY_UNREACHABLE = (
     "the KiroCrew gateway is not reachable, so computer use cannot run "
@@ -145,9 +167,8 @@ ERR_GATEWAY_UNREACHABLE = (
 )
 
 # Identity used when neither accepted source resolves — which is the NORMAL case on
-# macOS, the only platform with a driver (``KIROCREW_SESSION_KEY`` is injected only
-# by the ACP spawn path and ``KIROCREW_HOST_PID`` only by the Linux sandbox
-# launcher).
+# macOS, the only platform with a driver. Which launchers supply each source, and why
+# a GUI launch has neither, is stated once in the module docstring.
 #
 # Why this exists rather than an empty string: ``SnapshotIndex`` namespaces its
 # entries by
@@ -162,33 +183,73 @@ ERR_GATEWAY_UNREACHABLE = (
 # per session, so in the 1:1 shim topology the pid separates the namespaces exactly
 # as far as the sessions are actually separate — and it does so without reinstating
 # the unattended-surface refusal that was removed by product decision. On a POOLED
-# backend one process serves many sessions, so the pid separates only what the
+# backend one process serves many sessions, so the pid alone separates only what the
 # injected caller block does not already name: co-tenants gatewayd can name get real
-# per-session keys, and the residual — unnamed co-tenants sharing one
-# ``unresolved:<pid>`` namespace — is tracked as #5322. It is
+# per-session keys, and the unnamed ones would otherwise collapse onto one
+# ``unresolved:<pid>`` namespace. gatewayd injects a
+# per-CONNECTION nonce on every forwarded call, which is appended here, so two
+# unnamed co-tenants of one pooled process hold separate namespaces. It is
 # deliberately NOT presented as trustworthy attribution: the prefix names it as
-# unresolved so an audit reader cannot mistake a pid for a session identity.
+# unresolved so an audit reader cannot mistake a pid (or a nonce) for a session
+# identity.
 UNRESOLVED_SESSION_PREFIX = "unresolved:"
+
+#: Separates the process half from the connection half of an unresolved key.
+#: Not ``:``, which already separates the prefix from the pid — a distinct
+#: character keeps the two halves legible in an audit line.
+UNRESOLVED_TENANT_SEPARATOR = "#"
 
 
 def _unresolved_session_key() -> str:
-    """A per-PROCESS session identity for a session we could not name.
+    """A per-CONNECTION session identity for a session we could not name.
 
-    ``unresolved:<pid>`` of THIS shim process. kiro-cli spawns one shim per session,
-    so the pid separates two unresolved sessions exactly as far as they really are
-    separate — which is what keeps ``SnapshotIndex``'s ``(session_key, window_key)``
-    namespace from aliasing them onto one entry and letting one session's action
-    resolve against another's element indices.
+    ``unresolved:<pid>`` of THIS shim process, plus ``#<nonce>`` of the calling
+    CONNECTION when the gateway supplied one. Together they separate two
+    unresolved sessions exactly as far as they really are separate, in both
+    topologies:
 
-    Read at CALL time rather than captured at import: a ``fork``ed child would
-    otherwise inherit the parent's string and re-alias with it, which is the exact
-    failure this is here to prevent.
+    * 1:1 shim (no gateway, no nonce) — kiro-cli spawns one shim per session, so
+      the pid is already the separator and the key is unchanged.
+    * Pooled backend — one process serves N connections, so the pid separates
+      nothing; the gateway-minted per-connection nonce does.
+
+    Without the nonce half, two unnamed co-tenants of a pooled backend share one
+    key, which lets ``SnapshotIndex``'s ``(session_key, window_key)``
+    namespace alias them onto one entry and one session's action resolve
+    against another's element indices — while each session's own fingerprint
+    check still passed, because both trees describe the same window.
+
+    Both halves are read at CALL time rather than captured at import: a ``fork``ed
+    child would otherwise inherit the parent's pid string and re-alias with it,
+    and the nonce belongs to the call in flight, not to the process.
 
     Never presented as trustworthy attribution — the prefix says so. This is a
     namespace separator, not an authenticated identity; a genuine identity still
-    comes only from the two sources ``_resolve_session_key_strict`` accepts.
+    comes only from the two sources ``_resolve_session_key_strict`` accepts, and
+    the nonce is not one of them (it names a connection, not a principal).
     """
-    return f"{UNRESOLVED_SESSION_PREFIX}{os.getpid()}"
+    key = f"{UNRESOLVED_SESSION_PREFIX}{os.getpid()}"
+    nonce = current_tenant_nonce()
+    if nonce:
+        return f"{key}{UNRESOLVED_TENANT_SEPARATOR}{nonce}"
+    return key
+
+
+def _declares_identity(session_key: str) -> bool:
+    """Whether ``session_key`` is an identity the shim may CLAIM in ``X-Session-Key``.
+
+    Only a strictly-resolved key is. The ``unresolved:`` placeholder is a namespace
+    separator the shim minted for itself (see :func:`_unresolved_session_key`), and
+    a claim the gateway's AF_UNIX peer check would compare against the session it
+    resolves from the peer pid: the two can never agree, so declaring it makes
+    every unnamed call a 403 ``peer_session_mismatch``. No header is
+    the gateway's documented "nothing claimed, nothing to verify" arm.
+
+    Decided by the placeholder's own prefix rather than by a flag threaded from the
+    caller, so no future call site can put the placeholder in the header by
+    forgetting to pass one.
+    """
+    return bool(session_key) and not session_key.startswith(UNRESOLVED_SESSION_PREFIX)
 
 
 def _list_tools() -> list[dict[str, Any]]:
@@ -665,22 +726,27 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         logger.debug("computer-use enable-state probe failed; refusing", exc_info=True)
         return f"{ERROR_PREFIX}{REFUSAL_DISABLED}"
 
-    # STRICT identity, but NOT a gate. An unresolvable key is passed through as
-    # empty rather than refused: the unattended-surface rule was removed by product
-    # decision, so "we could not name the session" must not become "you may not
-    # drive the desktop". On macOS neither accepted source is even available to a
-    # GUI-launched kiro-cli (``KIROCREW_SESSION_KEY`` is injected only by the ACP
-    # spawn path, and ``KIROCREW_HOST_PID`` only by the Linux sandbox launcher), so
-    # refusing here made the whole feature unusable on its only supported platform.
+    # STRICT identity, but NOT a gate. An unresolvable key proceeds under the
+    # per-process placeholder rather than being refused: the unattended-surface rule
+    # was removed by product decision, so "we could not name the session" must not
+    # become "you may not drive the desktop". On macOS neither accepted source is even
+    # available to a GUI-launched kiro-cli — the module docstring names which launcher
+    # supplies each one — so refusing here made the whole feature unusable on its only
+    # supported platform.
     #
     # Still the STRICT resolver, and deliberately: the lenient one walks a file
     # ``mcp_core`` itself documents as "agent-writable and therefore forgeable", and
-    # an empty audit identity is honest where a forged one is a lie. What the audit
+    # an unnamed audit identity is honest where a forged one is a lie. What the audit
     # loses is attribution, which is worth less than the feature working.
-    session_key = _resolve_session_key_strict() or _unresolved_session_key()
-    header_err = _session_key_header_error(session_key)
-    if header_err:
-        return f"{ERROR_PREFIX}{header_err}"
+    session_key = require_strict_session_key("computer-use attribution")[0] or (
+        _unresolved_session_key()
+    )
+    # The header pre-flight applies to what goes in the header. The placeholder
+    # never does (see ``_declares_identity``), and it is ASCII by construction.
+    if _declares_identity(session_key):
+        header_err = _session_key_header_error(session_key)
+        if header_err:
+            return f"{ERROR_PREFIX}{header_err}"
 
     payload = _invoke(session_key, name, args)
     # ``text`` is the SUCCESS-AND-REFUSAL channel: the gateway answers 200 with
@@ -712,12 +778,17 @@ def _invoke(session_key: str, name: str, args: dict[str, Any]) -> dict[str, Any]
     and reported as an opaque internal error, where an unreachable gateway is
     both diagnosable and actionable.
 
-    The body carries the resolved session key as well as the header. The HEADER is
-    what the auth middleware sees; the BODY field is what the handler threads into
-    the dispatcher as the calling surface. Neither is an authorization claim the
-    gateway trusts on its own — the trust comes from the loopback local-secret
-    handshake plus the STRICT resolution above, which has already refused an empty
-    key before this function is reached.
+    The body carries the session key; the HEADER carries it only when it is a real,
+    strictly-resolved identity. The header is what the auth middleware kernel-verifies
+    on the AF_UNIX leg (``_verify_unix_peer``: a same-uid peer declaring a key that
+    differs from the one its ancestry resolves to is denied); the BODY field is what
+    the handler threads into the dispatcher as the calling surface and the
+    ``SnapshotIndex`` namespace. An ``unresolved:`` placeholder is a namespace, not
+    a claim, so it goes in the body and the header is omitted: the gateway's
+    empty-header arm is "nothing session-scoped is claimed, nothing to verify", which
+    is exactly true. Neither field is an authorization claim the gateway trusts on its
+    own; the trust comes from the loopback local-secret handshake plus the kernel
+    peer check on whatever IS declared.
     """
     body = json.dumps(
         {"tool": name, "args": args, "session_key": session_key, "agent": "", "app": ""}
@@ -725,45 +796,49 @@ def _invoke(session_key: str, name: str, args: dict[str, Any]) -> dict[str, Any]
     headers = {
         "Content-Type": "application/json",
         "X-Internal-Secret": _internal_secret(),
-        "X-Session-Key": session_key,
     }
+    if _declares_identity(session_key):
+        headers["X-Session-Key"] = session_key
 
-    def _send_once(base: str):
+    def _send_once(target: tuple[str, str]):
+        base, socket_path = target
         request = urllib.request.Request(
             f"{base}{INVOKE_PATH}", data=body, headers=headers, method="POST"
         )
-        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- URL is the loopback gateway (_api_base(): 127.0.0.1 plus a port from config/env or a run-marker whose ownership is re-verified per request) + a fixed internal path; never agent-controlled  # noqa: E501
-        with loopback_urlopen(request, timeout=INVOKE_TIMEOUT_SECS) as response:
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- URL is the loopback gateway (_resolve_api_target(): 127.0.0.1 plus a port from config/env or a run-marker whose ownership is re-verified per request) + a fixed internal path; never agent-controlled  # noqa: E501
+        with loopback_urlopen(
+            request, timeout=INVOKE_TIMEOUT_SECS, unix_socket_path=socket_path or None
+        ) as response:
             return json.loads(response.read())
 
-    api_base = _api_base()
+    # ONE resolution for this attempt, both transports derived from it — the
+    # unix socket lets the gateway kernel-verify this process against the
+    # session key it declares, and pairing it with the base from the SAME
+    # resolution keeps the two from naming different gateways.
+    target = _resolve_api_target()
     try:
-        decoded = _send_once(api_base)
+        decoded = _send_once(target)
     except urllib.error.HTTPError as exc:
         return _http_error_body(exc)
     except urllib.error.URLError as exc:
         detail = str(exc.reason) if isinstance(exc.reason, OSError) else str(exc)
         # The resolved base can predate the gateway: its port is recorded only in
-        # the run marker, so a refusal is worth one re-resolution before giving up.
+        # the run marker, so a refusal is worth one re-resolution before giving
+        # up. Whether that replay is ALLOWED is not restated here — it is
+        # mcp_core._replay_target's rule, shared with mcp_core._send, and None
+        # means do not replay. The wording of the refusal stays this shim's own.
         if isinstance(exc.reason, (ConnectionRefusedError, socket.gaierror)):
-            _invalidate_api_base()
-            retry_port, retry_source = _resolve_api_port()
-            # A default-source fall-through carries NO evidence: a listener on
-            # the default port could be any local process, and replaying would
-            # hand it the internal secret. Replay only chases positive
-            # evidence of a moved gateway. Same rule as mcp_core._send.
-            retry_base = f"http://127.0.0.1:{retry_port}"
-            if retry_source != "default" and retry_base != api_base:
-                try:
-                    decoded = _send_once(retry_base)
-                except urllib.error.HTTPError as retry_exc:
-                    # The replay REACHED the (moved) gateway and it answered with
-                    # a normal HTTP error — surface the structured body exactly
-                    # like a first-attempt HTTPError, not a stale "unreachable".
-                    return _http_error_body(retry_exc)
-                except Exception:
-                    return {"error": ERR_GATEWAY_UNREACHABLE.format(detail=detail)}
-            else:
+            retry_target = _replay_target(target[0])
+            if retry_target is None:
+                return {"error": ERR_GATEWAY_UNREACHABLE.format(detail=detail)}
+            try:
+                decoded = _send_once(retry_target)
+            except urllib.error.HTTPError as retry_exc:
+                # The replay REACHED the (moved) gateway and it answered with
+                # a normal HTTP error — surface the structured body exactly
+                # like a first-attempt HTTPError, not a stale "unreachable".
+                return _http_error_body(retry_exc)
+            except Exception:
                 return {"error": ERR_GATEWAY_UNREACHABLE.format(detail=detail)}
         else:
             return {"error": ERR_GATEWAY_UNREACHABLE.format(detail=detail)}

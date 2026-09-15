@@ -102,6 +102,7 @@ interface PreloadStub {
   openExternal: ReturnType<typeof vi.fn>
   updateHitbox: ReturnType<typeof vi.fn>
   setMenuHitbox: ReturnType<typeof vi.fn>
+  turnOff: ReturnType<typeof vi.fn>
 }
 
 /** Install the preload bridge the desktop windows have and a browser tab does not. */
@@ -115,6 +116,7 @@ function stubPreload(offBridge = vi.fn()): PreloadStub {
     openExternal: vi.fn(),
     updateHitbox: vi.fn(),
     setMenuHitbox: vi.fn(),
+    turnOff: vi.fn(),
   }
   ;(window as unknown as { crewCompanion?: unknown }).crewCompanion = bridge
   return bridge
@@ -812,22 +814,27 @@ describe('window-level bridge calls', () => {
 })
 
 describe('contextMenuAction', () => {
-  it('"quit" disables the app instead of quitting Kiro Crew itself', async () => {
+  it('"quit" disables the app and then closes the overlay at once', async () => {
     const { calls } = stubFetchAll({ ok: true })
     const bridge = stubPreload()
     petBridge.contextMenuAction!('quit')
-    await Promise.resolve()
+    await new Promise((r) => setTimeout(r, 0))
     expect(calls[0].url).toBe('/api/apps/crew-companion/disable')
     expect(calls[0].method).toBe('POST')
     // Disabling is a gateway call, not a window-level one.
     expect(bridge.contextMenuAction).not.toHaveBeenCalled()
+    // On success the overlay is closed immediately, not left for the reconcile tick.
+    expect(bridge.turnOff).toHaveBeenCalledOnce()
   })
 
-  it('a failed disable request is swallowed', async () => {
+  it('a failed disable leaves the companion up instead of closing it', async () => {
+    const bridge = stubPreload()
     stubFetchAll({ fails: true })
     expect(() => petBridge.contextMenuAction!('quit')).not.toThrow()
-    await Promise.resolve()
-    await Promise.resolve()
+    await new Promise((r) => setTimeout(r, 0))
+    // The disable failed, so the overlay must NOT be closed — better a companion
+    // that stays than one that vanishes with nothing actually turned off.
+    expect(bridge.turnOff).not.toHaveBeenCalled()
   })
 
   it('"gallery" opens the gallery window', () => {
@@ -844,14 +851,28 @@ describe('contextMenuAction', () => {
   })
 })
 
-describe('cross-display hooks are deliberately absent', () => {
-  // Left undefined and documented rather than deleted, so the ported hooks'
-  // `api?.on*?.()` guards resolve to no-ops on a single display.
-  it('drag and walk hooks are undefined so the hooks degrade to no-ops', () => {
-    expect(petBridge.dragStart).toBeUndefined()
-    expect(petBridge.dragEnd).toBeUndefined()
-    expect(petBridge.onDragUpdate).toBeUndefined()
-    expect(petBridge.onDragEnded).toBeUndefined()
+describe('cross-display drag hooks delegate to the preload bridge', () => {
+  // The main process now elects one active overlay and carries a drag between
+  // displays, so these are live delegates. With no bridge in this environment they
+  // must degrade safely: sends are no-ops and subscribes hand back a no-op remover.
+  it('drag sends are safe no-ops and subscribes return a remover without a bridge', () => {
+    expect(petBridge.dragStart).toBeInstanceOf(Function)
+    expect(petBridge.dragEnd).toBeInstanceOf(Function)
+    expect(petBridge.dragMouseUp).toBeInstanceOf(Function)
+    expect(() => petBridge.dragStart?.(1, 2)).not.toThrow()
+    expect(() => petBridge.dragEnd?.()).not.toThrow()
+    expect(() => petBridge.dragMouseUp?.()).not.toThrow()
+    expect(petBridge.onSetActive?.(() => {})).toBeInstanceOf(Function)
+    expect(petBridge.onDragUpdate?.(() => {})).toBeInstanceOf(Function)
+    expect(petBridge.onDragEnded?.(() => {})).toBeInstanceOf(Function)
+    expect(petBridge.onDragListenMouseUp?.(() => {})).toBeInstanceOf(Function)
+  })
+})
+
+describe('walk hooks are deliberately absent', () => {
+  // Left undefined and documented rather than deleted, so useWalking's
+  // `api?.on*?.()` guards resolve to no-ops until the main process drives them.
+  it('walk hooks are undefined so the hook degrades to no-ops', () => {
     expect(petBridge.onWalk).toBeUndefined()
     expect(petBridge.onWalkPath).toBeUndefined()
     expect(petBridge.onWalkCancel).toBeUndefined()

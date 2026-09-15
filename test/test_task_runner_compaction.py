@@ -1,8 +1,8 @@
-"""Task-runner compaction routes through the shared SessionManager path (#4686).
+"""Task-runner compaction routes through the shared SessionManager path.
 
 Pins the four contract points from the issue:
 
-(a) ``check_context`` no longer calls ``provider.compact()`` directly — it
+(a) ``check_context`` does not call ``provider.compact()`` directly — it
     delegates to :meth:`SessionManager.compact_if_needed`;
 (b) a second concurrent trigger on the same key is collapsed by the
     ``_compacting`` dedup (across the awaited seam AND the fire-and-forget
@@ -16,10 +16,10 @@ critical SETTLED verdict escalates to a reset (awaited on the seam, scheduled
 on the sync turn-end path), while unmeasurable readings — unknown, or stale
 showing no drop — defer instead of destroying a healthy session.
 
-Full gate-ladder parity between the two entry points (#5132) is pinned by
-``TestGateLadderParity``: both consume
-``SessionManager._compaction_gate_decision`` — the single owner of the gate
-order — so a gate added to one path only cannot silently diverge again.
+Full gate-ladder parity between the two entry points is pinned by
+``TestGateLadderParity``: the manager facade preserves the patchable dispatch
+seams while both implementations consume the coordinator's single gate owner,
+so a gate added to one path only cannot silently diverge again.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ import pytest
 
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.session import SessionManager
+from kiro_crew.session_compaction import CompactionCoordinator
 from kiro_crew.task_executor import check_context
 
 KEY = "taskrunner:t1:runtime"
@@ -125,7 +126,7 @@ class TestCheckContextRoutesThroughManager:
     @pytest.mark.asyncio
     async def test_check_context_delegates_to_compact_if_needed(self, cfg):
         """check_context awaits the public seam and never touches the provider
-        pair (context_usage_pct / compact) it used to call directly."""
+        pair (context_usage_pct / compact) it would otherwise call directly."""
         async with _managed(cfg, _compacting_provider_factory()) as mgr:
             provider, _, _ = await mgr.get_or_create(KEY)
             mgr.release(KEY)
@@ -472,7 +473,7 @@ class _FakeClaudeCode:
 
 
 class TestGateLadderParity:
-    """Full gate-order parity between the two compaction entry points (#5132).
+    """Full gate-order parity between the two compaction entry points.
 
     ``check_context_usage`` (sync, fire-and-forget via ``_trigger_compaction``)
     and ``compact_if_needed`` (awaited) must decide compaction identically:
@@ -688,24 +689,36 @@ class TestGateLadderParity:
             return ast.unparse(tree)
 
         gate_state_reads = (
-            "_compact_pending_verdict",
-            "_compact_cooldown_until",
-            "_context_pct_is_unknown",
-            "in self._compacting",
-            "connection_mode",
+            "self.state.pending_verdict",
+            "self.state.cooldown_until",
+            "self._deps.context_pct_is_unknown",
+            "in self.state.compacting",
+            "self._deps.is_cc_managed",
         )
-        # check_context_usage delegates via the trigger seam, which is itself
-        # pinned below to delegate to the ladder — the chain has one owner.
-        delegation_markers = (
-            (SessionManager.check_context_usage, "self._trigger_compaction("),
-            (SessionManager.compact_if_needed, "self._compaction_gate_decision("),
-            (SessionManager._trigger_compaction, "self._compaction_gate_decision("),
+        facade_markers = (
+            (SessionManager.check_context_usage, "self._compaction.check_context_usage("),
+            (SessionManager.compact_if_needed, "self._compaction.compact_if_needed("),
+            (SessionManager._trigger_compaction, "self._compaction._trigger_compaction("),
         )
-        for entry, marker in delegation_markers:
+        for entry, marker in facade_markers:
             src = executable_source(entry)
-            assert marker in src, f"{entry.__qualname__} no longer delegates its decision"
+            assert marker in src, f"{entry.__qualname__} no longer delegates to the coordinator"
             for needle in gate_state_reads:
                 assert needle not in src, f"{entry.__qualname__} reads gate state: {needle}"
-        ladder_src = executable_source(SessionManager._compaction_gate_decision)
+
+        # Coordinator entry points still hop through the owner facade, rather
+        # than bypassing SessionManager monkeypatches on trigger/gate seams.
+        service_markers = (
+            (CompactionCoordinator.check_context_usage, "owner._trigger_compaction("),
+            (CompactionCoordinator.compact_if_needed, "owner._compaction_gate_decision("),
+            (CompactionCoordinator._trigger_compaction, "owner._compaction_gate_decision("),
+        )
+        for entry, marker in service_markers:
+            src = executable_source(entry)
+            assert marker in src, f"{entry.__qualname__} bypasses the owner facade"
+            for needle in gate_state_reads:
+                assert needle not in src, f"{entry.__qualname__} reads gate state: {needle}"
+
+        ladder_src = executable_source(CompactionCoordinator._compaction_gate_decision)
         for needle in gate_state_reads:
             assert needle in ladder_src, f"ladder lost its own rung read: {needle}"

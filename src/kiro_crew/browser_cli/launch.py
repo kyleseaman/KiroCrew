@@ -38,6 +38,11 @@ boundary, so this module never writes ``chromiumSandbox``. A host that cannot
 run it -- a container without the needed kernel permissions -- needs an operator
 decision, not a default that quietly removes a boundary for everyone. That is
 what :func:`cli_env_overrides` deferring to an operator-set variable is for.
+
+**Session naming lives here too.** The CLI addresses browsers by session name,
+which is the other half of "which browser does a command reach"; keeping both
+variables in one module is what stops the engine and the session from being
+configured through unrelated seams.
 """
 
 from __future__ import annotations
@@ -45,9 +50,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
+from collections.abc import Mapping
 from pathlib import Path
 
+from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.browser_cli.install import (
+    ATTRIBUTION_REMEDY,
+    SeamSupport,
+    cli_lifecycle_env_support,
+)
 from kiro_crew.config.paths import config_dir
 
 logger = logging.getLogger(__name__)
@@ -60,7 +73,288 @@ CONFIG_ENV = "PLAYWRIGHT_MCP_CONFIG"
 #: the config can never disagree with what ``install-browser`` fetched.
 LAUNCH_ENGINE = "chromium"
 
+#: The variable `playwright-cli` reads to decide which browser session a command
+#: addresses. Its name is fixed by the CLI, not by us.
+SESSION_ENV = "PLAYWRIGHT_CLI_SESSION"
+
+#: The variable playwright-core reads before ``os.tmpdir()`` when choosing the
+#: daemon control-socket root. Its name is upstream's test-prefixed public seam,
+#: but it is the only supported way to keep the socket reachable after an
+#: agent's per-process scratch directory is reclaimed.
+SOCKETS_ENV = "PWTEST_SOCKETS_DIR"
+
+#: The registry root holding ``<workspace-hash>/<session>.session`` metadata.
+#: Fixed beside the socket root so controlled teardown can locate the socket
+#: without executing the user-writable playwright-cli wrapper.
+DAEMON_DIR_ENV = "PWTEST_DAEMON_SESSION_DIR"
+
+#: Short common root; each generated session gets its own `/<8hex>/s` and
+#: `/<8hex>/d` subtree so `playwright-cli list` cannot enumerate peer chats.
+_LIFECYCLE_DIR = "pw"
+_UNIX_SOCKET_PATH_MAX_BYTES = 103
+
+#: Marks a generated name as Kiro Crew's in ``playwright-cli list``, so an
+#: operator can tell an agent's browser from one they opened themselves.
+_SESSION_PREFIX = "kc-"
+
 _CONFIG_FILE = "playwright-cli-config.json"
+
+
+#: Leaf names :func:`socket_dir` and :func:`daemon_dir` build under a session dir.
+_LIFECYCLE_LEAVES = frozenset({"s", "d"})
+
+
+def _is_generated_leaf(leaf: str) -> bool:
+    """Whether *leaf* is the 8-hex filesystem leaf of a generated session."""
+    return len(leaf) == 8 and all(c in "0123456789abcdef" for c in leaf)
+
+
+def _session_leaf(session_name: str) -> str:
+    """Filesystem leaf for one generated ``kc-<8hex>`` session."""
+    if not session_name.startswith(_SESSION_PREFIX):
+        return ""
+    leaf = session_name.removeprefix(_SESSION_PREFIX)
+    return leaf if _is_generated_leaf(leaf) else ""
+
+
+def socket_dir(session_name: str, base: Path | None = None) -> Path:
+    """Stable, per-session daemon-socket root outside agent scratch."""
+    root = base if base is not None else config_dir() / _LIFECYCLE_DIR
+    return root / _session_leaf(session_name) / "s"
+
+
+def daemon_dir(session_name: str, base: Path | None = None) -> Path:
+    """Stable, per-session Playwright registry root outside agent scratch."""
+    root = base if base is not None else config_dir() / _LIFECYCLE_DIR
+    return root / _session_leaf(session_name) / "d"
+
+
+def _operator_base(configured: str) -> Path | None:
+    """An operator-chosen lifecycle root, or ``None`` to use the default.
+
+    ``None`` for an unset value AND for one of our own roots arriving by
+    INHERITANCE, which is the same distinction :func:`browser_session_env`
+    draws on the session name -- ours-by-inheritance is regenerated, only a
+    foreign value is honoured.
+
+    Both spawn sites build the child environment from ``{**os.environ, ...}``,
+    so a gateway started from inside an agent process hands its own
+    ``SOCKETS_ENV`` down. Treating that as an operator base namespaced EVERY
+    session it hosts one level deeper inside the parent's root, recursively:
+    measured 133 children under a single root and a depth of four, with real
+    socket paths at 79 of the ``_UNIX_SOCKET_PATH_MAX_BYTES`` budget. Nesting
+    spends ~12 bytes a level, so it walks into the AF_UNIX ceiling this module
+    already guards -- and that guard returns ``{}``, which drops the daemon back
+    under reclaimable scratch and reinstates the unreachability the roots exist
+    to prevent.
+
+    Recognition is by SHAPE -- a ``<root>/<8hex>/{s,d}`` tail, which is what
+    :func:`socket_dir` and :func:`daemon_dir` build, or the ``<root>/ui/s`` tail
+    :func:`ui_socket_dir` builds for the gateway's own CLI children -- not by
+    location under the current ``config_dir()``. Every trigger flow changes the
+    data home (``dev-backend.sh`` exports ``KIROCREW_HOME``, and a pod runs an
+    isolated one), so an inherited root sits under the PARENT's home and a
+    location test would read it as foreign and keep nesting. Shape is also why
+    the sibling ``kc-`` prefix guard survives crossing installations. The
+    residual cost is an operator root that happens to end in ``<8hex>/s`` or
+    ``ui/s``, which is treated as ours; that is the same collision the reserved
+    prefix already accepts.
+    """
+    if not configured:
+        return None
+    path = Path(configured)
+    if path.name in _LIFECYCLE_LEAVES and (
+        _is_generated_leaf(path.parent.name) or path.parent.name == _UI_LEAF
+    ):
+        return None
+    return path
+
+
+#: One warning per distinct lifecycle loss, keyed on the reason. A repeat of the
+#: SAME reason is silenced -- the gate is consulted on every session start, and
+#: an unattributable launcher otherwise logs one identical line per start -- while
+#: a reason that CHANGED is a different state and still speaks.
+_warned_lifecycle_losses: set[str] = set()
+
+
+def _warn_lifecycle_loss(support: SeamSupport, detail: str) -> None:
+    """Report why the CLI's lifecycle environment was left unchanged.
+
+    ``UNVERIFIED`` names the attribution that failed and what to do about it.
+    Only ``UNSUPPORTED`` -- both bundles read, a hook genuinely gone -- may
+    describe the installed CLI, because only then was the CLI measured. One
+    message for both claimed the capability gap either way, which sends the
+    operator to upgrade a CLI whose bundles already carry both hooks.
+    """
+    if support is SeamSupport.UNVERIFIED:
+        message = (
+            f"could not verify the playwright-cli daemon socket/session hooks: {detail}; "
+            f"leaving its lifecycle environment unchanged. To fix this, {ATTRIBUTION_REMEDY}. "
+            "The installed CLI's own capability was not measured."
+        )
+    else:
+        message = (
+            "installed playwright-cli does not expose the stable daemon "
+            "socket/session hooks; leaving its lifecycle environment unchanged"
+        )
+    if message in _warned_lifecycle_losses:
+        return
+    _warned_lifecycle_losses.add(message)
+    logger.warning("%s", message)
+
+
+def browser_socket_env(env: Mapping[str, str]) -> dict[str, str]:
+    """Environment additions keeping daemon sockets reachable and discoverable.
+
+    ``playwright-cli`` launches its daemon after Kiro Crew has pointed
+    ``TMPDIR`` at a per-process scratch directory. Without ``SOCKETS_ENV`` the
+    socket disappears when that scratch is reclaimed. ``DAEMON_DIR_ENV`` fixes
+    the corresponding session registry location, letting Kiro Crew find and
+    validate the exact generated session file at controlled teardown without
+    executing the user-writable CLI wrapper.
+
+    This helper is called only when Kiro Crew generated ``SESSION_ENV``.
+    A location variable holding a FOREIGN value is treated as an
+    operator-selected BASE root and namespaced by the generated session; one
+    holding a value already under our own lifecycle root arrived by inheritance
+    and is ignored in favour of that root, so namespaces stay siblings instead
+    of nesting (see :func:`_operator_base`). Non-generated operator sessions
+    never call this helper. Both final directories are owner-restricted. If
+    validation or preparation fails, no partial additions are returned and the
+    current TMPDIR/default-registry behavior remains. This helper performs
+    filesystem I/O and event-loop callers MUST offload it.
+    """
+    session_name = env.get(SESSION_ENV, "").strip()
+    if not _session_leaf(session_name):
+        return {}
+    support, detail = cli_lifecycle_env_support()
+    if support is not SeamSupport.SUPPORTED:
+        _warn_lifecycle_loss(support, detail)
+        return {}
+    configured_sockets = env.get(SOCKETS_ENV, "").strip()
+    configured_daemons = env.get(DAEMON_DIR_ENV, "").strip()
+    if (
+        configured_sockets
+        and not Path(configured_sockets).is_absolute()
+        or configured_daemons
+        and not Path(configured_daemons).is_absolute()
+    ):
+        logger.warning("Playwright lifecycle root overrides must be absolute paths")
+        return {}
+    sockets_path = socket_dir(session_name, _operator_base(configured_sockets))
+    daemons_path = daemon_dir(session_name, _operator_base(configured_daemons))
+    additions: dict[str, str] = {}
+    # Upstream builds `<root>/cli/<16-char-workspace>-<11-char-session>.sock`.
+    # Check the complete shortest non-trimmed form; if even that cannot fit,
+    # makeSocketPath raises and browsing fails before cleanup can help.
+    worst_case = sockets_path / "cli" / "0000000000000000-kc-00000000.sock"
+    if (
+        not platform_compat.IS_WINDOWS
+        and len(os.fsencode(str(worst_case))) > _UNIX_SOCKET_PATH_MAX_BYTES
+    ):
+        logger.warning(
+            "Playwright socket directory is too long for AF_UNIX (%d bytes): %s",
+            len(os.fsencode(str(worst_case))),
+            sockets_path,
+        )
+        return {}
+    for key, path in ((SOCKETS_ENV, sockets_path), (DAEMON_DIR_ENV, daemons_path)):
+        try:
+            platform_compat.make_owner_only_dir(path)
+            platform_compat.restrict_dir_to_owner(path)
+        except OSError:
+            logger.warning(
+                "could not prepare Playwright lifecycle directory at %s; "
+                "browser daemon cleanup may be unavailable",
+                path,
+            )
+            return {}
+        additions[key] = str(path)
+    return additions
+
+
+#: Leaf of the socket root for the CLI children the GATEWAY itself runs -- the
+#: ``show`` dashboard and the Browser panel's launcher. Not 8-hex on purpose, so
+#: it can never read as a generated session's namespace to :func:`_session_leaf`
+#: or :func:`_operator_base`.
+_UI_LEAF = "ui"
+
+
+def ui_socket_dir(base: Path | None = None) -> Path:
+    """Socket root shared by the gateway's own CLI children (``<root>/ui/s``)."""
+    root = base if base is not None else config_dir() / _LIFECYCLE_DIR
+    return root / _UI_LEAF / "s"
+
+
+def ui_daemon_dir(socket_dir: Path) -> Path:
+    """Daemon session registry beside the ui socket root (``<root>/ui/d``).
+
+    Derived from the socket root rather than the config dir so the two always
+    sit under one namespace, whichever base the operator configured.
+    """
+    return socket_dir.parent / "d"
+
+
+def ui_socket_env(env: Mapping[str, str]) -> dict[str, str]:
+    """Environment addition giving the gateway's own CLI children one socket root.
+
+    The ``show`` dashboard claims its singleton socket under ``SOCKETS_ENV`` and
+    the Browser panel's launcher sends its reveal request to that socket, so the
+    two children must agree on the root and the gateway must KNOW it -- which is
+    the whole reason to set it rather than inherit the CLI's default (a path
+    derived from the temp directory and a hash of the user name that the gateway
+    would otherwise have to re-derive). An operator-configured root is honoured
+    as a BASE and namespaced under it, the same doctrine as
+    :func:`browser_socket_env`; one of our own roots arriving by inheritance is
+    regenerated. When the hook cannot be confirmed on the CLI that would run, a
+    warning explains why and the result is empty, leaving the children on the
+    CLI's default. The result is also empty when the path would overflow the
+    AF_UNIX budget (a pod's long home), or when the directory cannot be prepared
+    owner-only. Performs filesystem I/O; event-loop callers offload it.
+    """
+    support, detail = cli_lifecycle_env_support()
+    if support is not SeamSupport.SUPPORTED:
+        _warn_lifecycle_loss(support, detail)
+        return {}
+    configured = env.get(SOCKETS_ENV, "").strip()
+    if configured and not Path(configured).is_absolute():
+        return {}
+    path = ui_socket_dir(_operator_base(configured))
+    # Upstream builds `<root>/cli/<16-char-workspace>-<11-char-session>.sock` and
+    # `<root>/dashboard/app.sock`; check the longer of the two shortest forms.
+    worst_case = path / "cli" / "0000000000000000-panel-00000.sock"
+    if (
+        not platform_compat.IS_WINDOWS
+        and len(os.fsencode(str(worst_case))) > _UNIX_SOCKET_PATH_MAX_BYTES
+    ):
+        logger.warning(
+            "browser view socket directory is too long for AF_UNIX (%d bytes): %s",
+            len(os.fsencode(str(worst_case))),
+            path,
+        )
+        return {}
+    try:
+        platform_compat.make_owner_only_dir(path)
+        platform_compat.restrict_dir_to_owner(path)
+    except OSError:
+        logger.warning("could not prepare the browser view socket directory at %s", path)
+        return {}
+    # The daemon session REGISTRY is pinned beside the socket root, for the same
+    # reason: a gateway started from inside an agent's shell inherits that
+    # agent's registry, the panel's sessions would register there, and after a
+    # crash and an ordinary restart (a clean environment) the sweep would list
+    # the default registry and never find the logged-in browser. Deterministic
+    # and gateway-owned, both children (the `show` dashboard that lists the
+    # sessions and the launcher that opens, reclaims and closes them) read the
+    # same one across every gateway life.
+    daemons = ui_daemon_dir(path)
+    try:
+        platform_compat.make_owner_only_dir(daemons)
+        platform_compat.restrict_dir_to_owner(daemons)
+    except OSError:
+        logger.warning("could not prepare the browser view daemon registry at %s", daemons)
+        return {}
+    return {SOCKETS_ENV: str(path), DAEMON_DIR_ENV: str(daemons)}
 
 
 def launch_config_path() -> Path:
@@ -133,3 +427,43 @@ def cli_env_overrides() -> dict[str, str]:
         return {}
     path = write_config()
     return {CONFIG_ENV: str(path)} if path is not None else {}
+
+
+def browser_session_env(env: Mapping[str, str]) -> dict[str, str]:
+    """Environment additions giving one agent process its own browser session.
+
+    The CLI addresses browsers by session NAME and resolves a command with no
+    name to the literal ``default``, so two agent processes that both run a bare
+    command drive the SAME browser: one navigates the other's page out from
+    under it, and either one's ``close`` leaves the other answering ``The
+    browser 'default' is not open``. A distinct name per process removes the
+    sharing without the agent having to remember ``-s=`` on every command.
+
+    The name is random rather than derived from the session key, because the
+    warm pool spawns a process BEFORE any session claims it: a key-derived name
+    would be wrong for exactly the sessions the pool serves, and handing a
+    per-session value to the spawn as ``extra_env`` would disqualify every
+    session from the pool (a non-empty ``extra_env`` is a pool bypass in
+    :meth:`kiro_crew.session.SessionManager.get_or_create`). Uniqueness per
+    process is the entire requirement; legibility is served by the prefix.
+
+    Empty when the variable is already set to a name we did not generate, the
+    same override doctrine as :func:`cli_env_overrides`: an operator who named a
+    session means one specific browser. Every process then shares that name,
+    which is theirs to choose — including ``attach``-style workflows that need a
+    fixed name. The ``kc-`` prefix is RESERVED for that reason: an operator who
+    wants a fixed shared name must not use it.
+
+    A value carrying that prefix is regenerated rather than preserved, because
+    it is one of ours arriving by INHERITANCE, not by intent. Both spawn paths
+    build the child env as ``{**os.environ}``, so a gateway started from inside
+    an agent process — which this repo's own ``kirocrew-worktree-dev`` skill
+    tells an agent to do via ``./dev-backend.sh`` — would pass its caller's
+    generated name down to every session it hosts. Preserving it there would
+    put every chat on that gateway back on one shared browser and silently
+    no-op the isolation this function exists to provide.
+    """
+    existing = env.get(SESSION_ENV, "").strip()
+    if existing and not existing.startswith(_SESSION_PREFIX):
+        return {}
+    return {SESSION_ENV: f"{_SESSION_PREFIX}{uuid.uuid4().hex[:8]}"}

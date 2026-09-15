@@ -1,8 +1,8 @@
 """A cron job's output reaches the channel that scheduled it, not Slack alone.
 
-An unattended run used to be delivered to Slack and nowhere else, so a job
-created from Discord (or any other transport) was invisible on the surface its
-owner actually watches. Routing is keyed off the job's ORIGIN session key -- the
+Delivering an unattended run to Slack and nowhere else leaves a job created
+from Discord (or any other transport) invisible on the surface its owner
+actually watches. Routing is keyed off the job's ORIGIN session key -- the
 session that created it -- because a ``cron:{id}`` key carries no channel
 namespace of its own and so can never name the surface the job belongs to.
 
@@ -65,8 +65,12 @@ def _make_orchestrator() -> Any:
 
 def _transport(*, proactive: bool = True, max_chars: int = 4000) -> MagicMock:
     tr = MagicMock()
+    # ``max_message_bytes=0`` mirrors the real ``TransportCapabilities`` default:
+    # the proactive egress legs chunk via ``chunk_for_transport``, which reads it
+    # to pick the byte-aware splitter for a byte-capped channel (Webex) and the
+    # char path otherwise. A fake omitting it would ``AttributeError`` on that read.
     tr.capabilities = SimpleNamespace(
-        supports_proactive_send=proactive, max_message_chars=max_chars
+        supports_proactive_send=proactive, max_message_chars=max_chars, max_message_bytes=0
     )
     tr.send_message = AsyncMock()
     tr.resolve_configured_target = AsyncMock(return_value=(DISCORD_CONVERSATION, ""))

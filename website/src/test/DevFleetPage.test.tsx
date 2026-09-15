@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { screen, waitFor, fireEvent, within, act } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 
-import DevFleetPage, { mergeLogWindow, LOG_GAP_MARKER, pruneVerdictLabel, gatewayRecovered } from '../pages/DevFleetPage'
+import DevFleetPage, { mergeLogWindow, LOG_GAP_MARKER, pruneVerdictLabel, gatewayRecovered, __resetDevFleetNoticesForTests } from '../pages/DevFleetPage'
 
 function renderPage() {
   return renderWithProviders(<DevFleetPage />, { route: '/dev-fleet' })
@@ -19,6 +19,11 @@ const FLEET = {
     { name: 'unprov', is_main: false, running: false, has_dist: false, behind: 0, last_updated_at: Date.now() / 1000 - 7200 },
   ],
 }
+
+// The page keeps its latest action failure in module state (so a failure that
+// lands while the page is unmounted is still shown on return); a suite must
+// not carry one test's failure into the next.
+beforeEach(() => { __resetDevFleetNoticesForTests() })
 
 describe('DevFleetPage', () => {
   beforeEach(() => {
@@ -308,7 +313,8 @@ describe('DevFleetPage', () => {
       worktrees: FLEET.worktrees.map((w) =>
         w.name === 'unprov' ? { ...w, provision_run_id: 'run-prov-dead' } : w),
     }
-    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+    let dismissBody: unknown = null
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url, opts) => {
       const u = typeof url === 'string' ? url : (url as Request).url
       if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET_WITH_FAILED), { status: 200 }))
       if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
@@ -316,6 +322,10 @@ describe('DevFleetPage', () => {
         return Promise.resolve(new Response(JSON.stringify({
           status: 'done', exit_code: 1, output: ['npm ERR! build failed'], started: Date.now() / 1000 - 300,
         }), { status: 200 }))
+      }
+      if (u.includes('/pod/provision/dismiss')) {
+        dismissBody = JSON.parse(String(opts?.body))
+        return Promise.resolve(new Response(JSON.stringify({ ok: true, dismissed: true }), { status: 200 }))
       }
       return Promise.resolve(new Response('{}', { status: 200 }))
     })
@@ -325,6 +335,64 @@ describe('DevFleetPage', () => {
     // The last log line renders twice (inline strip + expanded <pre> panel).
     await waitFor(() => expect(screen.getByText('Provision failed (exit 1)')).toBeInTheDocument(), { timeout: 3000 })
     expect(screen.getAllByText('npm ERR! build failed').length).toBeGreaterThanOrEqual(2)
+    fireEvent.click(within(screen.getByTestId('provision-error-unprov')).getByLabelText('Dismiss'))
+    await waitFor(() => expect(dismissBody).toEqual({ name: 'unprov', run_id: 'run-prov-dead' }))
+    await waitFor(() => expect(screen.queryByText('Provision failed (exit 1)')).toBeNull())
+  })
+
+  it('a slow dismiss does not erase a replacement failure that arrived while it was in flight', async () => {
+    // Regression: dismissProv awaits the server round-trip, so a REPLACEMENT
+    // provision can fail and reattach to the same worktree before the response
+    // lands. Deleting the strip unconditionally then hid the NEW failure (and
+    // its log) until the next reload. The clear is now guarded on the run id
+    // the user actually dismissed.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    let rid = 'run-prov-dead'
+    let releaseDismiss: (() => void) | null = null
+    const dismissPending = new Promise<void>((resolve) => { releaseDismiss = resolve })
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          ...FLEET,
+          worktrees: FLEET.worktrees.map((w) => (w.name === 'unprov' ? { ...w, provision_run_id: rid } : w)),
+        }), { status: 200 }))
+      }
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/run?id=run-prov-dead')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          status: 'done', exit_code: 1, output: ['old failure'], started: Date.now() / 1000 - 300,
+        }), { status: 200 }))
+      }
+      if (u.includes('/run?id=run-prov-new')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          status: 'done', exit_code: 2, output: ['new failure'], started: Date.now() / 1000 - 10,
+        }), { status: 200 }))
+      }
+      if (u.includes('/pod/provision/dismiss')) {
+        return dismissPending.then(() => new Response(JSON.stringify({ ok: true, dismissed: true }), { status: 200 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    try {
+      renderPage()
+      await waitFor(() => expect(screen.getByText('Provision failed (exit 1)')).toBeInTheDocument(), { timeout: 3000 })
+
+      // Dismiss the OLD failure; the POST stays in flight.
+      fireEvent.click(within(screen.getByTestId('provision-error-unprov')).getByLabelText('Dismiss'))
+
+      // A replacement provision fails and the next fleet poll reattaches it.
+      rid = 'run-prov-new'
+      await act(async () => { await vi.advanceTimersByTimeAsync(13000) })
+      await waitFor(() => expect(screen.getByText('Provision failed (exit 2)')).toBeInTheDocument(), { timeout: 3000 })
+
+      // The stale dismissal now resolves — it must leave the new strip alone.
+      releaseDismiss!()
+      await act(async () => { await vi.advanceTimersByTimeAsync(50) })
+      expect(screen.getByText('Provision failed (exit 2)')).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('reattached polling keeps the fetched log prefix and marks a scrolled gap', async () => {
@@ -660,7 +728,7 @@ describe('DevFleetPage', () => {
     const item = within(await screen.findByRole('menu')).getByText('Make live')
     fireEvent.click(item)
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument())
-    expect(screen.getByText('Make "feature-x" live?')).toBeInTheDocument()
+    expect(screen.getByText('Make “feature-x” live?')).toBeInTheDocument()
   })
 
   it('hides "Make live" for the worktree that is already live', async () => {
@@ -831,7 +899,7 @@ describe('DevFleetPage', () => {
     expect(btn).toBeInTheDocument()
     fireEvent.click(btn)
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument())
-    expect(screen.getByText('Make "main" live?')).toBeInTheDocument()
+    expect(screen.getByText('Make “main” live?')).toBeInTheDocument()
   })
 
   it('hides "Make live" on the MAIN row when main IS live', async () => {
@@ -960,7 +1028,7 @@ describe('DevFleetPage', () => {
     fireEvent.click(screen.getByLabelText('More actions'))
     fireEvent.click(within(await screen.findByRole('menu')).getByText('Make live'))
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument())
-    expect(screen.getByText('Make "feature-x" live?')).toBeInTheDocument()
+    expect(screen.getByText('Make “feature-x” live?')).toBeInTheDocument()
   })
 
   it('outside-click closes the portaled row-actions menu', async () => {
@@ -1021,11 +1089,15 @@ describe('DevFleetPage', () => {
   // The confirm popover used to be position:absolute inside the row, so the
   // Worktrees Card's `.card-glow { overflow: hidden }` clipped it. It is now
   // portaled to <body> with fixed positioning, like the row-actions menu.
-  async function openPullBuildConfirm() {
+  async function openPullBuildConfirm({ focusTrigger = false } = {}) {
     mockFleet(FLEET_MENU)
     renderPage()
     await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
     const trigger = screen.getByText('Pull+Build').closest('button') as HTMLButtonElement
+    // A real browser focuses a clicked button; the test DOM does not. Only a
+    // test that depends on that (the focus-return policy below) needs it, so
+    // it stays opt-in rather than papering over the difference everywhere.
+    if (focusTrigger) trigger.focus()
     fireEvent.click(trigger)
     return { trigger, pop: await screen.findByRole('dialog') }
   }
@@ -1083,6 +1155,71 @@ describe('DevFleetPage', () => {
     expect(trigger).toHaveFocus()
   })
 
+  it('outside-click dismissal leaves focus where the click put it, not back on the trigger', async () => {
+    // The popover now takes Escape, the Tab ring and the IME latch from the
+    // shared dialog contract, but NOT its focus-return half: that restores on
+    // unmount unconditionally, and an outside click must leave focus where the
+    // browser routed it (#2533). Turn `restoreFocus` back on and this goes red.
+    const { trigger, pop } = await openPullBuildConfirm({ focusTrigger: true })
+    expect(within(pop).getByText('Cancel')).toHaveFocus()
+    fireEvent.mouseDown(document.body)
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(trigger).not.toHaveFocus()
+  })
+
+  it('declines a boundary Tab that belongs to an IME composition', async () => {
+    // On WebKit the keydown that commits a candidate arrives AFTER
+    // compositionend with `isComposing` already false — unguarded, the trap
+    // would yank focus and abort the composition. Both ring boundaries are
+    // buttons today, so no composition can start on them; this pins that the
+    // trap stays safe if the popover ever grows a text field.
+    const { pop } = await openPullBuildConfirm()
+    const cancel = within(pop).getByText('Cancel')
+    const start = within(pop).getByText('Start')
+    expect(cancel).toHaveFocus()
+
+    fireEvent.compositionStart(cancel)
+    fireEvent.compositionEnd(cancel)
+    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
+
+    // Declined: focus stays where it was instead of wrapping to Start.
+    expect(cancel).toHaveFocus()
+    expect(start).not.toHaveFocus()
+  })
+
+  it('declines the forward-boundary Tab too — each branch carries its own claim', async () => {
+    // The scan requires the claim BETWEEN a branch and its focus move, but a
+    // behavioural pin per boundary is what proves the claim actually runs:
+    // one guarded branch must not stand in for its sibling.
+    const { pop } = await openPullBuildConfirm()
+    const start = within(pop).getByText('Start')
+    start.focus()
+    expect(start).toHaveFocus()
+
+    fireEvent.compositionStart(start)
+    fireEvent.compositionEnd(start)
+    fireEvent.keyDown(document, { key: 'Tab' })
+
+    // Declined: no wrap back to Cancel.
+    expect(start).toHaveFocus()
+  })
+
+  it('declines an Escape that belongs to an IME composition (popover stays open)', async () => {
+    // Escape on the same document-capture listener closes the popover AND
+    // yanks focus back to the trigger — the same harm as the Tab wrap, so
+    // the same claim guards it.
+    const { pop } = await openPullBuildConfirm()
+    const cancel = within(pop).getByText('Cancel')
+
+    fireEvent.compositionStart(cancel)
+    fireEvent.compositionEnd(cancel)
+    fireEvent.keyDown(document, { key: 'Escape' })
+
+    // Declined: the popover is still there and focus did not move.
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    expect(cancel).toHaveFocus()
+  })
+
   it('confirm popover opens downward when there is room below', async () => {
     mockFleet(FLEET_MENU)
     renderPage()
@@ -1114,6 +1251,143 @@ describe('DevFleetPage', () => {
     expect(pop.getAttribute('data-placement')).toBe('up')
     expect(pop.style.bottom).not.toBe('')
     expect(pop.style.top).toBe('')
+  })
+
+  /* ─── Row-actions menu: focus containment (#2533) ─── */
+  // ConfirmBtn's half of #2533 landed separately (see the confirm-dialog
+  // role=dialog/Escape test above); MenuBtn was left with Escape-only
+  // handling, so all three parts — focus entry, Tab containment, and focus
+  // return — are implemented here for the menu.
+
+  it('row-actions menu moves focus onto the first item when it opens, and Tab wraps within it', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    menuItems[menuItems.length - 1].focus()
+    fireEvent.keyDown(menu, { key: 'Tab' })
+    expect(menuItems[0]).toHaveFocus()
+    fireEvent.keyDown(menu, { key: 'Tab', shiftKey: true })
+    expect(menuItems[menuItems.length - 1]).toHaveFocus()
+  })
+
+  it('row-actions menu ArrowDown/ArrowUp cycle focus through items and wrap at both ends', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    // Down walks forward one item at a time.
+    fireEvent.keyDown(menu, { key: 'ArrowDown' })
+    expect(menuItems[1]).toHaveFocus()
+    // Down on the last item wraps to the first.
+    menuItems[menuItems.length - 1].focus()
+    fireEvent.keyDown(menu, { key: 'ArrowDown' })
+    expect(menuItems[0]).toHaveFocus()
+    // Up on the first item wraps to the last.
+    fireEvent.keyDown(menu, { key: 'ArrowUp' })
+    expect(menuItems[menuItems.length - 1]).toHaveFocus()
+    // Up walks backward one item at a time.
+    fireEvent.keyDown(menu, { key: 'ArrowUp' })
+    expect(menuItems[menuItems.length - 2]).toHaveFocus()
+  })
+
+  it('row-actions menu Home/End jump to the first/last item', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    fireEvent.keyDown(menu, { key: 'End' })
+    expect(menuItems[menuItems.length - 1]).toHaveFocus()
+    fireEvent.keyDown(menu, { key: 'Home' })
+    expect(menuItems[0]).toHaveFocus()
+  })
+
+  it('row-actions menu declines an arrow that belongs to an IME composition', async () => {
+    // On WebKit the keydown that moves through composition candidates can
+    // arrive AFTER compositionend with `isComposing` already false — an
+    // unguarded arrow branch would move menu focus mid-composition. Menu
+    // items are non-editable today; this pins the claim stays load-bearing
+    // if the menu ever grows a focusable text field.
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    fireEvent.compositionStart(menuItems[0])
+    fireEvent.compositionEnd(menuItems[0])
+    fireEvent.keyDown(document, { key: 'ArrowDown' })
+    // Declined: focus stays put instead of moving to the second item.
+    expect(menuItems[0]).toHaveFocus()
+  })
+
+  it('row-actions menu arrows enter the list when focus is outside it: Down to first, Up to last', async () => {
+    // Reachable edge: the fleet page polls, so an item holding focus can
+    // unmount mid-open and drop activeElement to <body>.
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    document.body.focus()
+    fireEvent.keyDown(menu, { key: 'ArrowUp' })
+    expect(menuItems[menuItems.length - 1]).toHaveFocus()
+    document.body.focus()
+    fireEvent.keyDown(menu, { key: 'ArrowDown' })
+    expect(menuItems[0]).toHaveFocus()
+  })
+
+  it('row-actions menu lets modified arrows through untouched (OS/browser shortcuts)', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    fireEvent.keyDown(menu, { key: 'ArrowDown', metaKey: true })
+    fireEvent.keyDown(menu, { key: 'ArrowDown', ctrlKey: true })
+    fireEvent.keyDown(menu, { key: 'End', altKey: true })
+    // Not the menu's keys: focus did not move.
+    expect(menuItems[0]).toHaveFocus()
+  })
+
+  it('selecting a row-actions menu item returns focus to the trigger', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    const trigger = screen.getByLabelText('More actions')
+    fireEvent.click(trigger)
+    const menu = await screen.findByRole('menu')
+    fireEvent.click(within(menu).getAllByRole('button')[0])
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
+    expect(trigger).toHaveFocus()
+  })
+
+  it('scroll-closing the row-actions menu restores focus to the trigger instead of orphaning it', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    const trigger = screen.getByLabelText('More actions')
+    fireEvent.click(trigger)
+    const menu = await screen.findByRole('menu')
+    // Focus-entry put focus inside the menu; a wheel scroll moves no DOM
+    // focus, so without the restore the unmount would drop focus to <body>.
+    expect(within(menu).getAllByRole('button')[0]).toHaveFocus()
+    fireEvent.scroll(window)
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
+    expect(trigger).toHaveFocus()
   })
 
   /* ─── Provision progress: expandable log panel + failure persistence ─── */
@@ -1150,6 +1424,7 @@ describe('DevFleetPage', () => {
       const u = typeof url === 'string' ? url : (url as Request).url
       if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET), { status: 200 }))
       if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/pod/provision/dismiss')) return Promise.resolve(new Response(JSON.stringify({ ok: true, dismissed: true }), { status: 200 }))
       if (u.includes('/pod/provision')) return Promise.resolve(new Response(JSON.stringify({ ok: true, run_id: 'run-f' }), { status: 200 }))
       if (u.includes('/run?id=run-f')) return Promise.resolve(new Response(JSON.stringify({ status: 'done', exit_code: 1, output: ['npm ERR! boom', 'FATAL: npm run build failed'] }), { status: 200 }))
       return Promise.resolve(new Response('{}', { status: 200 }))
@@ -1159,12 +1434,12 @@ describe('DevFleetPage', () => {
     fireEvent.click(screen.getByText('Provision'))
     // The persistent strip is proven by its dismiss button (the toast has no
     // this uniquely targets the persisted stepper) survives instead of vanishing.
-    await waitFor(() => expect(screen.getByLabelText('Dismiss provision status')).toBeInTheDocument(), { timeout: 4000 })
+    await waitFor(() => expect(screen.getByTestId('provision-error-unprov')).toBeInTheDocument(), { timeout: 4000 })
     // The log auto-expands on failure: a non-last output line shows in the panel.
     expect(screen.getByText(/npm ERR! boom/)).toBeInTheDocument()
     // Dismiss clears the persisted stepper and restores the Provision entry point.
-    fireEvent.click(screen.getByLabelText('Dismiss provision status'))
-    await waitFor(() => expect(screen.queryByLabelText('Dismiss provision status')).toBeNull())
+    fireEvent.click(within(screen.getByTestId('provision-error-unprov')).getByLabelText('Dismiss'))
+    await waitFor(() => expect(screen.queryByTestId('provision-error-unprov')).toBeNull())
     expect(screen.getByText('Provision')).toBeInTheDocument()
   }, 15000)
 
@@ -1240,7 +1515,7 @@ describe('DevFleetPage', () => {
     await waitFor(() => expect(screen.getByText('unprov')).toBeInTheDocument())
     fireEvent.click(screen.getByText('Provision'))
     // Ends in failure so the accumulated log auto-expands and persists.
-    await waitFor(() => expect(screen.getByLabelText('Dismiss provision status')).toBeInTheDocument(), { timeout: 10000 })
+    await waitFor(() => expect(screen.getByTestId('provision-error-unprov')).toBeInTheDocument(), { timeout: 10000 })
     // Both the earliest line (window 1, only ever in the first poll) and the
     // latest (final window) are present, proving windows were merged not
     // replaced. 'line-early-1' is unique to the panel; 'line-5' also shows in
@@ -1344,7 +1619,9 @@ describe('DevFleetPage', () => {
     expect(screen.getByText('Pruned 1 worktree(s)')).toBeInTheDocument()
     expect(screen.queryByText(/Prune: \d+ failed/)).not.toBeInTheDocument()
     // The forced name went out in force_names, not the regular names list.
-    expect(runBody).toEqual({ names: [], force_names: ['wt-kept'] })
+    // pruneExecute now always includes discard_untracked_paths as a MAP (empty
+    // here: wt-kept carries no untracked-only scratch classification).
+    expect(runBody).toEqual({ names: [], force_names: ['wt-kept'], discard_untracked_paths: {} })
   }, 15000)
 
   it('refetches the fleet with fresh=1 once a prune finishes', async () => {
@@ -1798,6 +2075,9 @@ describe('provision singleflight guard (issue #5294)', () => {
       const u = typeof url === 'string' ? url : (url as Request).url
       if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET_UNPROV), { status: 200 }))
       if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/pod/provision/dismiss')) {
+        return Promise.resolve(new Response(JSON.stringify({ ok: true, dismissed: true }), { status: 200 }))
+      }
       if (u.includes('/pod/provision')) {
         posts++
         return Promise.resolve(new Response(JSON.stringify({ ok: true, run_id: 'run-retry-' + posts }), { status: 200 }))
@@ -1816,9 +2096,9 @@ describe('provision singleflight guard (issue #5294)', () => {
     await waitFor(() => expect(screen.getByText('unprov')).toBeInTheDocument())
     // First click — provision fails.
     fireEvent.click(screen.getByText('Provision'))
-    await waitFor(() => expect(screen.getByLabelText('Dismiss provision status')).toBeInTheDocument(), { timeout: 6000 })
+    await waitFor(() => expect(screen.getByTestId('provision-error-unprov')).toBeInTheDocument(), { timeout: 6000 })
     // Dismiss the failure stepper.
-    fireEvent.click(screen.getByLabelText('Dismiss provision status'))
+    fireEvent.click(within(screen.getByTestId('provision-error-unprov')).getByLabelText('Dismiss'))
     await waitFor(() => expect(screen.getByText('Provision')).toBeInTheDocument(), { timeout: 3000 })
     // Retry — must succeed (guard was released in finally).
     fireEvent.click(screen.getByText('Provision'))

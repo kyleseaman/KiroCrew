@@ -218,6 +218,11 @@ and asymmetrically on purpose:
 - `_refresh_dynamic_fields()` **retracts** an entry a previous pass wrote while
   the gate was open, because a skip-only refresh would mean turning a feature off
   never reclaims the process turning it on started;
+
+`kirocrew doctor` is a third, read-only consumer: its MCP sections resolve the
+same registry gate (`cli_doctor._spec_gate_closed`) so a gated-off server's
+absence reads as informational rather than as a missing entry — the drift where
+doctor demanded what emission deliberately omitted was #6548.
 **The `@server` refs in `tools` / `allowedTools` are left exactly as they are.**
 Withholding the entry is the whole control: a `@server` ref resolves against the
 agent's own `mcpServers` plus the global `mcp.json`, so with no entry in either
@@ -263,7 +268,8 @@ signed in to, not a user preference, and because the client's filter is
 symmetric: outside registry mode a marked entry is the one that gets dropped.
 `command`/`args` stay either way, since the registry path is not the only
 consumer of this spec (doctor's handshake probe and the CC sidecar sync both
-launch from it). See
+launch from it — though doctor skips the probe for a server whose spec gate is
+closed, since no emitted spec defines it). See
 [../guides/enterprise-mcp-governance.md](../guides/enterprise-mcp-governance.md).
 
 `kirocrew-computer` carries **no `autoApprove` key and none may ever be added.**
@@ -330,7 +336,9 @@ Probes run from `POST /api/mcp/probe`:
   `declared` for the managed in-process fallback below). Both ride the cache
   into the API payload, so the UI can say *when* a status was true — the caches
   legitimately serve results up to their TTL, and an undated "Online" reads as
-  "now".
+  "now". A remote result may additionally carry **`authChallenge`** and, when
+  the grant lookup produced a verdict, **`authGrantPresent`**. Both ride the
+  same cache and are described with `needs_auth` below.
 - Timeout is `dashboard.mcp_probe_timeout_secs` (default 15s;
   `_PROBE_TIMEOUT_SECS` is the fallback if config is not loaded yet). Results
   are cached for `_PROBE_TTL_SECS` (1800s), after which status reads as
@@ -345,17 +353,112 @@ Probes run from `POST /api/mcp/probe`:
   excluded from the shared per-name probe cache, because a synthetic-identity
   handshake is a diagnostic and not the canonical observation the dashboard
   renders.
+- Remote header VALUES may carry `${VAR}`/`${env:VAR}` references — the
+  documented config form kiro-cli resolves at session runtime. The probe
+  resolves them through the gateway rewriter's declared-env expander
+  (`mcp_gateway.rewriter._expand_env_placeholders`): same regex, same
+  credential-filtered source view, and an unresolved reference stays literal —
+  so the probe presents the credential a session presents instead of sending
+  the reference as text and reporting the server's correct rejection as a
+  failing row. Probe-error redaction keys on the resolved values the probe
+  actually sent.
 - A remote server that answers the handshake with `401` — or with `403` carrying a
-  `WWW-Authenticate` challenge — and whose config has no static `Authorization`
-  header gets status `needs_auth` and an empty `error`, not `error`. The probe
+  `WWW-Authenticate` challenge — and whose sent headers carry no static
+  `Authorization` credential gets status `needs_auth` and an empty `error`, not
+  `error`. An `Authorization` value still carrying an unresolved `${VAR}`
+  reference (a missing or credential-filtered variable) supplied nothing, so it
+  does not count as a static credential here. The probe
   holds no OAuth token, because kiro-cli owns token custody
   ([design-notes/mcp-oauth-ownership.md](design-notes/mcp-oauth-ownership.md)), so
-  that answer carries no verdict on the server: an unauthorized server and one the
-  runtime calls successfully both return it. The dashboard renders `needs_auth` as
-  "Not verified" for that reason — naming an action the user may not need would
-  assert more than the probe observed. A `401` on an entry that DOES carry a static
-  `Authorization` header stays `error`: a supplied credential was rejected, which
-  is a real fault.
+  the status code alone carries no verdict on the server: an unauthorized server
+  and one the runtime calls successfully both return it.
+
+  **Two pieces of evidence split that ambiguity**, and the wording follows what
+  they support rather than the status code. The probe parses the challenge (a
+  Bearer challenge carrying a `scope` list or an https `resource_metadata` URL sets
+  `authChallenge`), and it stats kiro-cli's paired grant artifacts for the url to
+  set `authGrantPresent`. Three wordings follow, one per answer the pair supports:
+
+  | Evidence | Badge | Why |
+  |---|---|---|
+  | challenge, `authGrantPresent` false | **Sign-in required** | "Nobody has signed in" is observed, so the row names the action and states where it happens. |
+  | challenge, `authGrantPresent` true | **Signed in** (muted) | A grant artifact exists. The badge reports THAT, never that the server answers — the probe holds no token, so validity is the one thing it cannot check, and the hover says so. Toned muted rather than warn: amber is the panel's "act now" colour, and a resolved row wearing it is indistinguishable by colour from one that still needs a sign-in. |
+  | no challenge, or `authGrantPresent` absent | **Not verified** | An older gateway, or a bare `401`. Naming any state here would assert more than the probe observed. |
+
+  The middle row is what gives the guided sign-in an ending: without it a user who
+  followed the instruction landed back on the same badge they started from. It is
+  deliberately not "Online" — a stored grant is evidence a sign-in happened, not
+  proof it has not since been revoked, and only a probe carrying the runtime's
+  token could close that gap.
+
+  Reaching that ending is a VISIBLE instruction, not a hover. The panel is served
+  from the probe cache for the whole TTL, so a user returning from a completed
+  sign-in meets a row that still reads "Sign-in required"; if the "probe to
+  refresh" step lived only in the badge's `title` it would reach neither a
+  keyboard nor a touch user, at the moment of highest doubt. The cell carries one
+  clause, and the `title` carries the longer form naming the control and the state
+  the row lands in.
+
+  Grant-key derivation, paired artifact paths, and presence checks live in the
+  leaf `mcp_grant` module. The probe, connection mint, and persisted connection
+  status all consume that shared layout so a kiro-cli cache change cannot make
+  those surfaces disagree with one another. Its origin serialization matches
+  the Rust URL runtime at the byte boundary: Unicode domain names are
+  IDNA-encoded and IPv6 literals retain their brackets before hashing.
+
+  **`grant_presence()` is the single tri-state**, and there is deliberately only
+  one spelling of it. Each paired artifact is stat-ed exactly once and classified
+  by errno — the ENOENT family is a definitive absence, any other `OSError` is
+  "unknowable" — then the pair combines: either artifact definitively absent
+  decides it, any remaining failed stat makes it unknowable, otherwise present.
+  It is **not** built on `Path.is_file()`, and that is load-bearing rather than
+  stylistic: from Python 3.14 that method swallows every `OSError` and answers
+  `False`, so a permission error or a stalled mount would be indistinguishable
+  from "nothing was ever written". This package declares `requires-python >=
+  3.10` with no ceiling, so a build on 3.14 would silently collapse the middle
+  answer and tell the owner of an authorized server to sign in again — the exact
+  harm the three-valued design exists to prevent. Two spellings over the same
+  artifacts is how one of them loses that answer, which is why the probe and the
+  status module resolve through this one function.
+
+  **The grant stat is SEL-audited on whichever answer its caller acts on.** The
+  mint and the status module poll for a grant to *appear*, so only the positive
+  moves anything and only the positive is recorded — auditing each poll would
+  write one critical event per iteration of a single flow. The probe reads once
+  and renders either answer, and an absent pair is exactly what produces
+  "Sign-in required", so it passes `audit_absence=True` and the access leaves a
+  trail as `success` or `missing`. Opting in is the caller's, not the default's,
+  so a future polling caller cannot silently flood the log.
+
+  **Absence in the payload is meaningful, and the UI gates on an explicit `false`.**
+  `authChallenge` is omitted when the probe learned nothing about authorization.
+  `authGrantPresent` is omitted for that reason too, and *also* when the grant
+  lookup could not answer at all — a cache home that raises, such as a permission
+  error or a broken mount. Reporting an unanswerable lookup as `false` would tell
+  the owner of an already-authorized server to sign in again, so the three-valued
+  result is preserved to the wire rather than flattened. Each probe clears both
+  fields before it runs: the probe cache is keyed by NAME, so a row whose url was
+  edited would otherwise inherit the previous endpoint's verdict.
+
+  One degradation is NOT covered by that, and the limit is worth stating. The
+  lookup mirrors kiro-cli's own cache-key derivation and artifact layout, both
+  undocumented internals. If kiro-cli re-keys them, the stat succeeds against a
+  path that is simply absent, so the answer is `false` rather than unanswerable and
+  an authorized server reads "Sign-in required". That row does not recover on its
+  own: a second sign-in mints artifacts under the NEW key while Crew keeps stat-ing
+  the old one, so it goes on asking for a sign-in until the mirror here is
+  corrected. The recorded-hash tests pin the mirror only against itself, so the
+  drift would not fail in-repo either. Detecting it needs an observation of an
+  artifact kiro-cli actually wrote.
+
+  A `401` on an entry that DOES carry a static `Authorization` header stays
+  `error`: a supplied credential was rejected, which is a real fault. The
+  challenge is still recorded there, because "this server wants OAuth, so no
+  static header can satisfy it" is the actionable part of that failure. The GRANT
+  is not: `authGrantPresent` is read only by the "Sign-in required" wording, which
+  is gated on `needs_auth`, so looking it up on an `error` row would run a stat —
+  and let `grant_observed` write a critical SEL event — for an observation nothing
+  reads.
 - A probed stdio child that ignores a closed stdin costs
   `_PROBE_TEARDOWN_WAIT_SECS` twice (graceful wait, then again after SIGKILL)
   before the process-group reap, which is why that budget is a named constant
@@ -370,7 +473,9 @@ Probes run from `POST /api/mcp/probe`:
   debugging a server that was fine. `server.error` therefore leads with the
   machine-readable `mcp_probe_sandbox_unavailable:` prefix (mirroring the `code`
   field on dashboard JSON error bodies), states that the server itself may be fine,
-  and names the `agent.sandbox_allow_unsandboxed_exec` remedy. Because the cause is
+  and names the `agent.sandbox_allow_unsandboxed_exec` remedy (on Windows this
+  refusal means the key is declared `false` or a governance floor is pinned, since
+  the platform default permits the spawn). Because the cause is
   the HOST, it recurs identically for every server on every discovery cycle, so the
   remedy paragraph warns once per server name
   (`_warn_probe_sandbox_unavailable_once`) and demotes repeats to DEBUG.
@@ -478,12 +583,112 @@ reconcile that failed is reported in the danger tint instead of the usual
 user sees is not honesty — the sessions did restart, but against a config that
 may not match the sources, and that is the one thing the caller needs told.
 
+### Live reconcile: when no restart is needed at all
+
+kiro-cli 2.10.0+ watches `~/.kiro/agents` and `mcp.json` and reconciles a
+RUNNING session against an edit: only the changed servers restart, the
+conversation is kept, and the change applies at the next turn boundary. That
+makes the restart above redundant on that harness — it exists only to make
+kiro-cli re-read a file it already watches. `kiro_crew/mcp_hot_reload.py` owns
+the gate, and it is keyed to the processes actually running, never to the
+binary on disk: every live provider — the registered sessions plus the warm
+pool the reset would drain — must declare `LLMProvider.mcp_config_hot_reload`
+as a literal `True` (default `False`, harness-parity H14). `AcpProvider`
+answers it from membership in `ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD` (kiro-cli
+only — KAS gets its servers injected on `session/new`, claude reads no agent
+file) AND the `agentInfo.version` its own process reported at `initialize`
+being at or above `MCP_HOT_RELOAD_MIN_KIRO_CLI_VERSION`. That floor is
+2.21.0 — the release the reconcile semantics were observed on — not 2.10.0,
+where the watcher first shipped: a release in between keeps the always-correct
+reset until it is verified, because granting the skip to one that reconciles
+differently fails invisibly, and lowering the floor later is one line. The
+handshake version
+is what each process runs; after an in-place kiro-cli upgrade the file on disk
+is newer than every process spawned before it, so probing the file would answer
+for a version nothing is running. The gate fails CLOSED: one provider that has
+not handshaked, is below the floor, sits on another harness, or has not
+declared the capability at all resets everything as before. `POST
+/api/mcp/sync` consults it and, when it holds, touches no session —
+`sessions_reset: 0` is the observable outcome. With no live process at all
+there is nothing a reset could reach, so the answer is also to skip.
+`POST /api/sessions/restart` stays the unconditional manual path.
+
+The skip is inferred from that declaration, not observed: kiro-cli's
+`_kiro.dev/mcp/server_initialized` notification is the signal that a reconcile
+actually spawned the server, and the gate does not yet consult it. A watcher
+that fails at runtime therefore reads as success with nothing red; the
+troubleshooting entry below and the manual restart are the recovery, and
+confirmation-based hardening is a named follow-up.
+
+What the reconcile keys on shapes what the dashboard writes. An added, removed,
+or edited `mcpServers` entry is acted on; `disabled: true` stops the server's
+process and `disabledTools` hides a tool. A `@server` ref ADDED to `tools` is
+honoured from the next turn — so the sync's write order (entry, then ref) is
+fine. But a ref REMOVED while the server keeps running leaves its tools mounted,
+so dropping the ref is not a disable. The dashboard's disable path
+(`_sync_mcp_to_agent`, single and batch) therefore writes `disabled: true` onto
+the agent-file entry as well as removing the ref, and the enable path lifts it.
+The `disabled` in the kiro-global file cannot stand in: `includeMcpJson` is
+pinned false, so kiro-cli never reads that file. The marker also helps a cold
+session — a disabled server is no longer spawned only to sit unmounted.
+
 A probe that FAILS after the sanitizer stripped a declared env key names the key
 in its error (`_note_denied_env`). The sanitizer's own WARNING goes to the
 gateway log, which is not where someone staring at a red badge is looking: a
 Python server configured through `env.PYTHONPATH` fails the probe while working
 in a session, and unexplained that reads as a probe bug rather than the
 launcher boundary it is.
+
+### Which `mcp_gateway.*` knobs a config write reaches
+
+One knob is resolved per use rather than captured at boot, so a `config.json`
+write applies with no broker restart:
+
+- **`resolve_once_refresh_hours`** — `_mcp_resolve_refresh_secs()` reads the live
+  snapshot (falling back to a fingerprint-cached load before the watcher has
+  primed), so the pre-resolve loop's per-iteration re-read is a real re-read: a
+  longer or shorter window takes effect on the next pass. That is what makes the
+  loop's own documented promise true; it previously re-read the gateway's boot
+  copy, which never moved. It is read in the GATEWAY process, which is where the
+  config watcher runs.
+
+`response_spill_threshold_bytes` is read in the BROKER process
+(`gatewayd`), which runs no config watcher — `config.live.snapshot()` is always
+`None` there — so a per-use read of the live snapshot would be inert and the
+field stays boot-only (`RESPONSE_SPILL_THRESHOLD_BYTES`, resolved once at import:
+env pin `KIROCREW_MCP_SPILL_THRESHOLD` → config key → built-in 256 KiB), marked
+`restart=True` like the rest of the section. `read_buffer_limit_bytes` is boot-only
+for a second reason as well: it is handed to asyncio readers as `limit=` when they
+are CONSTRUCTED and cannot be changed afterwards. `socket_path`, `overlay_dir`,
+`idle_timeout_secs`, `max_backends`, `prewarm_count`, `stub_servers`,
+`poolable_servers`, `stub_overrides`, `pool_identity_env` and
+`forward_declared_env` ride the daemon's command line or size structures built
+once at spawn, so they too are marked `restart=True` in the config schema and
+apply to a broker started after the change.
+
+### Stub argument transport
+
+Generated overlays carry backend arguments as a base64url-encoded UTF-8 JSON
+string list in `--target-args-b64`. Pool-identity environment names use the same
+codec in `--pool-identity-env-b64`. The encoded alphabet contains no shell
+metacharacters: a Windows CLI can reparse the launch through `cmd.exe` without
+turning a delimiter into a pipeline. Empty arguments, Unicode and literal pipes
+retain their original boundaries. This is encoding, not encryption; arguments
+remain visible on the command line, and the longer representation still counts
+against the host's command-line length limit. On Windows, generation warns
+with the server name and command length when the base stub command reaches
+cmd.exe's 8,191 UTF-16-unit limit; it never logs the argument payload or rejects
+a launcher that can use a longer command. Per-session additions can grow the
+command further.
+
+The stub decodes before both fallback launch and command hashing. The rewriter's
+daemon target map decodes identically, preserving the hash used to select a
+backend. Encoded flags take precedence when present; malformed payloads fail
+rather than falling back to different arguments. Legacy `--target-args`,
+`--pool-identity-env` and `--target-args-sep` remain readable. Rewriter fingerprint
+schema 4 regenerates cached delimiter-based overlays on upgrade. Upgrades must
+keep the rewriter and stub from the same package; an older stub cannot consume
+the new flags.
 
 ## How app agents reach MCP servers
 
@@ -563,7 +768,26 @@ Managed servers, registered by `agent._MANAGED_MCP_SERVERS` and installed into
 | `kirocrew-cron` | `kirocrew mcp-cron` (`mcp_cron.py`) | `cron_add`, `cron_list`, `cron_update`, `cron_remove`, `cron_remove_all`, `cron_pause`, `cron_resume`, `cron_trigger` |
 | `kirocrew-core` | `kirocrew mcp-core` (`mcp_core.py` + `mcp_tools/`) | spawn/subagent, learn, task, messaging, artifact, workflow, knowledge and session-directive tools (see below) |
 | `kirocrew-computer` | `kirocrew mcp-computer` (`mcp_computer.py`) | `computer_list_apps`, `computer_launch_app`, `computer_get_state`, `computer_click`, `computer_drag`, `computer_type_text`, `computer_press_key`, `computer_set_value`, `computer_scroll`, `computer_perform_action`, `computer_end_turn` |
-| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_move_session` |
+| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_move_session`, `chat_folder_file_self`, `session_create`, `session_send`, `session_read_message`, `session_stop`, `session_close` |
+
+`kirocrew-dashboard` is one transport carrying **two** authorization models, which is
+what makes its assignment decision larger than its name suggests. The
+`chat_folder_*` verbs are bounded by RESOURCE ownership — a folder created by an app
+carries it in `owner_app`, and an app may reshape only its own. The `session_*` verbs
+are bounded by CALLER class instead, and one of them (`session_send`) writes a turn
+into another session's conversation; [session-control.md](../system-specs/modules/session-control.md)
+is their spec and carries that reasoning.
+
+The consequence to know before granting: an agent handed the whole server for folder
+organization has the session verbs too. Whether they prompt depends on how the grant
+is spelled — `_mcp_pattern` maps a bare `@kirocrew-dashboard` entry to a one-level
+glob, so it auto-approves all ten, while naming tools individually leaves the rest
+to `hooks.on_tool_call`. `_CONDUCTOR_DASHBOARD_GRANTS` and
+`_MEMBER_DASHBOARD_GRANTS` (`agent.py`) are the shipped examples of the individual
+form, and they differ from each other on exactly this axis: the member's list
+includes `session_send` and `session_stop` because `authorize_target` refuses a
+member caller on any session it did not create, and the conductor's withholds them
+because it has no such fence.
 
 CLI commands and their MCP twins:
 
@@ -584,6 +808,27 @@ CLI commands and their MCP twins:
 | `kirocrew learn remove` | `learn_remove` | `kirocrew-core` |
 | `kirocrew run TASK.md` | `task_run` | `kirocrew-core` |
 | `kirocrew computer apps` | `computer_list_apps` | `kirocrew-computer` |
+| `kirocrew knowledge dedup` | `knowledge_dedup` | `kirocrew-core` |
+| `kirocrew knowledge stats` | `knowledge_list_sources` | `kirocrew-core` |
+
+The last row is the one place a twin does not share its command's name, and it is
+a placement decision rather than an oversight. A tool in `kirocrew-core` costs
+context in every request of every session for as long as the session lives, so a
+fifth knowledge tool would be advertised forever to answer a question
+`knowledge_list_sources` was already 90% of: it opens the same store, over the
+same active-items rule, to serve the same "what is in this library" purpose. The
+aggregate is a strict superset of what its own query already computed, so it
+lands as a leading totals line on that tool instead, and the CLI verb and the
+tool render ONE `aggregate_stats()` call.
+
+The rule the MCP-first section states is that the model must get a structured
+tool rather than a bash-shaped CLI command — the model has one. Two conditions
+have to hold for that reading to be honest, and both are checked in
+`test_knowledge_stats.py`: the tool must actually surface the numbers (its
+descriptor advertises them, so deferral still selects it), and the capability
+must not be one an agent should be granted SEPARATELY, which would make it a
+`kirocrew-dashboard`-shaped opt-in server instead. It is not: anyone who may list
+sources already reads this data from that store, so the counts add no reach.
 
 `kirocrew-core` tools with no CLI twin, grouped by concern (authoritative list:
 `kiro_crew.mcp_tools.build_tool_list()`, which is what `mcp_core._list_tools`
@@ -592,9 +837,14 @@ answers `tools/list` from):
 - **Subagents:** `spawn_status`, `spawn_continue`, `spawn_steer`,
   `spawn_release`, `spawn_sub_agents`, `wait`
 - **Messaging and notification:** `send_message`, `send_notification`,
-  `delete_message`, `file_send`, `read_slack_profile`. `send_message` is the
-  agent's only proactive egress, and it names its destination rather than
-  inferring one: `session="slack"` / `channel` / `user` / `thread_ts` are the
+  `delete_message`, `update_message`, `file_send`, `read_slack_profile`.
+  `send_message` is the agent's only proactive egress to a NEW destination —
+  `update_message` rewrites a Slack message the bot itself already posted, on the
+  same gate ladder (strict identity, channel-agent containment,
+  `capabilities.messaging` and the `channels` scope for `"slack"`), because an
+  edit publishes new text to an audience rather than retracting what it has.
+  `send_message` names its destination rather than inferring one:
+  `session="slack"` / `channel` / `user` / `thread_ts` are the
   Slack fields, and `channel_type` is the non-Slack one — the transport of the
   conversation the calling session already belongs to. Exactly one of the two
   families may appear per call. The routing ladder and the fail-closed contract
@@ -605,15 +855,36 @@ answers `tools/list` from):
     over.** The `channels` scope is a per-transport allowlist, so vetting
     `"slack"` for a Telegram send evaluates a Telegram denial against Slack's
     rule — and refuses a permitted Telegram send whenever Slack is denied.
-  - **`channel_type` is the one `send_message` argument that requires
-    `_resolve_session_key_strict()`.** It posts into one specific conversation,
+  - **`channel_type` is the one `send_message` argument that requires strict
+    identity (via `require_strict_session_key`).** It posts into one specific conversation,
     which is the "targets a specific session" case below; the lenient walk
     climbs process ancestors, so a sub-agent would resolve to its parent and
     deliver into the parent's chat window. An unresolvable identity refuses the
     call rather than guessing.
 - **Session-bound directives** (`session_directive.DIRECTIVE_TOOLS`):
-  `ask_question`, `suggest_followup`, `monitor_start`, `monitor_update`,
-  `autonudge_stop`, `set_project`
+  `ask_question`, `suggest_followup`, `monitor_start`, `monitor_watch`,
+  `monitor_update`, `monitor_stop`, `autonudge_stop`, `set_project`,
+  `reset_conversation`
+- **Memory recall (V1 and V2):** `memory_recall` resolves authenticated session identity
+  once through `require_strict_session_key` and passes that same identity to the gateway.
+  Missing identity returns the shared gate's refusal and installation diagnosis.
+  It accepts a task query,
+  never a store selector. The gateway resolves the caller's bound V1 or private V2 memory
+  and returns bounded context with evidence; unavailable identity or memory
+  refuses the call. The MCP response keeps each selected body once in a trusted
+  reference context, with body-free evidence carrying stable references, scores,
+  provenance and truncation flags. UI previews are not model output. A call-local
+  projection and final serializer enforce the 3,000-character context limit and
+  16 KiB memory-result budget after redaction, including nested JSON escaping and
+  TextContent overhead with a 1 KiB reserve for normal RPC framing/IDs. This
+  projection retains no caller or session state in the MCP process. Arbitrarily large caller-supplied IDs are outside that bound.
+  Prompt construction does not perform embedding search;
+  the tool is called when earlier facts or experiences are needed. Owner-selected copying is a dashboard action, not an MCP
+  capability. The full contract is in
+  [memory](../system-specs/modules/memory-skills-hooks.md#member-memory-experience-and-lifecycle).
+- **Monitor read:** `monitor_inspect` (strict authenticated session
+  identity only; no ancestor fallback; reports a structured monitor or a legacy
+  timer loop's presence reading, whichever the session holds)
 - **Crew routing:** `select_crew`
 - **Sessions and history:** `list_sessions`, `get_chat_session`,
   `search_chat_history`
@@ -623,12 +894,37 @@ answers `tools/list` from):
   `artifact_folder_rename`, `artifact_folder_move`, `artifact_folder_delete`,
   `artifact_get_comments`, `artifact_post_comment`, `artifact_reply_comment`,
   `artifact_delete_comment`, `artifact_mark_review`, `deploy_artifact`
-- **Knowledge and skills:** `local_knowledge_search`, `knowledge_dedup`,
-  `knowledge_list_sources`, `skill_discover`, `skill_search`, `skill_fetch`,
-  `browse_outline`, `browse_search`
+- **Knowledge and skills:** `local_knowledge_search`, `knowledge_add_document`,
+  `skill_discover`, `skill_search`, `skill_fetch`,
+  `browse_outline`, `browse_search`. (`knowledge_dedup` and
+  `knowledge_list_sources` have CLI twins — see the table above.)
 - **Workflows and hooks:** `workflow_author`, `workflow_list`,
   `workflow_cancel`, `workflow_rerun_subtree`, `register_hook`
-- **Diagnostics:** `resource_status`, `issue_radar_record_investigation`
+- **Diagnostics:** `resource_status`, `issue_radar_record_investigation`,
+  `kiro_cli_logs` — a redacted tail of kiro-cli's own mcp/lsp protocol logs, so
+  the agent can self-diagnose a rejected turn. Reads log files only: never the
+  fenced identity/token stores, and never the conversation-bearing sources
+  (`kiro-chat.log`, session transcripts), each of which is one shared host file
+  per gateway that would disclose another session's conversation. That scope
+  holds only while mcp.log / lsp.log record protocol traffic rather than full
+  frame bodies, since they share the chat log's single-fixed-path,
+  all-sessions-interleaved shape and an MCP `tools/call` frame carries
+  conversation-derived arguments. Measured on kiro-cli 2.21.1: mcp.log is empty
+  across a session of continuous MCP tool calls, every lsp.log record is a
+  single-line `<timestamp> ERROR <module>: <message>` with no JSON-RPC envelope
+  and a longest line of 313 bytes, and sentinel strings passed as tool-call
+  arguments appear in neither file. Because that measures one version of a
+  component this repo does not pin, a source whose text carries serialized frames
+  is REFUSED whole and visibly, so a kiro-cli that starts logging payloads
+  surfaces as a refusal instead of a silent widening
+
+  Once private memory boundaries exist, `kiro_cli_logs` requires a strict caller
+  identity whose canonical memory scope is Global V1 before opening these shared
+  host logs. Private, missing, invalid, or unreadable identities receive a stable
+  refusal and a `denied_memory_scope` audit attempt; audit failure cannot permit
+  a read. Redaction does not establish which member owns ordinary log prose.
+  Pure V1 installations retain the existing diagnostics contract, and this MCP
+  admission guard does not change user-requested diagnostic bundles.
 - **App bridges (credentialed):** `ops_mission_control_api` — the MCP server
   process holds the gateway's internal secret and forwards only a frozen
   (method, path) allowlist of Ops Mission Control routes; the agent never
@@ -793,6 +1089,107 @@ the tool layer could only drift or race. What the tool layer still decides is th
 one question the endpoint cannot: whether the caller can be placed at all, since
 an unverifiable or delegated caller has no scope to bound a write to.
 
+**Filing your own session is a separate verb, `chat_folder_file_self`, because
+the grant is name-scoped.** `chat_folder_move_session` takes its target from an
+argument, so it is the one dashboard tool that writes a session OTHER than the
+caller's, and the conductor agents keep it behind an approval: they ingest
+untrusted content on unattended cycles, and `allowedTools` can name a tool but
+not an argument. That left the conductor unable to file ITSELF without a prompt,
+so it floated at the top level while its workers sat in the goal's folder.
+`chat_folder_file_self` has no `session` argument — the target is resolved from
+the verified caller key (`_own_chat_slot`: only a `dashboard:<slot>` key
+qualifies, because the slot key is stable for the tab's life while a
+channel- or cron-bound slot's `linked_session_key` can be rebound between the
+read and the write, so matching on it could file a different conversation;
+a private session and a crew member's pinned DM thread are refused too) — so the one
+placement it can write is the caller's own, which is exactly the placement the
+conductor grant invariant (create or read, never mutate what is not your own)
+admits. It resolves `folder` with `mkdir -p` semantics behind the same
+tree-shaping gate as `session_create`'s `folder`, and PATCHes the same
+`/api/chat/slots/<slot>/folder` route under the gate's verified key, carrying
+the slot's `created` stamp as `expected_created`: the endpoint's own identity
+re-check covers its own awaits, but the tool resolves the slot in an EARLIER
+request, and a tab that closes and is recreated under the same key in that gap
+would share the `dashboard:<key>` transcript key — so the endpoint refuses (409
+`session_gone`) when the token does not match the live slot's `created_at`. The
+conductors call it once in their first turn, then create every worker with
+`folder="<goal>/<agent>"`, giving one heading per goal with the conductor
+directly under it and one subfolder per agent kind.
+
+**Position is the one folder write the tool layer has to compose.** A folder's
+place among its siblings is an `order` int the endpoint stores verbatim and never
+renumbers, so there is no single value a caller could compute — which is why
+`chat_folder_move` takes `before`/`after` naming a SIBLING rather than a number.
+Most placements are still ONE write: when the store already has a free integer
+slot at that position — ahead of the first sibling, past the last, or in a gap a
+delete left behind — only the moved row is written, so the reposition cannot land
+half-applied. Only two neighbours holding adjacent integers, which is what a
+sidebar drag leaves behind, force the siblings to be renumbered; that renumber is
+contiguous from 0, the same values `computeReorderedFolders` writes, so the two
+paths leave one convention in the store instead of two.
+
+An anchor may stand in for `new_parent` because an omitted `new_parent` means the
+top level: without that, ordering a folder inside a folder would be
+inexpressible, since every call would drag it out to the root as the price of
+positioning it.
+
+Composing writes is where an app's confinement needs a rule the endpoint cannot
+state. The endpoint judges each PATCH on its own, so an app whose placement needs
+a renumber would have its first write accepted and a later one refused, leaving
+the person's sidebar in an order nobody chose and nothing to roll it back with.
+So the tool layer checks the WHOLE renumber against the caller's ownership before
+the first write and refuses the call intact — the only folder rule this layer
+decides, and it decides it because atomicity across several endpoint calls is a
+property only the caller can hold. A one-write placement is not gated: it touches
+the app's own row only, and the endpoint judges that write as it judges any other.
+
+The renumber path keeps one accepted residue. Several single-row writes cannot be
+made atomic from here, so a transport failure partway through leaves the
+destination's siblings carrying a mix of old and new numbers until the call is
+re-run — a display sequence, reported to the caller, over a field whose duplicates
+and gaps are already legal and already tie-broken by name. The sidebar's own drag
+has the same shape today, firing one `updateChatFolder` per changed folder with no
+transaction. Closing it for both paths needs a bulk order write that applies under
+the folder-store lock, which is a change to the store's API rather than to this
+layer.
+
+A second accepted residue sits on the read side. `GET /api/chat/folders` returns
+stored rows verbatim — the store's loader validates `id` and nothing else — so both
+readers of that response separately coerce `order` to a clamped integer and `name`
+to a string before comparing. That value-cleaning is duplicated in two languages
+because it happens in two consumers rather than once in the producer, and
+normalizing on the way out would delete it from both. Deferred rather than done
+here: this endpoint is shared by more consumers than the two that sort with it, and
+the change belongs with the store's API alongside the bulk write above. What such a
+normalization would NOT remove is the comparison itself — Python orders strings by
+code point where JavaScript orders by UTF-16 code unit, so the tool encodes
+`utf-16-be` to compare as the sidebar does, and no shape of producer output makes
+one language's comparison operator equal the other's.
+
+Neither side folds case. `str.lower()` reads the interpreter's Unicode tables and
+`String.prototype.toLowerCase` reads the browser's, so a character whose case
+mapping differs between those two versions folds differently on each side, and
+neither side owns both tables — the skew is unclosable in this layer rather than
+merely unlikely.
+
+`A`-`Z` folds anyway, through a literal 26-entry table in the tool and `+32`
+arithmetic on the code unit in the sidebar. That range's mapping is fixed in every
+Unicode version published, so folding it adds no version dependency, and it is worth
+folding because the name is not always merely a tie-break: a store written before
+`order` existed carries no `order` on any row, so every sibling ties at 0 and the
+name decides that whole sidebar. Raw code-unit order would render those
+uppercase-first until the first drag renumbered them.
+
+`chat_folder_tree` lists folders in that same stored order rather than by path,
+because it is what an anchor is picked from — an alphabetical listing would show a
+sequence the person never sees and make every `before`/`after` a guess. The
+comparator is `order` then name, and both sides read a missing `order` as 0:
+`folderTree.bySidebarOrder` for every surface that draws siblings, and
+`_chat_folder_order` for the tool. A folder written before the field existed
+carries no `order` at all, so a comparator without that coercion would compare
+`NaN`, fall through to its tie-break, and show the agent a different sequence than
+the person sees.
+
 Moving the decision to the endpoint makes the write's IDENTITY load-bearing, so
 the gate returns the key it verified and every folder write sends that key
 unchanged. The write helpers default to `_resolve_session_key`, whose `/proc`
@@ -858,6 +1255,24 @@ model launder one per-call gate decision into many, so do NOT add
 
 ## MCP tools MUST be stateless
 
+Private member runtimes keep the data home read-only even when MCP backend
+sharing is disabled. The direct `kirocrew-cron` server uses the private runtime
+marker only to select `POST /api/crons/tools`; it never falls back to opening
+`crons.json` or `.crons.lock` in the sandbox. The endpoint requires authenticated
+internal transport, verified process or delegated-proof identity matching the
+session header, and agreement between the protected process store and the
+session's validated private member binding. A marker, shared secret or session
+header alone grants no member authority.
+
+The host runs the same argument validation, cron ownership, governance and
+deterministic-job checks as the regular MCP tool dispatcher, in a worker with a
+request-scoped `CallerContext` that is restored even on failure. Private agent
+jobs remain usable through add/list/update/pause/resume/remove; private command
+and script jobs retain their explicit refusal. Transport failures never trigger
+a file-write fallback or an automatic mutation retry; an uncertain response asks
+the caller to inspect `cron_list` before retrying. Global V1 direct runtimes retain
+their existing local cron dispatch.
+
 **A new `kirocrew-core` or `kirocrew-cron` tool MUST NOT keep per-caller or
 per-session state in the MCP-server process. Resolve the caller's identity on
 every call and keep authoritative state in the gateway.**
@@ -876,8 +1291,11 @@ Two failure modes follow.
 backend: the warm pool spawns with an empty key, and a sub-agent inherits its
 parent's tree. `mcp_core.py` offers two resolvers:
 
-- `_resolve_session_key_strict()` for **anything that mutates or targets a
-  specific session** (post to a slot, change its state, deliver a callback). It
+- `_resolve_session_key_strict` for **anything that mutates or targets a
+  specific session** (post to a slot, change its state, deliver a callback) —
+  reached ONLY through `require_strict_session_key()`, the shared fail-closed
+  gate every reflexive tool module routes through (`REFLEXIVE_TOOL_MODULES`
+  enumerates them; a ratchet test rejects direct calls outside `mcp_core`). It
   accepts only the gateway-injected caller context (`mcp_caller.current_caller()`,
   which gatewayd stamps on every forwarded frame after stripping any
   client-forged `kirocrew.caller` block), the injected `KIROCREW_SESSION_KEY`, or
@@ -890,11 +1308,127 @@ parent's tree. `mcp_core.py` offers two resolvers:
 - `_resolve_session_key()` (lenient, still walks ancestors) is only for read-only
   and telemetry callers where misattribution is harmless.
 
-An unresolved key is not automatically a refusal. `mcp_computer.py` forwards an
-empty key and lets the call proceed, because neither strict source exists for a
+**What names a session on the stub path: the stub session token.** The injected
+caller context above is the only identity channel a pooled backend has, and every
+input gatewayd had for building it answered per RUNTIME, not per session: the
+stub's own self-report (its `KIROCREW_SESSION_KEY` or `session_pid_<pid>.txt`
+walk), gatewayd's own SO_PEERCRED `/proc` walk, and claim-push, which re-targeted
+every connection indexed under a runtime PID. One kiro-cli process hosts N ACP
+sessions, so all three answered with the parent slot for a `spawn_run` subagent's
+stub, and a parent re-claim overwrote whatever a subagent had. So Kiro Crew mints
+one unguessable token per ACP session (`claim.mint_stub_session_token`), puts it
+in the `env` of that session's injected stub entries
+(`session_servers.attach_stub_session_token`), and remembers it on the session
+handle. The stub returns it on its `register` frame as a sibling field — never a
+`PoolKey` dimension, which would make every session's backend private and turn
+pooling into a no-op — and `claim` frames carry it too. gatewayd then keys claims
+by `(pid, token)`: a claim re-targets the connections carrying its token, plus any
+connection carrying none, and a claim with NO token re-targets every connection
+under the PID exactly as before, which is what a stub launched from a
+hand-written config or an older overlay still needs.
+
+**The token narrows within a runtime; the runtime bounds who may present the
+token.** A claim binds the token together with the PID it named, and a register is
+answered from that binding only when the same PID is in the chain gatewayd walks
+from the **SO_PEERCRED peer pid** — never the stub's self-reported
+`ancestor_pids`. That distinction is the whole value of the second factor: the
+register frame is peer-supplied in full, so an actor who has read another
+session's token out of `/proc/<pid>/environ` (readable at the operator's own uid)
+can equally name that session's runtime in its own chain, and one actor would then
+satisfy both halves. The peer pid comes from the kernel and the walk is gatewayd's
+own, so the registrant cannot author it. The self-reported pids stay in the claim
+INDEX, where they are harmless: a claim only ever narrows to connections carrying
+its own token or none. A connection whose ancestry the kernel did not attest loses
+the register-time shortcut, not its identity — claim-push still reaches it through
+the index. (What a same-uid process can assert on the register frame itself is a
+separate, pre-existing question — a tokenless register's self-reported
+`session_key` is believed as it always was.)
+
+**A token nothing has claimed is refused, not resolved.** A binding outranks both
+process-tree sources at register time, and where no claim has named the token yet
+the connection stays identity-less — the stub's own self-report and the peer walk
+are not consulted, and neither is the stub-initiated `recaller` frame, whose key
+comes from the same walk. The refusal cannot be made conditional on some sibling
+session happening to be named: an empty binding table is the state a fresh daemon,
+a respawn and an evicted binding all share, and in each of those the tree answer
+would hand a subagent its parent's session. What repairs a deferred identity is
+the owning session's own claim — pushed before `session/new` where the owner is
+known, at `rekey()` on a pooled claim, and after `new_conversation` re-launches a
+worker's stubs.
+
+**And re-pushed at the start of every turn**, which is what re-binds a token whose
+daemon restarted under it and bounds that outage to the turn it happened in. Two
+places do it, because no single one sees every session: the shared identity
+publisher (`messaging/identity.py`, the same boundary that rewrites
+`session_pid_<pid>.txt`) covers each surface that drives a user turn, and
+`AcpSessionProvider.stream` covers the sessions no surface publishes for — which
+is where a subagent's turns live, the session type the token exists to protect.
+
+A claim carries a session key or gatewayd discards it, so every provider is told
+which session it serves when it is CONSTRUCTED rather than only at `rekey()`: that
+is a warm-pool event, and a cold start (pool miss, pooling off, a subagent's own
+session) reaches it never. A provider that learned its key there would re-claim
+with an empty one, which is rejected as malformed before the binding is recorded —
+so the token could never be re-bound and the session would stay identity-less for
+the rest of its life rather than for one turn.
+
+The token is a bearer name for a session's identity, so it is never logged, never
+in `stats()`, and stripped from the register payload before the prewarm recorder
+can persist it.
+
+`register_hook` also resolves through `require_strict_session_key`. Legacy
+Global hooks can still be registered without a conversation; private hooks
+require the gateway-authenticated caller and its protected member binding before
+any private identity is written to the hook session.
+
+Private Memory V2 requires **member authority**, independent of the shared
+internal secret or a claimed session header. Private ACP clients use direct MCP
+servers inside the member sandbox. They discard the shared broker overlay and
+socket before creating or resuming sessions, so reload and tool mirroring cannot
+restore pooled stubs. The sandbox withholds shared broker endpoints and their
+aliases. An older broker must not act as a host proxy for a private member.
+Global V1 retains its existing pooled MCP path.
+
+For calls that reach the current broker, gatewayd captures the accepted
+stub socket's kernel peer PID after a positive owner check, then offloads
+`issue_member_session_proof` immediately before each `tools/call` and `tools/list`. The issuer
+checks the protected published runtime binding and actual process ancestry;
+the Register payload's `ancestor_pids` never grants this authority. Gatewayd
+strips the client's caller block and injects a fresh optional `memberMemoryProof`
+inside its own caller metadata. `CallerContext.member_memory_proof` is omitted
+from diagnostic representations and never populated from environment fallback.
+The shared MCP server forwards only the current invocation's proof in
+`X-Member-Session-Proof`, including the managed-tool policy lookup. A listing
+received while another tool runs uses the listing's own caller and proof.
+Signed proof protocol version 2 remains valid for the originating process
+incarnation, so long `wait` and `spawn` calls retain their own callback authority.
+Every use revalidates the signature, live PID/start identity, protected session
+and store, durable session binding, and current Linux user/mount namespaces or
+macOS inherited sandbox state. An unavailable check refuses authorization.
+Legacy proof protocol version 1 keeps its original 60-second expiry. These are
+transport protocol versions, independent of Memory V1 and Memory V2.
+No proof is cached on a connection or replayed with backend recovery.
+Before forwarding either tool method, gatewayd also
+resolves the protected peer when the caller block is absent: a missing or forged
+session, corrupt binding, or failed proof for a protected runtime refuses that
+invocation outright. Omitting the proof must never downgrade the member into a
+global V1 caller inside the shared backend. Only a genuinely absent protected
+binding retains the legacy unowned V1 behavior.
+For an unpooled MCP process, `CallerContext.from_env()` likewise resolves the
+readonly protected ancestry before any cached legacy identity or environment
+value. It does not cache private results, so rekeys remain visible. A corrupt
+protected record returns an unresolved identity without trying legacy sidecars.
+The caller, recaller and backend-forwarding suites pin forgery removal,
+offloaded per-call issuance and concurrent caller isolation.
+
+An unresolved key is not automatically a refusal. `mcp_computer.py` forwards a
+namespace-only key (`unresolved:<shim pid>`, plus the gateway's per-connection
+nonce when there is one) and lets the call proceed, because neither strict source
+exists for a
 GUI-launched kiro-cli on macOS, so gating on identity would make the feature
 unusable on its only supported platform. What is lost there is audit
-*attribution*, not a control: the trail records an empty key, which is honest,
+*attribution*, not a control: the trail records a key the prefix marks as
+unresolved, which is honest,
 where the lenient walk would have recorded a forgeable one.
 
 **2. State belongs in the gateway.** The tool should be a thin forwarder: resolve
@@ -920,7 +1454,8 @@ and let a sub-agent's card land in its parent's slot.
 
 **Return a session directive and let the session-aware consumer apply it.** This
 is what the `ask_question` MCP tool itself now does, along with `monitor_start`,
-`monitor_update`, `autonudge_stop`, `set_project` and `suggest_followup`
+`monitor_watch`, `monitor_update`, `monitor_stop`, `autonudge_stop`, `set_project`
+and `suggest_followup`, and `reset_conversation`
 (`session_directive.DIRECTIVE_TOOLS`). The tool validates its arguments and
 returns a human-readable confirmation plus a marker line carrying the validated
 payload and **no session key**. `dashboard/chat_runner`'s tool-result handler
@@ -946,6 +1481,100 @@ framing token must not depend on characters that sanitizers and normalizers
 legitimately rewrite. `encode()` refuses above `MAX_DIRECTIVE_CHARS` (3800), under
 the ACP tool-result truncation bound, so an oversized payload fails loudly
 instead of losing its trailing marker.
+
+A tail-anchored marker must survive delivery, and a rejection must not be able to
+carry one. `validate_tool_args` reports an unknown field by echoing the argument
+NAME, which the model chooses, so that name is the injection point for both
+problems. A name carrying the sentinel plus a JSON payload plus a newline made the
+REJECTION string decode as a genuine directive under the real tool's authenticated
+identity — applying the arguments validation had just refused — so every place
+`mcp_shared` builds an `"Error: …"` result passes the interpolated text through
+`session_directive.neutralize_markers`. That defanging is applied only where the
+caller KNOWS the string is not a directive: doing it centrally over every tool
+result would defang the real marker too. Separately, a 9,000-character name
+produced a result whose refusal tag the transport cut removed, and the decline read
+as a lost marker again — `tag_refusal` elides the middle of an over-long text
+against `MAX_TOOL_RESULT_CHARS`, the single constant `acp/_dispatch.py` slices on.
+That bound alone is necessary but not sufficient, because the cut runs AFTER
+redaction and redaction GROWS text (a credential becomes a longer placeholder,
+measured 7,999 chars in and 8,755 out), so `preserve_tail_marker` re-attaches a
+marker the cut removed — the same re-injection the MCP App render marker already
+gets at that seam, for the same reason: a control token that decides how a frame is
+interpreted must not be a casualty of a length cut applied to the frame's prose.
+
+**A directive tool's result either carries the marker, or it is a tagged
+refusal — nothing in between.** The consumer cannot otherwise tell a decline from
+a marker destroyed in transport: both decode to "no directive", but only the
+second is a bug, and the diagnostic for the second is a WARNING
+(`session-directive decode FAILED … effect dropped`) whose whole purpose is to
+catch a rawOutput-envelope escaping regression. So every marker-less return is
+stamped with `_REFUSAL_SENTINEL` and reported at INFO as
+`session-directive REFUSED`: `encode()` stamps its own oversized-payload refusal,
+and `mcp_core._call_tool` stamps the rest via `refuse_if_markerless()`. That
+second producer sits at the OUTERMOST return because argument validation runs in
+the dispatch wrapper *ahead of* the handler, so a schema rejection never reaches
+code inside the tool that could tag itself. Tagging is diagnostic only and keys on
+the tool name alone: the token carries no payload and grants no effect, so it can
+change how a line is logged and never what is applied. Two consequences for a tool
+author — a directive tool must RETURN its declines rather than raise them (an
+exception escapes this return path and reads as a lost marker), and a caller that
+sees `decode FAILED` is looking at a transport bug or at a handler that crashed --
+the line names both, because a crash also drops the effect and asserting only the
+transport cause sends an operator hunting a regression that is not there.
+That first rule is enforced rather than left to convention: a parametrized test
+drives every name in `DIRECTIVE_TOOLS` with a hostile call and asserts the result
+is a marker or a tagged refusal, and its companion asserts the table covers the
+frozenset, so a new directive tool fails until it is added. The one raising
+dependency these handlers share, `parse_github_pull_request_target`, is reached
+through a single guarded seam (`_parsed_pull_request_target`) for the same reason
+-- guarding its two call sites independently is how the second one came to ship
+unguarded.
+
+`FieldSpec.clamp_to_max` is the other half of that: an over-long argument used to
+be able to defeat the request it was only describing. `autonudge_stop` and
+`monitor_stop` both take a `reason` that selects no behaviour — the applier just
+interpolates it into the outcome text and the persisted stop record — so their
+`reason` is TRUNCATED to the cap instead of rejecting the stop, and the truncated
+value carries a `[... truncated, dropped N chars]` note so the cut is visible
+wherever the value travels. `N` counts what THAT cut dropped, including the note's
+own cost — deliberately not the caller's original length, which the clamp cannot
+know because the field is sanitized before the cap is checked, so one number
+cannot honestly stand for both removals. Opt-in per field, and never for a field
+the handler acts on: a truncated control input is a wrong control input, and
+rejecting is the only safe answer there.
+
+Structured monitoring deliberately splits mutation from inspection.
+`monitor_watch`, `monitor_update`, and `monitor_stop` are directives: the
+consumer applies them to its authoritative session, so their payloads contain
+neither a session key nor a loop id. `monitor_inspect` needs a result in the same
+turn and therefore calls the session-bound read route only after
+`require_strict_session_key()` resolves, passing that exact key to `_get`.
+It projects that response into bounded agent-oriented state (check counts and
+accepted wake count, plus only a small failed/pending/unknown name sample),
+omitting wake instructions and browser/persistence internals. Inspection reports
+unavailable when strict identity is absent; it never falls back to the
+process-ancestor resolver. Every structured-monitor tool refusal caused by a
+missing or unsupported session binding returns an `Error:` result and writes an
+explicit `denied` SEL event; the shared MCP wrapper therefore records the call as
+failed rather than completed. The structured tool exposes no caller-declared
+evidence scope: requests that need comments or advisory findings route directly
+to the finite legacy tool whose agent turn can inspect them.
+Structured creation is admitted only from dashboard, Slack, and Discord sessions,
+the surfaces with typed wake dispatch and completion correlation. Webex retains
+finite legacy prompt loops but refuses `monitor_watch` at both the stateless tool
+and authoritative consumer boundaries.
+The legacy `monitor_start` descriptor routes supported pull-request readiness
+through `monitor_watch` only when typed provider facts fully determine the
+objective. Objectives that require interpreting comments or advisory review
+evidence keep a finite legacy loop instead of claiming the structured probe
+observes those facts.
+
+`monitor_watch.kind` is the closed set `github_pull_request`,
+`gitlab_merge_request`, `azure_devops_pull_request`, and
+`bitbucket_pull_request`, all with the `review_ready` objective. Its target is a
+canonical provider URL and is parsed against that kind before a directive is
+emitted. A later target-only update is revalidated against the retained kind by
+the authoritative session consumer.
 
 ### The one allowed exception: caller-agnostic process caches
 
@@ -981,6 +1610,27 @@ the gateway log.
 not appear in interactive kiro-cli or Kiro IDE sessions. If they do, something
 wrote them into a provider global.
 
-**A newly added server does not appear in sessions.** The warm pool holds
-pre-spawned processes carrying the old config. Use Apply & Restart, or
-`kirocrew config set`, which triggers a restart.
+**A newly added server does not appear in sessions.** On kiro-cli 2.21.0+ the
+running sessions reconcile the agent file themselves and the dashboard skips its
+reset (see "Live reconcile" above); a server that stays absent there means the
+entry never reached `~/.kiro/agents/kirocrew.json` — check `kirocrew doctor` —
+or the watcher failed at runtime, which the skip cannot see: `POST
+/api/sessions/restart` is the recovery. On an older kiro-cli, or another
+harness, the warm pool holds pre-spawned processes carrying the old config. Use
+Apply & Restart, or `kirocrew config set`, which triggers a restart.
+
+## Private workflow callers
+
+Workflow writes resolve the current strict MCP session and pass that same key
+to HTTP. This includes authoring, saved-definition runs, ad-hoc `source` and
+`intent` runs, cancellation and subtree reruns. Missing strict identity refuses
+the write before HTTP; a lenient ancestor-session fallback cannot authorize it.
+Kernel identity or a validated member proof still decides authority;
+headers, workflow ids and template names never select a private store. Workflow
+run/detail/list/cancel/rerun enforce the recorded execution scope. Private worker
+processes use direct projected MCP servers inside their existing OS sandbox,
+not shared V1 broker sessions. The deterministic workflow E2E model executes
+these real MCP transports through `sandboxed_spawn_argv` and `popen_limited`,
+which applies resource limits after exec rather than running Python in a fork
+child. Temporary launcher profiles are cleaned up even when spawning fails;
+synthetic tool events are not memory-access evidence.

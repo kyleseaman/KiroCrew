@@ -11,7 +11,9 @@ from typing import Any
 
 from aiohttp import web
 
-from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.config.loader import coerce_dict_section, update_config_locked
+from kiro_crew.dashboard.chat_utils import run_config_write
+from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.loop_lock import LoopBoundLock
 
 logger = logging.getLogger(__name__)
@@ -122,7 +124,9 @@ def _caller(request: web.Request, operation: str) -> tuple[str | None, web.Respo
             outcome="denied",
             error="authentication_required",
         )
-        return None, web.json_response({"error": "authentication required"}, status=401)
+        return None, web.json_response(
+            {"error": "authentication required", "code": "auth_required"}, status=401
+        )
     return str(request["user"]), None
 
 
@@ -463,13 +467,6 @@ def _merge_import_results(
     return merged
 
 
-def _get_config_lock() -> LoopBoundLock:
-    # Circular import: handlers.agents is re-exported by the package that imports us.
-    from kiro_crew.dashboard.handlers.agents import _get_config_lock as get_lock
-
-    return get_lock()
-
-
 def _audit_item_outcomes(caller: str, result: object) -> None:
     if not isinstance(result, dict):
         return
@@ -577,18 +574,27 @@ def _rebuild_agent_config() -> None:
 
 
 def _persist_state(completed: bool) -> None:
-    config = KiroCrewConfig.load()
-    config.dashboard.import_onboarded = completed
-    config.save()
+    # DELTA read-modify-write of the one key this endpoint owns, inside a
+    # single sidecar-flock hold -- a whole-document save() would publish a
+    # snapshot that can revert a concurrent writer's unrelated settings.
+    # Called off the loop via run_config_write.
+    def _mutate(doc: dict) -> dict:
+        coerce_dict_section(doc, "dashboard")["import_onboarded"] = completed
+        return doc
+
+    update_config_locked(mutate=_mutate)
 
 
 async def api_onboarding_import_scan(request: web.Request) -> web.Response:
-    """GET /api/onboarding/import/scan."""
+    """GET /api/onboarding/import/scan. Owner-only."""
     operation = "onboarding.import.scan"
     caller, error_response = _caller(request, operation)
     if error_response is not None:
         return error_response
     assert caller is not None
+    denied = await require_owner_dashboard_request(request, operation)
+    if denied is not None:
+        return denied
 
     try:
         result = await asyncio.to_thread(_backend().preview_import, source_ids=None)
@@ -596,19 +602,22 @@ async def api_onboarding_import_scan(request: web.Request) -> web.Response:
     except Exception:
         logger.exception("Onboarding import scan failed")
         _audit(caller=caller, operation=operation, outcome="failed", error="scan_failed")
-        return web.json_response({"error": "request failed"}, status=500)
+        return web.json_response({"error": "request failed", "code": "scan_failed"}, status=500)
 
     _audit(caller=caller, operation=operation, outcome="completed")
     return response
 
 
 async def api_onboarding_import_apply(request: web.Request) -> web.Response:
-    """POST /api/onboarding/import/apply."""
+    """POST /api/onboarding/import/apply. Owner-only."""
     operation = "onboarding.import.apply"
     caller, error_response = _caller(request, operation)
     if error_response is not None:
         return error_response
     assert caller is not None
+    denied = await require_owner_dashboard_request(request, operation)
+    if denied is not None:
+        return denied
 
     try:
         body = await request.json()
@@ -616,7 +625,9 @@ async def api_onboarding_import_apply(request: web.Request) -> web.Response:
         conflict_strategy = _parse_conflict_strategy(body)
     except (ValueError, TypeError):
         _audit(caller=caller, operation=operation, outcome="failed", error="invalid_request")
-        return web.json_response({"error": "invalid request"}, status=400)
+        return web.json_response(
+            {"error": "invalid request", "code": "invalid_request"}, status=400
+        )
 
     state = request.app.get("state")
     cron_service = getattr(state, "crons", None)
@@ -632,18 +643,22 @@ async def api_onboarding_import_apply(request: web.Request) -> web.Response:
             mcp_selected = {pair for pair in selected if pair[1] == "mcp_servers"}
             results: list[object] = []
             if config_selected:
-                async with _get_config_lock():
-                    results.append(
-                        await asyncio.to_thread(
-                            _apply_import,
-                            source_ids,
-                            config_selected,
-                            cron_service,
-                            vector_store,
-                            lesson_store,
-                            conflict_strategy,
-                        )
+                # run_config_write, not a manual lock + bare to_thread: the
+                # config-category importer read-modify-writes config.json, and
+                # a cancellation at a bare `await to_thread(...)` would release
+                # _get_config_lock() while the worker is still mid-rewrite --
+                # the same defect class the state handler guards against.
+                results.append(
+                    await run_config_write(
+                        _apply_import,
+                        source_ids,
+                        config_selected,
+                        cron_service,
+                        vector_store,
+                        lesson_store,
+                        conflict_strategy,
                     )
+                )
             if mcp_selected:
                 # MCP handlers acquire the MCP file lock before the config lock.
                 # Keep this phase outside the config lock to avoid lock inversion.
@@ -669,11 +684,13 @@ async def api_onboarding_import_apply(request: web.Request) -> web.Response:
                 _schedule_embedding_backfill(vector_store)
     except _InvalidSelection:
         _audit(caller=caller, operation=operation, outcome="failed", error="invalid_request")
-        return web.json_response({"error": "invalid request"}, status=400)
+        return web.json_response(
+            {"error": "invalid request", "code": "invalid_request"}, status=400
+        )
     except Exception:
         logger.exception("Onboarding import apply failed")
         _audit(caller=caller, operation=operation, outcome="failed", error="apply_failed")
-        return web.json_response({"error": "request failed"}, status=500)
+        return web.json_response({"error": "request failed", "code": "apply_failed"}, status=500)
 
     _audit_item_outcomes(caller, result)
     _audit(caller=caller, operation=operation, outcome="completed")
@@ -681,12 +698,15 @@ async def api_onboarding_import_apply(request: web.Request) -> web.Response:
 
 
 async def api_onboarding_import_state(request: web.Request) -> web.Response:
-    """PUT /api/onboarding/import/state."""
+    """PUT /api/onboarding/import/state. Owner-only."""
     operation = "onboarding.import.state"
     caller, error_response = _caller(request, operation)
     if error_response is not None:
         return error_response
     assert caller is not None
+    denied = await require_owner_dashboard_request(request, operation)
+    if denied is not None:
+        return denied
 
     try:
         body = await request.json()
@@ -694,15 +714,20 @@ async def api_onboarding_import_state(request: web.Request) -> web.Response:
             raise _InvalidSelection
     except (ValueError, TypeError):
         _audit(caller=caller, operation=operation, outcome="failed", error="invalid_request")
-        return web.json_response({"error": "invalid request"}, status=400)
+        return web.json_response(
+            {"error": "invalid request", "code": "invalid_request"}, status=400
+        )
 
     try:
-        async with _get_config_lock():
-            await asyncio.to_thread(_persist_state, body["completed"])
+        # run_config_write holds _get_config_lock() itself and shields the
+        # worker against cancellation -- a bare to_thread under a manual lock
+        # hold releases the lock on cancellation while the thread is still
+        # rewriting config.json.
+        await run_config_write(_persist_state, body["completed"])
     except Exception:
         logger.exception("Onboarding import state update failed")
         _audit(caller=caller, operation=operation, outcome="failed", error="state_failed")
-        return web.json_response({"error": "request failed"}, status=500)
+        return web.json_response({"error": "request failed", "code": "state_failed"}, status=500)
 
     _audit(caller=caller, operation=operation, outcome="completed")
     return web.json_response({"ok": True})

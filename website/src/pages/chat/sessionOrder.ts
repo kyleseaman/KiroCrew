@@ -1,5 +1,6 @@
 import { i18nT } from '../../i18n/t'
 import { compareText, fmtDateFields } from '../../i18n/format'
+import { safeGetItem } from '../../utils/safeStorage'
 
 /**
  * Session ordering + timestamp formatting, shared by the session sidebar and
@@ -10,6 +11,16 @@ import { compareText, fmtDateFields } from '../../i18n/format'
  * flyout would keep claiming "recent" while ranking by something else — so
  * there is one definition and both surfaces import it.
  */
+
+export const SESSION_SORT_STORAGE_KEY = 'mc-session-sort'
+const SORT_KEYS = new Set<SortKey>([
+  'date-desc', 'date-asc', 'created-desc', 'created-asc', 'name-asc', 'name-desc',
+])
+
+export function readSessionSortKey(): SortKey {
+  const stored = safeGetItem(SESSION_SORT_STORAGE_KEY)
+  return stored && SORT_KEYS.has(stored as SortKey) ? stored as SortKey : 'date-desc'
+}
 
 export type SortKey = 'date-desc' | 'date-asc' | 'created-desc' | 'created-asc' | 'name-asc' | 'name-desc'
 
@@ -37,6 +48,14 @@ export function slotActivityTs(
   return slot.last_turn_ts || slot.last_ts || slot.created
 }
 
+/** ISO-string -> epoch-seconds parse cache. A sidebar sort runs the comparator
+ *  O(n log n) times per slots mutation and the same few hundred ISO strings
+ *  recur across every run, so `new Date(iso)` per comparison is pure re-parse
+ *  cost on a hot path. Bounded: cleared wholesale at a size no realistic
+ *  session count reaches, so a long-lived tab cannot grow it without limit. */
+const _epochCache = new Map<string, number>()
+const _EPOCH_CACHE_MAX = 10000
+
 /** Last-activity instant in epoch SECONDS, with the fallback ladder both
  *  surfaces rely on. Returns 0 for a session with no usable timestamp, which
  *  sorts it last under `date-desc`. */
@@ -44,11 +63,16 @@ export function lastActivityEpoch(item: Sortable): number {
   if (item.modified != null) return item.modified
   const iso = slotActivityTs(item)
   if (!iso) return 0
+  const hit = _epochCache.get(iso)
+  if (hit !== undefined) return hit
   const ms = new Date(iso).getTime()
   // An unparseable timestamp ranks as "no timestamp" rather than poisoning the
   // comparator: NaN makes every comparison false, which leaves the whole list in
   // an arbitrary order rather than just misplacing the one broken row.
-  return Number.isNaN(ms) ? 0 : ms / 1000
+  const epoch = Number.isNaN(ms) ? 0 : ms / 1000
+  if (_epochCache.size >= _EPOCH_CACHE_MAX) _epochCache.clear()
+  _epochCache.set(iso, epoch)
+  return epoch
 }
 
 /** Shared comparator for both active sessions and history items. */
@@ -89,10 +113,16 @@ export function comparePinnedThenSort(
   b: Sortable,
   key: SortKey,
   pinned: ReadonlySet<string>,
+  pinnedRank?: ReadonlyMap<string, number>,
 ): number {
-  const pa = pinned.has(a.key) ? 0 : 1
-  const pb = pinned.has(b.key) ? 0 : 1
-  if (pa !== pb) return pa - pb
+  const aPinned = pinned.has(a.key)
+  const bPinned = pinned.has(b.key)
+  if (aPinned !== bPinned) return aPinned ? -1 : 1
+  if (aPinned && bPinned && pinnedRank) {
+    const rankDiff = (pinnedRank.get(a.key) ?? Number.MAX_SAFE_INTEGER)
+      - (pinnedRank.get(b.key) ?? Number.MAX_SAFE_INTEGER)
+    if (rankDiff !== 0) return rankDiff
+  }
   return compareBySort(a, b, key)
 }
 
@@ -117,7 +147,7 @@ export function comparePinnedThenSort(
  * two day indices allocates no `Date` where re-probing three midnights did.
  * It is the shape the command palette's own relative-time formatter already uses.
  */
-function localDaysAgo(now: Date, then: Date): number {
+export function localDaysAgo(now: Date, then: Date): number {
   const DAY_MS = 86_400_000
   const nowDay = Math.floor(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) / DAY_MS)
   const thenDay = Math.floor(Date.UTC(then.getFullYear(), then.getMonth(), then.getDate()) / DAY_MS)

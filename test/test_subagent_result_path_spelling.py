@@ -10,7 +10,7 @@ refusal surfaces as an approval prompt that times out instead of an error
 anybody can act on.
 
 The invariant these tests pin: every subagent path handed to a reader as TEXT
-carries the declared home spelling, while the paths used to actually open files
+carries the declared home spelling, while the paths that actually open files
 stay symlink-resolved so the traversal check remains sound.
 
 Each test asserts an observable emission, not an internal call, so reverting
@@ -158,10 +158,13 @@ class TestNoEmissionSiteStillUsesTheResolvedHelper:
 
     def test_agent_dir_is_never_stringified_into_text(self):
         offenders = []
-        for rel in ("subagent.py", "mcp_tools/spawn.py"):
+        paths = [self._SRC / "subagent.py", self._SRC / "mcp_tools" / "spawn.py"]
+        paths.extend(sorted((self._SRC / "subagent_manager").glob("*.py")))
+        for path in paths:
+            rel = path.relative_to(self._SRC).as_posix()
             # Explicit utf-8: these sources carry non-ASCII in comments, and a
             # Windows runner's default cp1252 cannot decode them.
-            source = (self._SRC / rel).read_text(encoding="utf-8")
+            source = path.read_text(encoding="utf-8")
             for lineno, line in enumerate(source.splitlines(), 1):
                 stripped = line.strip()
                 if stripped.startswith("#") or "_agent_dir(" not in stripped:

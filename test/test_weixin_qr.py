@@ -286,7 +286,7 @@ def test_render_qr_round_trips_the_scan_url():
 
 # -- _delete_env_key: it rewrites the user's credential file, so what it PRESERVES
 #    matters as much as what it removes. Untested before; the QR-encoder body that
-#    used to cover this file moved to kiro_crew.qr, which made the gap visible.
+#    covered this file, then moved to kiro_crew.qr, which made the gap visible.
 
 
 def test_delete_env_key_removes_only_the_named_key(tmp_path, monkeypatch):
@@ -378,3 +378,102 @@ def test_prune_sessions_survives_a_client_whose_close_cannot_be_scheduled(monkey
     }
     qr._prune_sessions()
     assert qr._SESSIONS == {}
+
+
+# ── Cross-process .env.lock exclusion ─────────────────────────────────────────
+# Regression: _commit_credential_and_config must acquire the shared .env.lock
+# advisory lock (same sidecar file used by `secrets import --apply`) so that the
+# WeChat sign-in handler and the CLI importer cannot interleave their
+# read-modify-write cycles.  If the lock is already held, the handler must abort
+# with OSError instead of writing a potentially stale value.
+
+
+def test_commit_credential_aborts_when_env_lock_is_held(tmp_path, monkeypatch):
+    """_commit_credential_and_config raises OSError when .env.lock is held.
+
+    Simulates a concurrent ``secrets import --apply`` holding the advisory lock
+    by patching ``platform_compat.try_acquire_lock`` to return False (the same
+    signal the importer uses to detect a held lock).  Confirms the handler:
+      * does NOT write WEIXIN_TOKEN to .env (no partial write),
+      * does NOT write config.json,
+      * raises OSError with a descriptive message.
+    """
+    import kiro_crew.platform_compat as _pc
+
+    ep = tmp_path / ".env"
+    ep.write_text("OTHER=keepme\n", encoding="utf-8")
+    cp = tmp_path / "config.json"
+    monkeypatch.setattr(qr, "env_path", lambda: ep)
+
+    # Simulate a held lock: try_acquire_lock returns False for the .env.lock fd.
+    # We only intercept the lock acquisition; all other platform_compat calls are
+    # left untouched.
+    original_try = _pc.try_acquire_lock
+
+    def _always_busy(fd, *, exclusive=False):  # noqa: ARG001
+        return False
+
+    monkeypatch.setattr(_pc, "try_acquire_lock", _always_busy)
+    # release_lock and os.close must still run (the fd was opened); patch
+    # release_lock to a no-op so the test does not need a real lockable fd.
+    monkeypatch.setattr(_pc, "release_lock", lambda fd: None)
+
+    with pytest.raises(OSError, match="locked by another process"):
+        qr._commit_credential_and_config(cp, "{}", "should-not-be-written")
+
+    # .env must be untouched — WEIXIN_TOKEN was not inserted.
+    assert qr._read_env_value("WEIXIN_TOKEN") is None
+    assert ep.read_text(encoding="utf-8") == "OTHER=keepme\n"
+    # config.json must not have been created.
+    assert not cp.exists()
+
+    monkeypatch.setattr(_pc, "try_acquire_lock", original_try)
+
+
+def test_commit_credential_succeeds_when_env_lock_is_free(tmp_path, monkeypatch):
+    """_commit_credential_and_config writes normally when it acquires the lock.
+
+    Complementary to the abort test above: confirm the happy-path still works
+    after the lock-acquisition layer was added (no regression in the normal case).
+    """
+    ep = tmp_path / ".env"
+    ep.write_text("OTHER=keepme\n", encoding="utf-8")
+    cp = tmp_path / "config.json"
+    monkeypatch.setattr(qr, "env_path", lambda: ep)
+
+    qr._commit_credential_and_config(cp, '{"weixin": {}}', "newtoken")
+
+    assert qr._read_env_value("WEIXIN_TOKEN") == "newtoken"
+    assert qr._read_env_value("OTHER") == "keepme"
+    assert cp.exists() and json.loads(cp.read_text()) == {"weixin": {}}
+
+
+def test_config_save_answers_only_after_the_watcher_applied_it(tmp_path, monkeypatch):
+    """The Weixin save carries the allow-list, so it must await the watcher's
+    dispatch before answering: a removed sender is unauthorized on the running
+    transport when the caller sees "saved", not one poll interval later."""
+    import asyncio
+    import json
+    from unittest.mock import AsyncMock
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    cp = tmp_path / "config.json"
+    cp.write_text(json.dumps({"weixin": {"enabled": True}}), encoding="utf-8")
+    monkeypatch.setattr(qr, "config_path", lambda: cp)
+    applied = AsyncMock()
+    monkeypatch.setattr(qr, "_hot_apply_after_write", applied)
+
+    app = web.Application()
+    qr.setup_weixin_routes(app)
+
+    async def _go():
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.put("/api/weixin/config", json={"allowed_user_ids": ["u-1"]})
+            return resp.status, await resp.json()
+
+    status, body = asyncio.run(_go())
+    assert status == 200 and body["ok"] is True
+    applied.assert_awaited_once()
+    assert json.loads(cp.read_text(encoding="utf-8"))["weixin"]["allowed_user_ids"] == ["u-1"]

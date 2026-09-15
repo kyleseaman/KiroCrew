@@ -3,7 +3,7 @@
 Two families, one module, so one test file. ``/stop``, ``/yolo`` and the
 dashboard-link TTL vocabulary existed as near-verbatim copies in three dispatchers;
 the ``spawn`` / ``cron`` / ``task run`` keyword replies existed only inside
-``slack/handler.py``. These tests pin the behaviour that used to be asserted per
+``slack/handler.py``. These tests pin the behaviour once asserted per
 channel (where the copies could drift), the CONTRACT the hoist has to preserve --
 the ``None`` sentinel meaning "not this command, keep routing", the retryable busy
 answer, and the redaction every reply owes an external surface -- and the two
@@ -470,7 +470,7 @@ class TestLayering:
         assert not offenders, offenders
 
     def test_the_allowed_edge_list_has_no_stale_entries(self) -> None:
-        """An exception that no longer exists must be deleted, not left to rot.
+        """An exception that does not exist must be deleted, not left to rot.
 
         Without this the list only ever grows, and a stale entry silently
         pre-authorizes an edge a future change might reintroduce for a different
@@ -640,12 +640,11 @@ class TestCron:
     async def test_remove_all_reports_each_job_and_batches_one_write(self) -> None:
         svc = MagicMock()
         svc.list_jobs.return_value = [_job("j1"), _job("j2")]
-        # `remove_jobs` answers `(removed_ids, missing_ids)`; the reply unpacks it
-        # for the SEL batch audit, so a bare mock is not a stand-in for the service.
+        # The command forwards the whole batch to the service's mutation/audit seam.
         svc.remove_jobs = AsyncMock(return_value=(["j1", "j2"], []))
         out = await cron_command_reply("cron remove all", svc) or ""
         assert "Removed 2 cron job(s)" in out and "`j1`" in out and "`j2`" in out
-        assert svc.remove_jobs.await_args.args[0] == ["j1", "j2"]
+        svc.remove_jobs.assert_awaited_once_with(["j1", "j2"], actor="system", source="messaging")
 
     @pytest.mark.asyncio
     async def test_remove_all_redacts_each_job_name(self) -> None:
@@ -655,12 +654,12 @@ class TestCron:
         assert _AWS_KEY not in (await cron_remove_all_reply(svc) or "")
 
     @pytest.mark.asyncio
-    async def test_every_channel_gets_the_delete_audits_not_only_slack(self) -> None:
-        """The audits moved WITH the command, which is the point of the hoist.
+    async def test_every_channel_forwards_delete_attribution_not_only_slack(self) -> None:
+        """Every shared command caller reaches the service-owned audit seam.
 
-        They arrived on Slack's own copy of `cron remove`; hoisting the command
-        without them would have been a silent revert for Slack and would have left
-        every other channel deleting cron jobs with no trail at all.
+        Actor and source arrived on Slack's old copy of `cron remove`; hoisting the
+        command must retain them for every channel without a duplicate command-level
+        audit.
         """
         svc = MagicMock()
         svc.list_jobs.return_value = [_job("j1")]
@@ -669,15 +668,11 @@ class TestCron:
 
         with patch("kiro_crew.messaging.commands.sel") as mock_sel:
             await cron_command_reply("cron remove all", svc, source="telegram", caller="7")
-            batch = mock_sel.return_value.log_api_access.call_args.kwargs
             await cron_command_reply("cron remove j1", svc, source="telegram", caller="7")
-            single = mock_sel.return_value.log_api_access.call_args.kwargs
 
-        assert batch["operation"] == "cron.batch_delete"
-        assert single["operation"] == "cron.remove"
-        for event in (batch, single):
-            assert event["source"] == "telegram", "the surface must be the channel, not slack"
-            assert event["caller"] == "7", "and the caller the person who typed it"
+        svc.remove_jobs.assert_awaited_once_with(["j1"], actor="7", source="telegram")
+        svc.remove_job_async.assert_awaited_once_with("j1", actor="7", source="telegram")
+        mock_sel.return_value.log_api_access.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_a_caller_that_names_nobody_still_leaves_a_record(self) -> None:
@@ -691,7 +686,8 @@ class TestCron:
         with patch("kiro_crew.messaging.commands.sel") as mock_sel:
             await cron_command_reply("cron remove all", svc, source="webex")
 
-        assert mock_sel.return_value.log_api_access.call_args.kwargs["caller"] == "webex"
+        svc.remove_jobs.assert_awaited_once_with(["j1"], actor="webex", source="webex")
+        mock_sel.return_value.log_api_access.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_remove_all_on_an_empty_roster_touches_nothing(self) -> None:
@@ -1059,3 +1055,37 @@ class TestListsHostState:
         out = commands.spawn_task_reply("list", manager, "telegram:kirocrew:direct:7")
         assert out is not None
         assert "mine" in out and "somebody elses" in out
+
+
+# ── the manual-/compact capability gate ───────────────────────────────
+
+
+class TestCompactUnsupportedBackend:
+    """The channel half of the dashboard's manual-/compact capability gate."""
+
+    def test_a_named_unsupported_backend_is_returned(self) -> None:
+        provider = SimpleNamespace(manual_compact_unsupported_backend="kas")
+        assert commands.compact_unsupported_backend(provider) == "kas"
+
+    def test_an_absent_property_reads_as_supported(self) -> None:
+        assert commands.compact_unsupported_backend(SimpleNamespace()) is None
+
+    def test_a_none_value_reads_as_supported(self) -> None:
+        provider = SimpleNamespace(manual_compact_unsupported_backend=None)
+        assert commands.compact_unsupported_backend(provider) is None
+
+    def test_an_empty_string_reads_as_supported(self) -> None:
+        provider = SimpleNamespace(manual_compact_unsupported_backend="")
+        assert commands.compact_unsupported_backend(provider) is None
+
+    def test_a_mocked_truthy_non_str_never_reads_as_a_refusal(self) -> None:
+        # A MagicMock answers every attribute with a truthy mock; the ABC's
+        # contract is a non-empty str, so anything else must pass through.
+        assert commands.compact_unsupported_backend(MagicMock()) is None
+
+    def test_the_reply_names_the_backend_and_reads_as_information(self) -> None:
+        reply = commands.compact_unsupported_reply("kas")
+        assert "kas" in reply
+        assert "automatically" in reply
+        # Informational, never an error.
+        assert "❌" not in reply and "⚠️" not in reply

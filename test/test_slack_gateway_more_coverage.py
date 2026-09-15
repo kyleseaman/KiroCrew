@@ -47,6 +47,7 @@ import pytest
 
 from kiro_crew.autonudge import APPROVAL_STALL_REASON, NudgeLoop
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.monitoring.models import MonitorOutcome, MonitorState
 from kiro_crew.slack import gateway as gw
 
 # ─── Helpers ─────────────────────────────────────────────────────────────
@@ -135,6 +136,108 @@ def _probe_proc(communicate: Any, *, returncode: int = 0) -> MagicMock:
 
 class TestWarnIfKiroCliOutdated:
     """The boot-time kiro-cli version probe never raises and never hangs."""
+
+    @pytest.fixture(autouse=True)
+    def _resolvable_kiro_cli(self):
+        """Every arm below exercises the spawn, which now needs a resolved path.
+
+        The probe resolves kiro-cli from the fixed install directories before
+        spawning, so without this the arms would take the "not installed" early
+        return on a host that has no kiro-cli and assert against a spawn that
+        never happened. The refusal path itself is covered separately by
+        :meth:`test_unresolvable_binary_never_spawns`.
+        """
+        with patch(
+            "kiro_crew.slack.gateway.resolve_kiro_cli", return_value="/opt/pinned/bin/kiro-cli"
+        ):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_binary_never_spawns(self, capsys):
+        """An unresolvable kiro-cli is not spawned by bare name.
+
+        This probe runs unattended at gateway boot, so falling back to a bare
+        argv0 would let a `PATH`-planted shim execute here — the `--version`
+        argument is no protection. Nothing to warn about, so nothing runs.
+        """
+        orch = _make_orchestrator()
+        with patch("kiro_crew.slack.gateway.resolve_kiro_cli", return_value=None):
+            with patch("asyncio.create_subprocess_exec") as spawn:
+                await orch._warn_if_kiro_cli_outdated()
+        spawn.assert_not_called()
+        assert "outdated" not in capsys.readouterr().out
+
+    @pytest.mark.asyncio
+    async def test_probe_execs_resolved_absolute_path(self):
+        """The resolved absolute path is argv0, and `PATH` is out of the lookup."""
+
+        async def _communicate() -> tuple[bytes, bytes]:
+            return (b"kiro-cli 9.9.9", b"")
+
+        proc = _probe_proc(_communicate)
+        orch = _make_orchestrator()
+        with patch(
+            "kiro_crew.slack.gateway.resolve_kiro_cli", return_value="/opt/pinned/bin/kiro-cli"
+        ) as mock_resolve:
+            with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as spawn:
+                await orch._warn_if_kiro_cli_outdated()
+        assert spawn.await_args.args[0] == "/opt/pinned/bin/kiro-cli"
+        mock_resolve.assert_called_once_with(include_inherited_path=False)
+
+    @pytest.mark.asyncio
+    async def test_path_only_install_is_refused_but_reported(self, caplog):
+        """A PATH-only install is refused for the spawn AND named in the log.
+
+        Refusing is the point of the pin, but silence about it would leave a
+        host that never auto-updates and never warns it is outdated with nothing
+        in `gateway.log` to say why. The line has to name the override, which is
+        the operator's way out.
+        """
+        orch = _make_orchestrator()
+
+        def _resolve(**kwargs: Any) -> str | None:
+            # Pinned lookup misses; the unpinned one (PATH included) hits.
+            return None if kwargs.get("include_inherited_path") is False else "/w/venv/bin/kiro-cli"
+
+        with caplog.at_level("WARNING"):
+            with patch("kiro_crew.slack.gateway.resolve_kiro_cli", side_effect=_resolve):
+                with patch("asyncio.create_subprocess_exec") as spawn:
+                    await orch._warn_if_kiro_cli_outdated()
+        spawn.assert_not_called()
+        assert "KIROCREW_KIRO_BIN" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_absent_backend_is_refused_quietly(self, caplog):
+        """No kiro-cli anywhere is not a problem to report — the backend is optional."""
+        orch = _make_orchestrator()
+        with caplog.at_level("WARNING"):
+            with patch("kiro_crew.slack.gateway.resolve_kiro_cli", return_value=None):
+                with patch("asyncio.create_subprocess_exec") as spawn:
+                    await orch._warn_if_kiro_cli_outdated()
+        spawn.assert_not_called()
+        assert "KIROCREW_KIRO_BIN" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_slow_home_directory_cannot_stall_boot(self, caplog):
+        """A wedged path lookup is bounded, and the refusal keeps boot moving.
+
+        `_init_services` awaits this probe BEFORE `_init_dashboard` binds its
+        socket, so an unbounded lookup on an unresponsive network-mounted home
+        would mean the dashboard never comes up at all.
+        """
+        orch = _make_orchestrator()
+
+        def _hang(**kwargs: Any) -> str:
+            time.sleep(5)  # outlives the budget pinned below
+            return "/opt/pinned/bin/kiro-cli"
+
+        with caplog.at_level("WARNING"):
+            with patch.object(gw, "_KIRO_CLI_RESOLVE_TIMEOUT_SECS", 0.01):
+                with patch("kiro_crew.slack.gateway.resolve_kiro_cli", side_effect=_hang):
+                    with patch("asyncio.create_subprocess_exec") as spawn:
+                        await orch._warn_if_kiro_cli_outdated()
+        spawn.assert_not_called()
+        assert "exceeded" in caplog.text
 
     @pytest.mark.asyncio
     async def test_unspawnable_binary_is_silent(self, capsys):
@@ -291,18 +394,36 @@ class TestDeliverResultRouting:
         orch.slack.post_message.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_slack_thread_arm_without_ts_falls_back_to_dm(self):
-        # "slack:C1" is only two segments, so there is no thread to reply in:
-        # the fallback opens the owner's DM and still rings the bell.
+    async def test_slack_channel_arm_without_ts_posts_to_the_channel(self, monkeypatch):
+        # "slack:C1" names a channel and no thread: post there as a new message
+        # (no owner-DM fallback), and still ring the bell. The tag is
+        # agent-writable, so the channel must be tracked for the post to happen —
+        # see test_slack_heartbeat_channel_deliver.py for the refusal legs.
+        monkeypatch.setattr("kiro_crew.slack.gateway.is_tracked_channel", lambda c: c == "C1")
         orch = _make_orchestrator()
         ds = _mock_dashboard_state()
         orch.dashboard_state = ds
         orch.slack = _mock_slack(dm="D7")
         await orch._deliver_result("Title", "task", "result", "slack:C1")
+        orch.slack.open_dm.assert_not_awaited()
+        assert orch.slack.post_message.await_args.args[0] == "C1"
+        assert orch.slack.post_message.await_args.args[2] is None
+        ds.notify.assert_called_once()
+        assert ds.notify.call_args.args[0] == "heartbeat"
+
+    @pytest.mark.asyncio
+    async def test_slack_channel_arm_with_empty_channel_falls_back_to_dm(self):
+        # A truncated tag ("slack:") has no channel to post to: posting to ""
+        # would raise inside the swallowed except and lose the report, so the
+        # owner-DM leg still covers it.
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        orch.slack = _mock_slack(dm="D7")
+        await orch._deliver_result("Title", "task", "result", "slack:")
         orch.slack.open_dm.assert_awaited_once_with("U_OWNER")
         assert orch.slack.post_message.await_args.args[0] == "D7"
         ds.notify.assert_called_once()
-        assert ds.notify.call_args.args[0] == "heartbeat"
 
     @pytest.mark.asyncio
     async def test_default_arm_notifies_even_when_dm_unavailable(self):
@@ -611,29 +732,6 @@ class TestAutoMigrateMemory:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-class TestInitCrew:
-    """Crew mode is optional: a construction failure disables it silently."""
-
-    def test_orchestrator_failure_disables_crew_mode(self, caplog):
-        orch = _make_orchestrator()
-        ds = _mock_dashboard_state()
-        ds.crew = None
-        orch.dashboard_state = ds
-        with caplog.at_level("WARNING"):
-            with patch(
-                "kiro_crew.crew_chat.CrewOrchestrator", side_effect=RuntimeError("bad wiring")
-            ):
-                orch._init_crew()
-        assert "crew mode disabled" in caplog.text
-
-    def test_no_dashboard_state_skips_crew_setup(self):
-        orch = _make_orchestrator()
-        orch.dashboard_state = None
-        with patch("kiro_crew.crew_chat.CrewOrchestrator") as ctor:
-            orch._init_crew()
-        ctor.assert_not_called()
-
-
 class TestInitMcpDiscovery:
     """Configured MCP servers are logged at boot for diagnosability."""
 
@@ -732,6 +830,139 @@ class TestNotifyNudgeExpired:
         assert title == "Monitoring loop spent its time budget"
         assert "60s wall-clock budget" in body
 
+    @pytest.mark.parametrize(
+        ("outcome", "title"),
+        [
+            (
+                MonitorOutcome.SUCCESS,
+                "Pull request monitor finished — review readiness reached",
+            ),
+            (MonitorOutcome.BUDGET, "Pull request monitor spent its budget"),
+            (MonitorOutcome.BLOCKED, "Pull request monitor stopped on a terminal blocker"),
+            (
+                MonitorOutcome.TARGET_UNAVAILABLE,
+                "Pull request monitor could not deliver an action",
+            ),
+        ],
+    )
+    def test_structured_terminal_wording(self, outcome: MonitorOutcome, title: str):
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(id="monitor-1", slot_key="chat-1", message="")
+        loop.active = False
+        loop.monitor = MonitorState(
+            kind="github_pull_request",
+            target="https://github.com/acme/widgets/pull/7",
+            objective="review_ready",
+            created_ts=1.0,
+            outcome=outcome,
+            stopped_at=2.0,
+        )
+
+        orch._notify_nudge_expired(loop)
+
+        assert ds.notify.call_args.args[1] == title
+        assert loop.monitor.target in ds.notify.call_args.args[2]
+
+    @pytest.mark.parametrize(
+        ("outcome", "reason", "expected", "forbidden"),
+        [
+            (MonitorOutcome.BLOCKED, "pull_request_closed", "was closed without merging", "If"),
+            (MonitorOutcome.BLOCKED, "provider_authentication", "credentials", "reopen"),
+            (MonitorOutcome.BLOCKED, "provider_authorization", "permission", "reopen"),
+            (MonitorOutcome.BLOCKED, "provider_setup", "setup", "reopen"),
+            (MonitorOutcome.BLOCKED, "approval_stall", "approval", "reopen"),
+            (MonitorOutcome.BLOCKED, "completion_evidence_unavailable", "completion", "reopen"),
+            (MonitorOutcome.BLOCKED, "session_unavailable", "conversation", "reopen"),
+            (
+                MonitorOutcome.BLOCKED,
+                "unsupported_monitor_version",
+                "Update Kiro Crew",
+                "reopen",
+            ),
+            (MonitorOutcome.BLOCKED, "invalid_monitor_record", "record", "reopen"),
+            (MonitorOutcome.BLOCKED, "future_reason", "details", "reopen"),
+            (MonitorOutcome.SUCCESS, "pull_request_merged", "was merged", "review-ready"),
+            (MonitorOutcome.SUCCESS, "review_ready", "ready for review", "decide the next step"),
+        ],
+    )
+    def test_structured_notice_uses_the_recorded_reason(self, outcome, reason, expected, forbidden):
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(id="monitor-1", slot_key="discord:kirocrew:direct:42", message="")
+        loop.active = False
+        loop.monitor = MonitorState(
+            kind="github_pull_request",
+            target="https://github.com/acme/widgets/pull/7",
+            objective="review_ready",
+            created_ts=1.0,
+            outcome=outcome,
+            stopped_at=2.0,
+            stopped_reason=reason,
+        )
+
+        orch._notify_nudge_expired(loop)
+
+        ds.notify.assert_called_once()
+        body = ds.notify.call_args.args[2]
+        assert expected in body
+        assert forbidden not in body
+        assert loop.monitor.target in body
+        assert ds.notify.call_args.kwargs["meta"] is None
+
+    def test_budget_notice_explains_how_to_continue(self):
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(id="monitor-1", slot_key="chat-1", message="")
+        loop.active = False
+        loop.monitor = MonitorState(
+            kind="github_pull_request",
+            target="https://github.com/acme/widgets/pull/7",
+            objective="review_ready",
+            created_ts=1.0,
+            outcome=MonitorOutcome.BUDGET,
+            stopped_at=2.0,
+        )
+
+        orch._notify_nudge_expired(loop)
+
+        assert "Start a new watch with a larger budget" in ds.notify.call_args.args[2]
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "https://github.com/acme/ghp_" + "a" * 36 + "/pull/7",
+            "https://example.com/?data=%67%68%70%5F" + "a" * 36,
+            "ghp_" + "a" * 36,
+        ],
+    )
+    def test_structured_notice_redacts_unsafe_retained_target(self, target):
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(id="monitor-1", slot_key="chat-1", message="")
+        loop.active = False
+        loop.monitor = MonitorState(
+            kind="github_pull_request",
+            target=target,
+            objective="review_ready",
+            created_ts=1.0,
+            outcome=MonitorOutcome.SUCCESS,
+            stopped_at=2.0,
+            stopped_reason="pull_request_merged",
+        )
+
+        orch._notify_nudge_expired(loop)
+
+        body = ds.notify.call_args.args[2]
+        assert "was merged" in body
+        assert target not in body
+        assert "ghp_" not in body
+        assert "REDACTED" in body
+
     def test_cycle_cap_wording(self):
         orch = _make_orchestrator()
         ds = _mock_dashboard_state()
@@ -744,6 +975,124 @@ class TestNotifyNudgeExpired:
             cycle_count=4,
         )
         orch._notify_nudge_expired(loop)
+        assert ds.notify.call_args.args[1] == "Monitoring loop hit its cycle cap"
+
+    def test_a_terminal_subject_outranks_the_wall_clock_budget(self):
+        """Terminal outranks EVERY early-stop reading, not just the cap.
+
+        Removing the cap guard was not enough: the runtime-budget branch is evaluated
+        before the terminal one, so a merge landing after the wall-clock budget expired
+        was reported as "its budget ran out without reporting done, its goal may still be
+        unmet" about a finished subject. The rule is expressed once now, as a ``terminal``
+        flag the earlier branches defer to.
+        """
+        from kiro_crew.autonudge import MONITOR_TERMINAL_REASON
+
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(
+            id="loop-terminal-past-budget",
+            slot_key="chat-4",
+            message="watch https://github.com/acme/widgets/pull/42 until green",
+            max_cycles=0,
+            cycle_count=7,
+            max_runtime_secs=60,
+            created_ts=time.time() - 600,
+            stopped_reason=MONITOR_TERMINAL_REASON,
+        )
+        orch._notify_nudge_expired(loop)
+        title = ds.notify.call_args.args[1]
+        assert "time budget" not in title, "a finished subject is not a spent budget"
+        assert title == "Monitoring loop finished — it reported done"
+
+    def test_a_terminal_subject_outranks_the_cycle_cap(self):
+        """A merge that lands ON the capping delivery must not read as an unmet goal.
+
+        The delivery carrying the terminal news increments ``cycle_count`` before the
+        settlement records ``stopped_reason`` -- deliberately, so a cancelled write
+        cannot lose the turn's accounting. So a pull request merging on the delivery
+        that reaches ``max_cycles`` made ``capped_out`` true, the terminal branch was
+        skipped, and the operator was told the goal was possibly unmet and to restart
+        a watch whose subject had merged.
+        """
+        from kiro_crew.autonudge import MONITOR_TERMINAL_REASON
+
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(
+            id="loop-terminal-at-cap",
+            slot_key="chat-3",
+            message="watch https://github.com/acme/widgets/pull/42 until green",
+            max_cycles=4,
+            cycle_count=4,
+            stopped_reason=MONITOR_TERMINAL_REASON,
+        )
+        orch._notify_nudge_expired(loop)
+        title = ds.notify.call_args.args[1]
+        assert "cycle cap" not in title, "a finished subject is terminal, cap or no cap"
+        assert title == "Monitoring loop finished — it reported done"
+
+    @pytest.mark.parametrize(
+        ("pending", "expected_title", "expected_body"),
+        [
+            ("success", "Monitoring loop finished — what it was watching is done", "merged"),
+            ("blocked", "Monitoring loop stopped — its subject was closed unmerged", "WITHOUT"),
+        ],
+    )
+    def test_an_owed_legacy_terminal_turn_outranks_the_cycle_cap(
+        self, pending, expected_title, expected_body
+    ):
+        """A gated legacy loop keeps terminal truth even when its cap wins the race."""
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(
+            id=f"loop-owed-{pending}",
+            slot_key="slack:C123:456.789",
+            message="watch https://github.com/acme/widgets/pull/42 until green",
+            max_cycles=4,
+            cycle_count=4,
+            stopped_reason="cycle_cap",
+            gate=True,
+            monitor=MonitorState(
+                kind="gh-pr",
+                target="acme/widgets#42",
+                objective="watch until green",
+                created_ts=0.0,
+                terminal_pending=pending,
+            ),
+        )
+
+        orch._notify_nudge_expired(loop)
+
+        assert ds.notify.call_args.args[1] == expected_title
+        assert expected_body in ds.notify.call_args.args[2]
+
+    def test_a_legacy_cap_with_no_owed_turn_still_reports_the_cap(self):
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(
+            id="loop-genuine-cap",
+            slot_key="slack:C123:456.791",
+            message="watch https://github.com/acme/widgets/pull/44 until green",
+            max_cycles=4,
+            cycle_count=4,
+            stopped_reason="cycle_cap",
+            gate=True,
+            monitor=MonitorState(
+                kind="gh-pr",
+                target="acme/widgets#44",
+                objective="watch until green",
+                created_ts=0.0,
+                terminal_pending="",
+            ),
+        )
+
+        orch._notify_nudge_expired(loop)
+
         assert ds.notify.call_args.args[1] == "Monitoring loop hit its cycle cap"
 
     def test_approval_stall_names_its_own_remedy(self):

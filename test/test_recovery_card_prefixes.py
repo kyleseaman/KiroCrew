@@ -25,7 +25,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 _STATE = _ROOT / "src/kiro_crew/dashboard/state.py"
 _CARD = _ROOT / "website/src/pages/chat/RecoveryCard.tsx"
 _EN = _ROOT / "website/src/i18n/locales/en.json"
-_SECURITY = _ROOT / "src/kiro_crew/security.py"
+_DENIED_RULES = _ROOT / "src/kiro_crew/security/denied_rules.py"
 _DENY_UTIL = _ROOT / "website/src/utils/denyReason.ts"
 
 #: ``NAME = "[Something — automatic recovery]"`` at module level in state.py.
@@ -86,7 +86,7 @@ def test_card_prefixes_all_exist_in_python() -> None:
 
 
 def test_synthetic_recovery_messages_carry_a_known_marker() -> None:
-    """The runner's two synthetic prompts must open with a card-known marker.
+    """Every synthetic prompt the runner injects must open with a card-known marker.
 
     They are built from the prefixes rather than hardcoding the marker, so this
     guards the composition (a lost f-string prefix) as well as the marker set.
@@ -96,7 +96,9 @@ def test_synthetic_recovery_messages_carry_a_known_marker() -> None:
     known = set(_card_prefixes().values())
     for msg in _SYNTHETIC_RECOVERY_MSGS:
         marker = msg.split("\n", 1)[0]
-        assert marker in known, f"synthetic recovery prompt opens with {marker!r}, which no card matches"
+        assert (
+            marker in known
+        ), f"synthetic recovery prompt opens with {marker!r}, which no card matches"
         assert msg.split("\n", 1)[1].strip(), "marker line is not followed by a body"
 
 
@@ -122,6 +124,11 @@ def test_synthetic_recovery_messages_carry_a_known_marker() -> None:
         # happened — the loop was force-stopped.
         "hook_loop_halted",
         "nudge_cap_reached",
+        # The post-compaction continuation card. Its own pair because nothing
+        # errored: reusing the backend-error labels would send the reader looking
+        # for a fault, when the earlier messages were deliberately summarized.
+        "context_compacted",
+        "summarized_mid_turn_continuing",
     ],
 )
 def test_new_card_labels_are_in_the_english_catalog(key: str) -> None:
@@ -145,9 +152,9 @@ def test_deny_marker_has_exactly_one_frontend_copy_and_it_matches_python() -> No
     matching, so the failure would surface as a card that still renders beside a
     suppression that silently stopped working.
     """
-    py = _SECURITY.read_text(encoding="utf-8")
+    py = _DENIED_RULES.read_text(encoding="utf-8")
     decl = re.search(r'^DENY_REASON_PREFIX = "(?P<value>[^"]+)"', py, re.MULTILINE)
-    assert decl, "security.py no longer declares DENY_REASON_PREFIX -- regex drift"
+    assert decl, "denied_rules.py no longer declares DENY_REASON_PREFIX -- regex drift"
     # The trailing space is a joiner, not part of the marker the frontend matches.
     marker = decl.group("value").rstrip()
 

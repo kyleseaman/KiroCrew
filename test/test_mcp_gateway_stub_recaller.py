@@ -62,9 +62,9 @@ def test_stub_session_key_from_pidfile(
     the ancestor walk (``CallerContext.from_env``) so the Register carries a
     real caller instead of an empty one — otherwise gatewayd stamps
     ``caller=None`` and state-mutating tools break."""
-    # Reset the process-lifetime from_env cache so a previously-resolved
-    # identity from another test cannot leak in (and monkeypatch teardown
-    # reverts whatever this test caches).
+    # Reset the process-lifetime from_env cache so an identity resolved by
+    # another test cannot leak in (and monkeypatch teardown reverts whatever
+    # this test caches).
     monkeypatch.setattr(kiro_crew.mcp_caller, "_FROM_ENV_CACHE", None)
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
     monkeypatch.delenv("KIROCREW_SESSION_KEY", raising=False)
@@ -215,7 +215,10 @@ async def test_run_bridge_installs_write_lock() -> None:
     stdin = asyncio.StreamReader()
     stdin.feed_eof()
     await asyncio.wait_for(
-        stub_mod.run_bridge(reader, w, stop, stdin=stdin, stdout_writer=w),
+        stub_mod.run_bridge(
+            reader, w, stop, stdin=stdin, stdout_writer=w,
+            session=stub_mod.StubSession(),
+        ),
         timeout=2.0,
     )
     assert getattr(w, "_mc_write_lock", None) is not None

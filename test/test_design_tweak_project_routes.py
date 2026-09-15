@@ -94,6 +94,162 @@ def _post(path: str, body: dict | None = None) -> tuple[server.Handler, _Recorde
 
 
 # ---------------------------------------------------------------------------
+# HTTP composition root -- routing, authorization, and error framing
+# ---------------------------------------------------------------------------
+
+_POST_DISPATCH_CASES = (
+    ("/submit", "_h_submit", False),
+    ("/clear", "_h_clear", True),
+    ("/delete", "_h_delete", True),
+    ("/source", "_h_set_source", False),
+    ("/target", "_h_set_source", False),
+    ("/projects", "_h_projects_add", False),
+    ("/projects/select", "_h_projects_select", False),
+    ("/projects/remove", "_h_projects_remove", False),
+    ("/projects/preview-url", "_h_projects_preview_url", False),
+    ("/dev-server/start", "_h_dev_server_start", True),
+    ("/dev-server/stop", "_h_dev_server_stop", True),
+    ("/pick-folder", "_h_pick_folder", False),
+    ("/send", "_h_send", True),
+    ("/delivered", "_h_delivered", True),
+    ("/delete-comment", "_h_delete_comment", True),
+    ("/thread", "_h_thread", True),
+)
+
+
+class TestHttpCompositionContract:
+    """Pin the thin HTTP adapter before its responsibilities are extracted."""
+
+    @pytest.mark.parametrize(
+        ("path", "expected_route", "expected_query"),
+        [
+            ("/api", "/", {}),
+            ("/api/", "/", {}),
+            (
+                "/api/projects/?id=request%201&tag=first&tag=second",
+                "/projects",
+                {"id": ["request 1"], "tag": ["first", "second"]},
+            ),
+            (
+                "/projects/?id=request%201&tag=first&tag=second",
+                "/projects",
+                {"id": ["request 1"], "tag": ["first", "second"]},
+            ),
+        ],
+    )
+    def test_route_normalizes_api_prefix_trailing_slash_and_query(
+        self, path, expected_route, expected_query
+    ):
+        handler, _response = _get(path)
+
+        assert handler._route() == (expected_route, expected_query)
+
+    @pytest.mark.parametrize(
+        ("route", "expected_handler", "takes_query"),
+        _POST_DISPATCH_CASES,
+    )
+    def test_every_post_route_dispatches_to_its_owned_handler(
+        self, route, expected_handler, takes_query, monkeypatch
+    ):
+        path = f"/api{route}/?id=request%201&cid=comment-1"
+        handler, response = _post(path)
+        calls = []
+
+        # Stub every dispatch target so a wrong branch is observable without
+        # letting the real handler touch queue state, processes, or native UI.
+        for handler_name, handler_takes_query in {
+            name: has_query for _route, name, has_query in _POST_DISPATCH_CASES
+        }.items():
+            if handler_takes_query:
+
+                def _record_query(query, *, name=handler_name):
+                    calls.append((name, query))
+
+                monkeypatch.setattr(handler, handler_name, _record_query)
+            else:
+
+                def _record_no_query(*, name=handler_name):
+                    calls.append((name, None))
+
+                monkeypatch.setattr(handler, handler_name, _record_no_query)
+
+        server.Handler.do_POST(handler)
+
+        expected_query = {
+            "id": ["request 1"],
+            "cid": ["comment-1"],
+        }
+        assert response.code is None
+        assert calls == [(expected_handler, expected_query if takes_query else None)]
+
+    def test_post_body_is_read_once_then_authorized_before_dispatch(self, monkeypatch):
+        body = {"type": "visual_edit_request", "comment": "one read"}
+        raw = json.dumps(body).encode()
+        handler, response = _post("/api/submit/", body)
+        events = []
+
+        class _ReadProbe(io.BytesIO):
+            def read(self, size=-1):
+                value = super().read(size)
+                events.append(("read", value))
+                return value
+
+        handler.rfile = _ReadProbe(raw)
+
+        def _authorize(method, authorized_body):
+            events.append(("authorize", method, authorized_body))
+            return True
+
+        monkeypatch.setattr(handler, "_authorized", _authorize)
+        monkeypatch.setattr(
+            handler,
+            "_h_submit",
+            lambda: events.append(("dispatch", handler._cached_body)),
+        )
+
+        server.Handler.do_POST(handler)
+
+        assert response.code is None
+        assert events == [
+            ("read", raw),
+            ("authorize", "POST", raw),
+            ("dispatch", raw),
+        ]
+
+    @pytest.mark.parametrize(
+        ("method", "path", "expected_payload"),
+        [
+            ("GET", "/api/missing/", {"error": "GET /missing not found"}),
+            ("POST", "/api/missing/", {"error": "POST /missing not found"}),
+        ],
+    )
+    def test_unknown_route_keeps_the_existing_404_json(
+        self, method, path, expected_payload
+    ):
+        handler, response = _make_handler(method, path)
+
+        getattr(server.Handler, f"do_{method}")(handler)
+
+        assert response.code == 404
+        assert response.payload == expected_payload
+
+    def test_unexpected_post_handler_error_keeps_the_existing_500_json(
+        self, monkeypatch
+    ):
+        handler, response = _post("/api/submit/")
+
+        def _explode():
+            raise RuntimeError("handler exploded")
+
+        monkeypatch.setattr(handler, "_h_submit", _explode)
+
+        server.Handler.do_POST(handler)
+
+        assert response.code == 500
+        assert response.payload == {"error": "handler exploded"}
+
+
+# ---------------------------------------------------------------------------
 # /projects (GET) — project listing
 # ---------------------------------------------------------------------------
 
@@ -186,6 +342,27 @@ class TestProjectsAdd:
         assert rec.payload["project"]["path"] == str(proj_dir.resolve())
         # Was also appended to _CFG
         assert len(server._CFG["projects"]) == 1
+
+    def test_register_valid_folder_persists_under_the_pinned_data_dir(
+        self, isolated_queue, tmp_path, monkeypatch
+    ):
+        """The registry write lands under the `DATA_DIR` this test pinned, not
+        under whatever real home was captured when the module was imported.
+        A `CONFIG_FILE` frozen from `DATA_DIR` at import ignores every later
+        repoint of `DATA_DIR`, so registering a project rewrites the operator's
+        real ~/.kiro/crew/apps/design-tweak/data/config.json -- this pins the
+        derive-at-access seam that keeps the write under the isolated dir."""
+        proj_dir = tmp_path / "webapp"
+        proj_dir.mkdir()
+        monkeypatch.setattr(server, '_detect_dev_servers', lambda root: [])
+        h, rec = _post("/projects", {"path": str(proj_dir)})
+        h._h_projects_add()
+        assert rec.code == 200
+        registry = server.request_state.config_file(server)
+        assert registry == server.DATA_DIR / "config.json"
+        assert registry.is_relative_to(isolated_queue.parent)
+        saved = json.loads(registry.read_text("utf-8"))
+        assert saved["projects"][0]["path"] == str(proj_dir.resolve())
 
     def test_refuses_sensitive_path_ssh(self, isolated_queue, monkeypatch):
         """_valid_root refuses paths containing .ssh; without this, the preview
@@ -516,7 +693,7 @@ class TestDevServer:
 
         `proj` is resolved BEFORE `_stop_dev_proc`, which can take as long as a
         SIGKILL escalation. Mutating that pre-lock dict afterwards would persist a
-        registry the project is no longer part of, so the handler re-resolves
+        registry the project is not part of, so the handler re-resolves
         inside the lock and saves nothing when it is gone.
         """
         proj = {"id": "ds7", "path": "/tmp/stop7", "name": "stop7",
@@ -695,7 +872,7 @@ class TestPickFolder:
     def test_non_darwin_returns_501(self, isolated_queue, monkeypatch):
         """Off macOS the picker returns a structured error rather than trying to
         spawn osascript; failure means Linux/Windows users see a raw crash."""
-        monkeypatch.setattr(server._sys, 'platform', 'linux')
+        monkeypatch.setattr(server, 'IS_MACOS', False)
         h, rec = _post("/pick-folder")
         h._h_pick_folder()
         assert rec.code == 501
@@ -704,7 +881,7 @@ class TestPickFolder:
     def test_picker_unavailable(self, isolated_queue, monkeypatch):
         """If trusted_system_bin returns None (osascript not at expected path),
         the handler returns a structured error, not a crash."""
-        monkeypatch.setattr(server._sys, 'platform', 'darwin')
+        monkeypatch.setattr(server, 'IS_MACOS', True)
         monkeypatch.setattr(server, 'trusted_system_bin', lambda name: None)
         # Release the lock if test isolation left it acquired
         if server._PICK_LOCK.locked():
@@ -717,7 +894,7 @@ class TestPickFolder:
     def test_picker_timeout(self, isolated_queue, monkeypatch):
         """A timed-out picker returns 408 rather than hanging; failure means the
         backend thread is blocked forever by a stuck dialog."""
-        monkeypatch.setattr(server._sys, 'platform', 'darwin')
+        monkeypatch.setattr(server, 'IS_MACOS', True)
         monkeypatch.setattr(server, 'trusted_system_bin', lambda name: '/usr/bin/osascript')
 
         def _timeout_run(*args, **kwargs):
@@ -734,7 +911,7 @@ class TestPickFolder:
     def test_picker_canceled(self, isolated_queue, monkeypatch):
         """A user-cancelled dialog returns ok=False/canceled=True; failure means
         cancellation is reported as an error and the UI shows an alert."""
-        monkeypatch.setattr(server._sys, 'platform', 'darwin')
+        monkeypatch.setattr(server, 'IS_MACOS', True)
         monkeypatch.setattr(server, 'trusted_system_bin', lambda name: '/usr/bin/osascript')
 
         result = subprocess.CompletedProcess(
@@ -751,7 +928,7 @@ class TestPickFolder:
     def test_picker_returns_path(self, isolated_queue, monkeypatch):
         """A successful pick returns the chosen path; failure means the folder
         registration flow is completely broken."""
-        monkeypatch.setattr(server._sys, 'platform', 'darwin')
+        monkeypatch.setattr(server, 'IS_MACOS', True)
         monkeypatch.setattr(server, 'trusted_system_bin', lambda name: '/usr/bin/osascript')
 
         result = subprocess.CompletedProcess(
@@ -769,7 +946,7 @@ class TestPickFolder:
     def test_picker_concurrent_lock(self, isolated_queue, monkeypatch):
         """Only one picker can be open at a time; a second attempt returns 409;
         failure means two dialogs stack invisibly and the user is confused."""
-        monkeypatch.setattr(server._sys, 'platform', 'darwin')
+        monkeypatch.setattr(server, 'IS_MACOS', True)
         # Acquire the lock to simulate a picker already running
         server._PICK_LOCK.acquire()
         try:
@@ -783,7 +960,7 @@ class TestPickFolder:
     def test_picker_oserror(self, isolated_queue, monkeypatch):
         """An OSError from subprocess is caught and reported; failure means the
         backend crashes on a permission-denied spawn."""
-        monkeypatch.setattr(server._sys, 'platform', 'darwin')
+        monkeypatch.setattr(server, 'IS_MACOS', True)
         monkeypatch.setattr(server, 'trusted_system_bin', lambda name: '/usr/bin/osascript')
 
         def _raise_os_error(*args, **kwargs):
@@ -830,7 +1007,7 @@ class TestSetSource:
 
     def test_set_url_rejects_non_loopback(self, isolated_queue, monkeypatch):
         """A non-loopback URL is rejected (SSRF); failure means the proxy can
-        be used to reach internal services."""
+        reach internal services."""
         h, rec = _post("/source", {"value": "http://internal.corp:8080"})
         h._h_set_source()
         assert rec.code == 400

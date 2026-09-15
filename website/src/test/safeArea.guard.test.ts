@@ -23,6 +23,10 @@ import { join, relative } from 'node:path'
 const WEBSITE_ROOT = join(__dirname, '..', '..')
 const SRC = join(WEBSITE_ROOT, 'src')
 
+/** Stable repository-relative path for allowlists and diagnostics. `relative()`
+ *  uses the host separator, while the checked-in allowlists use POSIX paths. */
+const repoRelative = (file: string) => relative(WEBSITE_ROOT, file).replaceAll('\\', '/')
+
 /** Physical edges plus the two axis shorthands, mapped to the safe utility
  *  that satisfies each. `inset-{x,y}-*` are included deliberately: they pin two
  *  edges at once and are just as capable of hugging a notch as `left-*`. */
@@ -166,7 +170,7 @@ describe('fixed surfaces inset themselves from the safe area', () => {
     const violations: string[] = []
 
     for (const file of walk(SRC)) {
-      const rel = relative(WEBSITE_ROOT, file)
+      const rel = repoRelative(file)
       for (const literal of stringLiterals(readFileSync(file, 'utf8'))) {
         if (!hasBareFixed(literal) || hasBlanketInset(literal)) continue
 
@@ -222,7 +226,7 @@ describe('fixed surfaces inset themselves from the safe area', () => {
     const violations: string[] = []
 
     for (const file of walk(SRC)) {
-      const rel = relative(WEBSITE_ROOT, file)
+      const rel = repoRelative(file)
       const src = readFileSync(file, 'utf8')
 
       for (const m of src.matchAll(STYLE_OBJ)) {
@@ -276,7 +280,7 @@ describe('fixed surfaces inset themselves from the safe area', () => {
     const violations: string[] = []
 
     for (const file of walk(SRC)) {
-      const rel = relative(WEBSITE_ROOT, file)
+      const rel = repoRelative(file)
       const src = readFileSync(file, 'utf8')
       for (const m of src.matchAll(/position\s*:\s*['"`]fixed['"`]/g)) {
         // The enclosing object literal: back to its opening brace, forward to
@@ -300,8 +304,42 @@ describe('fixed surfaces inset themselves from the safe area', () => {
       violations,
       'A `fixed` style-module object pinned to a screen edge lands under the Dynamic Island / '
         + 'home indicator, and neither the className nor the inline-style scan can see it.\n'
-        + "Wrap the offset: top: 'calc(env(safe-area-inset-top, 0px) + 18px)'.\n\n"
+        + "Wrap the offset — top: 'calc(var(--safe-area-top, 0px) + 18px)' (top goes through the "
+        + "display-mode-gated variable), other edges: 'calc(env(safe-area-inset-bottom, 0px) + 18px)'.\n\n"
         + `Violations:\n${violations.join('\n')}`,
     ).toEqual([])
+  })
+
+  /**
+   * The TOP inset is not a bare env() read: with browser chrome on screen the
+   * UA's own bar already sits below the status bar / display cutout, so a
+   * non-zero `env(safe-area-inset-top)` there is spurious — Android WebView
+   * browsers report the cutout height regardless of where the web view
+   * actually sits, which painted a dead band above the app header. Only when
+   * the app IS the window (installed PWA: standalone/fullscreen display mode)
+   * does the viewport really extend under the cutout.
+   *
+   * So the tailwind plugin routes the top edge through `--safe-area-top`, and
+   * index.css zeroes that variable outside standalone/fullscreen. Pinned at
+   * the source, like the compositor test pins the drawer's left inset: jsdom
+   * implements neither `env()` nor `display-mode`, so no behavioural assertion
+   * can tell the gated form from a bare env() — but reverting EITHER half
+   * (plugin back to env(), or the index.css gate deleted) silently reopens the
+   * dead band, and only on physical hardware.
+   */
+  it('routes the top inset through the display-mode-gated variable', () => {
+    const tailwindConfig = readFileSync(join(WEBSITE_ROOT, 'tailwind.config.js'), 'utf8')
+    // The plugin half: top resolves the variable (env() only as a load-race
+    // fallback), the other edges stay bare env() — those insets are real even
+    // in-browser (iOS landscape notch flanks, home indicator).
+    expect(tailwindConfig).toContain("'var(--safe-area-top, env(safe-area-inset-top))'")
+
+    const indexCss = readFileSync(join(SRC, 'index.css'), 'utf8')
+    // The stylesheet half: 0 by default, env() re-enabled only when the app is
+    // the window. Both declarations must survive for the gate to mean anything.
+    expect(indexCss).toMatch(/--safe-area-top:\s*0px/)
+    expect(indexCss).toMatch(
+      /@media\s*\(display-mode:\s*standalone\),\s*\(display-mode:\s*fullscreen\)\s*\{\s*:root\s*\{\s*--safe-area-top:\s*env\(safe-area-inset-top,\s*0px\)/,
+    )
   })
 })

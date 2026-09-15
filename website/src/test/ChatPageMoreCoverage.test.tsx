@@ -14,9 +14,9 @@
  *     rendering is covered by AssistantMessage.test.tsx.
  *
  *  2. The window-event listeners: `mc-config-changed` (chat-settings reload),
- *     `toggle-pin-chat-sidebar`, and `mc:run-in-terminal` (both the non-string
- *     guard and the PTY-never-connects timeout that reports failure back to the
- *     code block).
+ *     `toggle-pin-chat-sidebar`, `kirocrew-tool-call` (foreground browser
+ *     auto-open), and `mc:run-in-terminal` (both the non-string guard and the
+ *     PTY-never-connects timeout that reports failure back to the code block).
  *
  *  3. The welcome-state "Continue a previous chat?" suggestion list and
  *     `handleResumeSession`, reached by pre-filling the composer through the
@@ -27,15 +27,38 @@
  * faked: grouping, the render dispatch and the handlers run for real.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, act, waitFor, fireEvent, within } from '@testing-library/react'
+import { render, screen, act, waitFor, fireEvent, within, renderHook } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { createTestStore } from './helpers'
+import { RUN_IN_TERMINAL_READY_DEADLINE_MS, RUN_IN_TERMINAL_OPENING_GRACE_MS } from '../utils/fenceShell'
+import { useBottomTerminal, __resetBottomTerminal, removeTab } from '../hooks/useBottomTerminal'
+import { registerTerminalWs, unregisterTerminalWs } from '../utils/terminalRegistry'
+
+// The run-in-terminal rollback consults the popout probe to avoid tearing a
+// session out of a popped-out panel; the flag lets each test pick the state.
+let mockTerminalPopoutOpen = false
+vi.mock('../utils/terminalPopout', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../utils/terminalPopout')>()),
+  isPopoutOpen: () => mockTerminalPopoutOpen,
+}))
+const disposeTerminalSessionSpy = vi.hoisted(() => vi.fn())
+vi.mock('../components/CliPanel', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../components/CliPanel')>()
+  return {
+    ...actual,
+    disposeTerminalSession: (sessionId: string) => {
+      disposeTerminalSessionSpy(sessionId)
+      actual.disposeTerminalSession(sessionId)
+    },
+  }
+})
 import { ThemeProvider } from '../hooks/useTheme'
 import { store as appStore } from '../store'
-import { setVoicePlaying } from '../store/chatSlice'
+import { setVoicePlaying, switchSlot } from '../store/chatSlice'
+import { sseDisconnected } from '../store/dashboardSlice'
 import type { RootState } from '../store'
 import type { ChatMessage } from '../types'
 
@@ -55,7 +78,7 @@ interface AssistantProps {
 }
 let assistantProps: AssistantProps | null = null
 
-interface InputProps { value: string; onChange: (v: string) => void }
+interface InputProps { value: string; onChange: (v: string) => void; onScreenshot?: () => void }
 let inputProps: InputProps | null = null
 
 vi.mock('../pages/chat', async () => {
@@ -99,6 +122,21 @@ vi.mock('../components/FlyingQuote', async () => {
   return { default: () => React.createElement('div', { 'data-testid': 'flying-quote' }) }
 })
 
+// The split grid is stubbed to a prop recorder: what matters here is the
+// `openSideChat` capability ChatPage hands its panes (and when it withholds
+// it), not the grid's own layout, which SessionGridView's suite covers.
+interface GridProps { openSideChat?: (slot: string) => boolean | void | Promise<boolean | void> }
+let gridProps: GridProps | null = null
+vi.mock('../components/SessionGridView', async () => {
+  const React = await import('react')
+  return {
+    default: (props: GridProps) => {
+      gridProps = props
+      return React.createElement('div', { 'data-testid': 'session-grid' })
+    },
+  }
+})
+
 interface ProjectPickerProps { onSelect: (path: string) => void }
 let projectPickerProps: ProjectPickerProps | null = null
 vi.mock('../components/ProjectPicker', () => ({
@@ -118,7 +156,19 @@ vi.mock('../components/AgentDropdownList', () => ({ default: () => null, Default
 vi.mock('../components/ModelDropdownList', () => ({ default: () => null }))
 vi.mock('../components/InfoTip', () => ({ default: () => null }))
 vi.mock('../components/SegmentedControl', () => ({ default: () => null }))
-vi.mock('../components/WelcomeView', () => ({ default: () => null }))
+interface WelcomeProps {
+  onSwitchMode?: (mode: 'persistent' | 'incognito' | 'temporary') => void | Promise<void>
+}
+let welcomeProps: WelcomeProps | null = null
+vi.mock('../components/WelcomeView', async () => {
+  const React = await import('react')
+  return {
+    default: (props: WelcomeProps) => {
+      welcomeProps = props
+      return React.createElement('div', { 'data-testid': 'welcome' })
+    },
+  }
+})
 vi.mock('../pages/ChatSidebar', () => ({ default: () => null, SIDEBAR_MIN: 200, SIDEBAR_MAX: 500 }))
 vi.mock('../pages/chat/ActivityViewer', () => ({ default: () => null }))
 vi.mock('../pages/chat/SessionColorPicker', () => ({ default: () => null }))
@@ -160,8 +210,11 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
         data,
       })),
       isAtBottom: true,
+      getFollow: () => true,
       scrollToBottom: vi.fn(),
       mountIndex: vi.fn(() => false),
+      farmIsMeasured: () => true,
+      farmRecord: vi.fn(() => true),
       measureRef: () => () => {},
       topSentinelRef: { current: null },
       bottomSentinelRef: { current: null },
@@ -216,12 +269,20 @@ globalThis.fetch = vi.fn().mockResolvedValue({
 }) as never
 
 import ChatPage from '../pages/ChatPage'
+import { readSideChatDraft } from '../chat-core/composer/sideChatDrafts'
+import { ApiError } from '../api/apiError'
 
 // --- Fixtures ---------------------------------------------------------------
 
 const SLOT = {
   key: 'chat-1', title: 'chat-1', messages: 0, running: false,
   mode: '', created: '', last_ts: '',
+}
+const OTHER_SLOT = { ...SLOT, key: 'chat-2', title: 'chat-2' }
+const REMOTE_SLOT = {
+  ...SLOT,
+  memory_mode: 'temporary',
+  instance_id: 'crew-remote-1',
 }
 
 interface HistorySession { key: string; title: string; created: string; messages: number }
@@ -236,11 +297,16 @@ interface RenderOpts {
   /** Past sessions `api.sessions` yields — ChatPage fetches them on mount, so a
    *  preloaded `chat.history` would be overwritten before the first paint. */
   sessions?: HistorySession[]
+  /** The slot list, both preloaded and what `api.chatSlots` yields (ChatPage
+   *  refetches it on mount). Default: `chat-1` alone. A switch to a key the
+   *  list does not hold is undone by the page itself — its mode-guard clears
+   *  the active slot and the auto-select falls back to the first known one. */
+  slots?: (typeof SLOT)[]
 }
 
 function renderChatPage(messages: ChatMessage[], opts: RenderOpts = {}) {
-  const { chat = {}, sessions = [] } = opts
-  apiMocks.chatSlots = vi.fn().mockResolvedValue([SLOT])
+  const { chat = {}, sessions = [], slots = [SLOT] } = opts
+  apiMocks.chatSlots = vi.fn().mockResolvedValue(slots)
   apiMocks.chatSlotDetail = vi.fn().mockResolvedValue({
     messages, has_more: false, total: messages.length,
   })
@@ -254,7 +320,7 @@ function renderChatPage(messages: ChatMessage[], opts: RenderOpts = {}) {
       ...base.dashboard,
       status: { platform: 'darwin' } as unknown as RootState['dashboard']['status'],
       connected: true,
-      slots: [SLOT] as unknown as RootState['dashboard']['slots'],
+      slots: slots as unknown as RootState['dashboard']['slots'],
     },
     chat: {
       ...base.chat,
@@ -299,10 +365,13 @@ beforeEach(() => {
   assistantProps = null
   inputProps = null
   projectPickerProps = null
+  gridProps = null
+  welcomeProps = null
   chatSettings = { contentWidth: 'compact' }
   localStorage.clear()
   sessionStorage.clear()
   for (const k of Object.keys(apiMocks)) delete apiMocks[k]
+  disposeTerminalSessionSpy.mockClear()
   alertSpy = makeAlertSpy()
   vi.useFakeTimers({ shouldAdvanceTime: true })
 })
@@ -311,6 +380,28 @@ afterEach(() => {
   vi.clearAllTimers()
   vi.useRealTimers()
   alertSpy.mockRestore()
+})
+
+describe('Welcome recreation preserves remote execution', () => {
+  it('carries instanceId through a memory mode change', async () => {
+    apiSpy('dashboardConfig').mockResolvedValue({ default_memory_mode: 'persistent' })
+    apiSpy('createChatSlot').mockResolvedValue({
+      ...REMOTE_SLOT,
+      key: 'chat-new',
+      memory_mode: 'persistent',
+    })
+    apiSpy('deleteChatSlot').mockResolvedValue({ ok: true })
+    renderChatPage([], { slots: [REMOTE_SLOT] })
+    await waitFor(() => expect(welcomeProps).not.toBeNull())
+
+    await act(async () => {
+      await welcomeProps!.onSwitchMode?.('persistent')
+    })
+
+    await waitFor(() => expect(apiMocks.createChatSlot).toHaveBeenCalled())
+    expect(apiMocks.createChatSlot.mock.calls.at(-1)?.[8]).toBe('crew-remote-1')
+    expect(apiMocks.deleteChatSlot).toHaveBeenCalledWith('chat-1')
+  })
 })
 
 describe('ChatPage row callbacks — fork', () => {
@@ -337,29 +428,34 @@ describe('ChatPage row callbacks — fork', () => {
     expect(apiMocks.forkChatSlot).toHaveBeenCalledWith('chat-1', 3, undefined, undefined, 'tail')
   })
 
-  it('reports a refused fork through an alert instead of switching sessions', async () => {
+  it('reports a refused fork through the in-page ErrorNotice instead of switching sessions', async () => {
     apiSpy('forkChatSlot').mockResolvedValue({ ok: false, error: 'slot is busy' })
     await renderTurn()
     await act(async () => { await assistantProps!.onFork!(1) })
-    await waitFor(() => expect(alertSpy).toHaveBeenCalled())
-    expect(String(alertSpy.mock.calls[0][0])).toContain('slot is busy')
+    // The surface is the shared ErrorNotice (role="alert" + agent hand-off),
+    // never a native alert(): the rule `errors-use-error-notice` forbids the
+    // browser dialog, which also carried no structured context to the agent.
+    const notice = await screen.findByTestId('action-error')
+    expect(notice).toHaveAttribute('role', 'alert')
+    expect(notice.textContent).toContain('slot is busy')
+    expect(alertSpy).not.toHaveBeenCalled()
   })
 
-  it('still alerts when the fork request throws', async () => {
+  it('still reports when the fork request throws, naming the real reason', async () => {
     apiSpy('forkChatSlot').mockRejectedValue(new Error('network down'))
     await renderTurn()
     await act(async () => { await assistantProps!.onFork!(1) })
-    await waitFor(() => expect(alertSpy).toHaveBeenCalled())
-    const said = String(alertSpy.mock.calls[0][0])
+    const said = (await screen.findByTestId('action-error')).textContent ?? ''
     expect(said).toContain('Fork failed')
-    // Pinned deliberately: `unwrap()` rejects with a redux-toolkit
+    // Flipped, as this assertion's previous form asked to be: it pinned the
+    // reason being LOST — `unwrap()` rejects with a redux-toolkit
     // SerializedError (a PLAIN OBJECT), so the handler's `e instanceof Error`
-    // test is false and the fallback `String(e)` renders '[object Object]' —
-    // the reason is lost from the alert. Reported, not fixed here; when the
-    // handler learns to read `.message` off a serialized error this assertion
-    // is the one that should flip to the real text.
-    expect(said).toContain('[object Object]')
-    expect(said).not.toContain('network down')
+    // test was false and the `String(e)` fallback rendered '[object Object]'.
+    // The handler now reads the message through `utils/thunkError.errMessage`,
+    // which knows that shape, so the notice carries the real text.
+    expect(said).toContain('network down')
+    expect(said).not.toContain('[object Object]')
+    expect(alertSpy).not.toHaveBeenCalled()
   })
 })
 
@@ -377,10 +473,10 @@ describe('ChatPage row callbacks — plan from here', () => {
     apiSpy('forkChatSlot').mockResolvedValue({ ok: false, error: 'no orchestrator agent' })
     await renderTurn()
     await act(async () => { await assistantProps!.onPlanFromHere!(2) })
-    await waitFor(() => expect(alertSpy).toHaveBeenCalled())
-    const said = String(alertSpy.mock.calls[0][0])
+    const said = (await screen.findByTestId('action-error')).textContent ?? ''
     expect(said).toContain('no orchestrator agent')
     expect(said).not.toContain('Fork failed')
+    expect(alertSpy).not.toHaveBeenCalled()
   })
 
   it('surfaces a failed plan apply and resolves false', async () => {
@@ -389,7 +485,9 @@ describe('ChatPage row callbacks — plan from here', () => {
     let applied: boolean | undefined
     await act(async () => { applied = await assistantProps!.onApplyPlan!([]) })
     expect(applied).toBe(false)
-    expect(alertSpy).toHaveBeenCalledWith(expect.stringContaining('Failed to apply plan'))
+    const said = (await screen.findByTestId('action-error')).textContent ?? ''
+    expect(said).toContain('Failed to apply plan')
+    expect(alertSpy).not.toHaveBeenCalled()
   })
 
   it('resolves true and leaves the page quiet when the plan is accepted', async () => {
@@ -408,7 +506,9 @@ describe('ChatPage row callbacks — plan from here', () => {
     let applied: boolean | undefined
     await act(async () => { applied = await assistantProps!.onApplyPlan!([]) })
     expect(applied).toBe(false)
-    expect(alertSpy).toHaveBeenCalledWith(expect.stringContaining('Failed to apply plan'))
+    const said = (await screen.findByTestId('action-error')).textContent ?? ''
+    expect(said).toContain('Failed to apply plan')
+    expect(alertSpy).not.toHaveBeenCalled()
   })
 })
 
@@ -434,18 +534,89 @@ describe('ChatPage row callbacks — quote and ask', () => {
 
   it('routes Ask to the side panel and seeds it, leaving the main composer untouched', async () => {
     const { store } = await renderTurn()
-    const seeds: (string | undefined)[] = []
-    const onSeed = (e: Event) => { seeds.push((e as CustomEvent).detail?.text) }
-    window.addEventListener('side-seed', onSeed)
-    try {
-      act(() => { assistantProps!.onAsk!('why is this slow?') })
-      await waitFor(() => expect(seeds).toContain('why is this slow?'))
-    } finally {
-      window.removeEventListener('side-seed', onSeed)
-    }
+    act(() => { assistantProps!.onAsk!('why is this slow?') })
+    // The seed is a store write under the active slot (the shared chat-core
+    // seam), which is the slot the activity panel's Side Chat is bound to.
+    expect(readSideChatDraft(store.getState().chat.activeSlot!)).toBe('> why is this slow?\n\n')
     expect(store.getState().chat.activityTab).toBe('side')
     expect(store.getState().chat.activityOpen).toBe(true)
     expect(inputProps!.value).toBe('')
+  })
+
+  /** Enters split view through the header toggle and returns the grid's props.
+   *  Two known slots, so a switch to `chat-2` is a real re-bind rather than a
+   *  switch to a stranger the page would immediately undo. */
+  async function renderSplit() {
+    apiSpy('dashboardConfig').mockResolvedValue({ session_grid: true })
+    const { store } = await renderTurn({ slots: [SLOT, OTHER_SLOT] })
+    fireEvent.click(await screen.findByRole('button', { name: 'Enter split view' }))
+    await waitFor(() => expect(gridProps?.openSideChat).toBeTypeOf('function'))
+    return { store }
+  }
+
+  it('re-binds the activity panel to a split pane\'s slot before opening its Side Chat', async () => {
+    const { store } = await renderSplit()
+    let verdict: boolean | void | Promise<boolean | void>
+    act(() => { verdict = gridProps!.openSideChat!('chat-2') })
+    // A re-bind is a request the server can reject, so the opener reports its
+    // verdict only once the switch settled — the Side tab opens on the
+    // re-bound panel and the seam seeds on `true`.
+    expect(verdict!).toBeInstanceOf(Promise)
+    await expect(verdict!).resolves.toBe(true)
+    expect(store.getState().chat.activeSlot).toBe('chat-2')
+    expect(store.getState().chat.activityTab).toBe('side')
+    expect(store.getState().chat.activityOpen).toBe(true)
+  })
+
+  it('a re-bind the server rejects reports false and surfaces the failure — nothing is seeded', async () => {
+    const { store } = await renderSplit()
+    // The pane's session was deleted under it: the detail fetch 404s, so
+    // `switchSlot.rejected` falls back to the slot the page was on.
+    apiSpy('chatSlotDetail').mockRejectedValueOnce(new ApiError(404, 'no such slot'))
+    let verdict: boolean | void | Promise<boolean | void>
+    act(() => { verdict = gridProps!.openSideChat!('chat-2') })
+    await expect(verdict!).resolves.toBe(false)
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-1'))
+    expect(store.getState().chat.activityTab).not.toBe('side')
+    // The failure is said out loud above the composer, not swallowed.
+    await screen.findByText(/Couldn't open a Side Chat for that pane/)
+  })
+
+  it('a re-bind overtaken by a later switch reports false — the Side tab is not opened for the wrong pane', async () => {
+    const { store } = await renderSplit()
+    // Pane B's detail fetch hangs; the user goes back to pane A meanwhile.
+    let release: (v: unknown) => void = () => {}
+    apiSpy('chatSlotDetail').mockImplementationOnce(() => new Promise(res => { release = res }))
+    let verdict: boolean | void | Promise<boolean | void>
+    act(() => { verdict = gridProps!.openSideChat!('chat-2') })
+    expect(store.getState().chat.activeSlot).toBe('chat-2')
+    await act(async () => { await store.dispatch(switchSlot('chat-1')) })
+    expect(store.getState().chat.activeSlot).toBe('chat-1')
+    // B's stale fulfilment lands: the slice ignores it (user switched away), and
+    // so must the opener — a `true` here would seed B while A's panel opens.
+    await act(async () => { release({}) })
+    await expect(verdict!).resolves.toBe(false)
+    expect(store.getState().chat.activeSlot).toBe('chat-1')
+    expect(store.getState().chat.activityTab).not.toBe('side')
+  })
+
+  it('withholds Ask from the panes while disconnected instead of switching slots offline', async () => {
+    const { store } = await renderSplit()
+    const askWhileConnected = gridProps!.openSideChat!
+    act(() => { store.dispatch(sseDisconnected()) })
+    // The capability is dropped, so the panes' toolbars offer Copy / Quote only…
+    await waitFor(() => expect(gridProps!.openSideChat).toBeUndefined())
+    // …and a call that slipped through in the frame before the re-render does
+    // NOT dispatch the switch a disconnected gateway would reject — the
+    // rejection clears the active pane's messages, blanking the transcript the
+    // reader just selected from. Nothing moves and no Side Chat bound to the
+    // wrong slot opens. The opener reports the refusal (`false`) so the
+    // selection seam does not seed a quote into a Side Chat that never opened.
+    let outcome: boolean | void | Promise<boolean | void>
+    act(() => { outcome = askWhileConnected('chat-2') })
+    expect(outcome).toBe(false)
+    expect(store.getState().chat.activeSlot).toBe('chat-1')
+    expect(store.getState().chat.activityTab).not.toBe('side')
   })
 })
 
@@ -520,6 +691,23 @@ describe('ChatPage window-event listeners', () => {
     await waitFor(() => expect(localStorage.getItem('mc-sidebar-pinned')).not.toBe(first))
   })
 
+  it('opens the Browser panel when the foreground session starts a playwright-cli command', async () => {
+    const { store } = await renderTurn()
+    expect(store.getState().chat.activityOpen).toBe(false)
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('kirocrew-tool-call', {
+        detail: {
+          slot: 'chat-1',
+          is_shell: true,
+          input_preview: 'playwright-cli open https://example.test',
+        },
+      }))
+    })
+
+    await waitFor(() => expect(store.getState().chat.activityOpen).toBe(true))
+  })
+
   it('ignores a run-in-terminal request that carries no command', async () => {
     const { store } = await renderTurn()
     act(() => {
@@ -537,7 +725,7 @@ describe('ChatPage window-event listeners', () => {
   })
 
   it('answers a run-in-terminal request exactly once, carrying its reqId back', async () => {
-    const { store } = await renderTurn()
+    await renderTurn()
     const results: { reqId?: string; ok?: boolean }[] = []
     const onResult = (e: Event) => { results.push((e as CustomEvent).detail) }
     window.addEventListener('mc:run-in-terminal-result', onResult)
@@ -550,15 +738,376 @@ describe('ChatPage window-event listeners', () => {
       // "Run in terminal" now routes to the app-wide dock panel
       // (useBottomTerminal), not the chat-scoped activity panel, so
       // `chat.activityOpen` is intentionally untouched. The handler races the
-      // PTY against a ~6 s cap; either leg answers, and the `settled` latch is
-      // what guarantees the code-block button is told once and only once.
-      await act(async () => { await vi.advanceTimersByTimeAsync(7_000) })
+      // PTY against RUN_IN_TERMINAL_READY_DEADLINE_MS; either leg answers, and
+      // the `settled` latch is what guarantees the code-block button is told
+      // once and only once.
+      await act(async () => { await vi.advanceTimersByTimeAsync(RUN_IN_TERMINAL_READY_DEADLINE_MS + 1_000) })
       await waitFor(() => expect(results.length).toBe(1), { timeout: 5_000 })
     } finally {
       window.removeEventListener('mc:run-in-terminal-result', onResult)
     }
     expect(results[0].reqId).toBe('r2')
     expect(typeof results[0].ok).toBe('boolean')
+  })
+})
+
+describe('ChatPage run-in-terminal dispatch rollback (#10822)', () => {
+  const collect = () => {
+    const results: { reqId?: string; ok?: boolean }[] = []
+    const onResult = (e: Event) => { results.push((e as CustomEvent).detail) }
+    window.addEventListener('mc:run-in-terminal-result', onResult)
+    return { results, stop: () => window.removeEventListener('mc:run-in-terminal-result', onResult) }
+  }
+
+  beforeEach(() => { __resetBottomTerminal(); mockTerminalPopoutOpen = false })
+
+  it('leaves a tab the user already closed alone — no second PTY delete, no store write', async () => {
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const { results, stop } = collect()
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'npm test', reqId: 'rb3' },
+        }))
+      })
+      expect(dock.result.current.tabs.length).toBe(1)
+      const sessionId = dock.result.current.tabs[0].id
+
+      // The user closes the tab before the shell ever reports ready. The
+      // close path owns the teardown (including its own DELETE).
+      act(() => { removeTab(sessionId) })
+      expect(dock.result.current.tabs.length).toBe(0)
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(RUN_IN_TERMINAL_READY_DEADLINE_MS + 1_000) })
+
+      await waitFor(() => expect(results.length).toBe(1))
+      expect(results[0]).toMatchObject({ reqId: 'rb3', ok: false })
+      // The dispatch must not issue a second DELETE for a tab it no longer owns.
+      expect(fetchSpy).not.toHaveBeenCalledWith(
+        `/api/terminal/sessions/${sessionId}`, expect.objectContaining({ method: 'DELETE' }),
+      )
+    } finally {
+      stop()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('leaves the session alone when the panel was popped out before ready', async () => {
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const { results, stop } = collect()
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'npm test', reqId: 'rb4' },
+        }))
+      })
+      expect(dock.result.current.tabs.length).toBe(1)
+      const sessionId = dock.result.current.tabs[0].id
+
+      // The user pops the terminal panel out: the popout window now owns the
+      // session's connection, and the tab stays in the shared store.
+      mockTerminalPopoutOpen = true
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(RUN_IN_TERMINAL_READY_DEADLINE_MS + 1_000) })
+
+      await waitFor(() => expect(results.length).toBe(1))
+      expect(results[0]).toMatchObject({ reqId: 'rb4', ok: false })
+      // Deleting the PTY here would tear the live shell out of the popout.
+      expect(fetchSpy).not.toHaveBeenCalledWith(
+        `/api/terminal/sessions/${sessionId}`, expect.objectContaining({ method: 'DELETE' }),
+      )
+      expect(dock.result.current.tabs.length).toBe(1)
+    } finally {
+      stop()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('keeps the tab when the probe reports a live shell without a ready frame', async () => {
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const { results, stop } = collect()
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'npm test', reqId: 'rb-live' },
+        }))
+      })
+      expect(dock.result.current.tabs.length).toBe(1)
+      const sessionId = dock.result.current.tabs[0].id
+      fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({
+        enabled: true,
+        sessions: [{ session_id: sessionId, alive: true }],
+      }), { status: 200 }))
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(RUN_IN_TERMINAL_READY_DEADLINE_MS + 1_000) })
+
+      await waitFor(() => expect(fetchSpy).toHaveBeenCalledWith('/api/terminal/sessions'))
+      expect(results[0]).toMatchObject({ reqId: 'rb-live', ok: false })
+      expect(dock.result.current.tabs.length).toBe(1)
+      expect(fetchSpy).not.toHaveBeenCalledWith(
+        `/api/terminal/sessions/${sessionId}`, expect.objectContaining({ method: 'DELETE' }),
+      )
+      expect(disposeTerminalSessionSpy).not.toHaveBeenCalled()
+      // For a profile that replaces the readiness hook this is the routine
+      // outcome, so it cannot be the quiet one: the kept tab explains itself.
+      const said = (await screen.findByTestId('action-error')).textContent ?? ''
+      expect(said).toContain('shell is running')
+      expect(said).toContain('run the command there')
+    } finally {
+      stop()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('rolls back the tab and PTY when the probe reports a dead shell', async () => {
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const { results, stop } = collect()
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'npm test', reqId: 'rb-dead' },
+        }))
+      })
+      expect(dock.result.current.tabs.length).toBe(1)
+      const sessionId = dock.result.current.tabs[0].id
+      fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({
+        enabled: true,
+        sessions: [{ session_id: sessionId, alive: false }],
+      }), { status: 200 }))
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(RUN_IN_TERMINAL_READY_DEADLINE_MS + 1_000) })
+
+      await waitFor(() => expect(dock.result.current.tabs.length).toBe(0))
+      expect(results[0]).toMatchObject({ reqId: 'rb-dead', ok: false })
+      expect(fetchSpy).toHaveBeenCalledWith('/api/terminal/sessions')
+      expect(fetchSpy).toHaveBeenCalledWith(
+        `/api/terminal/sessions/${sessionId}`, { method: 'DELETE', keepalive: true },
+      )
+      expect(disposeTerminalSessionSpy).toHaveBeenCalledWith(sessionId)
+    } finally {
+      stop()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('rolls back an absent session locally without a DELETE the backend would 404', async () => {
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const { results, stop } = collect()
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'npm test', reqId: 'rb-absent' },
+        }))
+      })
+      expect(dock.result.current.tabs.length).toBe(1)
+      const sessionId = dock.result.current.tabs[0].id
+      // Absent on BOTH the first probe and the confirm probe: gone, not opening.
+      fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({
+        enabled: true,
+        sessions: [],
+      }), { status: 200 }))
+      fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({
+        enabled: true,
+        sessions: [],
+      }), { status: 200 }))
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(
+          RUN_IN_TERMINAL_READY_DEADLINE_MS + RUN_IN_TERMINAL_OPENING_GRACE_MS + 1_000,
+        )
+      })
+
+      await waitFor(() => expect(dock.result.current.tabs.length).toBe(0))
+      expect(results[0]).toMatchObject({ reqId: 'rb-absent', ok: false })
+      expect(fetchSpy).toHaveBeenCalledWith('/api/terminal/sessions')
+      // The backend registry has no such session, so a DELETE could only 404
+      // and surface a close failure for a session that needs no closing.
+      expect(fetchSpy).not.toHaveBeenCalledWith(
+        `/api/terminal/sessions/${sessionId}`, expect.objectContaining({ method: 'DELETE' }),
+      )
+      expect(disposeTerminalSessionSpy).toHaveBeenCalledWith(sessionId)
+      // Closing a watched tab is the routine outcome, so it must not be silent.
+      const said = (await screen.findByTestId('action-error')).textContent ?? ''
+      expect(said).toContain("wasn't sent")
+      expect(said).toContain('was closed')
+    } finally {
+      stop()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('keeps a session that is merely opening: absent, then listed alive on the confirm probe', async () => {
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const { results, stop } = collect()
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'npm test', reqId: 'rb-opening' },
+        }))
+      })
+      expect(dock.result.current.tabs.length).toBe(1)
+      const sessionId = dock.result.current.tabs[0].id
+      // First probe: the backend still holds the placeholder `ws.prepare()`
+      // reserved, which the sessions route skips -- so the session is absent.
+      fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({
+        enabled: true,
+        sessions: [],
+      }), { status: 200 }))
+      // Confirm probe: the shell finished spawning and is registered alive.
+      fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({
+        enabled: true,
+        sessions: [{ session_id: sessionId, alive: true }],
+      }), { status: 200 }))
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(
+          RUN_IN_TERMINAL_READY_DEADLINE_MS + RUN_IN_TERMINAL_OPENING_GRACE_MS + 1_000,
+        )
+      })
+
+      await waitFor(() => expect(results.length).toBe(1))
+      expect(results[0]).toMatchObject({ reqId: 'rb-opening', ok: false })
+      // An opening shell keeps its tab: rolling it back would remove the tab
+      // from under a shell about to come up, leaving it orphaned.
+      expect(dock.result.current.tabs.length).toBe(1)
+      expect(fetchSpy).not.toHaveBeenCalledWith(
+        `/api/terminal/sessions/${sessionId}`, expect.objectContaining({ method: 'DELETE' }),
+      )
+      expect(disposeTerminalSessionSpy).not.toHaveBeenCalled()
+    } finally {
+      stop()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('keeps the tab and local connection when the liveness probe fails', async () => {
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const { results, stop } = collect()
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'npm test', reqId: 'rb-probe-failed' },
+        }))
+      })
+      expect(dock.result.current.tabs.length).toBe(1)
+      const sessionId = dock.result.current.tabs[0].id
+      fetchSpy.mockRejectedValueOnce(new Error('network unavailable'))
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(RUN_IN_TERMINAL_READY_DEADLINE_MS + 1_000) })
+
+      await waitFor(() => expect(fetchSpy).toHaveBeenCalledWith('/api/terminal/sessions'))
+      expect(results[0]).toMatchObject({ reqId: 'rb-probe-failed', ok: false })
+      expect(dock.result.current.tabs.length).toBe(1)
+      expect(fetchSpy).not.toHaveBeenCalledWith(
+        `/api/terminal/sessions/${sessionId}`, expect.objectContaining({ method: 'DELETE' }),
+      )
+      expect(disposeTerminalSessionSpy).not.toHaveBeenCalled()
+      // A kept tab whose command never ran is unexplained unless the failure
+      // reaches the user through the required error surface -- while the probe's
+      // own transport error stays out of copy the user never asked for.
+      const said = (await screen.findByTestId('action-error')).textContent ?? ''
+      expect(said).toContain('left open')
+      expect(said).not.toContain('network unavailable')
+    } finally {
+      stop()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('shares one liveness probe between dispatches that reach their deadlines together', async () => {
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const { results, stop } = collect()
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'npm test', reqId: 'rb-dedupe-a' },
+        }))
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'npm run lint', reqId: 'rb-dedupe-b' },
+        }))
+      })
+      expect(dock.result.current.tabs.length).toBe(2)
+      const ids = dock.result.current.tabs.map(tab => tab.id)
+      fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({
+        enabled: true,
+        sessions: ids.map(id => ({ session_id: id, alive: true })),
+      }), { status: 200 }))
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(RUN_IN_TERMINAL_READY_DEADLINE_MS + 1_000) })
+
+      await waitFor(() => expect(results.length).toBe(2))
+      // Both dispatches deadlined in the same tick: one shared request, not one
+      // uncached request each.
+      const probes = fetchSpy.mock.calls.filter(([url]) => url === '/api/terminal/sessions')
+      expect(probes.length).toBe(1)
+      expect(dock.result.current.tabs.length).toBe(2)
+    } finally {
+      stop()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('keeps the tab when the shell becomes ready and the command is sent', async () => {
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const { results, stop } = collect()
+    const sent: Uint8Array[] = []
+    let sessionId = ''
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'npm test', reqId: 'rb2' },
+        }))
+      })
+      expect(dock.result.current.tabs.length).toBe(1)
+      sessionId = dock.result.current.tabs[0].id
+
+      // The PTY reports ready: registering the socket drains the ready
+      // listener synchronously and the command goes out on it.
+      const ws = { readyState: WebSocket.OPEN, send: (d: Uint8Array) => { sent.push(d) } } as unknown as WebSocket
+      act(() => { registerTerminalWs(sessionId, ws) })
+
+      await waitFor(() => expect(results.length).toBe(1))
+      expect(results[0]).toMatchObject({ reqId: 'rb2', ok: true })
+      expect(new TextDecoder().decode(sent[0])).toBe('npm test\n')
+
+      // The deadline passing afterwards must not tear down a live shell.
+      await act(async () => { await vi.advanceTimersByTimeAsync(RUN_IN_TERMINAL_READY_DEADLINE_MS + 1_000) })
+      expect(dock.result.current.tabs.length).toBe(1)
+      expect(fetchSpy).not.toHaveBeenCalledWith(
+        `/api/terminal/sessions/${sessionId}`, expect.objectContaining({ method: 'DELETE' }),
+      )
+    } finally {
+      stop()
+      if (sessionId) unregisterTerminalWs(sessionId)
+      vi.unstubAllGlobals()
+    }
   })
 })
 
@@ -666,5 +1215,33 @@ describe('ChatPage widget composer bridge', () => {
       window.dispatchEvent(new CustomEvent('mc-widget-send', { detail: {} }))
     })
     expect(inputProps!.value).toBe('')
+  })
+})
+
+// A failed screen capture used to be discarded by a bare `catch {}` commented
+// "user cancelled" -- but cancellation is NOT an error path: the route answers a
+// cancelled capture with 200 `{"path": ""}`, which the caller's `if (path)`
+// guard absorbs. So the only things that reached that catch were real failures
+// (the 400 off macOS, the 120s capture timeout, the request never reaching the
+// gateway), and the user saw nothing at all.
+describe('ChatPage screen capture failures', () => {
+  it('reports a failed capture instead of swallowing it', async () => {
+    apiSpy('screenshot').mockRejectedValue(new Error('screenshot timed out'))
+    await renderTurn()
+    await waitFor(() => expect(inputProps?.onScreenshot).toBeTypeOf('function'))
+    await act(async () => { inputProps!.onScreenshot!() })
+    // The notice names the action, not just the transport text: a bare
+    // "screenshot timed out" above the composer tells the user nothing about
+    // which click failed.
+    expect(await screen.findByText('Screenshot failed: screenshot timed out')).toBeInTheDocument()
+  })
+
+  it('stays silent when the user cancels, which is not a failure', async () => {
+    // The cancelled shape: HTTP 200, empty path. No notice, no attachment.
+    apiSpy('screenshot').mockResolvedValue({ path: '' })
+    await renderTurn()
+    await waitFor(() => expect(inputProps?.onScreenshot).toBeTypeOf('function'))
+    await act(async () => { inputProps!.onScreenshot!() })
+    expect(screen.queryByText(/unknown error/i)).not.toBeInTheDocument()
   })
 })

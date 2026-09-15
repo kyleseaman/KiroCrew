@@ -44,7 +44,8 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from tmpdir_helpers import short_tmp_base
 
-from kiro_crew import platform_compat
+from kiro_crew import atomic_write as atomic_write_mod
+from kiro_crew import pinned_fs, platform_compat
 from kiro_crew.dashboard.handlers import files as files_mod
 
 # ``api_file_raw`` and ``api_file_download`` open with ``os.O_NOFOLLOW``, which
@@ -52,6 +53,23 @@ from kiro_crew.dashboard.handlers import files as files_mod
 posix_only = pytest.mark.skipif(
     sys.platform == "win32",
     reason="os.O_NOFOLLOW does not exist on Windows, so this handler cannot run there",
+)
+
+# The pinned-publish branch needs a real parent descriptor, which the handler can
+# only produce where the descriptor-relative walk exists -- forcing a capability
+# probe cannot conjure ``os.O_DIRECTORY``. Derived from the probe rather than from
+# ``sys.platform`` so the Windows-simulation tests that delete ``os.O_NOFOLLOW`` at
+# runtime are covered by the same guard.
+needs_pinned_walk = pytest.mark.skipif(
+    not pinned_fs.supports_pinned_walk(),
+    reason="platform without a descriptor-relative directory walk",
+)
+
+# ``pinned`` parametrization shared by the two publish-failure tests below.
+_PUBLISH_BRANCHES = pytest.mark.parametrize(
+    "pinned",
+    [pytest.param(True, marks=needs_pinned_walk), pytest.param(False)],
+    ids=["pinned", "by-name"],
 )
 
 
@@ -168,9 +186,11 @@ class TestFileRead:
 
     @pytest.mark.asyncio
     async def test_schema_violation_is_400(self, mock_sel):
-        # '$' is outside FILE_READ_SCHEMA's allowed character class.
+        # A newline in the path: FILE_READ_SCHEMA refuses it because it splits
+        # the log line the path is written into. Ordinary punctuation is NOT a
+        # violation -- a filename may legally hold it.
         async with TestClient(TestServer(self._client_app())) as client:
-            resp = await client.get("/api/file-read?path=/tmp/$evil")
+            resp = await client.get("/api/file-read?path=/tmp/a%0Ab")
             assert resp.status == 400
             assert (await resp.json())["error"] == "invalid input"
 
@@ -178,7 +198,12 @@ class TestFileRead:
     async def test_forbidden_path_is_400(self, tmp_path, mock_sel):
         f = tmp_path / "blocked.txt"
         f.write_text("x", encoding="utf-8")
-        with patch.object(files_mod, "_validate_dashboard_path", return_value=None):
+        # Stubbed on the `handlers` package, not on `files_mod`: this endpoint
+        # opens through the shared open-and-check prefix, which resolves the
+        # validator through that package at call time (its documented
+        # monkey-patch seam, kept for the circular import). Same spelling the
+        # file-raw class below uses, for the same reason.
+        with patch("kiro_crew.dashboard.handlers._validate_dashboard_path", return_value=None):
             async with TestClient(TestServer(self._client_app())) as client:
                 resp = await client.get(f"/api/file-read?path={f}")
                 assert resp.status == 400
@@ -268,20 +293,20 @@ class TestFileWrite:
                 "/api/file-write", data="not json", headers={"Content-Type": "application/json"}
             )
             assert resp.status == 400
-            assert (await resp.json())["error"] == "invalid JSON body"
+            assert (await resp.json())["error"] == "invalid JSON"
 
     @pytest.mark.asyncio
     async def test_non_object_body_is_400(self, mock_sel):
         async with TestClient(TestServer(self._client_app())) as client:
             resp = await client.post("/api/file-write", json=["a", "list"])
             assert resp.status == 400
-            assert (await resp.json())["error"] == "invalid JSON body"
+            assert (await resp.json())["error"] == "body must be a JSON object"
 
     @pytest.mark.asyncio
     async def test_schema_violation_is_400(self, mock_sel):
         async with TestClient(TestServer(self._client_app())) as client:
             resp = await client.post(
-                "/api/file-write", json={"path": "/tmp/$evil", "content": "x"}
+                "/api/file-write", json={"path": "/tmp/a\nb", "content": "x"}
             )
             assert resp.status == 400
             assert (await resp.json())["error"] == "invalid input"
@@ -321,32 +346,85 @@ class TestFileWrite:
         assert f.read_text(encoding="utf-8") == "kept"
 
     @pytest.mark.asyncio
-    async def test_replace_failure_is_500_and_cleans_up_temp(self, tmp_path, mock_sel):
+    @_PUBLISH_BRANCHES
+    async def test_replace_failure_is_500_and_cleans_up_temp(self, tmp_path, mock_sel, pinned):
+        """A failed publish is a 500 that leaves the original intact and no temp.
+
+        Run over BOTH publish branches, because they are different syscalls with
+        different cleanup: with a pinned parent descriptor ``atomic_write``
+        publishes with ``renameat`` (``os.rename`` plus ``src_dir_fd``/
+        ``dst_dir_fd``) and reclaims the temp with ``os.unlink(name, dir_fd=)``,
+        while the by-name floor publishes with ``os.replace`` and unlinks by path.
+
+        The capability probe is FORCED rather than left to the host, and that is
+        load-bearing in both directions. ``pinned_parent_replace_supported()``
+        answers ``os.rename in os.supports_dir_fd``, and a patched ``os.rename``
+        is a mock that is not in that frozenset — so patching the syscall alone
+        would flip the probe to False and quietly exercise the by-name floor
+        twice. It is forced in BOTH modules that ask it, because they ask about
+        different things: the handler's binding decides whether a descriptor is
+        produced at all, and ``atomic_write``'s own decides whether it accepts the
+        one it is handed (it refuses rather than falling back to a by-name write).
+        The ``_mkstemp_at`` spy asserts which stager really ran, so neither case
+        can drift onto the other's branch unnoticed.
+
+        The pinned case SKIPS where the platform has no descriptor-relative walk:
+        forcing a probe cannot conjure ``os.O_DIRECTORY``, so on Windows the
+        handler has no descriptor to pass and the by-name floor is all there is.
+        """
         f = tmp_path / "doomed.md"
         f.write_text("original", encoding="utf-8")
-        with patch.object(os, "replace", side_effect=OSError("replace failed")):
+        doomed = "rename" if pinned else "replace"
+        with patch.object(
+            files_mod, "pinned_parent_replace_supported", lambda: pinned
+        ), patch.object(
+            atomic_write_mod, "pinned_parent_replace_supported", lambda: pinned
+        ), patch.object(
+            atomic_write_mod, "_mkstemp_at", wraps=atomic_write_mod._mkstemp_at
+        ) as staged_at, patch.object(
+            os, doomed, side_effect=OSError(f"{doomed} failed")
+        ):
             async with TestClient(TestServer(self._client_app())) as client:
                 resp = await client.post(
                     "/api/file-write", json={"path": str(f), "content": "never lands"}
                 )
                 assert resp.status == 500
                 assert (await resp.json())["error"] == "failed to write file"
+        assert staged_at.call_count == (1 if pinned else 0)
         assert f.read_text(encoding="utf-8") == "original"
         assert [p.name for p in tmp_path.iterdir()] == ["doomed.md"]
 
     @pytest.mark.asyncio
-    async def test_temp_unlink_failure_still_reports_500(self, tmp_path, mock_sel):
+    @_PUBLISH_BRANCHES
+    async def test_temp_unlink_failure_still_reports_500(self, tmp_path, mock_sel, pinned):
         """The cleanup ``os.unlink`` is itself wrapped: its OSError is swallowed
-        so the caller still gets the real 500 rather than an unhandled error."""
+        so the caller still gets the real 500 rather than an unhandled error.
+
+        Both branches again: the pinned cleanup passes ``dir_fd=`` and the
+        by-name one does not, so a swallowed failure has to be proven on each.
+        See the sibling above for why the probe is forced in both modules and why
+        the pinned case skips without a descriptor-relative walk.
+        """
         f = tmp_path / "twice.md"
         f.write_text("original", encoding="utf-8")
-        with patch.object(os, "replace", side_effect=OSError("replace failed")), \
-             patch.object(os, "unlink", side_effect=OSError("unlink failed")):
+        doomed = "rename" if pinned else "replace"
+        with patch.object(
+            files_mod, "pinned_parent_replace_supported", lambda: pinned
+        ), patch.object(
+            atomic_write_mod, "pinned_parent_replace_supported", lambda: pinned
+        ), patch.object(
+            atomic_write_mod, "_mkstemp_at", wraps=atomic_write_mod._mkstemp_at
+        ) as staged_at, patch.object(
+            os, doomed, side_effect=OSError(f"{doomed} failed")
+        ), patch.object(
+            os, "unlink", side_effect=OSError("unlink failed")
+        ):
             async with TestClient(TestServer(self._client_app())) as client:
                 resp = await client.post(
                     "/api/file-write", json={"path": str(f), "content": "nope"}
                 )
                 assert resp.status == 500
+        assert staged_at.call_count == (1 if pinned else 0)
         # The scratch file survives here precisely because unlink was blocked.
         leftovers = [p for p in tmp_path.iterdir() if p.name != "twice.md"]
         for p in leftovers:
@@ -449,7 +527,7 @@ class TestFileRaw:
     async def test_sensitive_path_is_403(self, tmp_path, mock_sel):
         f = tmp_path / "s.png"
         f.write_bytes(b"\x89PNG\r\n\x1a\n")
-        with patch("kiro_crew.security.is_sensitive_path", return_value=True):
+        with patch("kiro_crew.dashboard.handlers.files.is_sensitive_path", return_value=True):
             async with TestClient(TestServer(self._client_app())) as client:
                 resp = await client.get(f"/api/file-raw?path={f}")
                 assert resp.status == 403
@@ -499,7 +577,7 @@ class TestFileWatch:
     @pytest.mark.asyncio
     async def test_schema_violation_is_400(self, mock_sel):
         async with TestClient(TestServer(self._client_app())) as client:
-            resp = await client.get("/api/file-watch?path=/tmp/$evil")
+            resp = await client.get("/api/file-watch?path=/tmp/a%0Ab")
             assert resp.status == 400
             assert (await resp.json())["error"] == "invalid input"
 
@@ -536,9 +614,9 @@ class TestFileWatch:
 
     @pytest.mark.asyncio
     async def test_symlink_swapped_after_validation_aborts_stream(self, tmp_path, mock_sel):
-        """The watcher re-resolves the path on every change and bails if the
-        realpath moved, so a post-validation symlink swap cannot be used to
-        stream a different file's contents."""
+        """The watcher re-resolves the path on every change and bails when the
+        realpath moves, so a post-validation symlink swap cannot stream a
+        different file's contents."""
         f = tmp_path / "swapped.md"
         f.write_text("content\n", encoding="utf-8", newline="\n")
         target = str(f)
@@ -725,7 +803,7 @@ class TestRevealPath:
                 "/api/reveal", data="{", headers={"Content-Type": "application/json"}
             )
             assert resp.status == 400
-            assert (await resp.json())["error"] == "invalid JSON body"
+            assert (await resp.json())["error"] == "invalid JSON"
 
     @pytest.mark.asyncio
     async def test_traversal_in_path_is_400(self, mock_sel):
@@ -775,6 +853,8 @@ class TestRevealPath:
                     "/api/reveal", json={"path": str(f), "action": "open"}
                 )
                 assert resp.status == 200
+                # Windows has no launch-by-association verb, so the local grant
+                # degrades to the clipboard: `copy` carries the path to write.
                 assert await resp.json() == {"ok": True, "copy": str(f)}
 
     @pytest.mark.asyncio
@@ -808,6 +888,8 @@ class TestRevealPath:
                         "/api/reveal", json={"path": str(f), "action": action}
                     )
                     assert resp.status == 200, f"{platform}/{action} should not 500"
+                    # A local grant whose host had no working file manager
+                    # degrades to the clipboard: `copy` carries the path to write.
                     assert await resp.json() == {"ok": True, "copy": str(f)}
 
     @pytest.mark.asyncio
@@ -992,10 +1074,74 @@ def cfg_file(tmp_path):
 
 @pytest.fixture()
 def config_client_app(cfg_file, mock_sel) -> web.Application:
-    app = web.Application()
+    """The endpoint under an OWNER caller, so the body-validation paths are reachable.
+
+    ``PUT`` is owner-gated, and the gate reads ``request.app["state"]`` plus the
+    authenticated claims the token middleware normally populates. Without both,
+    every PUT below would answer 403 (or 500 on the missing state) and stop
+    testing what it names. ``owner_id = ""`` with the caller defaulting to the
+    signed local bootstrap subject is the standalone-local shape, matching
+    ``test_agent_config_owner_gate_invariant``; a test that wants a non-owner
+    sends ``X-Test-User``.
+    """
+
+    class _State:
+        owner_id = ""
+
+    @web.middleware
+    async def _identity(request, handler):
+        request["user"] = request.headers.get("X-Test-User", "local-app")
+        request["app"] = request.headers.get("X-Test-App", "")
+        return await handler(request)
+
+    app = web.Application(middlewares=[_identity])
+    app["state"] = _State()
     app.router.add_get("/api/dashboard/config", files_mod.api_dashboard_config)
     app.router.add_put("/api/dashboard/config", files_mod.api_dashboard_config)
     return app
+
+
+class TestDashboardConfigPutOwnerGate:
+    """The PUT gate fires ahead of body parsing and ahead of the config load."""
+
+    @pytest.mark.asyncio
+    async def test_non_owner_put_is_refused(self, config_client_app):
+        async with TestClient(TestServer(config_client_app)) as client:
+            resp = await client.put(
+                "/api/dashboard/config",
+                json={"gitlab_hosts": ["gitlab.example.com"]},
+                headers={"X-Test-User": "someone-else"},
+            )
+            assert resp.status == 403
+            assert (await resp.json())["code"] == "owner_only"
+
+    @pytest.mark.asyncio
+    async def test_non_owner_is_refused_before_the_body_is_parsed(self, config_client_app):
+        """A body that would 400 still answers 403: the gate runs first.
+
+        This is the observable form of "the gate fires BEFORE config-load I/O" —
+        an unparseable body cannot reach the 400 branch, so nothing downstream of
+        the gate ran.
+        """
+        async with TestClient(TestServer(config_client_app)) as client:
+            resp = await client.put(
+                "/api/dashboard/config",
+                data="{",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Test-User": "someone-else",
+                },
+            )
+            assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_get_stays_open_to_non_owner(self, config_client_app):
+        """Only PUT is gated — the settings UI polls GET on an interval."""
+        async with TestClient(TestServer(config_client_app)) as client:
+            resp = await client.get(
+                "/api/dashboard/config", headers={"X-Test-User": "someone-else"}
+            )
+            assert resp.status == 200
 
 
 class TestDashboardConfigPut:
@@ -1046,6 +1192,88 @@ class TestDashboardConfigPut:
         # Read-only fields were not persisted from the PUT body.
         assert got["gitlab_hosts"] == []
         assert got["jira_hosts"] == []
+
+    @pytest.mark.asyncio
+    async def test_link_patterns_round_trip(self, config_client_app):
+        rules = [{"pattern": r"\bPROJ-\d+\b", "url": "https://tracker.example.com/browse/{match}"}]
+        async with TestClient(TestServer(config_client_app)) as client:
+            resp = await client.put("/api/dashboard/config", json={"link_patterns": rules})
+            assert resp.status == 200
+            got = await (await client.get("/api/dashboard/config")).json()
+        assert got["link_patterns"] == rules
+
+    @pytest.mark.asyncio
+    async def test_link_patterns_preserve_pattern_whitespace_exactly(self, config_client_app):
+        # Whitespace in a regex is load-bearing: `PROJ-\d+ ` (trailing space)
+        # matches different text than `PROJ-\d+`. Neither the PUT handler nor
+        # the load-time coercer may strip it -- trimming is for blank-DETECTION
+        # only. Silent stripping broadened the stored pattern (mints links the
+        # operator never wrote); the two edge-space twins below are DIFFERENT
+        # regexes and must both survive, not collapse into the dedup 400.
+        rules = [
+            {"pattern": r"PROJ-\d+ ", "url": "https://one.example/{match}"},
+            {"pattern": r"PROJ-\d+", "url": "https://two.example/{match}"},
+            {"pattern": r" ID-\d+", "url": "https://three.example/{match}"},
+        ]
+        async with TestClient(TestServer(config_client_app)) as client:
+            resp = await client.put("/api/dashboard/config", json={"link_patterns": rules})
+            assert resp.status == 200
+            got = await (await client.get("/api/dashboard/config")).json()
+        # Byte-exact round trip through PUT -> disk -> coercer -> GET.
+        assert got["link_patterns"] == rules
+
+    @pytest.mark.asyncio
+    async def test_link_patterns_accept_mixed_case_scheme(self, config_client_app):
+        # The editor validates with the browser's URL parser, whose scheme is
+        # case-insensitive -- `HTTPS://x/{match}` passes the inline check, so
+        # the PUT (and the load coercer) must accept it too or the save dies
+        # with no inline warning. Stored byte-exactly, normalised nowhere.
+        rules = [{"pattern": r"\bCASE-\d+\b", "url": "HTTPS://tracker.example.com/browse/{match}"}]
+        async with TestClient(TestServer(config_client_app)) as client:
+            resp = await client.put("/api/dashboard/config", json={"link_patterns": rules})
+            assert resp.status == 200
+            got = await (await client.get("/api/dashboard/config")).json()
+        assert got["link_patterns"] == rules
+
+    @pytest.mark.asyncio
+    async def test_link_patterns_rejects_malformed(self, config_client_app):
+        bad_bodies = [
+            {"link_patterns": "not-a-list"},
+            {"link_patterns": ["not-a-dict"]},
+            {"link_patterns": [{"pattern": "", "url": "https://x.example/{match}"}]},
+            {"link_patterns": [{"pattern": "ok", "url": "javascript:alert(1)"}]},
+            {"link_patterns": [{"pattern": "ok", "url": "https://x.example/no-placeholder"}]},
+            {"link_patterns": [{"pattern": "ok", "url": "https://x.example/{match}"}] * 51},
+            {"link_patterns": [{"pattern": "a" * 301, "url": "https://x.example/{match}"}]},
+            # Duplicate patterns: the load-time coercer keeps only the first,
+            # so accepting both would persist a rule that GET then omits and a
+            # later editor save would silently drop from disk. Distinct urls
+            # under the same pattern are still one duplicate.
+            {
+                "link_patterns": [
+                    {"pattern": r"\bDUP-\d+\b", "url": "https://one.example/{match}"},
+                    {"pattern": r"\bDUP-\d+\b", "url": "https://two.example/{match}"},
+                ]
+            },
+            # Renderer parity: normaliseHref refuses userinfo and a '{match}'
+            # in the authority (the token could steer the host), so accepting
+            # these would store rules that never linkify and show no warning.
+            {"link_patterns": [{"pattern": "ok", "url": "https://{match}.example.com/x"}]},
+            {"link_patterns": [{"pattern": "ok", "url": "https://user:pw@x.example/{match}"}]},
+            {"link_patterns": [{"pattern": "ok", "url": "https://x.example:{match}/t"}]},
+            # Whitespace in the authority: Python's urlsplit tolerates it but
+            # the browser's URL parser refuses it, so the rule would store
+            # fine and silently never linkify.
+            {"link_patterns": [{"pattern": "ok", "url": "https://exa mple.com/{match}"}]},
+        ]
+        async with TestClient(TestServer(config_client_app)) as client:
+            for body in bad_bodies:
+                resp = await client.put("/api/dashboard/config", json=body)
+                assert resp.status == 400, body
+                assert (await resp.json())["code"] == "invalid_link_patterns"
+            # A malformed save persisted nothing.
+            got = await (await client.get("/api/dashboard/config")).json()
+        assert got["link_patterns"] == []
 
     @pytest.mark.asyncio
     async def test_boolean_fields_reject_non_booleans(self, config_client_app):
@@ -1116,12 +1344,21 @@ class TestDashboardConfigPut:
             assert resp.status == 400
             assert "verbosity" in (await resp.json())["error"]
 
+            resp = await client.put(
+                "/api/dashboard/config", json={"default_memory_mode": "forgetful"}
+            )
+            assert resp.status == 400
+            body = await resp.json()
+            assert "default_memory_mode" in body["error"]
+            assert body["code"] == "invalid_default_memory_mode"
+
     @pytest.mark.asyncio
     async def test_full_valid_put_round_trips_through_get(self, config_client_app):
         payload = {
             "restore_sessions": True,
             "restore_window_minutes": 30,
             "merge_queued_messages": True,
+            "default_memory_mode": "temporary",
             "widget_density": "less",
             "verbosity": "ultra",
             "quick_send": True,
@@ -1147,9 +1384,19 @@ class TestDashboardConfigPut:
             mock_sel.reset_mock()
             req = MagicMock()
             req.method = method
-            with patch("asyncio.to_thread", side_effect=asyncio.CancelledError):
-                with pytest.raises(asyncio.CancelledError):
-                    await files_mod.api_dashboard_config(req)
+            # PUT is owner-gated ahead of the load. This test is about what the
+            # LOAD does when it is cancelled, so the caller is the owner here;
+            # the gate's own behaviour is covered by
+            # TestDashboardConfigPutOwnerGate. Without this the MagicMock request
+            # reads as a non-owner and the gate answers before the load runs.
+            with patch(
+                "kiro_crew.dashboard.handlers.source_providers."
+                "is_owner_dashboard_request",
+                return_value=True,
+            ):
+                with patch("asyncio.to_thread", side_effect=asyncio.CancelledError):
+                    with pytest.raises(asyncio.CancelledError):
+                        await files_mod.api_dashboard_config(req)
             mock_sel.log_tool_invocation.assert_called_once_with(
                 session_key="dashboard",
                 tool_name=tool,
@@ -1204,6 +1451,54 @@ class TestContentMatchesExt:
         # No reliable magic for text or SVG: the extension allowlist is the gate.
         assert files_mod._content_matches_ext(".md", b"# anything")
         assert files_mod._content_matches_ext(".svg", b"<svg/>")
+
+
+class TestResolveRasterExt:
+    WEBP = b"RIFF\x10\x00\x00\x00WEBPVP8 " + b"\x00" * 8
+    PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+    HEIC = b"\x00\x00\x00\x18ftypheic" + b"\x00" * 8
+    MP4 = b"\x00\x00\x00\x18ftypisom" + b"\x00" * 8
+
+    def test_truthful_name_is_kept_verbatim(self):
+        # ".jpeg" stays ".jpeg" -- not normalised to the canonical ".jpg".
+        assert files_mod._resolve_raster_ext(".jpeg", b"\xff\xd8\xff\xe1" + b"\x00" * 12) == ".jpeg"
+        assert files_mod._resolve_raster_ext(".png", self.PNG) == ".png"
+
+    def test_mislabelled_raster_maps_to_the_sniffed_types_extension(self):
+        assert files_mod._resolve_raster_ext(".jpeg", self.WEBP) == ".webp"
+        assert files_mod._resolve_raster_ext(".jpg", self.PNG) == ".png"
+        assert files_mod._resolve_raster_ext(".png", b"GIF89a" + b"\x00" * 10) == ".gif"
+
+    def test_non_raster_bytes_resolve_to_nothing(self):
+        assert files_mod._resolve_raster_ext(".jpeg", self.HEIC) is None
+        assert files_mod._resolve_raster_ext(".png", b"<html>") is None
+        assert files_mod._resolve_raster_ext(".webp", b"RIFF\x00\x00\x00\x00WAVEmore") is None
+
+    def test_non_raster_extension_is_not_this_helpers_business(self):
+        assert files_mod._resolve_raster_ext(".pdf", b"%PDF-1.4") is None
+        assert files_mod._resolve_raster_ext(".svg", self.PNG) is None
+
+    def test_every_sniffable_raster_has_a_canonical_extension(self):
+        from kiro_crew.messaging import raster
+
+        assert set(files_mod._RASTER_MIME_EXT) == set(raster._MAGIC)
+        assert set(files_mod._RASTER_MIME_EXT.values()) <= set(files_mod._RASTER_EXT_MIME)
+
+    def test_mismatch_message_names_heif_containers(self):
+        msg = files_mod._content_mismatch_message(".jpeg", self.HEIC)
+        assert msg.startswith("This .jpeg file is really a HEIC/AVIF photo")
+        assert ".webp" in msg
+
+    def test_mismatch_message_for_other_bmff_brands_stays_generic(self):
+        # An mp4 wearing .jpeg is not a photo container; do not call it one.
+        msg = files_mod._content_mismatch_message(".jpeg", self.MP4)
+        assert msg.startswith("This file is not really a .jpeg image")
+
+    def test_mismatch_message_for_non_raster_extensions_is_unchanged(self):
+        assert (
+            files_mod._content_mismatch_message(".docx", b"nope")
+            == "File content does not match its type: .docx"
+        )
 
 
 class TestFuzzyScore:

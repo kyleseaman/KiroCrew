@@ -28,6 +28,7 @@ from kiro_crew.service.live_target import (
     InvalidTarget,
     maybe_reexec,
     pointer_path,
+    read_previous_target,
     read_target,
     read_target_reason,
     restore,
@@ -270,6 +271,48 @@ class TestReadTargetReason:
     def test_read_target_returns_none_when_absent(self):
         assert read_target() is None
 
+    def test_previous_target_round_trips_when_both_checkouts_validate(self, tmp_path):
+        current_root = tmp_path / "current"
+        previous_root = tmp_path / "previous"
+        current_root.mkdir()
+        previous_root.mkdir()
+        current = _make_valid_checkout(current_root)
+        previous = _make_valid_checkout(previous_root)
+
+        write_target(current, previous_checkout=previous)
+
+        assert read_target() == current.resolve()
+        assert read_previous_target() == previous.resolve()
+
+    def test_legacy_pointer_has_no_previous_target(self, tmp_path):
+        checkout = _make_valid_checkout(tmp_path)
+        write_target(checkout)
+        assert read_previous_target() is None
+
+    def test_invalid_previous_target_fails_closed(self, tmp_path):
+        checkout = _make_valid_checkout(tmp_path)
+        pointer_path().write_text(
+            json.dumps(
+                {
+                    "checkout": str(checkout),
+                    "previous_checkout": str(tmp_path / "missing"),
+                }
+            )
+        )
+        assert read_previous_target() is None
+
+    def test_unusable_current_target_keeps_valid_previous_available(self, tmp_path):
+        previous = _make_valid_checkout(tmp_path)
+        pointer_path().write_text(
+            json.dumps(
+                {
+                    "checkout": str(tmp_path / "removed-current"),
+                    "previous_checkout": str(previous),
+                }
+            )
+        )
+        assert read_previous_target() == previous.resolve()
+
 
 # ─── write_target() ────────────────────────────────────────────────────────
 
@@ -296,11 +339,10 @@ class TestWriteTarget:
         exist in a file that has not been locked down yet.
 
         atomic_write(restrict_to_owner=True) locks the TEMP file down before
-        any content reaches it (the previous post-rename lockdown left the
-        pointer inheriting the directory ACL on Windows for the write window,
-        issue #5285). Asserted by measuring the file's SIZE at lockdown time —
-        zero means no payload byte existed yet. A post-write stat passes on
-        the buggy ordering too, so it would not be a regression test.
+        any content reaches it. Asserted by measuring the file's SIZE at
+        lockdown time — zero means no payload byte existed yet. A post-write
+        stat passes even when lockdown follows the write, so measuring at
+        lockdown time is what makes this assertion meaningful.
         """
         from kiro_crew import platform_compat
 

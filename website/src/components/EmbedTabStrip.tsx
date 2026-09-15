@@ -4,7 +4,17 @@ import { useMutation } from '@tanstack/react-query'
 import { useAppSelector, useAppDispatch } from '../store'
 import { createSlot } from '../store/chatSlice'
 import { X, Plus } from 'lucide-react'
+import ErrorNotice from './ErrorNotice'
+import { errMessage } from '../utils/thunkError'
 import { useScrollEdges } from '../hooks/useScrollEdges'
+import {
+  TAB_STATUS_COLOR,
+  removeTabAt,
+  tabStatus,
+  tabStatusPulses,
+  truncateTabTitle,
+  type TabStatus,
+} from '../lib/sessionTabs'
 import type { ChatSlot } from '../types'
 
 import { i18nT } from '../i18n/t'
@@ -168,12 +178,9 @@ export default function EmbedTabStrip() {
   }
 
   const closeTab = (index: number) => {
-    const newTabs = [...tabs]
-    newTabs.splice(index, 1)
-    if (newTabs.length === 0) newTabs.push({ slug: '' })
-    let newIndex = activeIndex
-    if (activeIndex > index) newIndex--
-    else if (activeIndex >= newTabs.length) newIndex = newTabs.length - 1
+    const removed = removeTabAt(tabs, index, activeIndex)
+    const newTabs = removed.tabs.length ? removed.tabs : [{ slug: '' }]
+    const newIndex = removed.activeIndex
     setTabs(newTabs)
     setActiveIndex(newIndex)
     if (activeIndex === index) {
@@ -336,24 +343,17 @@ export default function EmbedTabStrip() {
   // Status dot color per tab
   const unreadSlots = useAppSelector(s => s.dashboard.unreadSlots)
 
-  const getStatus = (slug: string): 'idle' | 'running' | 'unread' | 'permission' | 'question' => {
+  // Status precedence, its colour vocabulary and the close-index arithmetic are
+  // shared with the dashboard's own session strip (lib/sessionTabs) so the two
+  // shells cannot drift on what a dot means or where a close lands.
+  const getStatus = (slug: string): TabStatus => {
     if (!slug) return 'idle'
-    const slot = slots.find(s => s.key === slug)
-    if (!slot) return 'idle'
-    if (slot.pending_approval) return 'permission'
-    // Above running: a blocking question card leaves the turn parked, so the tab
-    // would otherwise pulse "working" while it waits on the user.
-    if (slot.needs_input) return 'question'
-    if (slot.running) return 'running'
-    if (unreadSlots.includes(slug)) return 'unread'
-    return 'idle'
+    return tabStatus(slots.find(s => s.key === slug), unreadSlots, slug)
   }
 
   return (
-    <div
-      className="flex items-center shrink-0 border-b border-border px-1.5 py-1.5"
-      style={{ background: 'var(--bg)' }}
-    >
+    <div className="shrink-0 border-b border-border" style={{ background: 'var(--bg)' }}>
+    <div className="flex items-center px-1.5 py-1.5">
       {/* The wrapper exists for the edge cues: absolutely-positioned children
           of the scroller itself would travel with the scrolled content, so the
           fades anchor to this non-scrolling parent. It also owns the flex
@@ -371,7 +371,7 @@ export default function EmbedTabStrip() {
         {tabs.map((tab, i) => {
           const active = i === activeIndex
           const title = getTitle(tab.slug, i)
-          const truncated = title.length > 24 ? title.slice(0, 24) + '…' : title
+          const truncated = truncateTabTitle(title)
           const isDragged = dragSlug != null && (tab.slug || `new-${i}`) === dragSlug
           return (
             <div
@@ -400,11 +400,10 @@ export default function EmbedTabStrip() {
             >
               {tab.slug && (() => {
                 const status = getStatus(tab.slug)
-                const colors = { idle: 'var(--muted)', running: 'var(--accent)', unread: 'var(--ok)', permission: 'var(--warn)', question: 'var(--info)' }
                 return (
                   <span
-                    className={`shrink-0 w-1.5 h-1.5 rounded-full self-center mr-0.5 ${status === 'running' || status === 'permission' ? 'animate-pulse' : ''}`}
-                    style={{ background: colors[status] }}
+                    className={`shrink-0 w-1.5 h-1.5 rounded-full self-center mr-0.5 ${tabStatusPulses(status) ? 'animate-pulse' : ''}`}
+                    style={{ background: TAB_STATUS_COLOR[status] }}
                   />
                 )
               })()}
@@ -451,6 +450,24 @@ export default function EmbedTabStrip() {
       >
         <Plus size={14} />
       </button>
+    </div>
+      {createSlotMutation.isError && (
+        // A rejected createSlot otherwise leaves the "+" looking dead. Its own
+        // wrapping row beneath the strip: the tab row is a non-shrinking
+        // horizontal scroller, so a notice inside it would add a third action to
+        // that row and overflow a 320px viewport. The strip holds no draft (tabs
+        // are persisted to sessionStorage on every change), so the hand-off is on.
+        <div className="px-2 pb-1.5">
+          <ErrorNotice
+            variant="inline"
+            askAgent
+            testId="embed-tab-strip-create-error"
+            className="flex-wrap"
+            message={errMessage(createSlotMutation.error) || i18nT('components.embedTabStrip.new_chat_failed')}
+            onDismiss={() => createSlotMutation.reset()}
+          />
+        </div>
+      )}
     </div>
   )
 }

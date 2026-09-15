@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from 'react'
-import { widgetHeightKey, getWidgetHeight, setWidgetHeight, estimateWidgetHeight } from '../utils/widgetHeights'
+import { widgetHeightKey, getWidgetHeight, setWidgetHeight, estimateWidgetHeight, clampFrameHeight } from '../utils/widgetHeights'
 import { Maximize2, Minimize2, ExternalLink, Download, Star, RotateCw } from 'lucide-react'
-import { IconButton, IconButtonGroup } from './ui'
+import { Btn, IconButton, IconButtonGroup } from './ui'
 import { useTheme } from '../hooks/useTheme'
 import { sanitizeCssValue } from '../lib/cssSanitize'
 import { THEME_VAR_NAMES, buildSrcdoc } from '../lib/widgetSrcdoc'
@@ -13,7 +13,6 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { i18nT } from '../i18n/t'
 import { useSandboxDoc } from '../hooks/useSandboxDoc'
 import { useNearViewport } from '../hooks/useNearViewport'
-const MIN_HEIGHT = 80
 
 // Upper bound on the text a single widget action may pre-fill into the
 // composer. A malicious LLM-emitted <script> can postMessage
@@ -129,24 +128,21 @@ interface WidgetFrameProps {
   /** Explicit slug attribute on `<mcwidget slug="...">`. When the agent
    * re-emits a previously-saved artifact it MUST include this attribute so
    * the impression binds to the same artifact. For brand-new emissions the
-   * agent may omit it and we derive a stable slug from `messageTs +
-   * widgetIndex` instead. */
+   * agent may omit it and we derive a stable slug from `messageTs + html`
+   * instead. */
   slug?: string
   /** Parent message timestamp. Threaded through from AssistantMessage so
    * widgets without an explicit slug get a stable, location-anchored
    * identity that survives refreshes and prevents save-then-refresh
    * duplicate creation. */
   messageTs?: string
-  /** 0-based ordinal of this widget within the parent message. Two
-   * `<mcwidget>` tags in the same message disambiguate by this index. */
-  widgetIndex?: number
   /** Chat slot this widget was rendered in. Used to attribute a
    * fallback-created artifact to its session and to refresh the in-session
    * Artifacts tab after a star/unstar. Absent for embedded/detached renders. */
   slotKey?: string
 }
 
-export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, widgetIndex, slotKey }: WidgetFrameProps) {
+export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, slotKey }: WidgetFrameProps) {
   // Re-read theme CSS vars whenever the resolved theme, active color theme,
   // or themeVersion counter changes. themeVersion is the trigger for
   // in-place custom-theme edits via the theme editor: the slug stays the
@@ -195,7 +191,7 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
   // width, so it takes the default key space; a caller measuring at a different
   // width takes its own.
   const key = useMemo(() => widgetHeightKey(html), [html])
-  const [height, setHeight] = useState(() => getWidgetHeight(key) ?? estimateWidgetHeight())
+  const [height, setHeight] = useState(() => clampFrameHeight(getWidgetHeight(key) ?? estimateWidgetHeight()))
   // Mirror of `height` so the message handler (wired once per `key`) can
   // compare against the live value, plus a timer used to defer shrinks.
   const heightRef = useRef(height)
@@ -227,25 +223,30 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
   // See hooks/useSandboxDoc.ts: the frame loads a gateway-served document
   // rather than a `blob:` URL, and the previous document survives both an
   // in-flight and a failed re-mint.
-  const { url: blobUrl, failed: mintFailed, retry: retryMint } = useSandboxDoc(
+  const { url: blobUrl, failed: mintFailed, pending: mintPending, retry: retryMint } = useSandboxDoc(
     visible ? srcdoc : null,
   )
   // Fade the iframe in once its document loads, so the reveal is a soft fade
   // instead of an abrupt blink-then-appear. Reset to false whenever a new blob
   // is built (first reveal, theme change, content rebuild) so each fresh render
   // fades in too.
+  // Gated on the FIRST load only, and deliberately never reset when the document
+  // is rebuilt. Re-hiding on every new srcdoc leaves the frame blank until the
+  // next `load` fires; with the document now minted over the network (rather than
+  // a local blob:) that gap is a real round trip, long enough on a phone reaching
+  // the gateway through a tunnel to read as the widget vanishing after it had
+  // already rendered — and permanent if a further rebuild lands first. Same
+  // reasoning as ArtifactBody's `everLoaded`; keep the two in step.
   const [iframeLoaded, setIframeLoaded] = useState(false)
-
-  useEffect(() => {
-    if (!visible || !srcdoc) return
-    setIframeLoaded(false)
-  }, [srcdoc, visible])
 
   useEffect(() => {
     const handler = (e: MessageEvent) => {
       if (!iframeRef.current || e.source !== iframeRef.current.contentWindow) return
       if (e.data?.type === 'mc-widget-height' && typeof e.data.height === 'number') {
-        const h = Math.max(e.data.height, MIN_HEIGHT)
+        // Bounded at both ends by the shared clamp. Chat frames have always been
+        // self-sizing off this same report with no bound at all, so a
+        // viewport-coupled document could grow one without limit here.
+        const h = clampFrameHeight(e.data.height)
         // No-op when the clamped height is unchanged. An animated widget can
         // post the same height every frame; without this guard each report
         // re-ran applyHeight → persistHeightCache (synchronous localStorage
@@ -362,17 +363,17 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
   // Determine the effective slug for this impression. Priority:
   //  1. Explicit `slug` attribute from the agent (used when re-emitting a
   //     known saved artifact — see artifacts skill).
-  //  2. Derived from `messageTs + widgetIndex` — stable across refreshes,
-  //     so saving once and refreshing doesn't create a duplicate.
+  //  2. Derived from `messageTs + html`, so a slug hit proves the stored body
+  //     equals this impression. Identical bodies in one message share a slug.
   // Returns null only when neither is available (streaming/detached
   // widgets, or test fixtures); in that case bookmark is disabled.
   const effectiveSlug = useMemo(
     () => effectiveWidgetSlug({
       explicitSlug: slug,
       messageTs,
-      widgetIndex,
+      body: html,
     }),
-    [slug, messageTs, widgetIndex],
+    [slug, messageTs, html],
   )
   // Probe this widget's artifact. Cached via React Query with a 5-min
   // staleTime so repeated impressions / tab refocuses don't each fire a
@@ -562,14 +563,15 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
 
       {mintFailed && <div className="px-3 py-2 flex items-center gap-3 text-text">
         <span>{i18nT('components.widgetFrame.could_not_render')}</span>
-        <button
-          type="button"
-          className="btn btn-sm"
+        {/* Btn, not a raw `btn btn-sm` button: that class has no CSS behind it,
+            so the recovery control rendered as bare text. */}
+        <Btn
+          disabled={mintPending}
           onClick={retryMint}
         >
           <RotateCw className="lucide-inline" />
           {i18nT('components.widgetFrame.retry')}
-        </button>
+        </Btn>
       </div>}
 
       {/* While the document URL is in flight the row must keep the height the
@@ -610,8 +612,26 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
           src={blobUrl}
           onLoad={() => setIframeLoaded(true)}
           sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
+          // NO clipboard-write delegation here, deliberately. These frames host
+          // agent-generated HTML whose scripts run on load, so a delegated
+          // permission would let one overwrite the user's clipboard with no Copy
+          // action at all. Copying still works: lib/widgetSrcdoc.ts injects an
+          // execCommand fallback that a real button press satisfies and a
+          // gesture-less on-load script does not.
           className="w-full border-none bg-card transition-opacity duration-200 ease-out motion-reduce:transition-none"
-          style={{ height: expanded ? '100%' : height, opacity: iframeLoaded ? 1 : 0 }}
+          style={{
+            height: expanded ? '100%' : height,
+            // Same compositing promotion the artifact frame carries, for the same
+            // reason: an engine can lay this document out, run its scripts and
+            // report a correct height while never rasterizing it, which presents
+            // as an empty box rather than an error. Promoting the frame to its
+            // own layer is the one remedy that needs no timing — the others have
+            // to be fired after load, which races a slow document. This frame was
+            // left out when the artifact frame was promoted, so the inline-widget
+            // surface still had the gap.
+            transform: 'translateZ(0)',
+            opacity: iframeLoaded ? 1 : 0,
+          }}
           title={title}
         />
       </div>}

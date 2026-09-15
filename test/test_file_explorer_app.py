@@ -115,6 +115,65 @@ class TestIsSensitive:
         # The fix must not over-block: a genuine safe subdir stays accessible.
         assert server._is_sensitive(tmp_tree / ".kiro" / "crew" / "workspace" / "a.txt") is False
 
+    @pytest.mark.parametrize(
+        "relpath",
+        (
+            ".kube/admin.conf",
+            ".KUBE/admin.conf",
+            ".Kube/admin.conf",
+            ".docker/contexts/tls/key.pem",
+            ".DOCKER/contexts/tls/key.pem",
+            ".ssh/id_rsa",
+            ".SSH/id_rsa",
+            ".aws/credentials",
+            ".AWS/credentials",
+            ".GnuPG/secring.gpg",
+            ".NETRC",
+        ),
+    )
+    def test_credential_dirs_are_blocked_in_any_letter_case(self, tmp_tree, relpath):
+        """Same case-insensitive-volume reasoning as the crew-home marker above.
+
+        `SENSITIVE_DIRS` was compared case-SENSITIVELY, so ``~/.KUBE/admin.conf``
+        -- the same inode as ``~/.kube/admin.conf`` on macOS and Windows -- was
+        served. ``.kube`` and ``.docker`` had no second gate to fall back on
+        either: the shared `is_sensitive_path` fences the specific leaves
+        ``.kube/config`` and ``.docker/config.json``, so a kubeconfig or a client
+        key under any other name was reachable through an authenticated read.
+        """
+        assert server._is_sensitive(tmp_tree / relpath) is True, relpath
+
+    def test_the_safe_subdir_allowlist_is_case_SENSITIVE(self, tmp_tree):
+        """The allow-list must NOT fold case, unlike the deny-list beside it.
+
+        The two point in opposite directions, so the same operation is safe on one and
+        unsafe on the other. Folding a deny-list can only deny more; folding an
+        allow-list can only allow more -- and on a case-sensitive filesystem
+        ``crew/Skills`` is a genuinely different directory from the safe
+        ``crew/skills``, so folding would hand out a path deny-by-default withholds.
+
+        Erring the other way costs a spurious denial of a capitalised spelling on a
+        case-insensitive volume, which is the correct direction for this list.
+        """
+        assert server._is_sensitive(tmp_tree / ".kiro" / "crew" / "Skills" / "s.md") is True
+        assert server._is_sensitive(tmp_tree / ".kiro" / "crew" / "WORKSPACE" / "a.txt") is True
+        # The exact spelling still resolves, which is what the allow-list is for.
+        assert server._is_sensitive(tmp_tree / ".kiro" / "crew" / "skills" / "s.md") is False
+
+    def test_sensitive_dir_predicate_is_the_single_lookup(self):
+        """Pin the predicate itself: the call sites all route through it."""
+        assert server._is_sensitive_dir_name(".kube")
+        assert server._is_sensitive_dir_name(".KUBE")
+        assert server._is_sensitive_dir_name(".Docker")
+        assert not server._is_sensitive_dir_name("kube")
+        assert not server._is_sensitive_dir_name("src")
+        assert server._is_safe_crew_subdir("skills")
+        # NOT folded: an allow-list that folds case grants a distinct directory on any
+        # case-sensitive filesystem. See `_is_safe_crew_subdir`.
+        assert not server._is_safe_crew_subdir("SKILLS")
+        assert not server._is_safe_crew_subdir("Skills")
+        assert not server._is_safe_crew_subdir("config.json")
+
     def test_crew_home_root_detection_case_insensitive(self, tmp_tree):
         assert server._is_crew_home_root(tmp_tree / ".KIRO" / "crew") is True
         assert server._is_crew_home_root(tmp_tree / ".kiro" / "crew") is True
@@ -154,6 +213,50 @@ class TestListDir:
         entries, _ = server._list_dir(tmp_tree, depth=1, ignore=False)
         names = {e["name"] for e in entries}
         assert "node_modules" in names
+
+    def test_one_unreadable_sibling_does_not_collapse_listing(self, tmp_tree):
+        """One child raising OSError/PermissionError during its stat must not
+        abort the whole listing: readable siblings still list and the
+        unreadable child degrades to a non-error node."""
+        real_is_dir = Path.is_dir
+
+        def boom(self, *args, **kwargs):
+            if self.name == "file.txt":
+                raise PermissionError(1, "Operation not permitted")
+            return real_is_dir(self, *args, **kwargs)
+
+        with patch.object(Path, "is_dir", boom):
+            entries, _ = server._list_dir(tmp_tree, depth=1, ignore=True)
+
+        # The listing did not collapse to a single error node.
+        error_nodes = [e for e in entries if e.get("type") == "error"]
+        assert not error_nodes, f"listing collapsed to error node(s): {entries!r}"
+        # Readable siblings are still present.
+        names = {e["name"] for e in entries}
+        assert "code.py" in names
+        assert "subdir" in names
+        # The unreadable child is still listed (its stat failure degrades to a
+        # "missing" node via _entry_meta rather than vanishing).
+        assert "file.txt" in names
+
+    def test_kirocrew_safe_children_survives_unreadable_sibling(self, tmp_tree):
+        """A single unreadable child must not empty the crew-home safe-subdir
+        list: the readable safe subdirs still return."""
+        crew = tmp_tree / ".kiro" / "crew"
+        (crew / "skills").mkdir(parents=True)
+        (crew / "workspace").mkdir()
+        real_is_dir = Path.is_dir
+
+        def boom(self, *args, **kwargs):
+            if self.name == "skills":
+                raise PermissionError(1, "Operation not permitted")
+            return real_is_dir(self, *args, **kwargs)
+
+        with patch.object(Path, "is_dir", boom):
+            out = server._kirocrew_safe_children(crew)
+
+        names = {e["name"] for e in out}
+        assert "workspace" in names  # readable safe subdir still listed
 
 
 class TestFileHelpers:
@@ -442,6 +545,22 @@ class TestHTTPHandler:
         names = {e["name"] for e in responses[0][1]["entries"]}
         assert "file.txt" not in names  # kind=dir by default
         assert "subdir" in names
+
+    def test_complete_survives_unreadable_sibling(self, tmp_tree):
+        """One unreadable child must not empty the completion list: the
+        readable directories still complete."""
+        real_is_dir = Path.is_dir
+
+        def boom(self, *args, **kwargs):
+            if self.name == ".ssh":
+                raise PermissionError(1, "Operation not permitted")
+            return real_is_dir(self, *args, **kwargs)
+
+        with patch.object(Path, "is_dir", boom):
+            responses = self._make_request(f"/complete?path={tmp_tree}/&kind=dir")
+        assert responses[0][0] == 200
+        names = {e["name"] for e in responses[0][1]["entries"]}
+        assert "subdir" in names  # readable dir still completes
 
     def test_complete_bare_allowed_root_matches_trailing_slash(self, tmp_tree):
         """A bare allowed-root path (no trailing slash) must complete exactly
@@ -756,13 +875,22 @@ class TestAutoSdeRound1Findings:
                 pass
         cmd = captured.get("cmd")
         assert cmd, "wrap_argv never called — _search_rg did not build an rg command"
-        globs = [cmd[i + 1] for i, a in enumerate(cmd[:-1]) if a == "--glob"]
+        # Collected from BOTH spellings: the security exclusions use `--iglob`
+        # because ripgrep matches `--glob` case-SENSITIVELY, which left `~/.KUBE`
+        # and a case-variant crew home searchable — and a search returns the file
+        # BYTES, so that was the one filter whose bypass printed the secret rather
+        # than merely revealing a name.
+        globs = [cmd[i + 1] for i, a in enumerate(cmd[:-1]) if a in ("--glob", "--iglob")]
         crew_globs = [g for g in globs if ".kiro/crew" in g or ".kirocrew" in g]
         assert crew_globs == [
             "!**/.kiro/crew/**",
             "!**/.kirocrew/**",
         ], crew_globs
         assert all(g.startswith("!") for g in crew_globs)
+        icase = [cmd[i + 1] for i, a in enumerate(cmd[:-1]) if a == "--iglob"]
+        assert set(crew_globs) <= set(icase), f"crew globs must be case-insensitive: {icase}"
+        for sd in server.SENSITIVE_DIRS:
+            assert f"!**/{sd}" in icase, f"{sd} exclusion must be case-insensitive"
 
     def test_rg_no_kirocrew_globs_when_root_inside_safe_subdir(self, tmp_tree):
         """#17: searching inside .kirocrew/workspace adds no .kirocrew globs

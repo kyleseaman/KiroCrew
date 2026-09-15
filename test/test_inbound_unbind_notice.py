@@ -205,8 +205,8 @@ class TestWorkerThreadDelivery:
         returned = threading.Event()
 
         def _worker() -> None:
-            # No running loop on this thread — the exact condition that used to
-            # drop the notice.
+            # No running loop on this thread — the exact condition that drops
+            # the notice.
             assert not _has_running_loop()
             listener(KEY, LINK, "dashboard_unlink")
             # Set only after the callback returned, so waiting on it proves the
@@ -246,19 +246,29 @@ class TestDelivery:
         ],
     )
     @pytest.mark.asyncio
-    async def test_an_undeliverable_notice_is_a_silent_noop(
-        self, state: DashboardState, transport, permit: bool
+    async def test_an_undeliverable_notice_is_a_logged_noop(
+        self, state: DashboardState, transport, permit: bool, caplog
     ) -> None:
-        """The binding is already gone and audited; a failed notice adds nothing."""
+        """The binding is already gone and audited; a failed notice adds nothing —
+        but the drop itself must be visible to the operator. The user was NOT told
+        their conversation lost its way back, and the SEL event records the
+        removal, not the delivery failure, so a fully silent return here is a
+        traceless gap (a destroyed binding produces no channel notice and no
+        log line naming why)."""
         state.channel_transports["discord"] = transport or _Transport(proactive=False)
 
         with patch(
             "kiro_crew.platform.governance_profiles.vet_and_audit",
             return_value=SimpleNamespace(permitted=permit),
         ):
-            await state._notify_inbound_unbind(KEY, LINK, "entry_deleted")
+            with caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.state"):
+                await state._notify_inbound_unbind(KEY, LINK, "entry_deleted")
 
         assert state.channel_transports["discord"].sent == []
+        assert any(
+            "undeliverable" in record.message or "Failed to deliver" in record.message
+            for record in caplog.records
+        )
 
 
 class TestNoticeIsSafeAndHuman:

@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from 'react'
 import { safeSetItem } from '../utils/safeStorage'
+import { secureRandomId } from '../utils/secureId'
 
 /* ── App-wide bottom terminal panel ───────────────────────────────────────
  * A single docked terminal panel shared by the ENTIRE app (every route), as
@@ -55,7 +56,10 @@ export const MAX_VH = 0.72
 /** Fraction of the viewport width the right-docked panel may occupy. */
 export const MAX_VW = 0.55
 
-const mintId = () => Math.random().toString(36).slice(2, 14)
+// A terminal tab id doubles as the PTY session id the backend addresses, so it
+// is a security token and must not come from Math.random(); same rule as the
+// chat-scoped terminal tabs in usePanelTabs.
+const mintId = () => secureRandomId()
 const clampHeight = (h: number) => Math.max(MIN_HEIGHT, Math.round(h))
 const clampWidth = (w: number) => Math.max(MIN_WIDTH, Math.round(w))
 
@@ -178,6 +182,14 @@ export function adoptTab(id: string, cwd?: string): boolean {
   return true
 }
 
+/** Whether a tab with this session id is currently in the store. Lets the
+ *  run-in-terminal dispatch check, at its deadline, that the tab it minted is
+ *  still its own to roll back — a tab the user already closed is gone from
+ *  here, and rolling back anyway would double-delete the PTY. */
+export function hasTab(id: string): boolean {
+  return state.tabs.some(t => t.id === id)
+}
+
 /** Remove a tab from the store (the caller disposes the PTY/xterm first).
  *  Closing the last tab also hides the panel. */
 export function removeTab(id: string): void {
@@ -263,6 +275,11 @@ export function useBottomTerminalOpen(): boolean {
   return useSyncExternalStore(subscribe, getOpenSnapshot, getOpenSnapshot)
 }
 
+/** Imperative read of the same flag, for non-React callers that must know which
+ *  way a `toggleBottomTerminal` is about to go — see `terminalChordFocus.ts`,
+ *  which has to decide about focus BEFORE the panel unmounts. */
+export function isBottomTerminalOpen(): boolean { return state.open }
+
 /** Selector for just the `position` field. */
 function getPositionSnapshot(): TerminalPosition { return state.position }
 export function useTerminalPosition(): TerminalPosition {
@@ -273,7 +290,54 @@ export function useTerminalPosition(): TerminalPosition {
 export function __resetBottomTerminal(): void {
   state = { open: false, height: DEFAULT_HEIGHT, width: DEFAULT_WIDTH, position: 'bottom', tabs: [], activeId: null }
   emit()
+  setTerminalCloseFailed(false)
   if (typeof localStorage !== 'undefined') {
     try { localStorage.removeItem(STORAGE_KEY) } catch { /* ignore */ }
   }
+}
+
+/* ── Close-failure notice ──
+ * A rejected PTY DELETE for a tab that is already gone locally. A boolean flag,
+ * kept OUTSIDE the persisted layout state above, mirrored to localStorage under
+ * its own key purely as a cross-WINDOW transport: the popout frame returns
+ * itself to the main window the moment its last tab closes, and the main
+ * window's always-mounted panel root is then the surface the notice lands on.
+ * It is deliberately NOT read at module init — a report the server-side reaper
+ * backstops must not greet the next launch — and it is a flag rather than a
+ * rendered string so the reader window renders it in its own locale. The strip
+ * is never the host: closing the LAST tab unmounts it before a delayed
+ * rejection can render. */
+const CLOSE_ERROR_KEY = 'mc-terminal-close-error'
+let closeFailed = false
+const closeErrorListeners = new Set<() => void>()
+function emitCloseError() { for (const cb of closeErrorListeners) cb() }
+function subscribeCloseError(cb: () => void) {
+  closeErrorListeners.add(cb)
+  return () => { closeErrorListeners.delete(cb) }
+}
+function getCloseFailed(): boolean { return closeFailed }
+export function setTerminalCloseFailed(failed: boolean): void {
+  if (failed === closeFailed) return
+  closeFailed = failed
+  emitCloseError()
+  if (typeof localStorage === 'undefined') return
+  try {
+    // A UNIQUE value per failure, not a constant: `storage` only fires when the
+    // stored value changes, so a constant retained from a session that was never
+    // dismissed (the key is deliberately not read at launch) would swallow the
+    // next failure's event. Readers test presence, never the value.
+    if (failed) safeSetItem(CLOSE_ERROR_KEY, String(Date.now()))
+    else localStorage.removeItem(CLOSE_ERROR_KEY)
+  } catch { /* quota / locked storage — the in-window notice still rendered */ }
+}
+export function useTerminalCloseFailed(): boolean {
+  return useSyncExternalStore(subscribeCloseError, getCloseFailed, getCloseFailed)
+}
+if (typeof window !== 'undefined') {
+  // `storage` fires only in OTHER windows, so adopting here cannot loop.
+  window.addEventListener('storage', (e) => {
+    if (e.key !== CLOSE_ERROR_KEY) return
+    closeFailed = e.newValue != null
+    emitCloseError()
+  })
 }

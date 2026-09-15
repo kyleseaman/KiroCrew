@@ -57,13 +57,17 @@ import asyncio
 import logging
 import time
 import weakref
+from itertools import islice
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.dashboard.channel_folders import lookup_channel_folder
-from kiro_crew.dashboard.state import _normalize_slot_key
+from kiro_crew.dashboard.chat_title import _persist_title
+from kiro_crew.dashboard.chat_utils import effective_session_key
+from kiro_crew.dashboard.state import _normalize_slot_key, durable_row_count, row_mid
 from kiro_crew.history import carry_provenance, is_incognito_transcript
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.link import channel_namespace_of, is_channel_session_key
+from kiro_crew.messaging.upload_gate import live_dashboard_slot
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -130,6 +134,103 @@ def _redact_assistant(content: str) -> str:
     content, _ = redact_exfiltration_urls(content)
     content, _ = redact_credentials(content)
     return content
+
+
+def project_channel_turn_live(
+    dashboard_state: Any,
+    session_key: str,
+    user_text: str,
+    reply_text: str,
+    *,
+    broadcast_user: bool = False,
+) -> tuple[str, str] | None:
+    """Append one resumed turn to its open dashboard slot and return both row ids.
+
+    This is loop-side by contract: user then assistant append without an await between
+    them, so the live window observes one ordered pair. ``broadcast_user`` is explicit
+    because Telegram has no optimistic dashboard copy for its channel-originated row,
+    while Discord's established projection path does not broadcast that row.
+    """
+    slot = live_dashboard_slot(dashboard_state, session_key)
+    if slot is None:
+        return None
+    try:
+        user_mid = (
+            row_mid(
+                slot.append(
+                    "user",
+                    user_text,
+                    "msg msg-u",
+                    broadcast_user=broadcast_user,
+                )
+            )
+            or ""
+        )
+    except Exception:
+        logger.debug(
+            "channel turn projection: user append failed for %s", session_key, exc_info=True
+        )
+        return None
+
+    assistant_mid = ""
+    if reply_text:
+        try:
+            assistant_mid = row_mid(slot.append("assistant", reply_text, "msg msg-a")) or ""
+        except Exception:
+            logger.debug(
+                "channel turn projection: assistant append failed for %s",
+                session_key,
+                exc_info=True,
+            )
+
+    push = getattr(dashboard_state, "push_slots_update", None)
+    if callable(push):
+        try:
+            push()
+        except Exception:
+            logger.debug("channel turn projection: slot push failed", exc_info=True)
+    return user_mid, assistant_mid
+
+
+async def rename_channel_title_live(
+    dashboard_state: Any,
+    session_key: str,
+    title: str,
+) -> bool:
+    """Rename the open dashboard slot for *session_key* and keep every view aligned.
+
+    Returns ``False`` when no live slot owns the session, so the channel can fall
+    back to its conversation-log-only path. A live slot is authoritative once it
+    exists: changing only transcript metadata lets its later save rewrite the old
+    in-memory title over the new one. Match the dashboard's own manual-rename
+    ordering instead — update the slot synchronously, bump its title epoch so a
+    background titler stands down, persist through the epoch-aware helper, then
+    broadcast the exact value every dashboard client must render.
+
+    ``_persist_title`` is best-effort by dashboard contract. A failed immediate
+    metadata write leaves the updated live slot authoritative and a later slot
+    save can recover it; the dashboard's own rename endpoint makes the same trade.
+    """
+    slot = live_dashboard_slot(dashboard_state, session_key)
+    if slot is None:
+        return False
+
+    slot.title = title
+    slot._titled = True
+    slot._title_origin = "user"
+    slot._title_epoch = int(getattr(slot, "_title_epoch", 0)) + 1
+    persisted = await _persist_title(dashboard_state, slot)
+    if not persisted:
+        logger.warning("channel title update is live but not yet durable for %s", session_key)
+
+    push_title = getattr(dashboard_state, "push_slot_title", None)
+    if callable(push_title):
+        push_title(slot.key, title)
+    else:
+        push_slots = getattr(dashboard_state, "push_slots_update", None)
+        if callable(push_slots):
+            push_slots()
+    return True
 
 
 def _close_time(meta: dict[str, Any], file_mtime: float | None) -> float | None:
@@ -244,9 +345,7 @@ def needs_default_filing(meta: dict[str, Any]) -> bool:
     first surface happens exactly once per conversation.
     """
     return not (
-        meta.get("folder_id")
-        or meta.get("channel_folder_filed")
-        or meta.get("channel_origin")
+        meta.get("folder_id") or meta.get("channel_folder_filed") or meta.get("channel_origin")
     )
 
 
@@ -258,6 +357,7 @@ def surface_channel_session(
     *,
     session_key: str = "",
     folder_id: str = "",
+    folder_tags: list[str] | None = None,
 ) -> "_ChatSlot | None":
     """Create the dashboard slot for one channel session.
 
@@ -281,6 +381,15 @@ def surface_channel_session(
     hand keeps where they put it. The caller withholds it for a conversation that
     has already been filed once, so a later move (including a move back out to
     the top level) is never undone; see :func:`reconcile_channel_slots`.
+
+    *folder_tags* are the target folder's organizational tags, resolved and
+    validated by the caller (vocabulary membership, string ids). They are copied
+    onto the slot only on the same first-filing branch that applies *folder_id*:
+    a channel chat born into a tagged folder inherits exactly like a dashboard
+    chat created in it (creation-only — moves don't retro-tag). Tags persisted in
+    *meta* (written atomically with the filing marker by the reconcile pass) are
+    applied on every surface: that is recovery of an inheritance that already
+    happened, not a re-inheritance, so it does not violate the creation-only rule.
     """
     stem = session_info.get("key", "")
     if not stem or not is_channel_session_key(stem):
@@ -299,9 +408,7 @@ def surface_channel_session(
         )
         session_key = ""
     if not session_key:
-        logger.info(
-            "channel surface: %s has no mapped session key; surfacing unbound", stem
-        )
+        logger.info("channel surface: %s has no mapped session key; surfacing unbound", stem)
     try:
         slot = state.get_or_create_slot(
             name=slot_name,
@@ -320,14 +427,54 @@ def surface_channel_session(
     slot._titled = bool(raw_title)
     if meta.get("created_at"):
         slot.created_at = meta["created_at"]
+    # The identity of the transcript this surfacing read — lets a later save
+    # recognize a file recreated by another writer after a permanent delete
+    # (the delete-won guard in ``_save_slot_to_history``). Channel slots adopt
+    # append-created transcripts, so the observed on-disk value is the only
+    # honest anchor (the slot's own construction time never matches it). The
+    # observed bit records that this read happened even for legacy metadata
+    # without created_at, so the delete-won guard's evidence gate engages.
+    slot._disk_meta_created_at = str(meta.get("created_at") or "")
+    slot._disk_meta_observed = bool(meta)
+    slot._memory_assignment_from_history = True
     if meta.get("model"):
         slot.model = meta["model"]
+    if meta.get("autocompact_pct") is not None:
+        # Restore the per-session compaction threshold, mirroring the
+        # persistence loaders: without this, a surfaced slot's field stays
+        # None and the next save overwrites the persisted override with null.
+        # Local import: chat_persistence imports from this module, so a
+        # module-level import here would be circular.
+        from kiro_crew.dashboard.chat_persistence import _validate_autocompact_pct
+
+        slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
+        if slot.autocompact_pct is not None and state.sessions:
+            state.sessions.set_autocompact_pct(effective_session_key(slot), slot.autocompact_pct)
     if meta.get("workspace"):
         slot.workspace = meta["workspace"]
+    if meta.get("memory_store"):
+        slot.memory_store = str(meta["memory_store"])
     if meta.get("project"):
         slot.project = meta["project"]
     if meta.get("channel_folder_filed"):
         slot._channel_folder_filed = True
+    # Persisted tags are applied on EVERY surface, not just first filing: the
+    # filing write stores the inherited tags atomically with the filing marker
+    # (see reconcile), so a restore after a crash — where the marker exists but
+    # the slot never saved — recovers them from here. Validation is the shared
+    # authority-aware helper, matching the three sibling restore paths: it
+    # fails OPEN when the vocabulary is unreadable (_tags_authoritative=False),
+    # because pruning against an unknown vocabulary would drop every id, the
+    # next save would persist the loss, and the sticky filing marker blocks
+    # re-inheritance forever. Imported locally to avoid the module cycle
+    # through chat_persistence (chat_tags → chat_persistence → this module).
+    from kiro_crew.dashboard.chat_tags import validate_folder_tag_ids
+
+    tags_changed = False
+    for tid in validate_folder_tag_ids(meta.get("tags"), state):
+        if tid not in slot.tags:
+            slot.tags.append(tid)
+            tags_changed = True
     if meta.get("folder_id"):
         slot.folder_id = meta["folder_id"]
     elif folder_id and needs_default_filing(meta):
@@ -341,6 +488,21 @@ def surface_channel_session(
         # top level" from "never filed".
         slot.folder_id = folder_id
         slot._channel_folder_filed = True
+        # First filing = this chat's birth into the folder: copy the folder's
+        # tags by value, the same creation-only inheritance the dashboard
+        # slot-create path applies. The restore branch above deliberately does
+        # not — a persisted folder_id means the filing already happened.
+        for tid in folder_tags or []:
+            if tid not in slot.tags:
+                slot.tags.append(tid)
+                tags_changed = True
+    # "tags changed => revision changed": the slot was constructed with an empty
+    # list under its birth revision, and a concurrent slots GET may already have
+    # snapshotted that; the surfaced list must carry a revision of its own.
+    if tags_changed:
+        bump_revision = getattr(slot, "bump_tags_revision", None)
+        if callable(bump_revision):
+            bump_revision()
     if meta.get("pinned"):
         slot.pinned = True
 
@@ -371,7 +533,13 @@ def _rebuild_window(slot: "_ChatSlot", messages: list[dict[str, Any]]) -> None:
     """
     slot.messages.clear()
     slot._pending.clear()
-    slot._disk_older_count = max(0, len(messages) - _RESTORE_WINDOW)
+    older_cut = max(0, len(messages) - _RESTORE_WINDOW)
+    slot._disk_older_count = older_cut
+    # Durable-only view of the same prefix (transient-role lines excluded),
+    # recomputed from the transcript on every rebuild — the base absolute
+    # message positions are built over. ``islice`` avoids copying the whole
+    # prefix. See _ChatSlot.__init__.
+    slot._disk_older_durable_count = durable_row_count(islice(messages, older_cut))
     for msg in messages[-_RESTORE_WINDOW:]:
         role = msg.get("role", "assistant")
         cls = msg.get("cls") or ("msg msg-u" if role == "user" else "msg msg-a")
@@ -385,6 +553,7 @@ def _rebuild_window(slot: "_ChatSlot", messages: list[dict[str, Any]]) -> None:
             ts=msg.get("ts", ""),
             broadcast=False,
             meta=(msg["meta"] if isinstance(msg.get("meta"), dict) else None),
+            mint_mid=False,
         )
         # This transcript is the CHANNEL's, so most of these lines arrived from
         # Slack/Discord and carry a real origin. Provenance is not a
@@ -417,7 +586,7 @@ def _window_matches_disk(slot: "_ChatSlot", messages: list[dict[str, Any]]) -> b
     window = slot.messages
     if older + len(window) > len(messages):
         return False
-    expected = messages[older:older + len(window)]
+    expected = messages[older : older + len(window)]
     for mem, disk in zip(window, expected):
         if (
             mem.get("role") != disk.get("role")
@@ -428,9 +597,7 @@ def _window_matches_disk(slot: "_ChatSlot", messages: list[dict[str, Any]]) -> b
     return True
 
 
-def refresh_channel_window(
-    slot: "_ChatSlot", messages: list[dict[str, Any]], mtime: float
-) -> int:
+def refresh_channel_window(slot: "_ChatSlot", messages: list[dict[str, Any]], mtime: float) -> int:
     """Bring a bound slot's in-memory window up to date with its transcript.
 
     The tab and the channel write one file, but the tab's window is a snapshot
@@ -493,6 +660,7 @@ def refresh_channel_window(
             # the message that prompted it.
             broadcast_user=True,
             meta=(msg["meta"] if isinstance(msg.get("meta"), dict) else None),
+            mint_mid=False,
         )
         # See the equivalent call in _rebuild_window.
         carry_provenance(slot.messages[-1], msg)
@@ -729,9 +897,7 @@ async def _reconcile_channel_slots_locked(state: "DashboardState", window_minute
     # fails the next pass re-qualifies them from the same (now-unflagged)
     # state.
     reactivated = [
-        s.get("key", "")
-        for s in pending
-        if (metadata.get(s.get("key", "")) or {}).get("closed")
+        s.get("key", "") for s in pending if (metadata.get(s.get("key", "")) or {}).get("closed")
     ]
     if reactivated:
 
@@ -771,6 +937,11 @@ async def _reconcile_channel_slots_locked(state: "DashboardState", window_minute
         if ns and ns not in folder_ids:
             folder_ids[ns] = await lookup_channel_folder(state, ns)
 
+    # Folder tags are deliberately NOT read here: the raw ids are read fresh
+    # under ``tags_write_lock`` immediately before validation and the filing
+    # write below, so a folder PATCH or tag deletion landing while this pass
+    # runs can never stamp an obsolete tag set onto a freshly filed chat.
+
     surfaced = 0
     # A tab can be closed around this pass — resumed from History and
     # dismissed while the executor work was in flight, or dismissed just
@@ -794,6 +965,10 @@ async def _reconcile_channel_slots_locked(state: "DashboardState", window_minute
             if needs_default_filing(metadata.get(key) or {})
             else ""
         )
+        # Populated by the filing branch below with the ids it actually
+        # persisted, so the surface call applies exactly what the atomic
+        # write recorded — never the raw (or stale) resolve-time values.
+        inherited: list[str] = []
         if _tombstone_blocks(state, s):
             logger.debug("channel reconcile: %s closed by tombstone, skipping", key)
             continue
@@ -813,9 +988,7 @@ async def _reconcile_channel_slots_locked(state: "DashboardState", window_minute
             # now existing is the evidence that happened — filing over it would
             # restore the default folder after the next restart.
             if channel_slot_name(key) in state._slots:
-                logger.debug(
-                    "channel reconcile: %s surfaced while this pass ran; not filing", key
-                )
+                logger.debug("channel reconcile: %s surfaced while this pass ran; not filing", key)
                 to_file = ""
         if to_file:
             # Persist the placement BEFORE the slot becomes visible.
@@ -838,19 +1011,62 @@ async def _reconcile_channel_slots_locked(state: "DashboardState", window_minute
             # transcript the channel side appends to, and it takes a
             # cross-process lock.
             try:
-                filed = await asyncio.to_thread(
-                    log.update_metadata_if,
-                    key,
-                    {"folder_id": to_file, "channel_folder_filed": True},
-                    needs_default_filing,
+                # The inherited tags ride the SAME atomic write as the filing
+                # marker: the marker is what tells every later pass (and a
+                # post-crash restore) that inheritance already ran, so persisting
+                # it without the tags would make a crash between this write and
+                # the slot's first save silently drop them — the marker would
+                # block re-inheritance forever. One write keeps marker and tags
+                # crash-consistent.
+                #
+                # Validation happens HERE, at the point of application — and so
+                # does the READ: the folder's raw tag ids are read fresh inside
+                # the critical section, so a folder PATCH or tag deletion that
+                # committed while this pass ran is fully visible before anything
+                # is stamped onto the filed chat. The read, the intersection AND
+                # the filing write sit under ``tags_write_lock``, mirroring
+                # ``api_chat_slot_tags`` (whose docstring names preventing
+                # exactly this race); the lock ordering (tags_write_lock →
+                # folder-store lock) matches the folder create/PATCH paths.
+                # Marker + tags stay in ONE atomic write for crash consistency.
+                # Imported locally to avoid the module cycle through
+                # chat_persistence (chat_tags → chat_persistence → this module).
+                from kiro_crew.dashboard.chat_tags import (
+                    tags_write_lock,
+                    validate_folder_tag_ids,
                 )
+
+                def _read_folder_tags(
+                    folders: list[dict[str, Any]], fid: str = to_file
+                ) -> list[str]:
+                    for f in folders:
+                        if f.get("id") == fid and isinstance(f.get("tags"), list):
+                            return list(f["tags"])
+                    return []
+
+                filing_meta: dict[str, Any] = {
+                    "folder_id": to_file,
+                    "channel_folder_filed": True,
+                }
+                async with tags_write_lock(state):
+                    raw_folder_tags = await state.read_folders(_read_folder_tags)
+                    inherited = validate_folder_tag_ids(raw_folder_tags, state)
+                    if inherited:
+                        filing_meta["tags"] = list(inherited)
+                    filed = await asyncio.to_thread(
+                        log.update_metadata_if,
+                        key,
+                        filing_meta,
+                        needs_default_filing,
+                    )
             except Exception:
                 # Could not record it, so do not apply it in memory either:
                 # an in-memory-only placement would be lost on restart and
                 # filed again by the next pass. Leave the conversation unfiled
                 # and let a later pass retry.
                 logger.warning(
-                    "channel reconcile: could not persist folder filing for %s", key,
+                    "channel reconcile: could not persist folder filing for %s",
+                    key,
                     exc_info=True,
                 )
                 to_file = ""
@@ -875,6 +1091,7 @@ async def _reconcile_channel_slots_locked(state: "DashboardState", window_minute
                 transcripts[key],
                 session_key=state.sessions.channel_key_for_stem(key) if state.sessions else "",
                 folder_id=to_file,
+                folder_tags=inherited if to_file else None,
             )
             if slot:
                 surfaced += 1

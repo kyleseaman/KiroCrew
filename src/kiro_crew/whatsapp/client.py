@@ -29,6 +29,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from kiro_crew import extras
 from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
 from kiro_crew.platform_compat import make_owner_only_dir, restrict_to_owner
 from kiro_crew.whatsapp.jids import OwnIdentity, jid_to_str
@@ -36,7 +37,7 @@ from kiro_crew.whatsapp.jids import OwnIdentity, jid_to_str
 logger = logging.getLogger(__name__)
 
 MISSING_EXTRA_HINT = (
-    "The WhatsApp channel needs the optional dependency extra: " "pip install 'kirocrew[whatsapp]'"
+    f"The WhatsApp channel needs its optional dependency: {extras.install_hint('whatsapp')}"
 )
 
 STATE_UNPAIRED = "unpaired"
@@ -173,7 +174,6 @@ def _load_neonize() -> "tuple[Any, dict[str, Any]]":
         LoggedOutEv,
         MessageEv,
         PairStatusEv,
-        QREv,
         TemporaryBanEv,
     )
 
@@ -183,7 +183,6 @@ def _load_neonize() -> "tuple[Any, dict[str, Any]]":
         "LoggedOutEv": LoggedOutEv,
         "MessageEv": MessageEv,
         "PairStatusEv": PairStatusEv,
-        "QREv": QREv,
         "TemporaryBanEv": TemporaryBanEv,
     }
 
@@ -208,6 +207,7 @@ class WhatsAppClient:
         self.on_qr: Callable[[list[str]], None] | None = None
         self._client: Any = None
         self._idle_task: asyncio.Task | None = None
+        self._handler_tasks: set[asyncio.Task[Any]] = set()
         self.connected_at: float | None = None
         #: latest rotating QR codes + monotonic stamp (Settings pairing UI).
         self.latest_qr: list[str] = []
@@ -273,8 +273,8 @@ class WhatsAppClient:
         # after the restriction failed would pair the device and leave that
         # credential readable by any other local principal, which is exactly the
         # case a warning nobody reads does not cover.
-        # Off the loop: on Windows these resolve a SID and shell out to `icacls`,
-        # which is a subprocess on the one event loop that also carries every other
+        # Off the loop: these are blocking filesystem calls (the Windows DACL is
+        # applied in-process), and the one event loop also carries every other
         # channel and the liveness heartbeat. Still awaited rather than
         # fire-and-forget, because pairing must not begin until the credential's
         # directory is actually locked down.
@@ -291,19 +291,34 @@ class WhatsAppClient:
         LoggedOutEv = events["LoggedOutEv"]
         MessageEv = events["MessageEv"]
         PairStatusEv = events["PairStatusEv"]
-        QREv = events["QREv"]
         TemporaryBanEv = events["TemporaryBanEv"]
+
+        # Snapshot BEFORE NewAClient: constructing the client creates the sqlite
+        # store (schema and all), so a `session_exists()` asked afterwards is
+        # ALWAYS true and the first-boot pairing state would never be announced.
+        had_session = self.session_exists()
 
         # The first positional arg doubles as the sqlite session-store path
         # (ClientFactory passes its database_name through the same slot).
         client = NewAClient(self.db_path)
         self._client = client
 
-        @client.event(QREv)
-        async def _on_qr(_client: Any, event: Any) -> None:
+        # QR does NOT travel on the numbered event stream, so it cannot be
+        # registered with `client.event(...)`: `Event.execute` only dispatches
+        # INT_TO_EVENT codes into `list_func`, and QR is never one of them. The Go
+        # core delivers each rotating code by calling `NewAClient.__onQr`, which
+        # invokes `client.event._qr` directly, and `Event.__init__` pre-seeds that
+        # slot with a default that renders the code to a terminal — which a
+        # gateway started from a desktop launcher has no reader for. `client.qr()`
+        # is the supported registration, and it hands over ONE code as bytes per
+        # emission rather than a batch carrying `.Codes`.
+        async def _on_qr(_client: Any, data_qr: Any) -> None:
             import time as _time
 
-            codes = list(getattr(event, "Codes", []) or [])
+            code = (
+                data_qr.decode("utf-8", "replace") if isinstance(data_qr, bytes) else str(data_qr)
+            )
+            codes = [code] if code else []
             self.latest_qr = codes
             self.latest_qr_at = _time.monotonic()
             self._set_state(STATE_PAIRING, "scan the QR code from your phone")
@@ -312,6 +327,8 @@ class WhatsAppClient:
                     self.on_qr(codes)
                 except Exception:  # noqa: BLE001
                     logger.warning("whatsapp: QR observer failed", exc_info=True)
+
+        client.qr(_on_qr)
 
         @client.event(PairStatusEv)
         async def _on_pair(_client: Any, event: Any) -> None:
@@ -346,14 +363,21 @@ class WhatsAppClient:
 
         @client.event(MessageEv)
         async def _on_message(_client: Any, event: Any) -> None:
-            if self.on_message is None:
-                return
+            task = asyncio.current_task()
+            if task is not None:
+                self._handler_tasks.add(task)
             try:
-                await self.on_message(event)
-            except Exception:  # noqa: BLE001 — one bad message must not kill inbound
-                logger.exception("whatsapp: inbound handler failed")
+                if self.on_message is None:
+                    return
+                try:
+                    await self.on_message(event)
+                except Exception:  # noqa: BLE001 — one bad message must not kill inbound
+                    logger.exception("whatsapp: inbound handler failed")
+            finally:
+                if task is not None:
+                    self._handler_tasks.discard(task)
 
-        if not self.session_exists():
+        if not had_session:
             self._set_state(STATE_PAIRING, "waiting for first QR")
         await client.connect()
         self._idle_task = asyncio.get_running_loop().create_task(
@@ -799,4 +823,13 @@ class WhatsAppClient:
 
         norm = normalize_jid(jid_str)
         user, _, server = norm.partition("@")
-        return JID(User=user, Server=server or USER_SERVER)
+        # The JID proto marks RawAgent/Device/Integrator as required, so a
+        # two-field JID raises EncodeError at neonize's FFI boundary and every
+        # outbound call fails. Mirror neonize.utils.jid.build_jid: zero them.
+        return JID(
+            User=user,
+            RawAgent=0,
+            Device=0,
+            Integrator=0,
+            Server=server or USER_SERVER,
+        )

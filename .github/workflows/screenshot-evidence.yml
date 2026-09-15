@@ -54,7 +54,15 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -uo pipefail
-          changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA" -- \
+          # A diff this step could not COMPUTE is not a diff that touched
+          # nothing visual. `2>/dev/null || true` collapsed a failed `git diff`
+          # (a base or head object absent after a force-push race, a pruned
+          # base branch) onto the same empty string as "no visual surface
+          # changed", and the gate then skipped its own evidence step -- a
+          # required check reporting green having examined nothing. That
+          # polarity is worse than a false red, so an uncomputable diff fails
+          # loudly and is re-runnable instead.
+          if ! changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA" -- \
             'website/src/components/**' \
             'website/src/pages/**' \
             'website/src/apps/**' \
@@ -63,8 +71,10 @@ jobs:
             ':(exclude)website/src/**/*.test.ts' \
             ':(exclude)website/src/**/*.test.tsx' \
             ':(exclude)website/src/test/**' \
-            ':(exclude)website/src/**/*.d.ts' \
-            2>/dev/null || true)"
+            ':(exclude)website/src/**/*.d.ts')"; then
+            echo "::error::Could not compute the diff between the base and head commits, so this check cannot tell whether a user-visible surface changed. This is a diff failure, not an absence of visual changes -- re-run this job."
+            exit 1
+          fi
           if [ -n "$changed" ]; then
             echo "visual=true" >> "$GITHUB_OUTPUT"
             echo "Visual surfaces touched:"
@@ -93,15 +103,56 @@ jobs:
             exit 0
           fi
 
-          body="$(gh api "repos/$REPO/pulls/$PR" --jq '.body // ""' 2>/dev/null || true)"
+          # A body this step could not READ is not a body without evidence.
+          # `2>/dev/null || true` discarded both the error text and the exit
+          # status, so a transient API failure left `body` empty and every
+          # check below missed -- and the step then blamed the description,
+          # telling an author to attach evidence their PR already carried.
+          # The common case is transient, so absorb it here rather than
+          # spending the author's re-run on it: up to three attempts with a
+          # short backoff. A read that never succeeds fails closed (this gate
+          # is required, so an unreadable body must never pass silently) while
+          # naming the read as the cause. A description that is genuinely empty
+          # reads successfully on the first attempt and falls through to the
+          # no-evidence branch, which is correct.
+          body=""
+          read_ok=""
+          for attempt in 1 2 3; do
+            if body="$(gh api "repos/$REPO/pulls/$PR" --jq '.body // ""')"; then
+              read_ok=1
+              break
+            fi
+            echo "Reading the PR description failed on attempt $attempt."
+            if [ "$attempt" -lt 3 ]; then
+              sleep "$attempt"
+            fi
+          done
+          if [ -z "$read_ok" ]; then
+            echo "::error::Could not read this PR's description from the API after 3 attempts, so the check cannot judge whether it carries evidence. This is a read failure, not missing evidence -- re-run this job."
+            {
+              echo "### Could not read the PR description"
+              echo
+              echo "The API read for this PR's description failed on every attempt, so the"
+              echo "check could not tell whether visual evidence is present. On this"
+              echo "evidence alone there is nothing wrong with the description -- re-run"
+              echo "this job. The failing \`gh api\` output is above this summary in the"
+              echo "step log."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
 
           # Accept any form that actually renders as an image/video for a
-          # reviewer: markdown image, HTML img/video, a committed
-          # temp-screenshots path, or a GitHub user-attachment URL. Real
+          # reviewer: markdown image, HTML img/video, a GitHub user-attachment
+          # URL (what `gh pr edit --attach` and the web editor produce), or a
+          # temp-screenshots path from a PR that links a committed image. Real
           # evidence satisfies the gate outright, so it is checked before any
           # waiver: a body carrying both a screenshot and the marker passes on
-          # the screenshot.
-          if printf '%s' "$body" | grep -qiE '!\[[^]]*\]\([^)]+\)|<img[[:space:]]|<video[[:space:]]|temp-screenshots/|user-attachments/'; then
+          # the screenshot. Every body check reads from a here-string, never a
+          # `printf | grep` pipe: grep -q exits on the first match, the writer
+          # can die of SIGPIPE (141), and pipefail then makes that the
+          # pipeline's status, so a body that DID match would be misread as
+          # carrying no evidence.
+          if grep -qiE '!\[[^]]*\]\([^)]+\)|<img[[:space:]]|<video[[:space:]]|temp-screenshots/|user-attachments/' <<< "$body"; then
             echo "Visual evidence found in the PR description."
             exit 0
           fi
@@ -115,11 +166,11 @@ jobs:
           # body text is never read as a pattern; in both matches below the
           # untrusted body only ever reaches grep as stdin data, never as a
           # pattern or part of a command.
-          if printf '%s' "$body" | grep -qF -- '<!-- no-visual-delta -->'; then
+          if grep -qF -- '<!-- no-visual-delta -->' <<< "$body"; then
             # The justification needs visible content after the colon: literal
             # asterisks are skipped so a bare bold "**Why no screenshot:**"
             # does not count, while a reason opening with emphasis does.
-            if printf '%s' "$body" | grep -qiE 'why no screenshots?:(\*\*)?[[:space:]]*\**[^*[:space:]]'; then
+            if grep -qiE 'why no screenshots?:(\*\*)?[[:space:]]*\**[^*[:space:]]' <<< "$body"; then
               echo "::warning::'<!-- no-visual-delta -->' marker present in the PR body -- visual-evidence requirement waived. The author's justification is in the PR description."
               exit 0
             fi
@@ -151,11 +202,23 @@ jobs:
             echo "- A multi-step flow (wizard, modal, drag) -> a recording of the whole sequence"
             echo
             echo "**How to attach it** (see the \`web-verify\` and \`frontend-design-workflow\` skills)"
-            echo "1. Capture the surface yourself from a running dev server or pod."
-            echo "2. Commit the images under \`temp-screenshots/<feature>/\` -- never under"
-            echo "   \`docs/\` or \`src/kiro_crew/**\`, which ship in the wheel and the DMG."
-            echo "3. Embed with a commit-SHA-pinned URL so it survives branch deletion:"
-            echo "   \`![alt](https://github.com/$REPO/raw/<sha>/temp-screenshots/<feature>/<name>.png)\`"
+            echo "1. Capture the surface yourself from a running dev server or pod. Keep the"
+            echo "   files out of the repository: evidence is uploaded as a GitHub attachment,"
+            echo "   not committed."
+            echo "2. Write ordinary local paths into the description where each image belongs,"
+            echo "   \`![alt](./evidence/after.png)\`; a video alone in its paragraph,"
+            echo "   \`![](./evidence/demo.mp4)\`, renders as a player."
+            echo "3. Upload the same files with the description (gh >= 2.99):"
+            echo "   \`gh pr edit $PR --body-file <body.md> --attach ./evidence/after.png --attach ./evidence/demo.mp4\`"
+            echo "   (\`--attach\` works the same way on the \`create\` subcommand when opening the PR)."
+            echo "   Attach BEFORE the push you want reviewed: the UX review reads the description"
+            echo "   when a push lands (editing it starts no review). Attached after the push?"
+            echo "   Re-run the UX Review workflow, or push again."
+            echo "   Each path is rewritten in place to a permanent"
+            echo "   https://github.com/user-attachments/assets/... URL that survives"
+            echo "   force-pushes, branch deletion and merge. Dragging the file into the"
+            echo "   description in the web UI produces the same URL."
+            echo "   Limits: 10 MB per image/GIF, 100 MB per video."
             echo
             echo "**If the change genuinely has no visual delta** (pure rename, comment-only,"
             echo "or a non-rendering attribute), add the \`no-screenshots\` label and re-run."

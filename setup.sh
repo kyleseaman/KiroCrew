@@ -5,7 +5,7 @@
 # Sets up KiroCrew using only public tooling:
 #   1. Node.js (via ensure-node.sh)
 #   2. Optional tools (git-lfs, ffmpeg for voice)
-#   3. Agent backend: claude-agent-acp (npm i -g)
+#   3. Optional ACP adapter + Kiro CLI prerequisite disclosure
 #   4. Build frontend (npm/vite) + backend (pip)
 #   5. PATH config
 #   6. Agent config (kirocrew setup --agent-only)
@@ -43,15 +43,34 @@ _check() {
 
 echo "── Step 1: Python ──"
 _py=""
-for _candidate in python3.12 python3.11 python3.10 python3; do
-    if _check "$_candidate" && "$_candidate" -c "import sys; assert sys.version_info >= (3,10)" 2>/dev/null; then
+for _candidate in python3.12 python3.13 python3; do
+    if _check "$_candidate" && "$_candidate" -c "import sys; assert sys.version_info >= (3,12)" 2>/dev/null; then
         _py="$_candidate"
         break
     fi
 done
+# See cloud-install.sh's _has_provisioner: the automatic fallback may use a
+# version manager that is already installed, and may never install one, because
+# ensure-python.sh would do that by piping a remote script into sh.
+_has_provisioner() {
+    command -v mise >/dev/null 2>&1 || [ -x "$HOME/.local/bin/mise" ]
+}
+if [ -z "$_py" ] && [ -f "$_kirocrew_dir/ensure-python.sh" ] && _has_provisioner; then
+    # Runs from a clone, so the repo's own bootstrap is available: provision
+    # 3.12 rather than stopping on a distro whose archive cannot supply it.
+    echo "  → No system Python 3.12+; provisioning one via ensure-python.sh…"
+    bash "$_kirocrew_dir/ensure-python.sh" >/dev/null 2>&1 || true
+    _recorded="$(cat "${KIROCREW_HOME:-$HOME/.kiro/crew}/python-bin" 2>/dev/null || true)"
+    if [ -n "$_recorded" ] && [ -x "$_recorded" ] \
+        && "$_recorded" -c "import sys; assert sys.version_info >= (3,12)" 2>/dev/null; then
+        _py="$_recorded"
+    fi
+fi
 if [ -z "$_py" ]; then
-    echo "  ❌ Python 3.10+ required but not found."
-    echo "     Install Python 3.10+ (https://www.python.org/downloads/) and re-run."
+    echo "  ❌ Python 3.12+ required and could not be provisioned."
+    echo "     Install Python 3.12+ (https://www.python.org/downloads/), or install mise"
+    echo "     (https://mise.jdx.dev/installing-mise.html) and re-run — this script will"
+    echo "     then provision Python 3.12 through it."
     cd - > /dev/null 2>&1
     return 1 2>/dev/null || exit 1
 fi
@@ -132,9 +151,9 @@ if ! _check ffmpeg; then
 fi
 echo ""
 
-# ── 3. Agent backend (claude-agent-acp) ──
+# ── 3. Optional ACP adapter and Kiro CLI prerequisite ──
 
-echo "── Step 3: Agent Backend ──"
+echo "── Step 3: Agent Backends ──"
 if _check claude-agent-acp; then
     echo "  ✅ claude-agent-acp ($(which claude-agent-acp))"
 elif _check npm; then
@@ -142,13 +161,20 @@ elif _check npm; then
     if npm install -g "$ACP_NPM_PKG" >/dev/null 2>&1; then
         echo "  ✅ claude-agent-acp installed"
     else
-        echo "  ⚠️  npm i -g $ACP_NPM_PKG failed — install it manually before first run"
+        echo "  ⚠️  npm i -g $ACP_NPM_PKG failed — install it manually before selecting this backend"
     fi
 else
-    echo "  ⚠️  npm not found — install the agent backend later:"
+    echo "  ⚠️  npm not found — install the optional agent backend later:"
     echo "       npm i -g $ACP_NPM_PKG"
 fi
-echo "  (kiro-cli is an optional alternative backend: https://kiro.dev/docs/cli/installation)"
+if _check kiro-cli; then
+    echo "  ✅ kiro-cli ($(which kiro-cli))"
+else
+    echo "  ⚠️  Kiro CLI is required for the default agent."
+    echo "       Install it separately from https://kiro.dev/cli/"
+fi
+echo "  Sign in separately with: kiro-cli login"
+echo "  This script does not install Kiro CLI or handle sign-in."
 echo ""
 
 # ── 4. Build (npm/vite frontend + pip backend) ──
@@ -181,10 +207,33 @@ fi
 
 # Backend: venv + pip install -e .
 _venv="$_kirocrew_dir/.venv"
-if [ ! -d "$_venv" ] || [ ! -x "$_venv/bin/python" ]; then
-    echo "→ Creating virtual environment..."
+# Build the venv under a umask that masks group/other WRITE so bin/kirocrew
+# and its dirs are born non-group-writable -- `kirocrew service install`
+# refuses to attach its AppArmor profile to a group/world-writable launcher
+# (see the matching block in cli.sh for the full rationale). OR-ing with 022
+# only ADDS write-mask bits, so a stricter caller umask is preserved.
+_KC_PREV_UMASK="$(umask)"
+umask "$(printf '%03o' "$(( $(umask) | 022 ))")"
+# A reused venv keeps the perms it was born with: one built by an older installer
+# under a permissive umask still has a group/world-writable root or bin/, so the
+# AppArmor profile would keep refusing. Rebuild it under the tightened umask.
+if [ -d "$_venv" ] && [ -n "$(find "$_venv" "$_venv/bin" -prune \( -perm -g+w -o -perm -o+w \) -print 2>/dev/null)" ]; then
+    echo "→ Recreating virtual environment (existing one is group/world-writable)..."
+    rm -rf "$_venv"
+fi
+# Same requires-python reuse rule as install.sh: a pre-3.12 venv cannot host the
+# package, so rebuild rather than pip-install into it and hit a hard refusal.
+if [ ! -d "$_venv" ] || [ ! -x "$_venv/bin/python" ] \
+    || ! "$_venv/bin/python" -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
+    if [ -d "$_venv" ]; then
+        echo "→ Recreating virtual environment (existing interpreter < 3.12)..."
+        rm -rf "$_venv"
+    else
+        echo "→ Creating virtual environment..."
+    fi
     "$_py" -m venv "$_venv" || {
         echo "  ❌ Failed to create venv"
+        umask "$_KC_PREV_UMASK"
         cd - > /dev/null 2>&1
         return 1 2>/dev/null || exit 1
     }
@@ -195,8 +244,10 @@ if KIROCREW_SKIP_FRONTEND=1 "$_venv/bin/pip" install -e "$_kirocrew_dir" -q; the
     echo "  ✅ Build succeeded"
     # Record install method for tooling that branches on it
     echo "pip" > "$_kirocrew_dir/.install-method"
+    umask "$_KC_PREV_UMASK"
 else
     echo "  ❌ pip install failed"
+    umask "$_KC_PREV_UMASK"
     cd - > /dev/null 2>&1
     return 1 2>/dev/null || exit 1
 fi

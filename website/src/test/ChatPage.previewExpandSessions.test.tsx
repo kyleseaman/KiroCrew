@@ -8,11 +8,12 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { StrictMode } from 'react'
-import { render, act, screen, fireEvent } from '@testing-library/react'
+import { render, act, screen, fireEvent, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { createTestStore } from './helpers'
+import type { ChatSlot } from '../types'
 import { ThemeProvider } from '../hooks/useTheme'
 import { __resetPanelTabs } from '../hooks/usePanelTabs'
 import { sseSlots } from '../store/dashboardSlice'
@@ -82,8 +83,8 @@ Object.defineProperty(window, 'matchMedia', {
     addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
   })),
 })
-globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({}) }) as any
-globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} } as any
+globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({}) }) as unknown as typeof fetch
+globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} } as unknown as typeof ResizeObserver
 
 import ChatPage from '../pages/ChatPage'
 
@@ -96,7 +97,7 @@ function renderChat({ slots = 1, strict = false }: { slots?: number; strict?: bo
   // The sessions toggle only renders when there is a session to show.
   act(() => {
     store.dispatch(sseSlots(
-      Array.from({ length: slots }, (_, i) => ({ key: `slot-${i}`, title: `Session ${i}` }) as any),
+      Array.from({ length: slots }, (_, i) => ({ key: `slot-${i}`, title: `Session ${i}` }) as unknown as ChatSlot),
     ))
   })
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
@@ -237,9 +238,11 @@ describe('ChatPage — mobile session drawer inside preview expand mode', () => 
   })
   afterEach(() => { mockIsMobile = false })
 
-  it('closes the open drawer on entry and leaves it reopenable', () => {
-    // Mobile has its own state (`mobileSessions`) and no sessions toggle, so
-    // expand mode closes the drawer outright instead of suppressing it.
+  it('closes the open drawer on entry and leaves it reopenable', async () => {
+    // Mobile has its own state (the drawer phase machine) and no sessions
+    // toggle, so expand mode closes the drawer outright instead of suppressing
+    // it. The close is awaited because the panel now slides out and unmounts on
+    // arrival rather than vanishing on the spot.
     const openDrawer = () =>
       fireEvent.click(screen.getAllByRole('button', { name: 'Toggle sessions' })[0])
     renderChat()
@@ -247,7 +250,7 @@ describe('ChatPage — mobile session drawer inside preview expand mode', () => 
     expect(screen.getByTestId('sessions-drawer')).toBeInTheDocument()
 
     setExpanded(true)
-    expect(screen.queryByTestId('sessions-drawer')).not.toBeInTheDocument()
+    await waitFor(() => expect(screen.queryByTestId('sessions-drawer')).not.toBeInTheDocument())
 
     // Still reachable — an override would have made this button do nothing.
     openDrawer()

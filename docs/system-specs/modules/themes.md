@@ -28,9 +28,31 @@ a pack may ship. Validation is tier-scaled to payload trust.
 
 | Tier | `level` | Surface unlocked |
 |---|---|---|
-| **L0 Color** | 0 | the 54 theme CSS variables (dark + light) only |
-| **L1 Branded** | 1 | + `branding/` (logo, favicon, wordmark), `styles/fonts/`, scoped `overrides.css` |
+| **L0 Color** | 0 | the 56 theme CSS variables (dark + light) only |
+| **L1 Branded** | 1 | + `branding/` (logo, favicon, wordmark), `styles/fonts/`, scoped `overrides.css`, `loader/*.png\|webp\|gif\|svg` |
 | **L2 Experience** | 2 | + `overlays/` + `topbar/` sandboxed HTML, `audio/`, `persona.md` |
+
+Level-1 and Level-2 manifests may also declare `loaderIcons`: 4–8 distinct
+names from the bundled stock-symbol allowlist (`cloud`, `flower`, `heart`,
+`moon`, `sparkles`, `star`, `sun`, `zap`). The backend validates and surfaces
+the names in the theme asset descriptor; the frontend maps them to bundled
+Lucide components and reuses the existing carousel. No component code, SVG, or
+asset path crosses the manifest boundary. Missing declarations preserve the
+Kiro ghost poses, and trusted compiled themes retain the broader
+`registerThemeBranding()` component seam.
+
+Installed packs may also supply the loader **art**, not just select symbols:
+`loader/*.png` `.webp` `.gif` `.svg` (1–8 images, Level 1) are the pack's own
+loader art: one image renders on its own, 2–8 are cycled by the stock carousel.
+Animated WebP/APNG/GIF and animated SVG self-animate inside the `<img>`, so a
+pack can ship a single fully-authored loop. Each is served through the ordinary
+asset route with a strict Content-Type + `nosniff` under `_THEME_ASSET_CSP`
+(`default-src 'none'; sandbox`) and referenced only as an `<img>` — SVG is safe
+the same way `logo.svg` is (an `<img>`-loaded SVG runs in the browser's secure
+static/animated mode: no scripts, no external loads, animation still plays), so
+it needs no HTML-serving route of its own. The frontend
+`resolveLoader` precedence is: compiled `loader` → pack images (one on its own,
+2–8 cycled) → `loaderIcons` (manifest, then compiled) → the default poses.
 
 Constants (`dashboard/theme_validate.py`): `_THEME_MAX_LEVEL=2`,
 `_THEME_MAX_FONTS=6`, `_THEME_MAX_OVERLAYS=5`, `_THEME_PERSONA_MAX_CHARS=2000`,
@@ -67,7 +89,11 @@ runtime scoper still removes the pin, so the preference is protected either way.
 
 1. **Source** — a local directory (moved/copied) or an https `github.com` repo
    shallow-cloned server-side (`_clone_github`, `--depth 1`, 30s timeout, host
-   allowlist).
+   allowlist). The clone spawns through the sandbox chokepoint, which fails
+   **closed** where no OS sandbox backend exists: that refusal answers `503`
+   with `code: "theme_install_sandbox_unavailable"`, never an unsandboxed
+   retry — the URL is user-influenced and `git clone` executes remote content.
+   A **local** source spawns nothing, so it stays available on such a host.
 2. **Stage** — the source is copied into a private staging snapshot
    (`.install-staging-<token>`) via a per-file, symlink-rejecting,
    byte-bounded loop (`_copy_installed_theme`). The source dir remains
@@ -115,6 +141,12 @@ predate this subsystem and remain the color-theme surface.)
 - **Locked CSP** — overlay/topbar responses carry a fixed
   `Content-Security-Policy` including a `sandbox` directive; asset responses
   carry `X-Content-Type-Options: nosniff` and a content-type allowlist.
+- **Descriptor-pinned containment** — pack install and serving resolve the
+  opened file descriptor before trusting bytes: `/proc/self/fd` on Linux,
+  `fcntl.F_GETPATH` on macOS, and `GetFinalPathNameByHandleW` on Windows. The
+  resolved path must remain inside the pack root; an unavailable or failed
+  resolution rejects the read rather than falling back to a pathname-only
+  check.
 - **postMessage allowlist** — the parent (`ThemeExperienceLayer.tsx`) accepts
   only `theme:resize`, `theme:sound`, `theme:visibility`, and `theme:state`
   messages from a pack iframe; all others are dropped.

@@ -14,12 +14,17 @@ export type { KiroBonusCreditGrant, KiroCreditUsage }
 
 /**
  * What the modal can be handed: a reading, `null` while the gateway's usage
- * cache warms, `'none'` when the account has no credit plan, or `'failed'` when
- * the fetch itself failed with nothing cached. `null` is the ONLY value that
- * means "still loading" — the other two have nothing more to wait for, so
- * spinning on them would repeat the defect this distinction exists to remove.
+ * cache warms, `'none'` when the account has no credit plan, `'failed'` when
+ * the fetch itself failed with nothing cached, `'api-key'` when the account
+ * authenticates with an API key (usage needs an SSO/OIDC token that auth type
+ * never has, so the state is terminal by construction), or `'scrape-disabled'`
+ * when the free usage API returned no plan and the billed `/usage` text scrape
+ * is opted out (terminal until the user enables
+ * `dashboard.usage_text_scrape_enabled`). `null` is the ONLY
+ * value that means "still loading" — the others have nothing more to wait for,
+ * so spinning on them would repeat the defect this distinction exists to remove.
  */
-export type KiroAccountUsage = KiroCreditUsage | null | 'none' | 'failed'
+export type KiroAccountUsage = KiroCreditUsage | null | 'none' | 'failed' | 'api-key' | 'scrape-disabled'
 
 /** True only for an actual reading, so the sentinels cannot reach a field access. */
 const isUsageReading = (usage: KiroAccountUsage): usage is KiroCreditUsage =>
@@ -232,7 +237,12 @@ function CreditUsage({ usage }: { usage: KiroAccountUsage }) {
   if (!isUsageReading(usage)) {
     return (
       <div className="flex items-center gap-2 rounded-lg border border-border bg-bg-elevated/40 p-3.5 text-[13px] text-muted">
-        <AlertCircle className="lucide-inline shrink-0" /> {i18nT('components.kiroAccountModal.credit_usage_unavailable')}
+        <AlertCircle className="lucide-inline shrink-0" />{' '}
+        {i18nT(usage === 'api-key'
+          ? 'components.kiroAccountModal.credit_usage_api_key_auth'
+          : usage === 'scrape-disabled'
+            ? 'components.kiroAccountModal.credit_usage_scrape_disabled'
+            : 'components.kiroAccountModal.credit_usage_unavailable')}
       </div>
     )
   }
@@ -248,7 +258,7 @@ function CreditUsage({ usage }: { usage: KiroAccountUsage }) {
         <div className="mb-2 flex items-baseline gap-2">
           <span className="text-2xl font-bold text-text">{fmtNumber(usage.used)}</span>
           <span className="text-sm text-muted">/ {fmtNumber(usage.limit)} {i18nT('app.credits')}</span>
-          <span className="ml-auto rounded-md bg-accent px-2 py-0.5 text-[12px] font-medium text-white">
+          <span className="ml-auto rounded-md bg-accent px-2 py-0.5 text-[12px] font-medium text-accent-fg">
             {fmtPercent(pct / 100)}
           </span>
         </div>

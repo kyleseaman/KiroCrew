@@ -38,7 +38,8 @@ import kiro_crew.apps.bridges as bridges_mod
 import kiro_crew.apps.hooks_integration as hooks_mod
 import kiro_crew.apps.routes as routes_mod
 import kiro_crew.dashboard.handlers_instances as handlers_instances_mod
-from kiro_crew.instances.ssh_tunnel_manager import SshTunnelManager
+import kiro_crew.instances.ssh_tunnel_manager as ssh_tunnel_manager_mod
+from kiro_crew.instances.ssh_tunnel_manager import SshTunnelManager, TunnelStatus
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -71,8 +72,35 @@ class _RecordingRegistry:
         self.write_threads.append(threading.current_thread())
         return SimpleNamespace(id=instance_id)
 
-    def set_last_active(self, instance_id: str) -> None:
-        self.write_threads.append(threading.current_thread())
+
+def _tunnel_double(instance_id: str, *, pid: int = 4321, local_port: int = 18022) -> Any:
+    """Stand-in for ``_SshTunnel`` carrying every attribute ``_mark_recovered`` reads.
+
+    ``_SshTunnel.__init__`` assigns ``self.status`` (a real ``TunnelStatus``)
+    unconditionally, before any I/O, so a double that omits it can only produce
+    failures the production object cannot — and ``_mark_recovered`` does read
+    ``tunnel.status.local_port`` when it refreshes the forwarder identity.
+    """
+    return SimpleNamespace(
+        pid=pid, status=TunnelStatus(instance_id=instance_id, local_port=local_port)
+    )
+
+
+def _pin_forwarder_identity(monkeypatch: pytest.MonkeyPatch, *, reachable: bool) -> None:
+    """Pin whether ``_mark_recovered`` takes its forwarder-identity branch.
+
+    Unpinned, the branch is gated on ``process_start_time(pid)`` being truthy,
+    which holds iff that pid names a live, queryable process on the machine
+    running the test. That makes the code path a function of runner state rather
+    than of the test, so each test below pins the branch it means to exercise.
+    """
+    monkeypatch.setattr(
+        ssh_tunnel_manager_mod.platform_compat,
+        "process_start_time",
+        lambda pid: "pinned-start-time" if reachable else None,
+    )
+    if reachable:
+        monkeypatch.setattr(ssh_tunnel_manager_mod, "_reclaim_identity_key", lambda: b"k" * 32)
 
 
 # ---------------------------------------------------------------------------
@@ -171,16 +199,23 @@ async def test_disconnect_registry_write_off_the_loop_thread() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mark_recovered_registry_write_off_the_loop_thread() -> None:
+async def test_mark_recovered_registry_write_off_the_loop_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A tracked instance's recovery hint is persisted, on a worker thread."""
     loop_thread = threading.current_thread()
     registry = _RecordingRegistry()
     mgr = SshTunnelManager(registry)  # type: ignore[arg-type]
     # The double carries a pid: _mark_recovered persists the rebuilt child's
     # forwarder_pid alongside was_connected in its single hint write.
-    mgr._tunnels["some-instance"] = SimpleNamespace(pid=4321)  # type: ignore[assignment]
+    double = _tunnel_double("some-instance")
+    mgr._tunnels["some-instance"] = double
+    # Pin the forwarder-identity branch REACHABLE: it is the widest route to the
+    # hint write, and the only one that reads tunnel.status.local_port, so the
+    # offload assertion below covers the whole write path on every platform.
+    _pin_forwarder_identity(monkeypatch, reachable=True)
 
-    await mgr._mark_recovered("some-instance")
+    await mgr._mark_recovered("some-instance", double, 0)
 
     assert registry.write_threads, "the recovery hint write never happened"
     assert all(t is not loop_thread for t in registry.write_threads)
@@ -194,7 +229,7 @@ async def test_mark_recovered_skips_the_write_for_an_untracked_instance() -> Non
     registry = _RecordingRegistry()
     mgr = SshTunnelManager(registry)  # type: ignore[arg-type]
 
-    await mgr._mark_recovered("disconnected-instance")
+    await mgr._mark_recovered("disconnected-instance", _tunnel_double("disconnected-instance"), 0)
 
     assert registry.write_threads == [], (
         "recovery persisted was_connected=True for an instance no longer tracked"
@@ -216,16 +251,25 @@ class _BlockingRegistry(_RecordingRegistry):
 
 
 @pytest.mark.asyncio
-async def test_cancelled_persist_waits_for_the_worker_write() -> None:
+async def test_cancelled_persist_waits_for_the_worker_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Cancelling a caller mid-persist must NOT unwind the frame (and release
     the manager lock) while the worker write is still running — a cancelled
     to_thread await does not stop the thread, so an early unwind would let the
     late write race a subsequent locked write (e.g. a disconnect's reset)."""
     registry = _BlockingRegistry()
     mgr = SshTunnelManager(registry)  # type: ignore[arg-type]
-    mgr._tunnels["inst"] = SimpleNamespace(pid=4321)  # type: ignore[assignment]
+    inst_double = _tunnel_double("inst")
+    mgr._tunnels["inst"] = inst_double
+    # Pin the forwarder-identity branch UNREACHABLE: the subject here is the
+    # cancellation window around the BLOCKED registry write, so this wants the
+    # shortest deterministic route to it. Taking the identity branch instead
+    # would add two more to_thread hops ahead of that write, narrowing the
+    # sleep window below for no gain — test 1 above covers that branch.
+    _pin_forwarder_identity(monkeypatch, reachable=False)
 
-    task = asyncio.create_task(mgr._mark_recovered("inst"))
+    task = asyncio.create_task(mgr._mark_recovered("inst", inst_double, 0))
     await asyncio.sleep(0.05)  # the worker write is submitted and blocked
     task.cancel()
     await asyncio.sleep(0.05)  # cancellation delivered
@@ -349,7 +393,6 @@ def test_no_direct_registry_write_in_async_frames() -> None:
 
     write_methods = {
         "update",
-        "set_last_active",
         "remove",
         "get",
         "list",
@@ -383,7 +426,6 @@ def test_no_direct_registry_call_in_instances_handler_async_frames() -> None:
         "add",
         "update",
         "remove",
-        "set_last_active",
     }
     offenders: list[str] = []
     for owner, call in _calls_in_async_frames(_module_tree(handlers_instances_mod)):

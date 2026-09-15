@@ -75,7 +75,6 @@ export interface SessionSearchItem {
   /** Folder the session is filed under, when any (maps to a chip in the row). */
   folder_id?: string
   memory_mode?: 'persistent' | 'incognito' | 'temporary'
-  clean_mode?: boolean
   /** Owning remote instance, present only on federated-search rows. */
   instance_id?: string
   /** Display name of the owning remote instance (raw, never translated). */
@@ -152,6 +151,7 @@ export function createSessionsProvider(deps: SessionsProviderDeps): ResourceProv
         fetchSessions(q),
         fetchFolders
           ? fetchFolders().catch((err) => {
+              // eslint-disable-next-line no-console -- the distinct signal the comment above requires: results still render, so a swallowed folder failure is otherwise indistinguishable from "no folders"
               console.warn(
                 '[palette] session folder fetch failed; rendering results without folder chips',
                 err,

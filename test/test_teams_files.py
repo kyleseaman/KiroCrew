@@ -289,6 +289,59 @@ class TestResolvedAddressVetting:
         assert session.calls == [], "refused BEFORE the request, not after"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "address",
+        [
+            "100.64.0.1",  # RFC 6598 CGNAT -- what a tailnet and carrier NAT hand out
+            "100.127.255.254",
+            "fec0::1",  # deprecated IPv6 site-local
+            "::ffff:127.0.0.1",  # v4-mapped loopback
+            "2002:0a00:0001::1",  # 6to4 naming 10.0.0.1
+        ],
+    )
+    async def test_ranges_the_old_category_flag_vet_approved_are_refused(
+        self, tmp_path, monkeypatch, address
+    ) -> None:
+        """These five passed the six-flag check this vet replaced.
+
+        `100.64.0.0/10` is not in CPython's `is_private` table and `fec0::/10`
+        reports `is_global=True`, so an enumerated-category check approved both --
+        and on a host attached to a tailnet, that range IS the private network. The
+        mapped and 6to4 forms were evaluated as written rather than unwrapped, so
+        `::ffff:127.0.0.1` passed a check whose entire purpose was refusing
+        loopback. `link_unfurl.address_is_not_public` closes all five.
+        """
+
+        async def _resolves_inward(host: str, port: int = 443) -> list[str]:
+            return [address]
+
+        monkeypatch.setattr("kiro_crew.teams.client.resolve_addresses", _resolves_inward)
+        client, session = _client([_FakeResponse(chunks=[PNG_BYTES])])
+        with pytest.raises(ValueError):
+            await client.download_inbound_file("https://harmless.example/dl", str(tmp_path / "f"))
+        assert session.calls == [], "refused BEFORE the request, not after"
+
+    @pytest.mark.asyncio
+    async def test_an_unparseable_resolved_address_still_refuses(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The shared vet fails closed on a literal it cannot read.
+
+        The local `ipaddress.ip_address` guard that the delegation subsumes is dropped
+        because the delegation subsumes it -- so the property needs its own test,
+        or removing that guard would look like a regression.
+        """
+
+        async def _garbage(host: str, port: int = 443) -> list[str]:
+            return ["not-an-address"]
+
+        monkeypatch.setattr("kiro_crew.teams.client.resolve_addresses", _garbage)
+        client, session = _client([_FakeResponse(chunks=[PNG_BYTES])])
+        with pytest.raises(ValueError):
+            await client.download_inbound_file("https://harmless.example/dl", str(tmp_path / "f"))
+        assert session.calls == []
+
+    @pytest.mark.asyncio
     async def test_one_bad_answer_among_several_refuses_the_whole_host(
         self, tmp_path, monkeypatch
     ) -> None:
@@ -523,7 +576,7 @@ class TestOutboundSeal:
         assert client.images[0]["name"] == "image.png"
 
     def test_a_secret_the_length_cap_would_slice_is_still_caught(self) -> None:
-        """The cap can cut a token down to a prefix the scanner no longer matches.
+        """The cap can cut a token down to a prefix the scanner does not match.
 
         Scanning only the finished name would ship most of the secret; the source is
         scanned first, while the token is still intact.
@@ -765,7 +818,7 @@ class TestMidTurnFiles:
         """The regression: a queued upload must be fetched for the turn that runs.
 
         Ingesting at arrival and unlinking in that frame left the drained turn a
-        prompt naming a file that no longer existed -- the encoder skips it, so the
+        prompt naming a file that is already gone -- the encoder skips it, so the
         model answered about nothing with nothing logged.
         """
         from test_teams_midturn import _Provider, _Sessions

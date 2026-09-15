@@ -14,6 +14,7 @@ import types
 import pytest
 
 import kiro_crew.subagent as subagent
+from conftest import absent_sysconf
 from kiro_crew.subagent import compute_max_subagents, resolve_max_subagents
 
 # ``SubagentManager.spawn`` refuses -- registering no task -- while the host
@@ -99,7 +100,7 @@ def test_example_d_memory_binds(patch_host) -> None:
 
 def test_shared_marginal_cost_binds_on_provider_ceiling(patch_host) -> None:
     # Stage 1: with session-shared marginal costs (mem≈0.05 GB, cpu≈0.25 core),
-    # even a modest 8 GB / 4 core host is no longer RAM-bound — the cap rises to
+    # even a modest 8 GB / 4 core host is not RAM-bound — the cap rises to
     # the provider ceiling (hard_cap) instead of the legacy floor of 3.
     # mem_term = floor((8*0.8)/0.05) = 128; cpu_term = floor((4*0.8)/0.25) = 12;
     # min(128, 12, 16) = 12 (was 3 when the whole shared process was charged).
@@ -134,7 +135,7 @@ def test_floor_never_below_three(patch_host) -> None:
 
 
 def test_hard_cap_below_floor_is_raised_to_three(patch_host) -> None:
-    # A misconfigured subagent_auto_max < 3 no longer drops the cap below 3:
+    # A misconfigured subagent_auto_max < 3 does not drop the cap below 3:
     # compute_max_subagents enforces a hard floor of 3 (the loader also clamps
     # subagent_auto_max up to 3, but compute defends independently).
     patch_host(174.7, 48)
@@ -443,9 +444,9 @@ class TestQueuedDepthWiring:
 class TestQueuedIdentityRoundTrip:
     """A queued member must START under the id its caller was handed.
 
-    Regression: spawn() used to return a throwaway ``q<n>`` sentinel for any
-    spawn that hit the stagger/concurrency gate, and _drain_queue minted a FRESH
-    uuid when it actually started the agent. With the default 2s stagger that is
+    Without this, spawn() returns a throwaway ``q<n>`` sentinel for any
+    spawn that hits the stagger/concurrency gate, and _drain_queue mints a FRESH
+    uuid when it actually starts the agent. With the default 2s stagger that is
     every wave member after the first, so ``spawn_run``'s printed wave roster
     listed one real id plus N placeholders no agent ever had — the inline
     SubagentRunCard, which resolves a wave by matching those ids against live
@@ -536,26 +537,13 @@ class TestQueuedIdentityRoundTrip:
         assert info.id == announced
 
 
-class TestCpuJiffiesParser:
-    """_parse_cpu_jiffies: utime+stime from raw /proc/<pid>/stat bytes."""
-
-    def test_parses_utime_stime(self) -> None:
-        from kiro_crew.subagent import _parse_cpu_jiffies
-
-        # comm with spaces + an embedded ')' — rindex must find the real close.
-        # post-comm tokens: state(0) ... utime(11)=120 stime(12)=60
-        stat = b"1234 (kiro cli (node)) S 2 3 4 5 6 7 8 9 10 11 120 60 0 0"
-        assert _parse_cpu_jiffies(stat) == 180
-
-    def test_malformed_returns_zero(self) -> None:
-        from kiro_crew.subagent import _parse_cpu_jiffies
-
-        assert _parse_cpu_jiffies(b"garbage") == 0
-        assert _parse_cpu_jiffies(b"") == 0
-
-
 class TestSubtreeCpuJiffies:
-    """_subtree_cpu_jiffies: sums pid + descendants."""
+    """_subtree_cpu_jiffies: sums pid + descendants.
+
+    The parser and the walk itself live in ``platform_compat`` and are pinned in
+    ``test_proc_subtree_sample.py``; this covers the wrapper the Sessions rows
+    call.
+    """
 
     def test_sums_tree(self, monkeypatch) -> None:
         import kiro_crew.subagent as sub
@@ -563,8 +551,12 @@ class TestSubtreeCpuJiffies:
         # tree: 1 -> [2, 3]; 2 -> [4]
         children = {1: [2, 3], 2: [4], 3: [], 4: []}
         jiffies = {1: 100, 2: 50, 3: 25, 4: 10}
-        monkeypatch.setattr(sub, "_proc_children", lambda pid: children.get(pid, []))
-        monkeypatch.setattr(sub, "_proc_cpu_jiffies", lambda pid: jiffies.get(pid, 0))
+        monkeypatch.setattr(
+            sub.platform_compat, "_proc_children", lambda pid: children.get(pid, [])
+        )
+        monkeypatch.setattr(
+            sub.platform_compat, "_proc_cpu_jiffies", lambda pid: jiffies.get(pid, 0)
+        )
         assert sub._subtree_cpu_jiffies(1) == 185
 
 
@@ -578,16 +570,24 @@ class TestSampleLiveCosts:
         info._pid = 4242
         return info
 
+    @staticmethod
+    def _sample(rss_kb: int = -1, jiffies: int = 0):
+        """The one subtree reading the sweep takes per agent."""
+        from kiro_crew.platform_compat import SubtreeSample
+
+        return SubtreeSample(rss_kb, jiffies, None, None)
+
     def test_rss_high_water(self, monkeypatch) -> None:
         import kiro_crew.subagent as sub
 
         m = _mgr(running=1, max_concurrent=16, last_ts=0.0)
         info = self._agent()
         m._agents = {"a1": info}
-        monkeypatch.setattr(sub, "_subtree_cpu_jiffies", lambda pid: 0)
         # Two polls: 2 GB then 1 GB — peak must stick at 2.
         rss_seq = iter([2 * 1024 * 1024, 1 * 1024 * 1024])
-        monkeypatch.setattr(sub, "_proc_rss_kb", lambda pid: next(rss_seq))
+        monkeypatch.setattr(
+            sub, "_proc_subtree_sample", lambda pid, **kw: self._sample(rss_kb=next(rss_seq))
+        )
         m._sample_live_costs()
         m._sample_live_costs()
         assert info.peak_rss_gb == pytest.approx(2.0, abs=0.01)
@@ -598,7 +598,6 @@ class TestSampleLiveCosts:
         m = _mgr(running=1, max_concurrent=16, last_ts=0.0)
         info = self._agent()
         m._agents = {"a1": info}
-        monkeypatch.setattr(sub, "_proc_rss_kb", lambda pid: -1)  # ignore RSS
         monkeypatch.setattr(sub, "_CLK_TCK", 100)
 
         # Control wall-clock: poll1 t=10, poll2 t=11 (dt=1s).
@@ -609,8 +608,11 @@ class TestSampleLiveCosts:
         # StopIteration into unrelated event-loop cleanup.
         monkeypatch.setattr(sub.time, "monotonic", lambda: next(times, 11.0))
         # jiffies: 1000 then 1100 → 100 jiffies / (100 tck * 1s) = 1.0 core.
+        # RSS stays -1 so only the CPU half of the sample is under test.
         jiff = iter([1000, 1100])
-        monkeypatch.setattr(sub, "_subtree_cpu_jiffies", lambda pid: next(jiff))
+        monkeypatch.setattr(
+            sub, "_proc_subtree_sample", lambda pid, **kw: self._sample(jiffies=next(jiff))
+        )
 
         m._sample_live_costs()  # seeds baseline, no delta
         assert info.peak_cpu_cores == 0.0
@@ -626,12 +628,11 @@ class TestSampleLiveCosts:
         m._agents = {"d": done}
         called = {"n": 0}
 
-        def _rss(pid):
+        def _walk(pid, **kw):
             called["n"] += 1
-            return 1024 * 1024
+            return self._sample(rss_kb=1024 * 1024)
 
-        monkeypatch.setattr(sub, "_proc_rss_kb", _rss)
-        monkeypatch.setattr(sub, "_subtree_cpu_jiffies", lambda pid: 0)
+        monkeypatch.setattr(sub, "_proc_subtree_sample", _walk)
         m._sample_live_costs()
         assert called["n"] == 0  # done agent not sampled
         assert done.peak_rss_gb == 0.0
@@ -655,15 +656,18 @@ class TestSampleLiveCosts:
 
         # Shared runtime measures 4 GB RSS; with 2 live shared sessions each
         # agent is charged 2 GB, never the full 4 GB.
-        monkeypatch.setattr(sub, "_proc_rss_kb", lambda pid: 4 * 1024 * 1024)
-        monkeypatch.setattr(sub, "_subtree_cpu_jiffies", lambda pid: 0)
+        monkeypatch.setattr(
+            sub, "_proc_subtree_sample", lambda pid, **kw: self._sample(rss_kb=4 * 1024 * 1024)
+        )
         m._sample_live_costs()
 
         assert a.peak_rss_gb == pytest.approx(2.0, abs=0.01)
         assert b.peak_rss_gb == pytest.approx(2.0, abs=0.01)
         # Single shared session → full measured RSS (divisor 1).
         b.done = True
-        monkeypatch.setattr(sub, "_proc_rss_kb", lambda pid: 3 * 1024 * 1024)
+        monkeypatch.setattr(
+            sub, "_proc_subtree_sample", lambda pid, **kw: self._sample(rss_kb=3 * 1024 * 1024)
+        )
         m._sample_live_costs()
         assert a.peak_rss_gb == pytest.approx(3.0, abs=0.01)
 
@@ -787,12 +791,23 @@ class TestAvailableMemoryClamp:
         monkeypatch.setattr(sub, "_macos_available_memory_gb", lambda: 42.0)
         assert sub._available_memory_gb() == 42.0
 
-    def test_unsupported_platform_fails_open(self, monkeypatch) -> None:
-        """A platform with no probe yet (e.g. Windows) fails open to -1.0."""
+    def test_windows_reads_the_shared_host_probe(self, monkeypatch) -> None:
+        """Windows reads memory through ``platform_compat.host_available_mib``."""
         import kiro_crew.subagent as sub
 
         monkeypatch.setattr(sub.platform_compat, "IS_LINUX", False)
         monkeypatch.setattr(sub.platform_compat, "IS_MACOS", False)
+        monkeypatch.setattr(sub.platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(sub.platform_compat, "host_available_mib", lambda: 16384)
+        assert sub._available_memory_gb() == 16.0
+
+    def test_unsupported_platform_fails_open(self, monkeypatch) -> None:
+        """A platform with no probe yet fails open to -1.0."""
+        import kiro_crew.subagent as sub
+
+        monkeypatch.setattr(sub.platform_compat, "IS_LINUX", False)
+        monkeypatch.setattr(sub.platform_compat, "IS_MACOS", False)
+        monkeypatch.setattr(sub.platform_compat, "IS_WINDOWS", False)
         assert sub._available_memory_gb() == -1.0
 
 
@@ -812,7 +827,12 @@ class TestMacosMemoryProbe:
     def test_computes_available_gb_from_pages(self, monkeypatch) -> None:
         import kiro_crew.subagent as sub
 
-        monkeypatch.setattr(sub.os, "sysconf", lambda _n: 16384)  # 16 KiB pages
+        real_sysconf = getattr(sub.os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            sub.os,
+            "sysconf",
+            lambda n: 16384 if n == "SC_PAGE_SIZE" else real_sysconf(n),  # 16 KiB pages
+        )
         monkeypatch.setattr(sub, "_macos_vm_reclaimable_pages", lambda: 200000)
         expected = round(200000 * 16384 / (1024 ** 3), 2)
         assert sub._macos_available_memory_gb() == pytest.approx(expected, abs=0.01)
@@ -820,22 +840,32 @@ class TestMacosMemoryProbe:
     def test_none_page_count_fails_open(self, monkeypatch) -> None:
         import kiro_crew.subagent as sub
 
-        monkeypatch.setattr(sub.os, "sysconf", lambda _n: 16384)
+        real_sysconf = getattr(sub.os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            sub.os, "sysconf", lambda n: 16384 if n == "SC_PAGE_SIZE" else real_sysconf(n)
+        )
         monkeypatch.setattr(sub, "_macos_vm_reclaimable_pages", lambda: None)
         assert sub._macos_available_memory_gb() == -1.0
 
     def test_zero_page_count_fails_open(self, monkeypatch) -> None:
         import kiro_crew.subagent as sub
 
-        monkeypatch.setattr(sub.os, "sysconf", lambda _n: 16384)
+        real_sysconf = getattr(sub.os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            sub.os, "sysconf", lambda n: 16384 if n == "SC_PAGE_SIZE" else real_sysconf(n)
+        )
         monkeypatch.setattr(sub, "_macos_vm_reclaimable_pages", lambda: 0)
         assert sub._macos_available_memory_gb() == -1.0
 
     def test_sysconf_error_fails_open(self, monkeypatch) -> None:
         import kiro_crew.subagent as sub
 
-        def _boom(_n):
-            raise ValueError("SC_PAGE_SIZE unavailable")
+        real_sysconf = getattr(sub.os, "sysconf", absent_sysconf)
+
+        def _boom(n):
+            if n == "SC_PAGE_SIZE":
+                raise ValueError("SC_PAGE_SIZE unavailable")
+            return real_sysconf(n)
 
         monkeypatch.setattr(sub.os, "sysconf", _boom)
         assert sub._macos_available_memory_gb() == -1.0
@@ -843,7 +873,10 @@ class TestMacosMemoryProbe:
     def test_nonpositive_page_size_fails_open(self, monkeypatch) -> None:
         import kiro_crew.subagent as sub
 
-        monkeypatch.setattr(sub.os, "sysconf", lambda _n: 0)
+        real_sysconf = getattr(sub.os, "sysconf", absent_sysconf)
+        monkeypatch.setattr(
+            sub.os, "sysconf", lambda n: 0 if n == "SC_PAGE_SIZE" else real_sysconf(n)
+        )
         # _macos_vm_reclaimable_pages must not even be consulted
         monkeypatch.setattr(
             sub, "_macos_vm_reclaimable_pages", lambda: pytest.fail("should not run")
@@ -854,10 +887,10 @@ class TestMacosMemoryProbe:
 class TestQueuedSpawnParamsPreserved:
     """A queued spawn must drain with ALL its spawn() kwargs intact.
 
-    The queue previously stored only (task, parent, agent, max_turns, cwd), so a
-    drained spawn silently lost approval_mode / silent / model / allowed_tools /
-    bare — an auto (headless) spawn hit the deny-by-default gate and a silent
-    spawn started emitting output.
+    Storing only (task, parent, agent, max_turns, cwd) would make a drained
+    spawn silently lose approval_mode / silent / model / allowed_tools /
+    bare — an auto (headless) spawn would hit the deny-by-default gate and a silent
+    spawn would start emitting output.
     """
 
     def test_drain_forwards_all_spawn_kwargs(self) -> None:
@@ -898,9 +931,9 @@ class TestQueuedSpawnParamsPreserved:
 class TestForceReapDrainsQueue:
     """_force_reap frees a slot; it must pump the queue so a queued spawn starts.
 
-    Previously _force_reap decremented _running_count but never called
-    _drain_queue, so queued spawns were stranded until an unrelated agent
-    finished normally or a new spawn arrived.
+    Without the pump, _force_reap would decrement _running_count but never call
+    _drain_queue, so queued spawns stay stranded until an unrelated agent
+    finishes normally or a new spawn arrives.
     """
 
     @pytest.mark.asyncio
@@ -946,9 +979,12 @@ class TestLastSampleAndMemoryRows:
         m = _mgr(running=1, max_concurrent=16, last_ts=0.0)
         info = self._agent()
         m._agents = {"a1": info}
-        monkeypatch.setattr(sub, "_subtree_cpu_jiffies", lambda pid: 0)
         rss_seq = iter([2 * 1024 * 1024, 1 * 1024 * 1024])
-        monkeypatch.setattr(sub, "_proc_rss_kb", lambda pid: next(rss_seq))
+        monkeypatch.setattr(
+            sub,
+            "_proc_subtree_sample",
+            lambda pid, **kw: sub.platform_compat.SubtreeSample(next(rss_seq), 0, None, None),
+        )
         m._sample_live_costs()
         m._sample_live_costs()
 
@@ -964,8 +1000,11 @@ class TestLastSampleAndMemoryRows:
         a = self._agent(id="a1", _session_sharing=True)
         b = self._agent(id="a2", _session_sharing=True)
         m._agents = {"a1": a, "a2": b}
-        monkeypatch.setattr(sub, "_subtree_cpu_jiffies", lambda pid: 0)
-        monkeypatch.setattr(sub, "_proc_rss_kb", lambda pid: 2 * 1024 * 1024)
+        monkeypatch.setattr(
+            sub,
+            "_proc_subtree_sample",
+            lambda pid, **kw: sub.platform_compat.SubtreeSample(2 * 1024 * 1024, 0, None, None),
+        )
         m._sample_live_costs()
 
         assert a.last_rss_gb == pytest.approx(1.0, abs=0.01)

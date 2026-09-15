@@ -20,6 +20,7 @@ Every test writes only under ``tmp_path``; no network, no subprocess.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -74,6 +75,57 @@ class TestOffLoopWrappers:
             H.append_off_loop(log, "k", "user", "hi", agent="a")
         assert "inline append failed" in caplog.text
         log.append.assert_called_once_with("k", "user", "hi", agent="a")
+
+    def test_append_rows_groups_the_pair_under_one_atomic_hold(self, tmp_path) -> None:
+        """A prompt+result pair must not be two independent off-loop writes.
+
+        Dispatched separately, two worker threads can land them out of order or
+        land one alone, leaving the replay with a reversed or half-written run
+        that no timestamp ordering repairs. The rows go through one
+        ``atomic_appends`` hold instead, which is that contract's stated
+        companion for a multi-append caller that offloads.
+        """
+        log = H.ConversationLog(base_dir=tmp_path)
+        holds: list[str] = []
+        real_atomic = log.atomic_appends
+
+        @contextlib.contextmanager
+        def _spy(key: str):
+            holds.append(key)
+            with real_atomic(key):
+                yield
+
+        with patch.object(log, "atomic_appends", _spy):
+            H.append_rows_if_absent_off_loop(
+                log,
+                "cron:abc",
+                [
+                    ("user", "the prompt", "msg msg-u", "m-1"),
+                    ("assistant", "the result", "msg msg-a", "m-2"),
+                ],
+            )
+        assert holds == ["cron:abc"], "the pair must share exactly one atomic hold"
+        rows = log.read_messages("cron:abc")
+        assert [r["role"] for r in rows] == ["user", "assistant"], "order must be preserved"
+        assert [r["meta"]["mid"] for r in rows] == ["m-1", "m-2"]
+
+    def test_append_rows_keeps_per_row_idempotence(self, tmp_path) -> None:
+        """A row the slot save already persisted is skipped without dropping its sibling."""
+        log = H.ConversationLog(base_dir=tmp_path)
+        log.append("cron:abc", "user", "the prompt", mid="m-1")
+        H.append_rows_if_absent_off_loop(
+            log,
+            "cron:abc",
+            [
+                ("user", "the prompt", "msg msg-u", "m-1"),
+                ("assistant", "the result", "msg msg-a", "m-2"),
+            ],
+        )
+        rows = log.read_messages("cron:abc")
+        assert [r["role"] for r in rows] == ["user", "assistant"], (
+            "the already-present prompt must not be duplicated, and must not "
+            "suppress the result"
+        )
 
     def test_append_if_absent_off_loop_inline_failure_is_logged(self, caplog) -> None:
         log = MagicMock()
@@ -206,6 +258,23 @@ class TestTranscriptStems:
                 H._safe_key("dashboard:chat-1"),
             )
 
+    @pytest.mark.parametrize(
+        "key",
+        (
+            "slack:1699999999.000100",
+            "slack_1699999999.000100",
+            "1699999999.000100",
+        ),
+    )
+    def test_every_slack_spelling_has_the_same_lock_stems(self, key: str) -> None:
+        assert H.transcript_lock_stems(key) == (
+            "slack_1699999999.000100",
+            "1699999999.000100",
+        )
+
+    def test_plain_key_has_one_lock_stem(self) -> None:
+        assert H.transcript_lock_stems("dashboard:chat-1") == ("dashboard_chat-1",)
+
 
 class TestToolCallScanners:
     def test_count_tool_call_messages_counts_each_message_once(self) -> None:
@@ -296,6 +365,98 @@ class TestReadTailMessages:
         path = log._path("k")
         with patch("builtins.open", side_effect=OSError("locked")):
             assert log._read_tail_messages(path, 5, None) == []
+
+
+class TestReadFileChangeMessages:
+    def test_skips_large_irrelevant_rows_and_never_warms_message_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        log = _log(tmp_path)
+        path = log._path("large")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        change = {
+            "role": "assistant",
+            "content": "done",
+            "ts": "2026-08-25T18:00:00Z",
+            "meta": {"file_changes": [{"path": "/tmp/report.md"}]},
+        }
+        _write(
+            path,
+            _jsonl(
+                {"_type": "metadata"},
+                {"role": "assistant", "content": "x" * 1_000_000},
+                change,
+            ),
+        )
+
+        real_loads = H.json.loads
+        parsed_sizes: list[int] = []
+
+        def tracking_loads(value, *args, **kwargs):
+            parsed_sizes.append(len(value))
+            return real_loads(value, *args, **kwargs)
+
+        monkeypatch.setattr(H.json, "loads", tracking_loads)
+        rows = log.read_file_change_messages("large")
+
+        assert rows == [
+            {
+                "ts": "2026-08-25T18:00:00Z",
+                "meta": {"file_changes": [{"path": "/tmp/report.md"}]},
+            }
+        ]
+        assert len(parsed_sizes) == 1
+        assert parsed_sizes[0] < 1_000
+        assert len(log._msg_cache) == 0
+
+        def unexpected_parse(*_args, **_kwargs):
+            pytest.fail("unchanged projection should come from its lightweight cache")
+
+        monkeypatch.setattr(H.json, "loads", unexpected_parse)
+        assert log.read_file_change_messages("large") is rows
+
+    def test_changed_file_replaces_cached_projection(self, tmp_path: Path) -> None:
+        log = _log(tmp_path)
+        path = log._path("changed")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        first = {
+            "role": "assistant",
+            "ts": "2026-08-25T18:00:00Z",
+            "meta": {"file_changes": [{"path": "/tmp/old.md"}]},
+        }
+        second = {
+            "role": "assistant",
+            "ts": "2026-08-25T18:01:00Z",
+            "meta": {"file_changes": [{"path": "/tmp/new-report.md"}]},
+        }
+        _write(path, _jsonl({"_type": "metadata"}, first))
+        assert log.read_file_change_messages("changed")[0]["meta"] == first["meta"]
+
+        _write(path, _jsonl({"_type": "metadata"}, second))
+
+        assert log.read_file_change_messages("changed") == [
+            {"ts": second["ts"], "meta": second["meta"]}
+        ]
+
+    def test_session_write_invalidates_cached_projection(self, tmp_path: Path) -> None:
+        log = _log(tmp_path)
+        _write(
+            log._path("written"),
+            _jsonl(
+                {"_type": "metadata"},
+                {
+                    "role": "assistant",
+                    "content": "first",
+                    "meta": {"file_changes": [{"path": "/tmp/first.md"}]},
+                },
+            ),
+        )
+        assert log.read_file_change_messages("written")
+        assert "written" in log._file_change_cache
+
+        log.append("written", "assistant", "no document change")
+
+        assert "written" not in log._file_change_cache
 
 
 class TestLastMessagePreview:
@@ -748,7 +909,7 @@ class TestWriteStructuredMemory:
     def test_no_vector_store_is_noop(self) -> None:
         _consolidator()._write_structured_memory({"semantic": [{"key": "a"}]}, "k")
 
-    def test_semantic_write_delete_and_escalation(self, caplog) -> None:
+    def test_semantic_write_and_delete_keep_the_consolidation_source(self, caplog) -> None:
         vs = MagicMock()
         vs.set_semantic.return_value = None
         vs.delete_semantic.return_value = True
@@ -765,7 +926,7 @@ class TestWriteStructuredMemory:
         with caplog.at_level(logging.INFO, logger="kiro_crew.history"):
             c._write_structured_memory(result, "sess")
         sources = {kw["key"]: kw["source"] for _, kw in vs.set_semantic.call_args_list}
-        assert sources == {"plain": "consolidation:sess", "explicit": "user_explicit"}
+        assert sources == {"plain": "consolidation:sess", "explicit": "consolidation:sess"}
         vs.delete_semantic.assert_called_once_with("stale", "consolidation:sess")
         assert "2 written, 1 deleted" in caplog.text
 
@@ -799,12 +960,17 @@ class TestWriteStructuredMemory:
         }
         with caplog.at_level(logging.INFO, logger="kiro_crew.history"):
             c._write_structured_memory(result, "sess")
+        # ``facets`` is part of the call now: the consolidator stamps the carve axes
+        # it already holds. ``None`` here because this test drives
+        # ``_write_structured_memory`` directly rather than through ``_consolidate``,
+        # which is where ``_session_facets`` is built.
         vs.write_episodic.assert_called_once_with(
             text="a thing happened",
             conversation_id="sess",
             tags=["t"],
             importance=0.9,
             source="consolidation:sess",
+            facets=None,
         )
         assert "Wrote 1 episodic" in caplog.text
 
@@ -1351,6 +1517,11 @@ class TestSkillTextHelpers:
         [
             (None, ""),
             ("---\nname: x\n---\nbody text", "body text"),
+            # The locator tolerates a carriage return before each fence
+            # newline, exactly like SKILL_UPDATE's fence: a block the field
+            # parser reads must be a block this strips, or the header rides
+            # into the update-merge prompt under a re-emitted fence.
+            ("---\r\nname: x\r\n---\r\nbody text", "body text"),
             ("no frontmatter", "no frontmatter"),
         ],
     )
@@ -1422,7 +1593,7 @@ class TestSidecarSummariesSurviveMtimePreservingRewrites:
 
     So a compaction that drops half a transcript leaves the recorded signature
     still matching, and the sidecar describing the PRE-rewrite conversation is
-    served as valid. Unlike the in-process caches #4293 guards with a generation
+    served as valid. Unlike the in-process caches guarded with a generation
     counter, these are files on disk: the staleness outlives the process and is
     permanent until a genuine ``append`` lands.
     """

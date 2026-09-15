@@ -37,9 +37,9 @@
   },
   {
     "id": "credential-exfil-printenv-aws",
-    "pattern": ".*printenv.*AWS.*",
+    "pattern": "(?<![\\w-])printenv(?!\\w).*AWS_(?:SECRET|SESSION|SECURITY|ACCESS)",
     "category": "credential-exfil",
-    "description": "Blocks `printenv` dumping any AWS_* environment variable, which can leak AWS credentials held in the environment."
+    "description": "Blocks `printenv` naming a secret-bearing AWS variable (`AWS_SECRET*`, `AWS_SESSION*`, `AWS_SECURITY*`, `AWS_ACCESS*`), which prints the credential held in the environment. Naming a non-secret variable such as `AWS_REGION` is allowed."
   },
   {
     "id": "credential-exfil-kirocrew-token",
@@ -49,9 +49,9 @@
   },
   {
     "id": "credential-exfil-env-grep-aws",
-    "pattern": ".*env.*grep.*AWS.*",
+    "pattern": "(?<![\\w-])(?:environ|printenv|typeset|export\\s+-p|env|set)(?!\\w).*\\|.*(?:grep|awk|sed)(?!\\w).*AWS(?:(?![A-Za-z0-9_])|_(?![A-Za-z0-9])|_(?:SECRET|SESSION|SECURITY|ACCESS)|_(?:SECURIT|SECURI|SESSIO|ACCES|SECRE|SECUR|SESSI|ACCE|SECR|SECU|SESS|ACC|SEC|SES|AC|SE|A|S)(?![A-Za-z0-9_]))",
     "category": "credential-exfil",
-    "description": "Blocks `env | grep AWS`, which filters the environment for AWS_* variables and leaks any credentials stored there."
+    "description": "Blocks piping an environment dump (`env`, `printenv`, `set`, `export -p`, `typeset`, `/proc/<pid>/environ`) through grep/awk/sed for the bare `AWS`/`AWS_` prefix, a secret-bearing AWS variable, or a truncation of one such as `AWS_S`, which leaks any credentials stored there. Selecting a named non-secret variable such as `AWS_REGION` or `AWS_SDK_LOAD_CONFIG` is allowed."
   },
   {
     "id": "credential-exfil-python-boto3-get-credentials",
@@ -76,6 +76,48 @@
     "pattern": ".*wget.*169\\.254\\.169\\.254.*",
     "category": "credential-exfil",
     "description": "Blocks `wget` to the 169.254.169.254 instance metadata service (IMDS), a classic path to steal EC2 role credentials."
+  },
+  {
+    "id": "credential-exfil-imds-any",
+    "pattern": ".*169\\.254\\.169\\.254.*",
+    "category": "credential-exfil",
+    "description": "Blocks reaching the instance metadata service by ANY verb and ANY IP encoding (decimal, hex, octal, IPv6-mapped, and the fd00:ec2::254 endpoint) — the curl/wget rules above only cover those two verbs and the literal dotted quad."
+  },
+  {
+    "id": "data-exfil-curl-file-body",
+    "pattern": ".*curl.*--?data(-binary|-ascii|-urlencode)?[= ]@.*",
+    "category": "credential-exfil",
+    "description": "Blocks a `curl` request whose body is read from a LOCAL FILE (`-d @file` and every --data variant), the tell-tale shape of pushing local data out to a remote."
+  },
+  {
+    "id": "data-exfil-curl-multipart-upload",
+    "pattern": ".*curl.*(-F|--form)\\s*\\S*=@.*",
+    "category": "credential-exfil",
+    "description": "Blocks a `curl` multipart upload that attaches a local file (`-F field=@file`), for any field name."
+  },
+  {
+    "id": "data-exfil-curl-upload",
+    "pattern": ".*curl.*(--upload-file|(^|\\s)-T\\s*\\S).*",
+    "category": "credential-exfil",
+    "description": "Blocks a `curl` file upload (`--upload-file` / `-T file`), which sends a local file to a remote endpoint."
+  },
+  {
+    "id": "data-exfil-wget-post-file",
+    "pattern": ".*wget.*--post-file.*",
+    "category": "credential-exfil",
+    "description": "Blocks `wget --post-file`, which posts the contents of a local file to a remote endpoint."
+  },
+  {
+    "id": "data-exfil-nc-file-redirect",
+    "pattern": ".*(^|\\s)nc(at)?\\s+\\S.*<.*",
+    "category": "credential-exfil",
+    "description": "Blocks piping a local file into `nc`/`ncat` via input redirection, a plain-socket way to ship data off the host."
+  },
+  {
+    "id": "reverse-shell-devtcp",
+    "pattern": ".*/dev/(tcp|udp)/.*",
+    "category": "reverse-shell",
+    "description": "Blocks bash's /dev/tcp and /dev/udp pseudo-devices, which open a raw socket to a remote host without any external tool — the classic dependency-free reverse shell."
   },
   {
     "id": "credential-exfil-curl-aws-secret",
@@ -357,7 +399,7 @@
     "id": "iac-teardown-cdk-destroy",
     "pattern": "cdk destroy.*",
     "category": "iac-teardown",
-    "description": "Blocks `cdk destroy`, which tears down an entire AWS CDK stack and all its provisioned cloud resources — irreversible infrastructure and data loss."
+    "description": "Blocks `cdk destroy`, which tears down an entire AWS CDK stack and all its provisioned cloud resources \u2014 irreversible infrastructure and data loss."
   },
   {
     "id": "local-destructive-chmod-777",
@@ -492,6 +534,12 @@
     "description": "Blocks 'git push <remote>' with a single argument (no branch), which pushes to the configured upstream and can publish to a protected branch unattended."
   },
   {
+    "id": "git-publish-push-ambiguous-ref",
+    "pattern": ".*git\\s+(-\\S+\\s+[^-]\\S*\\s+|-\\S+\\s+)*push\\s+.*[\\s:]\\+?(head|@|fetch_head)(\\s.*|$)",
+    "category": "git-publish",
+    "description": "Blocks 'git push' whose destination is a symbolic ref that resolves at run time (HEAD, @, FETCH_HEAD) — if the checked-out branch is a protected one, this publishes to it, and the target cannot be verified before the push runs."
+  },
+  {
     "id": "git-publish-push-protected-branch-name",
     "pattern": ".*git\\s+(-\\S+\\s+[^-]\\S*\\s+|-\\S+\\s+)*push\\s+.*[\\s:]\\+?(main|mainline|master)(\\s.*|$)",
     "category": "git-publish",
@@ -531,7 +579,7 @@
     "id": "iac-teardown-kubectl-delete-namespace",
     "pattern": "kubectl delete namespace.*",
     "category": "iac-teardown",
-    "description": "Blocks `kubectl delete namespace`, which deletes a Kubernetes namespace and cascades to every workload, service, and volume inside it — irreversible cluster-wide teardown."
+    "description": "Blocks `kubectl delete namespace`, which deletes a Kubernetes namespace and cascades to every workload, service, and volume inside it \u2014 irreversible cluster-wide teardown."
   },
   {
     "id": "local-destructive-mkfs",
@@ -555,7 +603,7 @@
     "id": "iac-teardown-pulumi-destroy",
     "pattern": "pulumi destroy.*",
     "category": "iac-teardown",
-    "description": "Blocks `pulumi destroy`, which deletes all cloud resources managed by a Pulumi stack — irreversible infrastructure teardown."
+    "description": "Blocks `pulumi destroy`, which deletes all cloud resources managed by a Pulumi stack \u2014 irreversible infrastructure teardown."
   },
   {
     "id": "local-destructive-rm-rf-root",
@@ -573,7 +621,7 @@
     "id": "iac-teardown-terraform-destroy",
     "pattern": "terraform destroy.*",
     "category": "iac-teardown",
-    "description": "Blocks `terraform destroy`, which destroys every resource tracked in the Terraform state — irreversible infrastructure and data loss."
+    "description": "Blocks `terraform destroy`, which destroys every resource tracked in the Terraform state \u2014 irreversible infrastructure and data loss."
   },
   {
     "id": "sql-truncate-table",
@@ -588,192 +636,6 @@
     "description": "Blocks piping a wget download directly into bash, which executes arbitrary remote code with no chance to inspect the script first."
   },
   {
-    "id": "sensitive-file-read-cat-aws",
-    "pattern": ".*cat.*/\\.aws/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using cat to read files under ~/.aws, which holds AWS access keys and session credentials that could be exfiltrated."
-  },
-  {
-    "id": "sensitive-file-read-cat-ssh",
-    "pattern": ".*cat.*/\\.ssh/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using cat to read files under ~/.ssh, which holds private SSH keys and known-hosts data granting remote access."
-  },
-  {
-    "id": "sensitive-file-read-cat-gnupg",
-    "pattern": ".*cat.*/\\.gnupg/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using cat to read files under ~/.gnupg, which holds GPG private keyrings and trust data used to sign or decrypt secrets."
-  },
-  {
-    "id": "sensitive-file-read-cat-gpg",
-    "pattern": ".*cat.*/\\.gpg/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using cat to read files under ~/.gpg, which holds GPG key material used to sign or decrypt secrets."
-  },
-  {
-    "id": "sensitive-file-read-cat-netrc",
-    "pattern": ".*cat.*/\\.netrc.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using cat to read ~/.netrc, which stores plaintext login/password credentials for FTP, HTTP, and other services."
-  },
-  {
-    "id": "sensitive-file-read-cat-git-credentials",
-    "pattern": ".*cat.*/\\.git-credentials.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using cat to read ~/.git-credentials, which stores plaintext Git remote usernames and access tokens."
-  },
-  {
-    "id": "sensitive-file-read-cat-npmrc",
-    "pattern": ".*cat.*/\\.npmrc.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using cat to read ~/.npmrc, which can contain npm registry auth tokens."
-  },
-  {
-    "id": "sensitive-file-read-cat-pypirc",
-    "pattern": ".*cat.*/\\.pypirc.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using cat to read ~/.pypirc, which can contain PyPI upload usernames and API tokens."
-  },
-  {
-    "id": "sensitive-file-read-cat-docker-config",
-    "pattern": ".*cat.*/\\.docker/config\\.json.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using cat to read ~/.docker/config.json, which holds base64-encoded container registry credentials."
-  },
-  {
-    "id": "sensitive-file-read-cat-kube-config",
-    "pattern": ".*cat.*/\\.kube/config.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using cat to read ~/.kube/config, which holds Kubernetes cluster tokens, client certs, and API credentials."
-  },
-  {
-    "id": "sensitive-file-read-cat-kirocrew-env",
-    "pattern": ".*cat.*/(?:\\.kiro/crew|\\.kirocrew)/\\.env.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using cat to read Kiro Crew's own credential file (~/.kiro/crew/.env, or the pre-move ~/.kirocrew/.env), which holds Kiro Crew's own secrets and environment credentials."
-  },
-  {
-    "id": "sensitive-file-read-head-aws",
-    "pattern": ".*head.*/\\.aws/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using head to read files under ~/.aws, which holds AWS access keys and session credentials."
-  },
-  {
-    "id": "sensitive-file-read-tail-aws",
-    "pattern": ".*tail.*/\\.aws/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using tail to read files under ~/.aws, which holds AWS access keys and session credentials."
-  },
-  {
-    "id": "sensitive-file-read-less-aws",
-    "pattern": ".*less.*/\\.aws/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using less to read files under ~/.aws, which holds AWS access keys and session credentials."
-  },
-  {
-    "id": "sensitive-file-read-more-aws",
-    "pattern": ".*more.*/\\.aws/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using more to read files under ~/.aws, which holds AWS access keys and session credentials."
-  },
-  {
-    "id": "sensitive-file-read-strings-aws",
-    "pattern": ".*strings.*/\\.aws/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using strings to extract text from files under ~/.aws, which holds AWS access keys and session credentials."
-  },
-  {
-    "id": "sensitive-file-read-base64-aws",
-    "pattern": ".*base64.*/\\.aws/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using base64 to encode/dump files under ~/.aws, a common way to exfiltrate AWS credentials past text filters."
-  },
-  {
-    "id": "sensitive-file-read-head-ssh",
-    "pattern": ".*head.*/\\.ssh/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using head to read files under ~/.ssh, which holds private SSH keys granting remote access."
-  },
-  {
-    "id": "sensitive-file-read-tail-ssh",
-    "pattern": ".*tail.*/\\.ssh/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using tail to read files under ~/.ssh, which holds private SSH keys granting remote access."
-  },
-  {
-    "id": "sensitive-file-read-less-ssh",
-    "pattern": ".*less.*/\\.ssh/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using less to read files under ~/.ssh, which holds private SSH keys granting remote access."
-  },
-  {
-    "id": "sensitive-file-read-more-ssh",
-    "pattern": ".*more.*/\\.ssh/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using more to read files under ~/.ssh, which holds private SSH keys granting remote access."
-  },
-  {
-    "id": "sensitive-file-read-strings-ssh",
-    "pattern": ".*strings.*/\\.ssh/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using strings to extract text from files under ~/.ssh, which holds private SSH keys granting remote access."
-  },
-  {
-    "id": "sensitive-file-read-base64-ssh",
-    "pattern": ".*base64.*/\\.ssh/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks using base64 to encode/dump files under ~/.ssh, a common way to exfiltrate private SSH keys past text filters."
-  },
-  {
-    "id": "sensitive-file-read-cp-aws",
-    "pattern": ".*cp.*/\\.aws/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks copying files out of ~/.aws, which would duplicate AWS credentials to an unprotected location for exfiltration."
-  },
-  {
-    "id": "sensitive-file-read-cp-ssh",
-    "pattern": ".*cp.*/\\.ssh/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks copying files out of ~/.ssh, which would duplicate private SSH keys to an unprotected location for exfiltration."
-  },
-  {
-    "id": "sensitive-file-read-python-aws",
-    "pattern": ".*python.*open.*/\\.aws/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks a Python open() of files under ~/.aws, a scripted path to read AWS credentials past shell-verb filters."
-  },
-  {
-    "id": "sensitive-file-read-python-ssh",
-    "pattern": ".*python.*open.*/\\.ssh/.*",
-    "category": "sensitive-file-read",
-    "description": "Blocks a Python open() of files under ~/.ssh, a scripted path to read private SSH keys past shell-verb filters."
-  },
-  {
-    "id": "self-protection-restart",
-    "pattern": ".*kiro.?crew(?:\\s+--?[a-z-]+(?:[= ]\\S+)?)*\\s+restart.*",
-    "category": "self-protection",
-    "description": "Blocks 'kirocrew restart' so the agent cannot restart its own gateway process and disrupt the running session or evade in-flight controls."
-  },
-  {
-    "id": "self-protection-update",
-    "pattern": ".*kiro.?crew(?:\\s+--?[a-z-]+(?:[= ]\\S+)?)*\\s+update.*",
-    "category": "self-protection",
-    "description": "Blocks 'kirocrew update' so the agent cannot self-update (git pull + rebuild + execv restart) and swap out its own running code without operator oversight."
-  },
-  {
-    "id": "self-protection-cloud",
-    "pattern": ".*kiro.?crew(?:\\s+--?[a-z-]+(?:[= ]\\S+)?)*\\s+cloud\\s+(destroy|stop|start|launch|connect|tunnel|log(in|out)).*",
-    "category": "self-protection",
-    "description": "Blocks 'kirocrew cloud' lifecycle subcommands (destroy/stop/start/launch/connect/tunnel/login/logout) so the agent cannot tear down, provision, re-authenticate, or sign out its own cloud instance."
-  },
-  {
-    "id": "self-protection-gateway-restart",
-    "pattern": ".*kiro.?crew(?:\\s+--?[a-z-]+(?:[= ]\\S+)?)*\\s+gateway restart.*",
-    "category": "self-protection",
-    "description": "Blocks 'kirocrew gateway restart' so the agent cannot bounce its own gateway server and interrupt the active session or supervision."
-  },
-  {
     "id": "self-protection-kill",
     "pattern": "(?:(?:\\A|[;&|\\n`]|\\$\\()[\\s\"'(]*[\\w.:/\\\\-]*(?:pkill|killall)\\b[^;&#>]*\\bkiro[-.]?crew\\b|(?:\\A|[;&|\\n`]|\\$\\()[\\s\"'(]*[\\w.:/\\\\-]*kill\\b[^;&#>]*(?:\\$\\(|`)[^;&#>]*\\bkiro[-.]?crew\\b)",
     "category": "self-protection",
@@ -786,46 +648,10 @@
     "description": "Blocks 'kirocrew cron adopt' so the agent cannot assign itself ownership of a scheduled job. A cron's owning session both manages the job and receives its output, and the MCP cron tools deliberately cannot write that field -- without this rule a session could reach the same power through bash and claim a job that belongs to another session. The gaps between the words tolerate anything that is not a command separator, rather than enumerating what may sit there: the CLI accepts '-v'/'--verbose' and '--no-jail' before a subcommand, a shell redirection is legal anywhere in a simple command, and $IFS is a word separator too, so an allow-list of interlopers would need extending on each new spelling. A single '&' is allowed through because '2>&1' is a redirection, while '&&' still ends the match: the three words have to belong to ONE simple command."
   },
   {
-    "id": "legacy-get-secret",
-    "pattern": "get_secret.*",
-    "category": "credential-exfil",
-    "description": "Blocks explicit secret-fetching tool names such as `get_secret_value`, which read credential material that could be exfiltrated."
-  },
-  {
-    "id": "legacy-read-secret",
-    "pattern": "read_secret.*",
-    "category": "credential-exfil",
-    "description": "Blocks explicit secret-reading tool names such as `read_secret`, which read credential material that could be exfiltrated."
-  },
-  {
-    "id": "legacy-delete-stack-underscore",
-    "pattern": ".*delete_stack.*",
-    "category": "aws-destructive",
-    "description": "Blocks the boto3 underscore form `delete_stack`, which destroys a CloudFormation stack and every resource it manages."
-  },
-  {
-    "id": "legacy-terminate-instance-underscore",
-    "pattern": ".*terminate_instance.*",
-    "category": "aws-destructive",
-    "description": "Blocks the boto3 underscore form `terminate_instance(s)`, which permanently shuts down and deletes running EC2 instances."
-  },
-  {
-    "id": "legacy-drop-table-underscore",
-    "pattern": ".*drop_table.*",
-    "category": "sql",
-    "description": "Blocks the underscore form `drop_table`, which permanently deletes a database table and all its rows."
-  },
-  {
-    "id": "legacy-delete-table-underscore",
-    "pattern": ".*delete_table.*",
-    "category": "aws-destructive",
-    "description": "Blocks the boto3 underscore form `delete_table`, which permanently deletes a DynamoDB table and every item it holds."
-  },
-  {
-    "id": "legacy-delete-bucket-underscore",
-    "pattern": ".*delete_bucket.*",
-    "category": "aws-destructive",
-    "description": "Blocks the boto3 underscore form `delete_bucket`, which removes an S3 bucket and can cause irreversible data loss."
+    "id": "self-protection-dev-mode-out-of-root-confirm",
+    "pattern": ".*--confirm-out-of-install-root.*",
+    "category": "self-protection",
+    "description": "Blocks any agent command carrying the `--confirm-out-of-install-root` flag, the operator's explicit attestation for granting app dev mode on a UI root outside the app's install directory. The dev-mode grant relaxes the unauthenticated UI route's root containment, so an agent able to pass the flag itself would convert an auto-approved shell into a self-granted serving grant on an arbitrary host directory. The confirmation must come from the operator's own terminal, which these rules do not govern."
   },
   {
     "id": "credential-exfil-kirocrew-token-argv",
@@ -837,6 +663,12 @@
     "id": "self-protection-kill-interpreter",
     "pattern": "(?:(?:os\\.system|os\\.popen|os\\.exec\\w*|(?:asyncio\\.)?create_subprocess_\\w*|(?:\\w+\\.)?(?:run|call|check_call|check_output|popen|Popen|getoutput|getstatusoutput)|commands\\.getoutput|popen\\d?|system|shell_exec|passthru|proc_open|child_process\\.exec\\w*|exec\\w*sync|spawn\\w*|kernel\\.system|io\\.popen)(?:\\s*\\(?\\s*[a-z]{0,2}['\"][^'\"]*\\b(?:pkill|killall)\\b[^'\"]*\\b(?:kiro[-.]?crew|irocrew)\\b|[\\s\\(\\[]*['\"][\\w.:/\\\\-]*(?:pkill|killall)['\"][\\s,\\[\\]\\(\\)+*'\"=\\w-]*['\"][^'\"]*(?:kiro[-.]?crew|irocrew))|(?:os\\.kill(?:pg)?|process\\.kill|\\bkillpg)\\s*\\([^)]*irocrew)",
     "category": "self-protection",
-    "description": "Blocks an interpreter payload that terminates a kirocrew process through a library call rather than as a shell command -- a pkill/killall command and the product name inside one quoted string passed to an executing sink such as `os.system(...)` or `execSync(...)`. Sink-qualified so prose, a commit message or a regex literal naming both is not a kill."
+    "description": "Blocks an interpreter payload that terminates a kirocrew process through a library call rather than as a shell command -- a pkill/killall command and the product name inside one quoted string passed to an executing sink such as ``os.system(...)`` or ``execSync(...)``. Sink-qualified so prose, a commit message or a regex literal naming both is not a kill."
+  },
+  {
+    "id": "sandbox-escape-ssh-self",
+    "pattern": "(?:\\A|[;&|\\n`]|\\$\\()[\\s\"'(]*(?:[\\w.:/\\\\-]*[/\\\\])?(?:ssh|scp|sftp|rsync)(?:\\.exe)?\\s+(?:\\S*@)?(?:localhost|127\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}|\\[?::1\\]?|\\$\\(\\s*hostname|`\\s*hostname|\\$\\{?hostname\\}?)(?=[\\s:'\\\");&|#]|\\Z)",
+    "category": "self-protection",
+    "description": "Blocks ssh/scp/sftp/rsync targeting this same machine (localhost, 127.x.x.x, ::1, $(hostname), or this host's own name/addresses), which re-enters the host OUTSIDE the agent sandbox: a command run through `ssh localhost` bypasses every other control here, and passwordless sudo on the far side completes a full escape. Connections to other hosts stay allowed, with one declared exception: a first-seen DOTTED hostname in HOST position is refused once, per process, while an off-loop DNS check rules out a loopback alias, then cached; a dotless name is answered from the hosts file same-call, without a refusal."
   }
 ]

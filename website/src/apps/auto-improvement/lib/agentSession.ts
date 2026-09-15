@@ -22,6 +22,9 @@ import { useCallback, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import { api } from '../../../api/client'
+import { sendTurn } from '../../../chat-core/transport/sendTurn'
+import { settleSeedReceipt } from '../../../utils/seedReceipt'
+import { isMissingSlotError } from '../../../utils/thunkError'
 import { useAppDispatch } from '../../../store'
 import { createSlot, deleteSlot, switchSlot } from '../../../store/chatSlice'
 
@@ -146,13 +149,13 @@ async function resolveFolderId(repo: string): Promise<string> {
   return created.id
 }
 
-/** True when an error means the slot is genuinely gone (404), as opposed to a
- *  transient failure reaching the gateway. Only the former justifies replacing
- *  a session; treating a network blip as "deleted" would orphan a live one. */
-function isMissingSlot(e: unknown): boolean {
-  const msg = e instanceof Error ? e.message : String(e ?? '')
-  return /\b404\b/.test(msg) || /not found/i.test(msg)
-}
+// Whether a rejection means the slot is genuinely GONE (and so justifies opening
+// a replacement) is decided by `utils/thunkError`, shared with Issue Radar's
+// identical fallback rather than spelled out here as well. Both classify the
+// rejection `.unwrap()` throws, and both were broken by reading it as
+// `e instanceof Error ? e.message : String(e)` — RTK serializes the error, so
+// that yields `'[object Object]'` and the fallback never fires. Two copies of the
+// rule is how they came to be broken in lockstep, so there is now one.
 
 export interface OpenSessionArgs {
   kind: SubjectKind
@@ -210,7 +213,7 @@ export function useAgentSession(): UseAgentSession {
             await dispatch(switchSlot(existing.slot_key)).unwrap()
             resumed = true
           } catch (e) {
-            if (!isMissingSlot(e)) throw e
+            if (!isMissingSlotError(e)) throw e
           }
           if (resumed) {
             navigate('/chat')
@@ -218,25 +221,45 @@ export function useAgentSession(): UseAgentSession {
           }
         }
 
-        // Fresh session: folder -> slot (filed) -> seed and run -> link.
+        // Fresh session: folder -> slot (filed + titled) -> seed and run -> link.
         const folderId = await resolveFolderId(repo)
-        const slot = await dispatch(createSlot({ folder_id: folderId })).unwrap()
+        // Title on the CREATE payload, not a rename afterwards. `createSlot`
+        // accepts it for the reason its own comment gives: the server pins the
+        // name (locking the background auto-titler out) and the create broadcast
+        // already carries it. A follow-up rename instead paints a generated title
+        // first and, being best-effort, can fail silently -- leaving the slot with
+        // whatever the auto-titler chooses. Same shape the Issue Radar path uses.
+        // App-owned workstreams choose their memory contract explicitly; a
+        // general chat preference must not silently alter their behavior.
+        const slot = await dispatch(
+          createSlot({
+            folder_id: folderId,
+            title: truncate(title),
+            memory_mode: 'persistent',
+          }),
+        ).unwrap()
         // The slot is persisted but not yet linked, so a failure before the seed
         // would leave an empty session that the next click cannot find. Rollback
         // covers exactly that window and stops the moment the seed is in flight:
         // once the POST may have been accepted the agent is starting, and
         // deleting the slot would cancel real work over a metadata hiccup.
         createdSlotKey = slot.key
-        // Best-effort readable title; the session works regardless.
-        api.renameSlot(slot.key, truncate(title)).catch(() => {})
-        const seedInFlight = api.sendChat(prompt, slot.key)
+        // The chat-core transport owns the receipt contract (`POST /api/chat?ws=1`
+        // RESOLVES on 4xx/5xx, a 200 can still decline with `{ok:false}`, a hung
+        // POST is bounded by its deadline) and never rejects: every outcome is
+        // a receipt status.
+        const seedInFlight = sendTurn({ message: prompt, slot: slot.key })
         createdSlotKey = null
-        const seeded = await seedInFlight
-        // fetch RESOLVES on 4xx/5xx, so without this check a rejected prompt
-        // would still be recorded and navigated to, leaving an empty session.
-        if (seeded && typeof seeded === 'object' && 'ok' in seeded && !(seeded as Response).ok) {
+        const receipt = await seedInFlight
+        // `settleSeedReceipt` owns the seed policy (shared with the other app
+        // seeder): only a seed that provably never ran -- refused, or no receipt
+        // and the slot stays empty -- tears the empty slot down; recording and
+        // navigating to it would be exactly the empty session this guard exists
+        // to prevent. Everything else is, or may be, running and is recorded.
+        const verdict = await settleSeedReceipt(receipt, slot.key)
+        if (!verdict.ran) {
           await dispatch(deleteSlot(slot.key)).unwrap().catch(() => {})
-          throw new Error(`could not seed the session (HTTP ${(seeded as Response).status})`)
+          throw new Error(verdict.reason)
         }
         const record = await saveRecord(key, {
           slot_key: slot.key,

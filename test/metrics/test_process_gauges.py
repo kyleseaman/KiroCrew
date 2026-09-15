@@ -44,6 +44,29 @@ def _collect(register=pg.register_process_gauges):
     return out
 
 
+def _collect_data(register=pg.register_process_gauges):
+    """Same as :func:`_collect`, but keeps each metric's DATA object.
+
+    The data object is what carries the instrument kind: a ``Sum`` has
+    ``aggregation_temporality``, a ``Gauge`` has none. Asserting on it is how the
+    "these are gauges, not counters" contract is pinned at the SDK level rather
+    than by reading the registration source.
+    """
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    register(provider.get_meter("test"))
+    data = reader.get_metrics_data()
+    provider.shutdown()
+    out: dict[str, object] = {}
+    if data is None:
+        return out
+    for rm in data.resource_metrics:
+        for sm in rm.scope_metrics:
+            for metric in sm.metrics:
+                out[metric.name] = metric.data
+    return out
+
+
 # ---------------------------------------------------------------------------
 # raw readers
 # ---------------------------------------------------------------------------
@@ -63,18 +86,17 @@ def test_os_thread_count_matches_proc_when_available():
     assert count >= threading.active_count()
 
 
-def test_open_fds_positive_and_excludes_probe_fd():
-    count = pg.read_open_fds()
-    if count is None:
-        pytest.skip("no fd directory on this platform")
-    # stdin/stdout/stderr at minimum; the enumeration fd itself is excluded.
-    assert count >= 3
+def test_open_fds_delegates_to_the_shared_probe():
+    # The probe's behavior (fd-dir correction, Windows handle count) is pinned
+    # in test_platform_compat_coverage.py; here only the delegation matters.
+    with patch.object(pg.platform_compat, "count_open_fds", return_value=17):
+        assert pg.read_open_fds() == 17
 
 
 def test_readers_return_none_not_raise_when_proc_missing():
     with patch.object(pg.platform_compat, "process_thread_count", return_value=None):
         assert pg.read_os_threads() is None
-    with patch.object(pg.os, "listdir", side_effect=OSError("no proc")):
+    with patch.object(pg.platform_compat, "count_open_fds", return_value=None):
         assert pg.read_open_fds() is None
 
 
@@ -94,10 +116,10 @@ def test_collection_yields_expected_metrics():
     for name in (
         pg.GAUGE_THREADS_PYTHON,
         pg.GAUGE_RSS,
-        pg.COUNTER_CPU_SECONDS,
-        pg.COUNTER_GC_COLLECTIONS,
-        pg.COUNTER_GC_COLLECTED,
-        pg.COUNTER_GC_UNCOLLECTABLE,
+        pg.GAUGE_CPU_SECONDS,
+        pg.GAUGE_GC_COLLECTIONS,
+        pg.GAUGE_GC_COLLECTED,
+        pg.GAUGE_GC_UNCOLLECTABLE,
     ):
         assert name in metrics, f"{name} missing from collection"
         assert metrics[name], f"{name} produced no data points"
@@ -109,11 +131,52 @@ def test_collection_yields_expected_metrics():
 
     assert metrics[pg.GAUGE_THREADS_PYTHON][0].value >= 1
     assert metrics[pg.GAUGE_RSS][0].value > 1 << 20
-    assert metrics[pg.COUNTER_CPU_SECONDS][0].value > 0
+    assert metrics[pg.GAUGE_CPU_SECONDS][0].value > 0
 
     # GC counters carry the generation attribute for all three generations.
-    gens = {dp.attributes["generation"] for dp in metrics[pg.COUNTER_GC_COLLECTIONS]}
+    gens = {dp.attributes["generation"] for dp in metrics[pg.GAUGE_GC_COLLECTIONS]}
     assert gens == {"0", "1", "2"}
+
+
+def test_every_instrument_is_a_gauge_not_a_sum():
+    """No instrument here may be a Sum — that is what a cumulative series is.
+
+    The process CPU and GC readings were observable COUNTERS, which made them the
+    only cumulative series Kiro Crew exported, and one cumulative series forces
+    every consumer into stateful whole-hour aggregation (its hourly increment is
+    last-minus-first across the whole hour, per host and per process lifetime).
+    The DELTA route is not the alternative: an observable callback reads an
+    external lifetime total, so the first collection after a provider rebuild
+    would re-emit the entire total as one giant delta.
+
+    Asserted off the collected DATA rather than by spying on the meter, so it
+    holds against the SDK's own classification.
+    """
+    from opentelemetry.sdk.metrics.export import Gauge
+
+    for name, data in _collect_data().items():
+        assert isinstance(data, Gauge), f"{name} collected as {type(data).__name__}, not Gauge"
+        assert not hasattr(
+            data, "aggregation_temporality"
+        ), f"{name} carries a temporality, so it is an accumulating instrument"
+
+
+def test_lifetime_totals_are_declared_for_the_consumer_that_must_know():
+    """A lifetime-total gauge is not interchangeable with a state gauge.
+
+    Its newest sample is "since this process started", so a consumer that reports
+    the newest sample as a reading shows a number that only grows. The dashboard
+    aggregator differences them instead, and it finds them through this tuple —
+    which must therefore name exactly the four whose reading accumulates, and
+    must stay a subset of the roster.
+    """
+    assert set(pg.LIFETIME_TOTAL_METRICS) == {
+        pg.GAUGE_CPU_SECONDS,
+        pg.GAUGE_GC_COLLECTIONS,
+        pg.GAUGE_GC_COLLECTED,
+        pg.GAUGE_GC_UNCOLLECTABLE,
+    }
+    assert set(pg.LIFETIME_TOTAL_METRICS) <= set(pg.ALL_METRIC_NAMES)
 
 
 def test_collection_includes_os_views_on_linux():
@@ -177,10 +240,14 @@ def test_observable_counters_survive_provider_rebuild(tmp_path):
     provider, and telemetry consent changes rebuild the provider in-process —
     the first post-rebuild collection would re-emit the process-lifetime total
     as one giant delta. With CUMULATIVE export each cycle re-emits the running
-    snapshot, and the aggregator reduces the (PID, attrs) stream time-ordered
-    and window-relative, so two providers writing to the same shard (an off/on
-    toggle) still aggregate to the in-window activity: never a doubled 250,
-    never the four export cycles summed (500), and never the raw lifetime
+    snapshot, and the aggregator reduces the (PID, process-identity, attrs)
+    stream time-ordered and window-relative — both providers run in THIS
+    process, so the exporter stamps the same module-cached identity on every
+    record and the segments stitch into one stream (on a platform without a
+    start-time read the records carry no identity and the value heuristic
+    stitches them identically). Two providers writing to the same shard (an
+    off/on toggle) still aggregate to the in-window activity: never a doubled
+    250, never the four export cycles summed (500), and never the raw lifetime
     snapshot — the stream's first sample (100) is the baseline, so the growth
     to 150 reports as 50.
     """

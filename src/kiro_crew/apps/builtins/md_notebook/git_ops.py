@@ -24,9 +24,13 @@ import base64
 import logging
 import os
 import re
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Optional
+from pathlib import Path, PureWindowsPath
+from typing import Any, Iterator, Optional
+
+from kiro_crew import platform_compat
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +60,62 @@ def in_trash(path: str) -> bool:
     return TRASH_DIR in path.replace("\\", "/").split("/")
 
 
+def staged_temp_name(name: str) -> str:
+    """Name for the sibling temp a durable write stages beside *name*."""
+    return f"{name}.{uuid.uuid4().hex}.tmp"
+
+
+#: Basenames of temps a save has staged and not yet consumed. A save registers
+#: its temp for the whole of its transaction, so `status()` can tell the temp
+#: THIS process is mid-publish on from a file that merely looks like one.
+#: Nothing else may hide a path: see the reasoning in `status()`.
+#:
+#: Keyed on the BASENAME, not the full path: the name carries a uuid4 hex, which
+#: is unique on its own, and comparing bare names sidesteps every way two
+#: spellings of the same path can differ (case, 8.3 short names, a symlinked
+#: vault root, separator flavour). A missed match here would silently re-open
+#: the bug the filter exists to close, so the comparison must not depend on
+#: canonicalising two paths built by different call sites.
+_inflight_temps: set[str] = set()
+
+
+@contextmanager
+def inflight_temp(tmp: str | os.PathLike[str]) -> Iterator[None]:
+    """Mark *tmp* as this process's in-flight staged temp for the block's life.
+
+    Registration is the ONLY evidence `status()` accepts for hiding a path.
+    The name shape cannot serve: `<name>.<32 hex>.tmp` is what this module
+    produces, not a shape only this module can produce, so a user file wearing
+    it would be withheld from the user's own repository. Ownership is knowable
+    exactly while the transaction that staged the temp is still running, which
+    is the span this context manager covers.
+    """
+    name = PureWindowsPath(os.fspath(tmp)).name
+    _inflight_temps.add(name)
+    try:
+        yield
+    finally:
+        _inflight_temps.discard(name)
+
+
+def is_inflight_temp(path: str) -> bool:
+    """True when *path* names a temp a save in this process is publishing."""
+    return PureWindowsPath(path).name in _inflight_temps
+
+
 # Seconds before a git invocation is abandoned. Network operations (clone,
 # fetch, push) get the longer budget. Overridable via environment for hosts
 # where subprocess spawn and filesystem latency are slow or highly variable
 # (e.g. shared Windows CI runners) — mirrors FE_GIT_TIMEOUT_SEC in the
 # file_explorer app.
-GIT_TIMEOUT_SEC = int(os.environ.get("MDNB_GIT_TIMEOUT_SEC", 30))
+#: Windows pays a much higher cost per git invocation — process creation is
+#: dearer and Defender real-time-scans the object store — and one sync() or
+#: status() pass issues six to ten of them, so a large vault hit
+#: ``git <cmd> timed out after 30s`` on a host where nothing was actually wrong.
+#: The budget is doubled there so the app works unconfigured, with
+#: MDNB_GIT_TIMEOUT_SEC still overriding on either platform.
+_DEFAULT_GIT_TIMEOUT_SEC = 60 if platform_compat.IS_WINDOWS else 30
+GIT_TIMEOUT_SEC = int(os.environ.get("MDNB_GIT_TIMEOUT_SEC", _DEFAULT_GIT_TIMEOUT_SEC))
 GIT_NETWORK_TIMEOUT_SEC = int(os.environ.get("MDNB_GIT_NETWORK_TIMEOUT_SEC", 180))
 
 
@@ -257,12 +311,16 @@ def _windows_git_bin_dirs() -> tuple[str, ...]:
     """
     dirs: list[str] = []
     program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    # A 32-bit host interpreter sees %ProgramFiles% as "Program Files (x86)" while
+    # a 64-bit Git-for-Windows installs under "Program Files", so probing only the
+    # former failed closed with git_failed on an otherwise correct machine.
+    program_w6432 = os.environ.get("ProgramW6432", "")
     localappdata = os.environ.get("LOCALAPPDATA", "")
-    roots = (
-        [program_files, os.path.join(localappdata, "Programs")]
-        if localappdata
-        else [program_files]
-    )
+    roots = [program_files]
+    if program_w6432 and program_w6432 != program_files:
+        roots.append(program_w6432)
+    if localappdata:
+        roots.append(os.path.join(localappdata, "Programs"))
     for root in roots:
         dirs.append(os.path.join(root, "Git", "cmd"))
         dirs.append(os.path.join(root, "Git", "bin"))
@@ -275,8 +333,9 @@ def _windows_git_bin_dirs() -> tuple[str, ...]:
 #: otherwise shadow ``git`` with a planted binary that then runs unsandboxed on
 #: the next sync. On a normal POSIX host git lives in one of these, so PATH is
 #: never consulted there. The Windows entries cover both the machine-wide and
-#: the per-user Git-for-Windows install roots (the backend itself is macOS/Linux
-#: only; these serve Windows dev hosts and CI test runners).
+#: the per-user Git-for-Windows install roots, and are load-bearing rather than
+#: a test-runner convenience: the manifest declares Windows, so this is the
+#: lookup a real Windows user's vault operations go through.
 _GIT_BIN_DIRS: tuple[str, ...] = (
     "/usr/bin",
     "/bin",
@@ -292,7 +351,8 @@ def _git_bin() -> str:
     Only the trusted system directories above are searched — never ``PATH`` —
     so a planted binary in a workspace-writable PATH entry cannot win. The
     Windows entries cover both the machine-wide and the per-user
-    Git-for-Windows install roots (Windows dev hosts and CI test runners).
+    Git-for-Windows install roots, which the manifest's Windows declaration makes
+    a real user path rather than a CI convenience.
     Fails closed if git is not found in a trusted location.
     """
     global _git_bin_memo
@@ -310,9 +370,19 @@ def _git_bin() -> str:
             if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
                 _git_bin_memo = candidate
                 return candidate
+    # Windows has no OS sandbox backend, so this fail-close is the only thing
+    # standing between a vault operation and an untrusted binary — say what to
+    # install rather than leaving the user with a bare git_failed.
+    detail = (
+        " On Windows, install Git for Windows (winget install --id Git.Git) in its "
+        "default location, or set MD_NOTEBOOK_GIT_BIN to git.exe. PATH is "
+        "deliberately not consulted, so a git only PATH knows about is not used."
+        if platform_compat.IS_WINDOWS
+        else ""
+    )
     raise GitError(
         "no trusted git binary found in a system location "
-        f"({', '.join(_GIT_BIN_DIRS)}); install git or set MD_NOTEBOOK_GIT_BIN"
+        f"({', '.join(_GIT_BIN_DIRS)}); install git or set MD_NOTEBOOK_GIT_BIN{detail}"
     )
 
 
@@ -359,11 +429,17 @@ async def run_git(
         env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=platform_compat.IS_POSIX,
+        creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        proc.kill()
+        # Git may have spawned ssh, credential helpers or git-remote-* children
+        # that inherited its PIPE handles. Kill the whole isolated process tree
+        # and use the shared bounded reap, so cleanup cannot turn this timeout
+        # into an unbounded wait for a surviving helper's EOF.
+        await platform_compat.kill_and_reap(proc)
         raise GitError(f"git {args[0]} timed out after {timeout}s") from None
     stdout = out.decode("utf-8", "replace")
     stderr = err.decode("utf-8", "replace")
@@ -618,14 +694,45 @@ async def status(dir_: str, subfolder: Optional[str] = None) -> list[FileChange]
         if rel:
             changes.append(FileChange(path=rel, kind="added"))
 
-    if prefix:
-        changes = [c for c in changes if c.path.startswith(prefix)]
     # The local trash lives inside the vault, so git sees it. Filtering here
     # keeps a trashed note out of the commit message and out of the notes
     # listing's pending badge; `auto_commit` additionally excludes it from the
     # pathspec, because `add -A` stages from the working tree and never consults
     # this list.
-    return [c for c in changes if not in_trash(c.path)]
+    #
+    # A temp a note save is publishing is likewise not user content, and
+    # committing one is worse than a stray file: it is generated data on the
+    # remote under a note-shaped commit message. Only its ADDITION is dropped.
+    # A temp that reached a commit before this filter existed is tracked, and
+    # its removal must stay committable -- otherwise the app could never clean
+    # up the mess the old behaviour made.
+    #
+    # OWNERSHIP, NOT NAME SHAPE, is what authorizes hiding a file. `<name>.<32
+    # hex>.tmp` is the shape this module PRODUCES; it is not a shape only this
+    # module can produce. A user -- or another tool -- may genuinely create a
+    # file with that name, and an earlier revision of this filter excluded it on
+    # the shape alone. That file then vanished from the pending badge, from the
+    # commit, and from the remote, with nothing to tell anyone it had been
+    # dropped. Silently withholding unknown filesystem content from the user's
+    # own git repository is a worse failure than committing a stray temp.
+    #
+    # So only `is_inflight_temp` may hide a path: a temp THIS process currently
+    # knows it is publishing, registered for the whole stage-and-retry
+    # transaction. Everything else is filesystem content and stays visible.
+    #
+    # The consequence is deliberate: an orphan left behind when a cleanup unlink
+    # lost the race becomes VISIBLE once its transaction ends and nothing can
+    # evidence ownership. That is the safe direction to fail. Reaping an
+    # aged orphan is a lifecycle problem with its own answer; a permanent
+    # filename-shape exclusion is not that answer, because it cannot tell an
+    # orphan from a file the user put there.
+    return [
+        c
+        for c in changes
+        if (prefix is None or c.path.startswith(prefix))
+        and not in_trash(c.path)
+        and not (c.kind == "added" and is_inflight_temp(c.path))
+    ]
 
 
 def _commit_message(changes: list[FileChange]) -> str:
@@ -934,7 +1041,7 @@ async def sync(
         elif not origin_urls:
             raise GitError(f"No remote.origin.url configured for {dir_}")
 
-        # Refuse to sync if the vault's git remote no longer matches the URL it
+        # Refuse to sync if the vault's git remote does not match the URL it
         # was created/attached with. A vault's `.git/config` is agent-writable,
         # so a prompt-injected agent could repoint `remote.origin.url` (or
         # `pushurl`) at an attacker and have auto-sync upload the note history

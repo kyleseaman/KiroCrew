@@ -7,7 +7,7 @@
  * every other enable failure stays a plain error, and Cancel grants nothing.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 
@@ -41,10 +41,15 @@ vi.mock('../api/client', () => ({
     uninstallPreview: vi.fn().mockResolvedValue({ dependencies: { removable: [], shared: [], userInstalled: [] } }),
     installApp: vi.fn(),
     openApp: vi.fn(),
+    appContributors: vi.fn(() => Promise.resolve({ contributors: [] })),
   },
 }))
 
 vi.mock('../hooks/useTheme', () => ({ useTheme: () => ({ theme: 'dark' }) }))
+
+// happy-dom cannot drive real Radix menus — swap in the repo's stateful mock
+// so the launchpad tile's overflow menu (where Enable now lives) opens.
+vi.mock('@radix-ui/react-dropdown-menu', async () => await import('./__mocks__/@radix-ui/react-dropdown-menu'))
 
 // Render catalog KEYS, not English. The trust-modal strings are authored in the
 // locale catalogs; asserting on their English would make this suite a copy of
@@ -74,9 +79,14 @@ vi.mock('../components/SegmentedControl', () => ({
   ),
 }))
 
-import AppsPage from '../pages/AppsPage'
+import LibraryPage from '../pages/apps/LibraryPage'
 import AppDetailPage from '../pages/AppDetailPage'
-import { isTrustDeniedError, APP_EXECUTION_DENIED, safeHref } from '../components/appstore/TrustAppModal'
+import {
+  isTrustDeniedError,
+  APP_EXECUTION_DENIED,
+  credentialFreeRepository,
+  safeHref,
+} from '../components/appstore/TrustAppModal'
 
 /** An ApiError-shaped rejection: message plus the raw structured body. */
 function apiError(status: number, body: object, message = 'boom') {
@@ -106,7 +116,10 @@ const THIRD_PARTY = {
   description: 'Feature flags in your agentic workspace.',
   version: '1.0.0',
   author: 'launchdarkly',
-  repo: 'https://github.com/launchdarkly-labs/launchdarkly-kiro-crew-app',
+  // `repo` is the legacy/display alias. The server-resolved clone target is
+  // deliberately different so the modal cannot accidentally authorize this.
+  repo: 'https://github.com/launchdarkly-labs/catalog-alias',
+  trustRepository: 'https://git.example.test/launchdarkly/kiro-crew-app',
   tags: ['feature-flags'],
   featured: 1,
   installed: true,
@@ -119,9 +132,9 @@ function renderPage() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
     <QueryClientProvider client={qc}>
-      <MemoryRouter initialEntries={['/apps']}>
+      <MemoryRouter initialEntries={['/apps/library']}>
         <Routes>
-          <Route path="/apps" element={<AppsPage />} />
+          <Route path="/apps/library" element={<LibraryPage />} />
           <Route path="/apps/detail/:name" element={<div data-testid="detail-route" />} />
         </Routes>
       </MemoryRouter>
@@ -155,13 +168,18 @@ function renderDetailFromGet(name = THIRD_PARTY.name) {
 /**
  * Click Enable on the third-party app.
  *
- * The Library tab is the surface that offers it: FeaturedSpotlight/AppListRow
- * only render Enable for a hidden BUILT-IN, so an installed-but-disabled
- * third-party app is enabled from its installed card (or the detail page).
+ * The Library page (/apps/library) is the surface that offers it:
+ * FeaturedSpotlight/AppListRow only render Enable for a hidden BUILT-IN, so an
+ * installed-but-disabled third-party app is enabled from its launchpad tile's
+ * overflow menu (the tile caps its action row at two peers — Open plus the
+ * menu — so Enable lives behind the MoreHorizontal trigger).
  */
 async function clickEnable() {
-  fireEvent.click(await screen.findByRole('button', { name: /appsPage\.library/ }))
-  const btn = await screen.findByRole('button', { name: /installedAppCard\.enable$/ })
+  const trigger = await screen.findByRole('button', {
+    name: `pages.libraryPage.tile_more_actions ${THIRD_PARTY.displayName}`,
+  })
+  fireEvent.click(trigger)
+  const btn = await screen.findByRole('menuitem', { name: /installedAppCard\.enable$/ })
   fireEvent.click(btn)
   return btn
 }
@@ -178,6 +196,7 @@ beforeEach(() => {
     {
       name: THIRD_PARTY.name, displayName: THIRD_PARTY.displayName, version: '1.0.0',
       enabled: false, installedAt: '2026-08-03T00:00:00Z', origin: 'registry',
+      trustRepository: THIRD_PARTY.trustRepository,
       manifest: {
         name: THIRD_PARTY.name, version: '1.0.0', displayName: THIRD_PARTY.displayName,
         description: THIRD_PARTY.description, author: THIRD_PARTY.author, repo: THIRD_PARTY.repo,
@@ -190,7 +209,7 @@ beforeEach(() => {
   untrustApp.mockResolvedValue({ apps: [], ineffective: [], allowAll: false })
   // Detail-page load: not installed yet, so the registry entry is the source of
   // truth and the page offers Get rather than Enable/Disable.
-  getApp.mockRejectedValue(new Error('not installed'))
+  getApp.mockRejectedValue(apiError(404, { error: 'not installed' }))
   system.mockResolvedValue({ hostname: 'localhost' })
 })
 
@@ -216,7 +235,19 @@ describe('isTrustDeniedError', () => {
   })
 })
 
-describe('AppsPage trust gate', () => {
+describe('LibraryPage trust gate', () => {
+  // The consent flow is reached by clicking Enable on a DISABLED third-party
+  // tile, which the Library's default "enabled only" view filters out. This
+  // block is about the trust gate, not the default view, so it opts into the
+  // show-all view (persisted `mc-apps-library-show-all` toggle, '1' = show all)
+  // to render the tile it acts on.
+  beforeEach(() => {
+    localStorage.setItem('mc-apps-library-show-all', '1')
+  })
+  afterEach(() => {
+    localStorage.removeItem('mc-apps-library-show-all')
+  })
+
   it('opens the consent modal when enable is refused with app_execution_denied', async () => {
     enableApp.mockRejectedValue(TRUST_DENIED())
     renderPage()
@@ -224,12 +255,16 @@ describe('AppsPage trust gate', () => {
 
     await waitFor(() => expect(modalTitle()).toBeTruthy())
     // Scope disclosure, the three capabilities, and the provenance line.
-    expect(screen.getByText(`${K}.scope`)).toBeTruthy()
+    // Both copy lines interpolate the app identity. Missing these vars renders
+    // the raw `{{app}}` token in the real catalog-backed UI.
+    expect(screen.getByText(`${K}.scope LaunchDarkly`)).toBeTruthy()
+    expect(screen.getByText(`${K}.intro LaunchDarkly`)).toBeTruthy()
     expect(screen.getByText(`${K}.capability_python`)).toBeTruthy()
     expect(screen.getByText(`${K}.capability_backend`)).toBeTruthy()
     expect(screen.getByText(`${K}.capability_shell`)).toBeTruthy()
     expect(screen.getByText(`${K}.source`)).toBeTruthy()
-    expect(screen.getByText(THIRD_PARTY.repo)).toBeTruthy()
+    expect(screen.getByText(THIRD_PARTY.trustRepository)).toBeTruthy()
+    expect(screen.queryByText(THIRD_PARTY.repo)).toBeNull()
     // The raw backend string never reaches the user.
     expect(screen.queryByText(/is not trusted to run its own code/)).toBeNull()
   })
@@ -242,23 +277,102 @@ describe('AppsPage trust gate', () => {
 
     fireEvent.click(confirmBtn())
 
-    await waitFor(() => expect(trustApp).toHaveBeenCalledWith(THIRD_PARTY.name))
+    await waitFor(() => expect(trustApp).toHaveBeenCalledWith(
+      THIRD_PARTY.name,
+      THIRD_PARTY.trustRepository,
+    ))
     await waitFor(() => expect(enableApp).toHaveBeenCalledTimes(2))
     expect(trustApp).toHaveBeenCalledTimes(1)
     // Grant landed and the retry succeeded → the modal closes.
     await waitFor(() => expect(modalTitle()).toBeNull())
   })
 
+  it('fails closed instead of rendering or rewriting embedded clone credentials', async () => {
+    const secret = 'SuperSecret'
+    const credentialed = `HTTPS://User:${secret}@Git.Example.test/Owner/App.git?Ref=Case#Frag`
+    listApps.mockResolvedValueOnce([{
+      name: THIRD_PARTY.name,
+      displayName: THIRD_PARTY.displayName,
+      version: '1.0.0',
+      enabled: false,
+      origin: 'registry',
+      trustRepository: credentialed,
+      manifest: { name: THIRD_PARTY.name, version: '1.0.0' },
+    }])
+    enableApp.mockRejectedValueOnce(TRUST_DENIED()).mockResolvedValue({ ok: true })
+
+    renderPage()
+    await clickEnable()
+    await waitFor(() => expect(enableApp).toHaveBeenCalledTimes(1))
+    expect(modalTitle()).toBeNull()
+    expect(screen.queryByText(new RegExp(secret))).toBeNull()
+    expect(trustApp).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    'deploy:ScpSecret@git.example.test:Owner/App.git',
+    'deploy:ScpSecret@git.example.test/Owner/App.git',
+    ':ScpSecret@git.example.test/Owner/App.git',
+  ])('fails closed for an ambiguous colon-bearing SCP consent proof: %s', async credentialed => {
+    const secret = 'ScpSecret'
+    listApps.mockResolvedValueOnce([{
+      name: THIRD_PARTY.name,
+      displayName: THIRD_PARTY.displayName,
+      version: '1.0.0',
+      enabled: false,
+      origin: 'registry',
+      trustRepository: credentialed,
+      manifest: { name: THIRD_PARTY.name, version: '1.0.0' },
+    }])
+    enableApp.mockRejectedValueOnce(TRUST_DENIED()).mockResolvedValue({ ok: true })
+
+    renderPage()
+    await clickEnable()
+    await waitFor(() => expect(enableApp).toHaveBeenCalledTimes(1))
+    expect(modalTitle()).toBeNull()
+    expect(screen.queryByText(new RegExp(secret))).toBeNull()
+    expect(trustApp).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    'ssh://deploy@git.example.test/Owner/App.git',
+    'deploy@git.example.test:Owner/App.git',
+  ])('preserves the server-reviewed Git routing identity in consent proof: %s', async reviewed => {
+    listApps.mockResolvedValueOnce([{
+      name: THIRD_PARTY.name,
+      displayName: THIRD_PARTY.displayName,
+      version: '1.0.0',
+      enabled: false,
+      origin: 'registry',
+      trustRepository: reviewed,
+      manifest: { name: THIRD_PARTY.name, version: '1.0.0' },
+    }])
+    enableApp.mockRejectedValueOnce(TRUST_DENIED()).mockResolvedValue({ ok: true })
+
+    renderPage()
+    await clickEnable()
+    await waitFor(() => expect(modalTitle()).toBeTruthy())
+
+    expect(screen.getByText(reviewed)).toBeTruthy()
+    fireEvent.click(confirmBtn())
+    await waitFor(() => expect(trustApp).toHaveBeenCalledWith(THIRD_PARTY.name, reviewed))
+  })
+
   it('keeps the modal open and reports inline when the retried enable fails', async () => {
     enableApp.mockRejectedValue(TRUST_DENIED())
+    // The rollback probe must not PROVE absence here (a 404 would), so the
+    // grant stands and the copy points at Settings.
+    getApp.mockRejectedValue(apiError(500, { error: 'gateway exploded' }, 'gateway exploded'))
     renderPage()
     await clickEnable()
     await waitFor(() => expect(modalTitle()).toBeTruthy())
 
     fireEvent.click(confirmBtn())
 
-    await waitFor(() => expect(screen.getByRole('alert').textContent)
-      .toBe(`${K}.failed LaunchDarkly`))
+    // `toContain`, not `toBe`: the failure renders through the shared ErrorNotice,
+    // whose `role="alert"` node also carries the agent hand-off button's label.
+    await waitFor(() => expect(within(screen.getByRole('dialog')).getByRole('alert').textContent)
+      .toContain(`${K}.failed LaunchDarkly`))
     expect(modalTitle()).toBeTruthy()
   })
 
@@ -323,7 +437,10 @@ describe('registry install trust gate', () => {
 
     fireEvent.click(confirmBtn())
 
-    await waitFor(() => expect(trustApp).toHaveBeenCalledWith(THIRD_PARTY.name))
+    await waitFor(() => expect(trustApp).toHaveBeenCalledWith(
+      THIRD_PARTY.name,
+      THIRD_PARTY.trustRepository,
+    ))
     // The retry is the install, re-run once for the same app.
     await waitFor(() => expect(installFromRegistryStream).toHaveBeenCalledTimes(2))
     expect(installFromRegistryStream.mock.calls[1][0]).toBe(THIRD_PARTY.name)
@@ -337,11 +454,14 @@ describe('registry install trust gate', () => {
     installFromRegistryStream.mockResolvedValue(INSTALL_DENIED())
     renderDetailFromGet()
     await waitFor(() => expect(modalTitle()).toBeTruthy())
+    // The page loaded from the registry (the suite's 404 default). From here the
+    // rollback probe must not prove absence, so the grant stands.
+    getApp.mockRejectedValue(apiError(500, { error: 'gateway exploded' }, 'gateway exploded'))
 
     fireEvent.click(confirmBtn())
 
-    await waitFor(() => expect(screen.getByRole('alert').textContent)
-      .toBe(`${K}.failed LaunchDarkly`))
+    await waitFor(() => expect(within(screen.getByRole('dialog')).getByRole('alert').textContent)
+      .toContain(`${K}.failed LaunchDarkly`))
     expect(modalTitle()).toBeTruthy()
   })
 
@@ -361,25 +481,28 @@ describe('registry install trust gate', () => {
     await waitFor(() => expect(untrustApp).toHaveBeenCalledWith(THIRD_PARTY.name))
     // Nothing was left behind, so the copy must say that rather than sending the
     // user to Settings to remove a grant that is already gone.
-    await waitFor(() => expect(screen.getByRole('alert').textContent)
-      .toBe(`${K}.failed_generic LaunchDarkly`))
+    await waitFor(() => expect(within(screen.getByRole('dialog')).getByRole('alert').textContent)
+      .toContain(`${K}.failed_generic LaunchDarkly`))
     expect(modalTitle()).toBeTruthy()
   })
 
   it('KEEPS the grant when absence cannot be proven — only a 404 rolls back', async () => {
     // The other half, and the anti-guess rule. Only a 404 proves the name is
     // unoccupied; a network error or a 500 proves nothing, and revoking on that
-    // would switch off an app that exists and works. The suite default rejects
-    // `getApp` with a plain Error (no status), so this is that branch: the grant
-    // stands and the copy points the user at Settings to review it.
+    // would switch off an app that exists and works. The suite default is a 404
+    // (so the detail page loads from the registry — a non-404 rejection is now
+    // a load FAILURE, not "not installed"); the probe is switched to a 500 once
+    // the page is up, so this is that branch: the grant stands and the copy
+    // points the user at Settings to review it.
     installFromRegistryStream.mockResolvedValue(INSTALL_DENIED())
     renderDetailFromGet()
     await waitFor(() => expect(modalTitle()).toBeTruthy())
+    getApp.mockRejectedValue(apiError(500, { error: 'gateway exploded' }, 'gateway exploded'))
 
     fireEvent.click(confirmBtn())
 
-    await waitFor(() => expect(screen.getByRole('alert').textContent)
-      .toBe(`${K}.failed LaunchDarkly`))
+    await waitFor(() => expect(within(screen.getByRole('dialog')).getByRole('alert').textContent)
+      .toContain(`${K}.failed LaunchDarkly`))
     expect(untrustApp).not.toHaveBeenCalled()
   })
 
@@ -424,8 +547,8 @@ describe('registry install trust gate', () => {
     await waitFor(() => expect(untrustApp).toHaveBeenCalledWith(THIRD_PARTY.name))
     // Nothing was left behind, so the copy says so rather than sending the user to
     // Settings after a grant that is already gone.
-    await waitFor(() => expect(screen.getByRole('alert').textContent)
-      .toBe(`${K}.failed_generic LaunchDarkly`))
+    await waitFor(() => expect(within(screen.getByRole('dialog')).getByRole('alert').textContent)
+      .toContain(`${K}.failed_generic LaunchDarkly`))
   })
 
   it('rolls the grant back when the retried install is ABORTED', async () => {
@@ -472,7 +595,7 @@ describe('registry install trust gate', () => {
 })
 
 describe('safeHref — the provenance link is not a script sink', () => {
-  // REGRESSION: `app.repo` is registry-index content. Rendering it straight into
+  // REGRESSION: repository text is remote content. Rendering it straight into
   // `href` made `javascript:...` a one-click script-execution vector in the
   // dashboard's own origin — on the very dialog whose job is to gate code
   // execution. The link was added to satisfy a usability finding and opened this.
@@ -493,5 +616,25 @@ describe('safeHref — the provenance link is not a script sink', () => {
     ]) {
       expect(safeHref(bad)).toBeNull()
     }
+  })
+})
+
+describe('credentialFreeRepository', () => {
+  it('strips credentials and suffixes without changing Git routing identity', () => {
+    expect(credentialFreeRepository(
+      'SSH://Git:SuperSecret@[2001:DB8::A]:2222/Owner/Repo?Ref=Case#Frag',
+    )).toBe('SSH://Git@[2001:DB8::A]:2222/Owner/Repo')
+    expect(credentialFreeRepository('git@EXAMPLE.COM:Owner/Repo'))
+      .toBe('git@EXAMPLE.COM:Owner/Repo')
+    expect(credentialFreeRepository('deploy:secret@EXAMPLE.COM:Owner/Repo'))
+      .toBeUndefined()
+    expect(credentialFreeRepository('deploy:secret@EXAMPLE.COM/Owner/Repo'))
+      .toBeUndefined()
+    expect(credentialFreeRepository(':secret@EXAMPLE.COM/Owner/Repo'))
+      .toBeUndefined()
+    expect(credentialFreeRepository(
+      'HTTPS://User:SuperSecret@EXAMPLE.COM/Owner/Repo?token=secret#private',
+    )).toBe('HTTPS://EXAMPLE.COM/Owner/Repo')
+    expect(credentialFreeRepository('/Tmp/user@host/repo')).toBe('/Tmp/user@host/repo')
   })
 })

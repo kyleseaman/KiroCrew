@@ -2,8 +2,6 @@
 
 Covers:
 (a) Response under limit passes untouched
-(b) Over transport limit + parseable id -> only that request fast-failed -32000
-(c) Id unparseable -> all pending failed, none hanging
 (d) Over spill threshold -> spill file has full content, in-band truncated
 (e) Spill failure (unwritable dir) -> original forwarded unmodified
 (f) Non-tool-result frames over threshold pass through untouched
@@ -21,7 +19,6 @@ from unittest.mock import patch
 from kiro_crew import platform_compat as pc
 from kiro_crew.mcp_gateway.spill import (
     cleanup_old_spill_files,
-    extract_id_from_bytes,
     maybe_spill_response,
 )
 
@@ -39,33 +36,6 @@ class TestUnderThresholdPassthrough:
     def test_empty_line_passthrough(self):
         """An empty or whitespace line passes through."""
         assert maybe_spill_response(b"\n", "test-server", 100) == b"\n"
-
-
-# --- (b) Over transport limit + parseable id -> per-request fast-fail ---
-
-
-class TestExtractId:
-    def test_string_id(self):
-        data = b'{"jsonrpc":"2.0","id":"gw-12345-7","result":{}}'
-        assert extract_id_from_bytes(data) == "gw-12345-7"
-
-    def test_integer_id(self):
-        data = b'{"jsonrpc":"2.0","id":42,"result":{}}'
-        assert extract_id_from_bytes(data) == 42
-
-    def test_no_id(self):
-        data = b'{"jsonrpc":"2.0","method":"notify"}'
-        assert extract_id_from_bytes(data) is None
-
-    def test_garbage(self):
-        data = b'\x00\x01\x02binary garbage'
-        assert extract_id_from_bytes(data) is None
-
-    def test_id_in_first_4kb(self):
-        """Id within first 4KB is found even with large payload after."""
-        prefix = b'{"jsonrpc":"2.0","id":"found-it","result":{"content":[{"type":"text","text":"'
-        payload = prefix + b"x" * 10000 + b'"}]}}\n'
-        assert extract_id_from_bytes(payload) == "found-it"
 
 
 # --- (d) Over spill threshold -> spill file with full content ---
@@ -151,7 +121,7 @@ class TestSpillToFile:
             wrong: list[str] = []
             monkeypatch.setattr(pc, "restrict_dir_to_owner", lambda p: calls.append(str(p)))
             # The file-shaped helper must NOT be what a directory goes through:
-            # its icacls grants carry no (OI)(CI), so spilled payloads written
+            # its grants carry no (OI)(CI), so spilled payloads written
             # into the directory afterwards would not inherit the lockdown.
             monkeypatch.setattr(pc, "restrict_to_owner", lambda p: wrong.append(str(p)))
         loose = tmp_path / "mcp_spill"
@@ -187,13 +157,24 @@ class TestSpillFailure:
         }
         line = json.dumps(msg, separators=(",", ":")).encode("utf-8") + b"\n"
 
-        # Point at a non-existent path that can't be created
-        fake_home = "/nonexistent/path/that/cannot/be/created"
+        # A home that cannot be created ON ANY HOST: a path beneath a regular
+        # file, so `mkdir(parents=True)` fails with NotADirectoryError /
+        # FileExistsError everywhere. The previous `/nonexistent/path/...`
+        # literal only looked uncreatable: on Windows a leading slash is
+        # drive-relative, so it resolved to a writable `C:\nonexistent\...`,
+        # the spill SUCCEEDED, and a 300 KiB sidecar was left at the drive
+        # root -- which then made `install_app("/nonexistent/path")` in
+        # test_app_manager see a real directory.
+        blocker = tmp_path / "blocker"
+        blocker.write_bytes(b"")
+        fake_home = str(blocker / "home")
         with patch.dict(os.environ, {"KIROCREW_HOME": fake_home}):
             result = maybe_spill_response(line, "server", 100_000)
 
-        # Original returned unmodified
+        # Original returned unmodified, and nothing was written anywhere.
         assert result == line
+        assert blocker.is_file()
+        assert not (blocker / "home").exists()
 
 
 # --- (f) Non-tool-result frames over threshold pass through ---

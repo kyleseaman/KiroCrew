@@ -25,6 +25,7 @@ import errno
 import io
 import logging
 import os
+import struct
 import subprocess
 import sys
 import types
@@ -53,8 +54,8 @@ _POSIX_ONLY = pytest.mark.skipif(
 #
 # This file's method is to simulate BOTH platform branches from one host: it
 # flips ``IS_POSIX`` / ``IS_WINDOWS`` and monkeypatches ``os.getuid``,
-# ``os.getpgid``, ``os.killpg``, ``os.fchmod``, ``/proc/locks`` reads and the
-# Windows ``icacls`` subprocess. On real Windows those attributes do not exist
+# ``os.getpgid``, ``os.killpg``, ``os.fchmod`` and ``/proc/locks`` reads.
+# On real Windows those attributes do not exist
 # (so ``monkeypatch.setattr`` raises before any assertion) and the faked
 # branches diverge from what the OS actually does -- which produced 13 failures
 # across two CI rounds in TestFlockOwnerPid, TestRestrictToOwner,
@@ -266,11 +267,15 @@ class _StubbornStream:
 
 
 class TestEnsureUtf8Console:
-    def test_noop_off_windows(self, monkeypatch):
+    def test_off_windows_only_publishes_environment(self, monkeypatch):
         monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        monkeypatch.setenv("PYTHONUTF8", "0")
+        monkeypatch.setenv("PYTHONIOENCODING", "ascii")
         before = sys.stdout
         pc.ensure_utf8_console()
         assert sys.stdout is before
+        assert os.environ["PYTHONUTF8"] == "1"
+        assert os.environ["PYTHONIOENCODING"] == "utf-8:backslashreplace"
 
     def test_reconfigure_in_place_is_preferred(self, monkeypatch):
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
@@ -578,8 +583,17 @@ class TestGetProcessStartId:
         _fake_libproc(monkeypatch, payload=None, ret=-1)
         assert pc.get_process_start_id(5) is None
 
-    def test_windows_is_unknown_rather_than_a_mismatch(self, monkeypatch):
+    def test_windows_uses_query_only_creation_identity(self, monkeypatch):
         monkeypatch.setattr(pc.sys, "platform", "win32")
+        monkeypatch.setattr(
+            pc, "process_start_time", lambda pid: "133000123456789" if pid == 5 else None
+        )
+        assert pc.get_process_start_id(5) == "133000123456789"
+        assert pc.get_process_start_id(6) is None
+
+    def test_windows_unreadable_identity_is_unknown(self, monkeypatch):
+        monkeypatch.setattr(pc.sys, "platform", "win32")
+        monkeypatch.setattr(pc, "process_start_time", lambda pid: None)
         assert pc.get_process_start_id(5) is None
 
     def test_identity_never_contains_a_colon(self, monkeypatch):
@@ -587,6 +601,43 @@ class TestGetProcessStartId:
         _fake_libproc(monkeypatch, payload=_bsdinfo(sec=17, usec=1), ret=136)
         value = pc.get_process_start_id(5)
         assert value is not None and ":" not in value
+
+
+@pytest.mark.parametrize(
+    "scenario", ["unique", "duplicate", "closed", "truncated", "denied", "oversize"]
+)
+def test_windows_tcp_peer_table_refuses_uncertain_identity(monkeypatch, scenario):
+    monkeypatch.setattr(pc, "IS_WINDOWS", True)
+    row = struct.pack(
+        "<I4sI4sII",
+        1 if scenario == "closed" else 5,
+        b"\x7f\x00\x00\x01",
+        0xD007,
+        b"\x7f\x00\x00\x01",
+        0xE803,
+        2468,
+    )
+    count = 2 if scenario in {"duplicate", "truncated"} else 1
+    raw = struct.pack("<I", count) + row * (2 if scenario == "duplicate" else 1)
+
+    def query(buffer, size_pointer, *_args):
+        size = ctypes.cast(size_pointer, ctypes.POINTER(pc.wintypes.DWORD))
+        if scenario == "denied":
+            return 5
+        size.contents.value = 16 * 1024 * 1024 if scenario == "oversize" else len(raw)
+        if buffer is None:
+            return 122
+        ctypes.memmove(buffer, raw, len(raw))
+        return 0
+
+    monkeypatch.setattr(
+        pc.ctypes,
+        "WinDLL",
+        lambda *a, **kw: types.SimpleNamespace(GetExtendedTcpTable=_Fn(query)),
+        raising=False,
+    )
+    result = pc.get_tcp_peer_pid(("127.0.0.1", 1000), ("127.0.0.1", 2000))
+    assert result == (2468 if scenario == "unique" else None)
 
 
 # ---------------------------------------------------------------------------
@@ -1299,6 +1350,31 @@ class TestRmtreeForce:
         monkeypatch.setattr(pc.shutil, "rmtree", lambda *_a, **_k: None)
         assert pc.rmtree_force(root) is False
 
+    def test_missing_tree_is_already_removed(self, tmp_path):
+        assert pc.rmtree_force(tmp_path / "missing") is True
+
+    def test_nested_missing_race_does_not_hide_a_surviving_root(self, monkeypatch, tmp_path):
+        root = tmp_path / "tree"
+        root.mkdir()
+
+        def _nested_missing(*_args: Any, **_kwargs: Any) -> None:
+            raise FileNotFoundError("nested entry disappeared")
+
+        monkeypatch.setattr(pc.shutil, "rmtree", _nested_missing)
+        assert pc.rmtree_force(root) is False
+        assert root.exists()
+
+    def test_delete_error_is_reported_without_raising(self, monkeypatch, tmp_path):
+        root = tmp_path / "tree"
+        root.mkdir()
+
+        def _boom(*_args: Any, **_kwargs: Any) -> None:
+            raise OSError("denied")
+
+        monkeypatch.setattr(pc.shutil, "rmtree", _boom)
+        assert pc.rmtree_force(root) is False
+        assert root.exists()
+
     def test_readonly_hook_retries_the_operation(self, tmp_path):
         victim = tmp_path / "ro.txt"
         victim.write_text("x")
@@ -1575,120 +1651,6 @@ class TestProcessTokenSid:
         assert pc.process_owner_sid(7) is None
 
 
-class TestCurrentUserSid:
-    @staticmethod
-    def _fresh_caches(monkeypatch: pytest.MonkeyPatch) -> None:
-        # Both memos are module-scoped; give each test its own so no test
-        # depends on another having run (or not run) first.
-        monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
-        monkeypatch.setattr(pc, "_TOKEN_SID_CACHE", [])
-
-    def test_none_on_posix(self, monkeypatch):
-        self._fresh_caches(monkeypatch)
-        monkeypatch.setattr(pc, "IS_POSIX", True)
-        assert pc._current_user_sid() is None
-
-    def test_prefers_the_access_token_and_memoises_it(self, monkeypatch):
-        self._fresh_caches(monkeypatch)
-        calls: list[int] = []
-
-        def _token() -> str:
-            calls.append(1)
-            return "S-1-5-21-9"
-
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_process_token_sid", _token)
-
-        assert pc._current_user_sid() == "*S-1-5-21-9"
-        assert pc._current_user_sid() == "*S-1-5-21-9"
-        assert len(calls) == 1
-
-    def test_falls_back_to_whoami_when_the_token_is_unavailable(self, monkeypatch):
-        self._fresh_caches(monkeypatch)
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_process_token_sid", lambda: None)
-        monkeypatch.setattr(pc.shutil, "which", lambda _n: r"C:\whoami.exe")
-        result = types.SimpleNamespace(
-            returncode=0, stdout=b'"CORP\\zezhen","S-1-5-21-7-7-7-500"\n'
-        )
-        monkeypatch.setattr(pc.subprocess, "run", lambda *_a, **_k: result)
-        assert pc._current_user_sid() == "*S-1-5-21-7-7-7-500"
-
-    def test_a_failing_whoami_is_not_cached(self, monkeypatch):
-        # A transient failure must stay retryable — memoising None would poison
-        # every later restrict_to_owner for the process lifetime.
-        self._fresh_caches(monkeypatch)
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_process_token_sid", lambda: None)
-        monkeypatch.setattr(pc.shutil, "which", lambda _n: r"C:\whoami.exe")
-        monkeypatch.setattr(
-            pc.subprocess,
-            "run",
-            lambda *_a, **_k: types.SimpleNamespace(returncode=1, stdout=b""),
-        )
-        assert pc._current_user_sid() is None
-        assert pc._USER_SID_CACHE == []
-
-    def test_a_whoami_spawn_error_is_none(self, monkeypatch):
-        self._fresh_caches(monkeypatch)
-
-        def _boom(*_a: Any, **_k: Any) -> Any:
-            raise OSError("not found")
-
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_process_token_sid", lambda: None)
-        monkeypatch.setattr(pc.shutil, "which", lambda _n: None)
-        monkeypatch.setattr(pc.subprocess, "run", _boom)
-        assert pc._current_user_sid() is None
-
-    @pytest.mark.parametrize("stdout", [b'"only-one-field"\n', b'"CORP\\u","NOT-A-SID"\n'])
-    def test_unparseable_whoami_output_is_none(self, monkeypatch, stdout):
-        self._fresh_caches(monkeypatch)
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_process_token_sid", lambda: None)
-        monkeypatch.setattr(pc.shutil, "which", lambda _n: r"C:\whoami.exe")
-        monkeypatch.setattr(
-            pc.subprocess,
-            "run",
-            lambda *_a, **_k: types.SimpleNamespace(returncode=0, stdout=stdout),
-        )
-        assert pc._current_user_sid() is None
-
-    def test_bare_sid_strips_the_icacls_prefix_and_memoises(self, monkeypatch):
-        self._fresh_caches(monkeypatch)
-        calls: list[int] = []
-
-        def _token() -> str:
-            calls.append(1)
-            return "*S-1-5-21-4"
-
-        monkeypatch.setattr(pc, "_process_token_sid", _token)
-        assert pc.current_user_sid() == "S-1-5-21-4"
-        assert pc.current_user_sid() == "S-1-5-21-4"
-        assert len(calls) == 1
-
-    def test_bare_sid_is_none_when_the_token_read_fails(self, monkeypatch):
-        self._fresh_caches(monkeypatch)
-        monkeypatch.setattr(pc, "_process_token_sid", lambda: None)
-        assert pc.current_user_sid() is None
-
-    def test_local_user_id_is_the_uid_on_posix(self, monkeypatch):
-        monkeypatch.setattr(pc, "IS_POSIX", True)
-        assert pc.local_user_id() == os.getuid()
-
-    def test_local_user_id_is_a_stable_crc_of_the_sid_on_windows(self, monkeypatch):
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "current_user_sid", lambda: "S-1-5-21-4")
-        first = pc.local_user_id()
-        assert isinstance(first, int) and first != 0
-        assert pc.local_user_id() == first
-
-    def test_local_user_id_collapses_to_zero_without_a_sid(self, monkeypatch):
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "current_user_sid", lambda: None)
-        assert pc.local_user_id() == 0
-
-
 class TestRestrictToOwner:
     def test_posix_applies_owner_only_mode(self, tmp_path):
         secret = tmp_path / "token.key"
@@ -1701,75 +1663,68 @@ class TestRestrictToOwner:
         # An Owner-Rights-only DACL would lock the caller out of a file created
         # by a different principal, so an unresolvable SID must fail loud.
         monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_current_user_sid", lambda: None)
+        monkeypatch.setattr(pc, "current_user_sid", lambda: None)
 
         def _never(*_a: Any, **_k: Any) -> Any:
-            pytest.fail("icacls must not run without a resolved SID")
+            pytest.fail("no DACL may be written without a resolved SID")
 
-        monkeypatch.setattr(pc.subprocess, "run", _never)
+        monkeypatch.setattr(pc.windows_acl, "apply_owner_only", _never)
         with pytest.raises(OSError, match="cannot resolve current user SID"):
             pc.restrict_to_owner(tmp_path / "token.key")
 
     def test_windows_grants_both_owner_rights_and_the_caller(self, monkeypatch, tmp_path):
         seen: dict[str, Any] = {}
 
-        def _run(argv: Any, **kwargs: Any) -> Any:
-            seen["argv"] = argv
-            seen["kwargs"] = kwargs
-            return types.SimpleNamespace(returncode=0, stderr=b"", stdout=b"")
+        def _apply(path: Any, *, inherit: bool, sids: Any, **_kw: Any) -> None:
+            seen["path"] = path
+            seen["inherit"] = inherit
+            seen["sids"] = tuple(sids)
 
         monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_current_user_sid", lambda: "*S-1-5-21-3")
-        monkeypatch.setattr(pc.shutil, "which", lambda _n: r"C:\icacls.exe")
-        monkeypatch.setattr(pc.subprocess, "run", _run)
+        monkeypatch.setattr(pc, "current_user_sid", lambda: "S-1-5-21-3")
+        monkeypatch.setattr(pc.windows_acl, "apply_owner_only", _apply)
 
         pc.restrict_to_owner(tmp_path / "token.key")
 
-        argv = seen["argv"]
-        assert "/inheritance:r" in argv
-        assert f"{pc._OWNER_RIGHTS_SID}:F" in argv
-        assert "*S-1-5-21-3:F" in argv
-        assert seen["kwargs"]["creationflags"] == pc._SUBPROCESS_NO_WINDOW
+        # Bare SIDs, both grants present, file shape (no inheritance).
+        assert seen["sids"] == ("S-1-3-4", "S-1-5-21-3"), seen
+        assert seen["inherit"] is False, seen
 
     def test_windows_does_not_duplicate_the_owner_rights_grant(self, monkeypatch, tmp_path):
         seen: dict[str, Any] = {}
 
-        def _run(argv: Any, **_kwargs: Any) -> Any:
-            seen["argv"] = argv
-            return types.SimpleNamespace(returncode=0, stderr=b"", stdout=b"")
+        def _apply(path: Any, *, inherit: bool, sids: Any, **_kw: Any) -> None:
+            seen["sids"] = tuple(sids)
 
         monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_current_user_sid", lambda: pc._OWNER_RIGHTS_SID)
-        monkeypatch.setattr(pc.shutil, "which", lambda _n: r"C:\icacls.exe")
-        monkeypatch.setattr(pc.subprocess, "run", _run)
+        monkeypatch.setattr(
+            pc, "current_user_sid", lambda: pc._OWNER_RIGHTS_SID.removeprefix("*")
+        )
+        monkeypatch.setattr(pc.windows_acl, "apply_owner_only", _apply)
         pc.restrict_to_owner(tmp_path / "token.key")
-        assert seen["argv"].count(f"{pc._OWNER_RIGHTS_SID}:F") == 1
+        assert seen["sids"].count("S-1-3-4") == 1, seen
 
     @_POSIX_ONLY
-    def test_windows_raises_on_a_non_zero_icacls(self, monkeypatch, tmp_path):
+    def test_windows_raises_when_the_dacl_write_fails(self, monkeypatch, tmp_path):
         monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_current_user_sid", lambda: "*S-1-5-21-3")
-        monkeypatch.setattr(pc.shutil, "which", lambda _n: r"C:\icacls.exe")
-        monkeypatch.setattr(
-            pc.subprocess,
-            "run",
-            lambda *_a, **_k: types.SimpleNamespace(
-                returncode=5, stderr=b"Access is denied.", stdout=b""
-            ),
-        )
-        with pytest.raises(OSError, match="Access is denied"):
+        monkeypatch.setattr(pc, "current_user_sid", lambda: "S-1-5-21-3")
+
+        def _boom(*_a: Any, **_k: Any) -> None:
+            raise pc.windows_acl.AclWriteFailed("SetNamedSecurityInfoW failed (error 5)")
+
+        monkeypatch.setattr(pc.windows_acl, "apply_owner_only", _boom)
+        with pytest.raises(OSError, match="owner-only DACL could not be applied"):
             pc.restrict_to_owner(tmp_path / "token.key")
 
     @_POSIX_ONLY
-    def test_windows_raises_when_icacls_cannot_be_spawned(self, monkeypatch, tmp_path):
+    def test_windows_raises_when_the_security_api_is_unavailable(self, monkeypatch, tmp_path):
         def _boom(*_a: Any, **_k: Any) -> Any:
-            raise subprocess.SubprocessError("timeout")
+            raise pc.windows_acl.AclUnavailable("cannot load the Windows security API")
 
         monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "_current_user_sid", lambda: "*S-1-5-21-3")
-        monkeypatch.setattr(pc.shutil, "which", lambda _n: r"C:\icacls.exe")
-        monkeypatch.setattr(pc.subprocess, "run", _boom)
-        with pytest.raises(OSError, match="icacls invocation failed"):
+        monkeypatch.setattr(pc, "current_user_sid", lambda: "S-1-5-21-3")
+        monkeypatch.setattr(pc.windows_acl, "apply_owner_only", _boom)
+        with pytest.raises(OSError, match="owner-only DACL could not be applied"):
             pc.restrict_to_owner(tmp_path / "token.key")
 
     def test_make_owner_only_dir_warns_instead_of_raising(self, monkeypatch, caplog, tmp_path):
@@ -1796,8 +1751,8 @@ class TestRestrictToOwner:
         # Must be the DIRECTORY helper: restrict_to_owner's grants are
         # file-shaped (no (OI)(CI)), so files created inside would not inherit
         # the lockdown.
-        monkeypatch.setattr(pc, "restrict_dir_to_owner", called.append)
-        monkeypatch.setattr(pc, "restrict_to_owner", wrong.append)
+        monkeypatch.setattr(pc, "restrict_dir_to_owner", lambda p: called.append(p))
+        monkeypatch.setattr(pc, "restrict_to_owner", lambda p: wrong.append(p))
         target = tmp_path / "secrets"
         pc.make_owner_only_dir(target)
         assert called and str(called[0]) == str(target)
@@ -1859,13 +1814,13 @@ class TestFindPythonInterpreter:
         self._resolve(
             monkeypatch,
             {
-                "python3.12": "/brazil-path/python3.12",
-                "python3.11": "/x/build/private/python3.11",
-                "python3.10": "/usr/bin/python3.10",
+                "python3.12": "/x/build/private/python3.12",
+                "python3": "/brazil-path/python3",
+                "python3.13": "/usr/bin/python3.13",
             },
         )
-        monkeypatch.setattr(pc.subprocess, "check_output", lambda *_a, **_k: "3.10\n")
-        assert pc.find_python_interpreter() == "/usr/bin/python3.10"
+        monkeypatch.setattr(pc.subprocess, "check_output", lambda *_a, **_k: "3.13\n")
+        assert pc.find_python_interpreter() == "/usr/bin/python3.13"
 
     def test_skips_the_microsoft_store_stub(self, monkeypatch):
         stub = r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\python.exe"
@@ -1889,16 +1844,16 @@ class TestFindPythonInterpreter:
 
     def test_the_reject_predicate_falls_through_rather_than_aborting(self, monkeypatch):
         # A single unusable interpreter must not short-circuit the whole search.
-        # POSIX order is 3.12, 3.11, 3.10, python3, 3.13 — vetoing 3.12 must
-        # land on 3.11, not give up.
+        # POSIX order is 3.12, python3, 3.13 — vetoing 3.12 must land on
+        # python3, not give up.
         monkeypatch.setattr(pc, "IS_WINDOWS", False)
         self._resolve(
             monkeypatch,
-            {"python3.12": "/usr/bin/python3.12", "python3.11": "/usr/bin/python3.11"},
+            {"python3.12": "/usr/bin/python3.12", "python3": "/usr/bin/python3"},
         )
         monkeypatch.setattr(pc.subprocess, "check_output", lambda *_a, **_k: "3.12\n")
         picked = pc.find_python_interpreter(reject=lambda p: p.endswith("3.12"))
-        assert picked == "/usr/bin/python3.11"
+        assert picked == "/usr/bin/python3"
 
     def test_nothing_resolvable_is_none(self, monkeypatch):
         self._resolve(monkeypatch, {})
@@ -2143,6 +2098,77 @@ class TestProcPeakRss:
             kernel32=types.SimpleNamespace(GetCurrentProcess=_const(1)),
         )
         assert pc.proc_peak_rss_bytes() == 0
+
+
+class TestCountOpenFds:
+    """``count_open_fds`` is the ONE shared open-fd probe.
+
+    Both the ``kirocrew.process.open_fds`` gauge and gatewayd's
+    zombie-diagnostic ``fd_count`` delegate here, so these tests pin the probe
+    once: the POSIX steady-state correction, the None contract, and the
+    Windows handle-count route.
+    """
+
+    def test_posix_count_is_positive_and_excludes_the_probe_fd(self):
+        count = pc.count_open_fds()
+        if count is None:
+            pytest.skip("no fd probe on this platform")
+        # stdin/stdout/stderr at minimum; the enumeration fd itself excluded.
+        assert count >= 3
+
+    def test_posix_correction_never_goes_negative(self, monkeypatch, tmp_path):
+        empty = tmp_path / "fd"
+        empty.mkdir()
+        monkeypatch.setattr(pc, "_FD_DIRS", (str(empty),))
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        assert pc.count_open_fds() == 0
+
+    def test_second_fd_dir_is_the_fallback(self, monkeypatch, tmp_path):
+        fallback = tmp_path / "fd"
+        fallback.mkdir()
+        for name in ("0", "1", "2", "3"):
+            (fallback / name).write_text("")
+        monkeypatch.setattr(pc, "_FD_DIRS", (str(tmp_path / "missing"), str(fallback)))
+        # Four entries, minus the enumeration fd the listing itself opens.
+        assert pc.count_open_fds() == 3
+
+    def test_none_when_no_probe_works_on_posix(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(pc, "_FD_DIRS", (str(tmp_path / "missing"),))
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        assert pc.count_open_fds() is None
+
+    def test_windows_reads_the_kernel_handle_count_raw(self, monkeypatch, tmp_path):
+        def _get_handle_count(_process: Any, out: Any) -> int:
+            out._obj.value = 42
+            return 1
+
+        _fake_windows(
+            monkeypatch,
+            kernel32=types.SimpleNamespace(
+                GetCurrentProcess=_const(1),
+                GetProcessHandleCount=_Fn(_get_handle_count),
+            ),
+        )
+        monkeypatch.setattr(pc, "_FD_DIRS", (str(tmp_path / "missing"),))
+        # Raw: the handle query opens no extra handle, so no -1 correction.
+        assert pc.count_open_fds() == 42
+
+    def test_windows_api_failure_is_none(self, monkeypatch, tmp_path):
+        _fake_windows(
+            monkeypatch,
+            kernel32=types.SimpleNamespace(
+                GetCurrentProcess=_const(1),
+                GetProcessHandleCount=_const(0),
+            ),
+        )
+        monkeypatch.setattr(pc, "_FD_DIRS", (str(tmp_path / "missing"),))
+        assert pc.count_open_fds() is None
+
+    def test_windows_loader_failure_is_none(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.delattr(pc.ctypes, "WinDLL", raising=False)
+        monkeypatch.setattr(pc, "_FD_DIRS", (str(tmp_path / "missing"),))
+        assert pc.count_open_fds() is None
 
 
 class TestProcRssForPid:
@@ -2824,7 +2850,7 @@ class TestDescendantHandleScanCleanup:
 
         closed: list[int] = []
         monkeypatch.setattr(pc, "_windows_process_parent_map", _parent_map)
-        monkeypatch.setattr(pc, "_open_process_termination_handle", lambda _pid: 9001)
+        monkeypatch.setattr(pc, "_open_process_termination_handle", lambda _pid, **_k: 9001)
         monkeypatch.setattr(
             pc,
             "_windows_process_handle_identity",
@@ -2835,16 +2861,54 @@ class TestDescendantHandleScanCleanup:
             pc.descendant_termination_handles(100, {}, 8001)
         assert closed == [9001]
 
-    def test_skips_children_whose_handle_cannot_be_opened(self, monkeypatch):
-        # A child that exits between the snapshot and the open is not an error;
-        # it just is not ours to terminate.
+    @pytest.mark.parametrize("outcome", ["live", "unknown", "gone"])
+    def test_unopenable_child_requires_proven_absence(self, monkeypatch, outcome):
+        # OpenProcess denial is not death, even if a query-only probe says False.
+        # Only a fresh complete snapshot can prove that the child disappeared.
+        scans = 0
+
+        def snapshot():
+            nonlocal scans
+            scans += 1
+            if scans > 1:
+                if outcome == "unknown":
+                    raise OSError("snapshot unavailable")
+                if outcome == "gone":
+                    return {}
+            return {101: 100}
+
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_windows_process_parent_map", snapshot)
+        monkeypatch.setattr(pc, "_open_process_termination_handle", lambda _pid, **_k: None)
+        monkeypatch.setattr(pc, "pid_exists", lambda _pid: False)
+        monkeypatch.setattr(pc, "_windows_process_handle_identity", lambda _h: (100, 10, None))
+        if outcome == "gone":
+            assert pc.descendant_termination_handles(100, {}, 8001) == {}
+        else:
+            with pytest.raises(OSError, match="unavailable"):
+                pc.descendant_termination_handles(100, {}, 8001)
+        assert scans == 2
+
+    @pytest.mark.parametrize("unreadable", [True, False])
+    def test_unknown_identity_refuses_but_proven_foreign_child_is_excluded(
+        self, monkeypatch, unreadable
+    ):
+        closed: list[int] = []
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         monkeypatch.setattr(pc, "_windows_process_parent_map", lambda: {101: 100})
-        monkeypatch.setattr(pc, "_open_process_termination_handle", lambda _pid: None)
+        monkeypatch.setattr(pc, "_open_process_termination_handle", lambda _pid, **_k: 9001)
         monkeypatch.setattr(
-            pc, "_windows_process_handle_identity", lambda _h: (100, 10, None)
+            pc,
+            "_windows_process_handle_identity",
+            {8001: (100, 10, 20), 9001: None if unreadable else (101, 21, None)}.get,
         )
-        assert pc.descendant_termination_handles(100, {}, 8001) == {}
+        monkeypatch.setattr(pc, "close_process_handle", closed.append)
+        if unreadable:
+            with pytest.raises(OSError, match="identity unreadable"):
+                pc.descendant_termination_handles(100, {}, 8001)
+        else:
+            assert pc.descendant_termination_handles(100, {}, 8001) == {}
+        assert closed == [9001]
 
 
 class TestCloseProcessHandleWindows:

@@ -51,13 +51,25 @@ from kiro_crew.dashboard.handlers.usage import (
 )
 from kiro_crew.dashboard.state import NEW_SESSION_TITLE
 from kiro_crew.hooks import validate_file_path
-from kiro_crew.metrics.provider import TELEMETRY_ENV_VAR, env_pin
+from kiro_crew.jsonl_util import bounded_records
+from kiro_crew.metrics.provider import TELEMETRY_ENV_VAR, env_pin, otlp_egress_active
+from kiro_crew.metrics.schema import RESOURCE_ATTR_PROCESS_START_TIME
+from kiro_crew.metrics.turns import TURN_COST_METRIC, TURN_CREDITS_METRIC, TURN_METRIC
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
 
 _STARTUP_METRIC = "kirocrew.session.startup.duration"
-_TURN_METRIC = "kirocrew.turn.duration"
+# Read from the emitter's own constant rather than re-spelled: a reader and an
+# emitter naming the instrument differently is a silently empty panel.
+_TURN_METRIC = TURN_METRIC
+# The turn's two billing histograms. Claimed BY NAME below, ahead of the generic
+# histogram branch, because that branch reports every statistic under `*_ms`
+# keys: a credit or a dollar amount arriving there would be rendered as a
+# millisecond duration on the Telemetry page. They are reported inside the turn
+# block under unit-neutral keys instead, each carrying its own `unit`.
+_TURN_CREDITS_METRIC = TURN_CREDITS_METRIC
+_TURN_COST_METRIC = TURN_COST_METRIC
 # The end-to-end startup point. The claude path emits no ``phase`` attribute at
 # all, so an absent phase is treated as the total (see _aggregate).
 _PHASE_TOTAL = "total"
@@ -78,6 +90,47 @@ _COST_WINDOW_DAYS = 7
 # two entries wide and needs no cap.
 _OTHER_SPLIT_ATTRS = frozenset({"warm"})
 
+# Gauge names whose reading is a monotonic PROCESS-LIFETIME total, not the
+# current state of anything: the process CPU/GC instruments plus the inventory
+# probe-failure count. Each instrument module declares its own
+# ``LIFETIME_TOTAL_METRICS`` -- the module that registers an instrument is the one
+# that knows what its reading means -- and this is where the two are merged, so
+# neither module has to know about the other and no name is re-listed here.
+#
+# These are reduced through the CUMULATIVE reducer instead of the gauge one.
+# Two reasons, and both matter:
+#
+#   * The gauge reducer reports the newest sample, which for a lifetime total is
+#     "CPU seconds since this process started" — a number that only grows and
+#     answers nothing about the window on screen. The cumulative reducer already
+#     computes exactly the right thing (newest minus first-in-window, per
+#     process-identity stream), so this is a routing decision, not a new reducer.
+#   * They WERE observable counters, so shards written before that changed carry
+#     them as CUMULATIVE sums. Routing both shapes into the same per-stream
+#     structure is what keeps one continuous series across the switch instead of
+#     splitting the window into a counter row and a gauge row.
+#
+# Resolved on FIRST USE, not at import. This module is imported while the gateway
+# is still assembling its routes, and importing the two instrument modules there
+# costs a measured 22ms and 14 extra modules (including sqlite3, via
+# platform_compat's dependency chain) for a telemetry subsystem that is off by
+# default — work on the boot path before the socket is even bound. The names are
+# needed only inside :func:`_aggregate`, which runs per request, so the import
+# happens there and the merged set is memoized for the life of the process.
+_lifetime_total_gauges: "frozenset[str] | None" = None
+
+
+def _lifetime_total_gauge_names() -> "frozenset[str]":
+    """The merged lifetime-total roster, imported on first use and cached."""
+    global _lifetime_total_gauges
+    if _lifetime_total_gauges is None:
+        from kiro_crew.metrics.inventory_gauges import LIFETIME_TOTAL_METRICS as _inventory
+        from kiro_crew.metrics.process_gauges import LIFETIME_TOTAL_METRICS as _process
+
+        _lifetime_total_gauges = frozenset(_process + _inventory)
+    return _lifetime_total_gauges
+
+
 # Only terminal-fault outcomes count toward fault_rate. The two watchdog
 # recovery outcomes ("tool_stall" and "stale_recover") are NOT faults: a
 # recovered stall is re-driven in place and tracked separately under
@@ -95,11 +148,22 @@ _OTHER_SPLIT_ATTRS = frozenset({"warm"})
 # budget already spent dies with "start a new chat" — the emit site labels
 # it distinctly so the recovered-stall exclusion cannot hide dead sessions,
 # and fault_rate stays a single-series computation.
-# Every entry here must have a producer: either a _turn_outcome return label
+# Every entry here must have a producer: either a turn_outcome return label
 # or "unknown" (minted by this aggregator for attribute-less points) — the
-# cross-module test enforces that, so a dead entry (e.g. a "cancelled" label
-# nothing ever emitted — user cancels map to "error") cannot linger and
-# mislead readers about what fault_rate counts.
+# cross-module test enforces that, so a dead entry cannot linger and mislead
+# readers about what fault_rate counts.
+# "cancelled" is deliberately ABSENT rather than omitted by accident: folding a
+# user cancel into "error" would put every press of Stop in this numerator and
+# report the one outcome the operator caused on purpose as the system failing. It
+# has its own label and stays out of the numerator, while remaining in the
+# DENOMINATOR alongside "ok" and the recovered stalls — a cancelled turn did run,
+# so removing it would shrink the population fault_rate is a share of.
+# "unclassified" is deliberately ABSENT: it marks a turn whose surface had no
+# stop reason to give (a bare TurnUsage at a helper call site), so counting it
+# would invent a fault for every clean background turn the moment this metric
+# started sampling them. It is not folded into "ok" either — it stays its own
+# slice in the outcome breakdown so the blind spot is visible rather than
+# resolved by a guess in either direction.
 _TERMINAL_FAULT_OUTCOMES = frozenset({"error", "timeout", "unknown", "stall_exhausted"})
 
 # (shard-fingerprint, TTL) cache — shards are append-only, so a change to any
@@ -144,9 +208,22 @@ def _telemetry_cfg() -> _TelemetryState:
         enabled = bool(cfg.enabled)
         if getattr(cfg, "local_dir", None):
             directory = Path(cfg.local_dir).expanduser()
-        # Presence only. The endpoint string can carry credentials, so it never
-        # leaves this function; the panel only needs to know one is configured.
-        otlp_configured = bool(str(getattr(cfg, "otlp_endpoint", "") or "").strip())
+        # Presence only, and resolved the same way _build_recorder resolves it:
+        # from the active telemetry provider's destination set, NOT from the
+        # endpoint string. An edition that supplies its own collector must not be
+        # able to leave this panel reporting "nothing is exported" while metrics
+        # leave the machine. The endpoint value never leaves that resolution; the
+        # panel only needs to know whether egress would happen.
+        try:
+            otlp_configured = otlp_egress_active(cfg)
+        except Exception:
+            # Posture unresolvable (a provider that raised, an uncomposable
+            # context). Report egress rather than promising local-only: this
+            # answer is a DISCLOSURE, so its closed direction is "assume it
+            # exports". The panel then disables the enable direction instead of
+            # offering a write the config route refuses with 409 anyway.
+            logger.debug("OTLP egress posture unresolvable; reporting egress", exc_info=True)
+            otlp_configured = True
     except Exception:
         logger.debug("telemetry config load failed; assuming disabled", exc_info=True)
     env_var = TELEMETRY_ENV_VAR
@@ -230,8 +307,9 @@ class _Hist:
 
     Merging them positionally fabricates values. Two generations with the same
     bucket-count length would pass a naive length check while meaning entirely
-    different things — a pre-change sample sitting in the old ``+Inf`` bucket
-    would be added to the new ``+Inf`` bucket, and a 5s sample could be counted
+    different things — a sample from one generation sitting in its ``+Inf``
+    bucket would be added to the other's ``+Inf`` bucket, and a 5s sample could be
+    counted
     into a 5-minute bucket, letting ``_pct_from_buckets`` report a p90 that no
     turn ever took. Grouping also keeps ``count``/``sum``/``min``/``max``
     consistent with the percentiles: accumulating those across generations while
@@ -243,9 +321,9 @@ class _Hist:
     long as it out-counted the new one: right after a boundary change the window
     still holds up to ``_WINDOW_DAYS`` of old samples against a handful of new
     ones, so the OLD bounds would be reported — for the turn metric that means
-    continuing to serve the very ceiling-pinned percentiles this grouping exists
-    to eliminate, while omitting the new samples entirely. Recency makes the
-    change take effect on the first post-change sample. The reported population
+    serving the very ceiling-pinned percentiles this grouping exists to eliminate,
+    while omitting the new samples entirely. Recency makes a boundary change take
+    effect on the first sample after it. The reported population
     is then small but truthful, and ``count`` says so; fuller-but-wrong is the
     failure mode being fixed.
 
@@ -483,9 +561,9 @@ def _finite(raw: Any) -> float | None:
     ``_aggregate`` and every field ``_Hist.add`` consumes. Shards are
     external input and Python's ``json`` accepts ``Infinity``/``NaN``
     literals, so a bare ``float(...)`` admits values that poison sums and an
-    ``int(float(...))`` timestamp conversion raises ``OverflowError`` — four
-    review rounds landed in this branch before this invariant: every scalar
-    passes through here, and anything non-numeric or non-finite becomes None.
+    ``int(float(...))`` timestamp conversion raises ``OverflowError``. The
+    invariant: every scalar passes through here, and anything non-numeric or
+    non-finite becomes None.
     """
     try:
         v = float(raw)
@@ -578,8 +656,8 @@ def _iter_export_cycles(
         shard_day = "-".join(stem_parts[1:4])
         shard_pid = stem_parts[4] if len(stem_parts) > 4 and stem_parts[4].isdigit() else ""
         try:
-            with p.open(encoding="utf-8") as fh:
-                for line in fh:
+            with p.open("rb") as fh:
+                for line in bounded_records(fh, p, label="telemetry"):
                     try:
                         obj = json.loads(line)
                     except ValueError:
@@ -591,8 +669,8 @@ def _iter_export_cycles(
 
 def _iter_metric_points(
     shard_paths: list[Path],
-) -> Iterator[tuple[str, dict[str, Any], str, str, dict[str, Any]]]:
-    """Yield ``(name, data point, shard day, shard pid, data block)`` per point.
+) -> Iterator[tuple[str, dict[str, Any], str, str, str, dict[str, Any]]]:
+    """Yield ``(name, data point, shard day, shard pid, identity, data block)``.
 
     Every ``kirocrew.*`` data point is yielded; the name filter is load-bearing
     rather than defensive. One meter carries all three namespaces the recorder
@@ -601,26 +679,37 @@ def _iter_metric_points(
     Dropping the other two here is what keeps them out of :func:`_other_series`,
     whose rows the startup panel renders as core metrics.
 
+    ``identity`` is the writing process's resource-level start-time token
+    (``RESOURCE_ATTR_PROCESS_START_TIME``, stamped by the local exporter), or
+    ``""`` for legacy shards written before the field existed — the scope level
+    is still pure OTLP grouping and stays unread. Tolerate-garbage applies
+    twice: a resource whose shape is not the exporter's dict form, AND a token
+    that is not a string (the exporter only ever writes strings), both read as
+    identity-less rather than raising or minting a spurious identity — a
+    stringified garbage value would silently disable the legacy reset
+    heuristic for that stream.
+
     The metric-level ``data`` block rides along because a Sum's block carries
     ``aggregation_temporality``/``is_monotonic`` while a Gauge's carries neither
     — the scalar branch of :func:`_aggregate` classifies on it.
     """
     for obj, shard_day, shard_pid in _iter_export_cycles(shard_paths):
-        # resource -> scope -> metric is pure OTLP grouping; nothing below reads
-        # the resource or the scope.
-        metrics = (
-            m
-            for rm in obj.get("resource_metrics", []) or []
-            for sm in rm.get("scope_metrics", []) or []
-            for m in sm.get("metrics", []) or []
-        )
-        for metric in metrics:
-            name = metric.get("name") or ""
-            if not name.startswith("kirocrew."):
-                continue
-            data = metric.get("data") or {}
-            for dp in data.get("data_points", []) or []:
-                yield name, dp, shard_day, shard_pid, data
+        for rm in obj.get("resource_metrics", []) or []:
+            resource = rm.get("resource")
+            res_attrs = resource.get("attributes") if isinstance(resource, dict) else None
+            identity = ""
+            if isinstance(res_attrs, dict):
+                raw = res_attrs.get(RESOURCE_ATTR_PROCESS_START_TIME)
+                if isinstance(raw, str):
+                    identity = raw
+            for sm in rm.get("scope_metrics", []) or []:
+                for metric in sm.get("metrics", []) or []:
+                    name = metric.get("name") or ""
+                    if not name.startswith("kirocrew."):
+                        continue
+                    data = metric.get("data") or {}
+                    for dp in data.get("data_points", []) or []:
+                        yield name, dp, shard_day, shard_pid, identity, data
 
 
 def _daily_series(daily: dict[str, dict[str, _Hist]]) -> list[dict[str, Any]]:
@@ -637,6 +726,110 @@ def _daily_series(daily: dict[str, dict[str, _Hist]]) -> list[dict[str, Any]]:
                 "warm_p50_ms": round(_pct_from_buckets(w.buckets, w.bounds, 0.50), 1),
             }
         )
+    return out
+
+
+def _model_key(attrs: dict[str, Any]) -> str:
+    """The ``model`` attribute as a split key, or ``"unknown"``.
+
+    The emitter omits the attribute entirely when the model is empty rather than
+    sending ``model=""`` (``metrics/turns._model_attrs``), and shards written
+    before the attribute existed carry it nowhere. Both fold to one named bucket
+    so the amount is still counted: dropping the sample would make the split's
+    totals disagree with the pooled ``total`` reported beside them.
+    """
+    raw = attrs.get("model")
+    text = str(raw).strip() if raw is not None else ""
+    return text or "unknown"
+
+
+def _amount_by_model(by_model: dict[str, "_Hist"]) -> list[dict[str, Any]]:
+    """Per-model spend attribution: count, total and mean, biggest spender first.
+
+    Count/total/mean rather than the percentiles ``_amount_stats`` reports for the
+    pooled figure. The question a spend split answers is "which model spent the
+    money", which totals answer exactly; per-model p50/p90 would multiply the
+    payload by a bucket array per model to answer a distribution question nobody
+    asked of a single model.
+
+    EVERY model, never truncated -- the same rule the sibling ``cost_breakdown``
+    block on this page states for its own ``by_model``, and for the same reason: a
+    top-N cut hides exactly the cheap-model-creep a spend split exists to show.
+    Safe because the key is bounded by domain rather than by hope -- ``model`` is
+    drawn from the host's CONFIGURED model set (see ``metrics/turns._model_attrs``,
+    which is also what lets it be an attribute under the cardinality contract at
+    all), so this is a handful of entries, not one per request.
+
+    Sorted by total DESCENDING, then by name, so the row a reader wants is first
+    and the order is stable across requests for equal totals.
+    """
+    rows: list[dict[str, Any]] = []
+    for model, hist in by_model.items():
+        g = hist._dominant()
+        if g is None:
+            continue
+        cnt = int(g["count"])
+        if cnt <= 0:
+            continue
+        total = float(g["sum"])
+        rows.append(
+            {
+                "model": model,
+                "count": cnt,
+                "total": round(total, 6),
+                "mean": round(total / cnt, 6),
+            }
+        )
+    rows.sort(key=lambda r: (-float(r["total"]), str(r["model"])))
+    return rows
+
+
+def _amount_stats(
+    hist: "_Hist", unit: str, by_model: dict[str, "_Hist"] | None = None
+) -> dict[str, Any]:
+    """Percentiles for a NON-duration histogram, under unit-neutral keys.
+
+    ``_Hist.stats()`` names every field ``*_ms`` and rounds to one decimal, both
+    of which are correct for the duration family and wrong for an amount: a
+    dollar figure reported as ``p50_ms`` is a unit lie the frontend then formats
+    with a millisecond suffix, and one-decimal rounding turns a sub-cent turn
+    into ``0.0``. So the keys drop the suffix, the ``unit`` travels WITH the
+    numbers instead of being implied by them, and rounding keeps six decimals —
+    enough for a fraction of a cent to survive.
+
+    Deliberately NOT a second signature on ``stats()``: the duration surfaces
+    read ``p50_ms`` from a dozen places, and making that key conditional would
+    make every one of them depend on a unit argument they have no reason to know
+    about.
+
+    ``by_model`` adds the attribution split. The pooled figure alone cannot
+    answer "which model spent this", which is the question the ``model``
+    attribute was added to the emitters to make answerable — without the split
+    here, the attribute is recorded and then discarded at the one place that
+    reports the amount. Absent (rather than empty) when no split was collected,
+    so a caller that does not track one publishes no empty key.
+    """
+    g = hist._dominant()
+    if g is None:
+        return {"count": 0, "unit": unit}
+    cnt = int(g["count"])
+    out = {
+        "count": cnt,
+        "unit": unit,
+        "total": round(float(g["sum"]), 6),
+        "mean": round(float(g["sum"]) / cnt, 6) if cnt else 0.0,
+        "p50": round(_pct_from_buckets(g["buckets"], g["bounds"], 0.50), 6),
+        "p90": round(_pct_from_buckets(g["buckets"], g["bounds"], 0.90), 6),
+        "min": round(g["min"], 6) if g["min"] is not None else 0.0,
+        "max": round(g["max"], 6) if g["max"] is not None else 0.0,
+        # Same disclosure the duration surfaces make: >0 means the window
+        # straddles a bucket-boundary change and only the dominant generation is
+        # reported here, with total_count the full population.
+        "other_generations": hist.other_generations,
+        "total_count": hist.total_count,
+    }
+    if by_model:
+        out["by_model"] = _amount_by_model(by_model)
     return out
 
 
@@ -676,12 +869,15 @@ def _other_series(
 
 
 def _cumulative_series(
-    other_cum: dict[str, dict[tuple[str, str], list[tuple[int, float]]]],
+    other_cum: dict[str, dict[tuple[str, str, str], list[tuple[int, float]]]],
 ) -> list[dict[str, Any]]:
-    """Window-relative totals for CUMULATIVE sums, name-sorted.
+    """Window-relative totals for lifetime-total streams, name-sorted.
 
-    Observable counters (CPU seconds, GC stats) re-emit a process-lifetime
-    snapshot every export cycle. Two ordering/window traps shape this reducer:
+    Two record shapes land here and they describe the same thing: a CUMULATIVE
+    sum (what the process CPU/GC instruments wrote while they were observable
+    counters) and a lifetime-total GAUGE (what they write now). Either way the
+    stream re-emits a process-lifetime snapshot every export cycle. Two
+    ordering/window traps shape this reducer:
 
     * Samples were buffered during the scan and are sorted by timestamp here,
       because shard iteration order is not chronological — a per-PID stream
@@ -694,30 +890,46 @@ def _cumulative_series(
       process that started in-window loses at most the activity before its
       first export cycle — under-reporting, never over-reporting.
 
-    Within a sorted stream, counter-RESET detection still applies: a value
-    dropping below its own segment max marks a process boundary (PID reuse,
-    restart), banking the finished segment; re-emitted snapshots >= the max are
-    no-ops, so provider rebuilds (telemetry off/on) stay idempotent. Stream
-    total = banked segments + live segment - baseline (never negative: the
-    baseline is a member of the first segment, so that segment's max bounds
-    it); cross-process total = sum over streams.
+    Streams are keyed by (shard PID, process identity, attrs). The identity is
+    the resource-level start-time token the exporter stamps
+    (``RESOURCE_ATTR_PROCESS_START_TIME``), so a PID reused by a new process
+    lands in a NEW stream deterministically — each process contributes its own
+    window-relative delta even when the reuser's first snapshot already exceeds
+    the predecessor's maximum, the one shape the value heuristic below cannot
+    see. An unchanged identity across provider rebuilds (telemetry off/on)
+    stitches the rebuild segments into one stream. Within an identity-keyed
+    stream a value below the running maximum is shard garbage, never a reset:
+    one identity is one OS process, whose lifetime totals are monotonic,
+    and banking a garbage drop would double-count the recovery.
+
+    The value-below-segment-max RESET heuristic applies ONLY to identity-less
+    streams (legacy shards written before the field existed, or platforms
+    whose start-time read is unavailable): a drop marks a process boundary,
+    banking the finished segment; re-emitted snapshots >= the max are no-ops,
+    so provider rebuilds stay idempotent. Either way, stream total = banked
+    segments + live segment - baseline (never negative: the baseline is a
+    member of the first segment, so that segment's max bounds it);
+    cross-process total = sum over streams.
     """
     out: list[dict[str, Any]] = []
     for name in sorted(other_cum):
         cum_attrs: dict[str, float] = {}
         cum_total = 0.0
-        for (_, csig), samples in other_cum[name].items():
+        for (_, identity, csig), samples in other_cum[name].items():
             ordered = sorted(samples, key=lambda t: t[0])
             baseline = ordered[0][1]
-            banked = 0.0
-            seg: float | None = None
-            for _, val in ordered:
-                if seg is not None and val < seg:
-                    banked += seg
-                    seg = val
-                else:
-                    seg = val if seg is None else max(seg, val)
-            cval = banked + (seg or 0.0) - baseline
+            if identity:
+                cval = max(val for _, val in ordered) - baseline
+            else:
+                banked = 0.0
+                seg: float | None = None
+                for _, val in ordered:
+                    if seg is not None and val < seg:
+                        banked += seg
+                        seg = val
+                    else:
+                        seg = val if seg is None else max(seg, val)
+                cval = banked + (seg or 0.0) - baseline
             if csig:
                 cum_attrs[csig] = cum_attrs.get(csig, 0.0) + cval
             else:
@@ -809,16 +1021,38 @@ def _aggregate(shard_paths: list[Path]) -> dict[str, Any]:
     # concurrently — collapsing them on timestamp alone would show whichever
     # process exported last as "the" process state.
     other_gauge: dict[str, dict[tuple[str, str], tuple[int, float]]] = {}
-    # CUMULATIVE sums (observable counters): per (pid, attrs) stream, buffer
-    # (time_unix_nano, value) samples during the scan. The reduction —
-    # timestamp ordering, counter-RESET detection, window-relative baseline —
-    # happens in _cumulative_series once the scan is done, because shard
-    # iteration order is not chronological and reset detection is only sound
-    # on a time-ordered stream.
-    other_cum: dict[str, dict[tuple[str, str], list[tuple[int, float]]]] = {}
+    # Lifetime-total streams — CUMULATIVE sums, plus the lifetime-total gauges
+    # named by _lifetime_total_gauge_names(): per (pid, process-identity,
+    # attrs) stream, buffer (time_unix_nano, value) samples during the scan.
+    # The identity is the resource-level start-time token, so a reused PID
+    # starts a NEW stream deterministically ("" for legacy shards, which
+    # reduce under the value heuristic). The reduction — timestamp ordering,
+    # counter-RESET detection, window-relative baseline — happens in
+    # _cumulative_series once the scan is done, because shard iteration order
+    # is not chronological and reset detection is only sound on a time-ordered
+    # stream.
+    other_cum: dict[str, dict[tuple[str, str, str], list[tuple[int, float]]]] = {}
     turn = _Hist()
+    # The turn's billed amount, kept OUT of other_hist so it is never reported
+    # under `*_ms` keys. Exactly one of the two is populated on a given host —
+    # the acp backend bills credits, claude_code bills dollars — so the other
+    # reports an empty stat block, which reads as "this host does not bill here"
+    # rather than as a measured zero.
+    turn_credits = _Hist()
+    turn_cost = _Hist()
+    # Spend per model, for the attribution split reported inside the turn block.
+    # Keyed by the emitted ``model`` attribute; a turn served by a fallback model
+    # blanks it, which _model_key folds to "unknown" rather than dropping the
+    # sample -- spend that happened must appear in the split's total even when the
+    # model that spent it cannot be named.
+    turn_credits_by_model: dict[str, _Hist] = {}
+    turn_cost_by_model: dict[str, _Hist] = {}
+    # Resolved once per call rather than per datapoint: the first call imports the
+    # instrument modules (deferred off the gateway boot path) and every later one
+    # is a cached lookup.
+    lifetime_totals = _lifetime_total_gauge_names()
 
-    for name, dp, shard_day, shard_pid, data in _iter_metric_points(shard_paths):
+    for name, dp, shard_day, shard_pid, identity, data in _iter_metric_points(shard_paths):
         attrs = dp.get("attributes") or {}
         is_hist = "bucket_counts" in dp
         if name == _STARTUP_METRIC and is_hist:
@@ -848,6 +1082,12 @@ def _aggregate(shard_paths: list[Path]) -> dict[str, Any]:
             db["cold" if spawned else "warm"].add(dp)
         elif name == _TURN_METRIC and is_hist:
             turn.add(dp, outcome=str(attrs.get("outcome", "unknown")))
+        elif name == _TURN_CREDITS_METRIC and is_hist:
+            turn_credits.add(dp)
+            turn_credits_by_model.setdefault(_model_key(attrs), _Hist()).add(dp)
+        elif name == _TURN_COST_METRIC and is_hist:
+            turn_cost.add(dp)
+            turn_cost_by_model.setdefault(_model_key(attrs), _Hist()).add(dp)
         elif is_hist:
             other_hist.setdefault(name, _Hist()).add(dp)
             for ak in _OTHER_SPLIT_ATTRS:
@@ -872,12 +1112,16 @@ def _aggregate(shard_paths: list[Path]) -> dict[str, Any]:
             ts = int(fts) if fts is not None else 0
             # A Sum's data block carries aggregation_temporality/is_monotonic;
             # a Gauge's carries neither. DELTA sums (regular counters)
-            # accumulate across cycles. CUMULATIVE sums (observable counters:
-            # CPU seconds, GC stats) re-emit a process-lifetime snapshot every
-            # cycle, so summing them would multiply by cycle count — they are
-            # buffered per (PID, attrs) stream and reduced window-relative
-            # after the scan (_cumulative_series). Gauges keep the newest
-            # sample per attribute set.
+            # accumulate across cycles. CUMULATIVE sums re-emit a
+            # process-lifetime snapshot every cycle, so summing them would
+            # multiply by cycle count — they are buffered per (PID, identity,
+            # attrs) stream and reduced window-relative after the scan
+            # (_cumulative_series). Gauges keep the newest sample per attribute
+            # set, EXCEPT the lifetime-total gauges (process CPU/GC), whose
+            # newest sample is a running total rather than a state: those take
+            # the same window-relative path, which is also what stitches them to
+            # the cumulative-sum records the same instruments wrote before they
+            # became gauges. See _lifetime_total_gauge_names().
             is_sum = "aggregation_temporality" in data or "is_monotonic" in data
             try:
                 # OTel JSON: DELTA=1, CUMULATIVE=2. Same chokepoint contract
@@ -887,14 +1131,16 @@ def _aggregate(shard_paths: list[Path]) -> dict[str, Any]:
             except (TypeError, ValueError, OverflowError):
                 cumulative = False
             key = ",".join(f"{k}={attrs[k]}" for k in sorted(attrs)) if attrs else ""
-            if is_sum and cumulative:
+            if (is_sum and cumulative) or (not is_sum and name in lifetime_totals):
                 if ts <= 0:
-                    # A cumulative sample that cannot be ordered cannot join
-                    # the delta math — and letting it sort oldest would make
-                    # it the stream baseline, resurrecting the
+                    # A lifetime total that cannot be ordered cannot join the
+                    # delta math — and letting it sort oldest would make it the
+                    # stream baseline, resurrecting the
                     # lifetime-as-window-total bug on one corrupt record.
                     continue
-                other_cum.setdefault(name, {}).setdefault((shard_pid, key), []).append((ts, val))
+                other_cum.setdefault(name, {}).setdefault((shard_pid, identity, key), []).append(
+                    (ts, val)
+                )
             elif is_sum:
                 rec = other_ctr.setdefault(name, {"total": 0.0, "by_attr": {}})
                 rec["total"] += val
@@ -915,13 +1161,28 @@ def _aggregate(shard_paths: list[Path]) -> dict[str, Any]:
     turn_outcome = turn.outcomes
     turn_total = sum(turn_outcome.values())
     turn_faults = sum(v for k, v in turn_outcome.items() if k in _TERMINAL_FAULT_OUTCOMES)
+    # fault_rate is computed over the turns whose outcome is KNOWN, not over every
+    # turn. ``unclassified`` marks a turn whose surface had no stop reason to give
+    # (a helper call site passing a bare TurnUsage), and it cannot go in either
+    # position honestly: in the numerator it invents a fault for every clean
+    # background turn, and in the denominator alone it silently dilutes the rate
+    # towards zero as background traffic grows — an optimistic dashboard, which is
+    # the failure mode this metric's widening was supposed to end. Excluded from
+    # both. The count needs no field of its own: it already ships in this same
+    # response as ``outcome["unclassified"]``, so a reader can see exactly how
+    # much of the window fault_rate does not cover.
+    turn_classified = turn_total - turn_outcome.get("unclassified", 0)
     turn_block = {
         # ``other_generations`` arrives via stats(): >0 means the window
         # straddles a bucket-boundary change and only the dominant generation
         # is reported (see _Hist).
         **turn.stats(),
         "outcome": turn_outcome,
-        "fault_rate": round(turn_faults / turn_total, 4) if turn_total else 0.0,
+        "fault_rate": round(turn_faults / turn_classified, 4) if turn_classified else 0.0,
+        # What the turn COST, beside how long it took, so spend per turn is read
+        # against latency over the same population rather than joined by hand.
+        "credits": _amount_stats(turn_credits, "credit", turn_credits_by_model),
+        "cost_usd": _amount_stats(turn_cost, "usd", turn_cost_by_model),
     }
 
     return {
@@ -1054,8 +1315,29 @@ async def api_context_trace(request: web.Request) -> web.Response:
 
     Independent of the telemetry main switch: the usage rows this reads are
     always written, so the trace works with OTEL collection off.
+
+    Dashboard-only. Unlike ``/api/usage/turns`` this reader has no row-ownership
+    model, and its rows carry the turn's billing — so an app caller is refused
+    outright (deny-by-default, App Kit §5.2) rather than handed an arbitrary
+    slot's data. The 404 is indistinguishable from an unknown route on purpose,
+    and the refusal is SEL-audited like every app-caller decision.
     """
+    request_app = str(request.get("app", "") or "")
     slot = (request.query.get("slot") or "").strip()
+    if request_app:
+
+        def _audit_denied() -> None:
+            _sel_mod.sel().log_api_access(
+                caller=request_app,
+                operation="context_trace",
+                outcome="denied",
+                source="app_isolation",
+                resources=f"slot={slot or '(missing)'}",
+                error="dashboard-only endpoint",
+            )
+
+        await asyncio.to_thread(_audit_denied)
+        return web.json_response({"error": "not found", "code": "not_found"}, status=404)
     if not slot:
         return web.json_response({"error": "slot is required", "code": "slot_required"}, status=400)
     trace = await asyncio.to_thread(context_trace, slot, _WINDOW_DAYS)
@@ -1355,7 +1637,11 @@ async def api_collection_status(request: web.Request) -> web.Response:
     ignores, and ``overlay_override`` does the same for a ``config.local.json``
     entry that would make the switch snap back after a successful save.
 
-    ``otlp_configured`` reports that ``telemetry.otlp_endpoint`` is set. That makes
+    ``otlp_configured`` reports that enabling collection would send metrics off
+    this machine — resolved from the active telemetry provider's destination set,
+    the same one ``_build_recorder`` attaches readers for, not from the
+    ``telemetry.otlp_endpoint`` string (which is only how the DEFAULT provider
+    names a destination; an edition may supply its own collector). That makes
     collection not-local — ``_build_recorder`` attaches an OTLP reader — so the
     config route refuses to ENABLE it from here and the panel disables that
     direction rather than offering a write that comes back 409. Disabling stays

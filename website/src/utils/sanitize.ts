@@ -118,17 +118,64 @@ export function sanitizeCredentials(text: string): string {
 // ── Exfiltration URL detection (matches redact_exfiltration_urls in security.py) ──
 const URL_RE = /https?:\/\/([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})(:\d+)?(\/[^\s)"'>]*)?/g
 const EXFIL_QUERY_MIN_LEN = 200
-const EXFIL_PATTERNS = new RegExp(
+
+// PATTERN signals: each names a shape rather than a size, and each runs for
+// EVERY URL — no host and no carve-out escapes them — so this redactor still
+// flags every pattern the undifferentiated check flagged. Non-global so `.test()`
+// carries no sticky `.lastIndex` between calls.
+//
+// Heavy URL-encoding: 20+ CONSECUTIVE percent-encoded octets. Mirrors the
+// backend's _EXFIL_PERCENT_RE.
+const EXFIL_PERCENT_RE = /%[0-9A-Fa-f]{2}(?:%[0-9A-Fa-f]{2}){20,}/i
+
+// Hard credential markers. Mirrors the backend's _HARD_CREDENTIAL_RE.
+const EXFIL_CREDENTIAL_RE = new RegExp(
   '(?:' +
-    '[A-Za-z0-9+/=]{40,}' +                          // base64-like blob
-    '|%[0-9A-Fa-f]{2}(?:%[0-9A-Fa-f]{2}){20,}' +    // heavy URL-encoding
-    '|(?:AKIA|ASIA)[A-Z0-9]{16}' +                   // AWS access key ID
+    '(?:AKIA|ASIA)[A-Z0-9]{16}' +                    // AWS access key ID
     '|(?:ssh-rsa|ssh-ed25519)[\\s+%]' +               // SSH public key
     '|BEGIN[\\s+%](?:RSA|DSA|EC|OPENSSH)[\\s+%]PRIVATE[\\s+%]KEY' + // private key header
     '|xox[bpas]-[0-9a-zA-Z-]+' +                     // Slack token
   ')',
   'i',
 )
+
+// Base64-like blob, 40+ chars — the shape an encoded payload has. Same spelling
+// as the backend's `_EXFIL_PATTERNS` base64 branch, and it OVER-matches by
+// design: `+` is the form-encoded spelling of a space, so ~7 words of
+// unpunctuated prose in a `+`-encoded `body=` are one run in this class and are
+// redacted. That is accepted rather than fixed, and this signal is deliberately
+// NOT waivable, because both available narrowings — dropping `+` from the class,
+// or splitting the query on `+` before testing — let an attacker `+`-chunk a 40+
+// char secret straight past it. A false positive on prose costs a placeholder; a
+// chunking bypass costs the payload.
+const EXFIL_B64_RE = /[A-Za-z0-9+/=]{40,}/i
+
+// Aggregate query LENGTH is the one signal that names no shape at all: it fires on
+// any richly-parameterised URL, which is why prefilled issue links —
+// `…/issues/new?title=…&body=<a paragraph of prose>&labels=…` — render as a
+// `[REDACTED: suspicious URL]` placeholder.
+//
+// It is NOT waived for that shape, deliberately, and no future shape-based waiver
+// belongs here either. `isPrefilledIssueUrl` used to waive it (#7824), first on
+// shape alone and later pinned to this project's own tracker; both spellings are
+// exfiltration primitives, because what this function sanitizes is MODEL-AUTHORED
+// text. Injected content steers the model into emitting a prefill URL whose `body`
+// carries percent-encoded private context, the waiver skips the length check, the
+// link renders as the familiar "file an issue" affordance, the user submits it —
+// and the issue is PUBLIC, so the attacker reads it. Pinning the repository does
+// not help: this project's tracker is world-readable, which is the point of it.
+//
+// A URL's shape says nothing about who authored it, and a marker placed IN the
+// text travels in the channel the injection already controls. Provenance has to
+// come from a different channel, which the product already has: the backend's
+// `diagnostics._issue_url` assembles the prefill link from STRUCTURED fields and
+// the dashboard renders its own anchor from the `github_issue_url` JSON field,
+// which no redactor scans (`ReportProblemModal`, `ReportProblemCard`). A link that
+// never enters model prose never needs a waiver.
+//
+// If you are here to make a long legitimate URL render, narrow or replace this
+// heuristic for EVERY host on its own merits (#7820 also reports
+// monitorportal.amazon.com) — do not reintroduce a per-shape escape hatch.
 
 export function sanitizeExfiltrationUrls(text: string): string {
   let out = text
@@ -139,7 +186,12 @@ export function sanitizeExfiltrationUrls(text: string): string {
     const qmark = pathAndQuery.indexOf('?')
     if (qmark === -1) continue
     const query = pathAndQuery.slice(qmark + 1)
-    if (query.length >= EXFIL_QUERY_MIN_LEN || EXFIL_PATTERNS.test(query)) {
+    const redact =
+      EXFIL_PERCENT_RE.test(query) ||
+      EXFIL_CREDENTIAL_RE.test(query) ||
+      EXFIL_B64_RE.test(query) ||
+      query.length >= EXFIL_QUERY_MIN_LEN
+    if (redact) {
       out = out.replace(m[0], i18nT('utils.sanitize.redacted_suspicious_url', { domain }))
     }
   }

@@ -27,18 +27,23 @@ _ensure_ssl_certs()
 
 import argparse
 import asyncio
+import atexit
 import faulthandler
 import importlib
+import importlib.machinery
+import json
 import logging
 import os
+import queue
 import shutil
 import subprocess
 import sys
-from logging.handlers import RotatingFileHandler
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from pathlib import Path
 from typing import NoReturn
 
 from kiro_crew import __version__, cli_help, platform_compat
+from kiro_crew.apps import builtins as _builtins_pkg
 from kiro_crew.apps.builtins import BUILTIN_NAMES as _BUILTIN_NAMES
 from kiro_crew.config import KiroCrewConfig, config_dir, ensure_data_home
 from kiro_crew.config.loader import (
@@ -51,6 +56,7 @@ from kiro_crew.crash_guard import install as _install_crash_guard
 from kiro_crew.env import git_build_info
 from kiro_crew.gateway_lock import GatewayLock, GatewayLockError
 from kiro_crew.history import ConversationLog, HistoryConsolidator
+from kiro_crew.knowledge import store as knowledge_store
 from kiro_crew.knowledge.dedup import dedup_sweep
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.log_redaction import install_log_redaction
@@ -282,7 +288,24 @@ def _project_dir_file() -> Path:
 
 
 def _ensure_node(proj_dir: str = "") -> bool:
-    """Run ensure-node.sh to guarantee a supported Node. Returns True if node is OK."""
+    """Run ensure-node.sh to guarantee a supported Node. Returns True if node is OK.
+
+    Skipped on Windows, where it is not merely unhelpful but actively harmful.
+    ``ensure-node.sh`` is a POSIX shell script and the repo ships no Windows
+    equivalent, so the spawn resolves ``bash`` through ``PATH`` -- and on Windows
+    ``C:\\Windows\\System32\\bash.exe`` is WSL's launcher, so the call prints a
+    UTF-16 "Windows Subsystem for Linux has no installed distributions" banner into
+    whatever stdout it inherited and installs nothing. A pod gateway inherits its
+    wrapper's redirected stdout, so that banner lands in the pod's own log and
+    reads as pod output. ``env.ensure_node`` already returns None here for the same
+    reason; this is the second caller of the same script.
+
+    A Windows host gets its Node from the platform installer or a version manager,
+    which ``_node_ok`` already sees, so returning that answer is the whole
+    behaviour rather than a degraded one.
+    """
+    if platform_compat.IS_WINDOWS:
+        return _node_ok()
     script = None
     env_dir = os.environ.get("KIROCREW_PROJECT_DIR")
     for candidate in [
@@ -313,7 +336,16 @@ def _node_ok() -> bool:
         return False
     try:
         node_ver = subprocess.run(
-            ["node", "-v"],
+            # The RESOLVED path, not the bare name. ``shutil.which`` is PATHEXT-aware
+            # and can answer ``node.CMD`` on Windows (nvm-windows, volta and corepack
+            # all install shims), while ``CreateProcess`` extends a bare name with
+            # ``.exe`` only -- so on such a host spawning "node" raises
+            # ``FileNotFoundError`` and this returns False while node works. A host
+            # whose node resolves to ``node.EXE`` is unaffected either way, which is
+            # why the bug is invisible on most machines and total on some. Harmless
+            # on POSIX, where the resolved path is what the bare name would have
+            # found anyway.
+            [node, "-v"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -558,6 +590,7 @@ def _resolve_gateway_args(args: argparse.Namespace) -> dict:
     return {
         "no_dashboard": getattr(args, "slack_only", False),
         "no_crons": getattr(args, "no_crons", False),
+        "no_tunnel": getattr(args, "no_tunnel", False),
         "no_open": no_open,
         "port_override": port,
         "json_ready": json_ready,
@@ -586,7 +619,7 @@ def _diagnostic_port(gw_kwargs: dict) -> int | None:
         # Deferred import: ``dashboard.urls`` is a stdlib-only leaf, but
         # importing it executes ``dashboard/__init__`` — keep it out of
         # cli.py's module scope so non-gateway commands and the MCP stdio
-        # servers never touch the dashboard package (see issue #3504).
+        # servers never touch the dashboard package.
         from kiro_crew.dashboard.urls import parse_dashboard_url
 
         return parse_dashboard_url(KiroCrewConfig.load().dashboard.url)[1]
@@ -595,10 +628,93 @@ def _diagnostic_port(gw_kwargs: dict) -> int | None:
         return None
 
 
+def _knowledge_stats(args) -> None:
+    """``kirocrew knowledge stats [--json]`` -- read-only counts, no repair verb."""
+
+    db_path = config_dir() / "workspace" / "knowledge" / "knowledge.db"
+    as_json = bool(getattr(args, "json", False))
+    if not db_path.exists():
+        sel().log_tool_invocation(
+            session_key="cli", source="cli", tool_name="knowledge_stats", outcome="not_configured"
+        )
+        if as_json:
+            print(json.dumps({"error": "not_configured"}))
+        else:
+            print("Knowledge Library is not configured (no knowledge.db). Ingest documents first.")
+        return
+    # Read-only means the FILE is opened read-only. A normal open runs the
+    # schema migration, whose orphan sweep takes the writer lock and deletes
+    # itemless source rows -- a write this verb must not make. The trade is
+    # that a library behind this schema is reported, not repaired here.
+    store = KnowledgeStore.open_read_only(str(db_path))
+    try:
+        stats = store.aggregate_stats()
+    except knowledge_store.sqlite3.OperationalError as exc:
+        if "no such" not in str(exc):
+            raise
+        sel().log_tool_invocation(
+            session_key="cli", source="cli", tool_name="knowledge_stats", outcome="schema_behind"
+        )
+        if as_json:
+            print(json.dumps({"error": "schema_behind", "detail": str(exc)}))
+        else:
+            print(
+                f"Knowledge database is behind this schema ({exc}). Stats opens it "
+                "read-only and does not migrate; start the gateway or run "
+                "`kirocrew knowledge dedup --apply` once to migrate it, then retry."
+            )
+        return
+    finally:
+        store.db.close()
+    sel().log_tool_invocation(
+        session_key="cli",
+        source="cli",
+        tool_name="knowledge_stats",
+        outcome="success",
+        metadata={"sources": stats.sources, "documents": stats.documents, "items": stats.items},
+    )
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "sources": stats.sources,
+                    "documents": stats.documents,
+                    "items": stats.items,
+                    "per_source": [
+                        {
+                            "id": s.source_id,
+                            "name": s.name,
+                            "documents": s.documents,
+                            "items": s.items,
+                        }
+                        for s in stats.per_source
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return
+    print(
+        f"Knowledge Library: {stats.sources} source(s), "
+        f"{stats.documents} document(s), {stats.items} item(s)"
+    )
+    if not stats.per_source:
+        return
+    # Width from the data, so a long source name does not wrap the count columns.
+    name_width = max(len(s.name) for s in stats.per_source)
+    print(f"\n  {'SOURCE'.ljust(name_width)}  {'DOCS':>6}  {'ITEMS':>6}")
+    for s in stats.per_source:
+        print(f"  {s.name.ljust(name_width)}  {s.documents:>6}  {s.items:>6}")
+
+
 def _knowledge(args) -> None:
-    """``kirocrew knowledge dedup [--apply]`` -- collapse cross-source duplicate docs."""
-    if getattr(args, "knowledge_action", None) != "dedup":
-        print("Usage: kirocrew knowledge dedup [--apply]")
+    """``kirocrew knowledge dedup|stats`` -- duplicate collapse and read-only counts."""
+    action = getattr(args, "knowledge_action", None)
+    if action == "stats":
+        _knowledge_stats(args)
+        return
+    if action != "dedup":
+        print("Usage: kirocrew knowledge dedup [--apply] | kirocrew knowledge stats [--json]")
         return
     apply = bool(getattr(args, "apply", False))
     db_path = config_dir() / "workspace" / "knowledge" / "knowledge.db"
@@ -608,9 +724,29 @@ def _knowledge(args) -> None:
         )
         print("Knowledge Library is not configured (no knowledge.db). Ingest documents first.")
         return
-    store = KnowledgeStore(str(db_path))
+    if apply:
+        store = KnowledgeStore(str(db_path))
+    else:
+        # The dry run promises "no changes", and an ordinary open breaks that
+        # promise before the sweep starts: the constructor runs the schema
+        # migration, whose orphan reap deletes itemless source rows. So the
+        # preview opens the file read-only (SQLite mode=ro) and only --apply
+        # takes the migrating, writing open.
+        store = KnowledgeStore.open_read_only(str(db_path))
     try:
         results = dedup_sweep(store, apply=apply)
+    except knowledge_store.sqlite3.OperationalError as exc:
+        if apply or "no such" not in str(exc):
+            raise
+        sel().log_tool_invocation(
+            session_key="cli", source="cli", tool_name="knowledge_dedup", outcome="schema_behind"
+        )
+        print(
+            f"Knowledge database is behind this schema ({exc}). The dry run opens it "
+            "read-only and does not migrate; start the gateway or run "
+            "`kirocrew knowledge dedup --apply` once to migrate it, then retry."
+        )
+        return
     finally:
         store.db.close()
     sel().log_tool_invocation(
@@ -790,6 +926,97 @@ class _FdTrackingRotatingFileHandler(RotatingFileHandler):
         _redirect_fds_to(Path(self.baseFilename))
 
 
+class _CliLogQueueHandler(QueueHandler):
+    """Marker subclass so re-entrant setup (and tests) can find the CLI's own
+    queue handler among whatever other handlers the process accumulated."""
+
+
+# Commands that run an asyncio event loop for hours -- the ones the loop-stall
+# watchdog guards. Only these need file-handler I/O moved off the calling
+# thread, and none of them ever exec-over-self, so the atexit / bounded
+# force-exit drains cover every exit path they have. Short-lived CLI verbs
+# keep synchronous handlers: several replace the process via ``os.exec*``
+# (``logs -f`` -> tail/journalctl, ``config edit`` -> $EDITOR, ``pod exec``),
+# which skips atexit and would strand queued records -- and none of them runs
+# an event loop, so the queue buys them nothing.
+_LONG_LIVED_COMMANDS = {"serve", "gateway", "chat", None}
+
+_LOG_QUEUE_LISTENER: QueueListener | None = None
+
+
+def _stop_log_queue_listener(timeout: float | None = None) -> None:
+    """Stop the log queue listener, draining every queued record to disk.
+
+    Idempotent — registered via ``atexit`` so process shutdown flushes the
+    queued tail. Also the deterministic drain point for tests: after this
+    returns, every record logged before the call has been written by the
+    file handler.
+
+    ``timeout`` bounds the drain for force-exit paths (a second SIGINT/
+    SIGTERM hard-exits via ``os._exit``, which skips atexit): the sentinel
+    is enqueued and the listener thread joined for at most that long, so a
+    wedged disk cannot hang the force exit. When the thread does not finish
+    in time, flush/close are skipped — they would block on the same wedged
+    handler.
+    """
+    global _LOG_QUEUE_LISTENER
+    listener, _LOG_QUEUE_LISTENER = _LOG_QUEUE_LISTENER, None
+    if listener is None:
+        return
+    try:
+        if timeout is None:
+            listener.stop()
+        else:
+            listener.enqueue_sentinel()
+            # QueueListener has no bounded stop; join its (private but stable
+            # across 3.10-3.14) thread handle against the deadline.
+            thread = getattr(listener, "_thread", None)
+            if thread is not None:
+                thread.join(timeout)
+                if thread.is_alive():
+                    return  # wedged handler — do not block the force exit
+    except Exception:
+        return  # interpreter-teardown races must not raise
+    for handler in listener.handlers:
+        try:
+            handler.flush()
+            handler.close()
+        except Exception:
+            pass  # a broken handler must not block shutdown
+
+
+async def drain_log_queue_before_hard_exit(timeout: float = 2.0) -> None:
+    """Flush the queued ``gateway.log`` tail from an ``async`` hard-exit path.
+
+    ``os._exit`` runs no ``atexit`` handler, so the drain registered by
+    :func:`_setup_cli_logging` never fires on a path that hard-exits -- every
+    record still sitting in the queue is lost, including the ones logged
+    immediately before the exit, which are the most diagnostic ones a
+    post-mortem has.
+
+    :func:`_stop_log_queue_listener` is a *synchronous* bounded drain (it
+    joins the listener thread), so calling it inline from a coroutine would
+    park the event loop for up to ``timeout``. Offload it to
+    :func:`~kiro_crew.executors.subprocess_executor` -- the pool reserved for
+    teardown work that can block on a wedged resource -- under an outer
+    deadline, exactly as the restart path already does for the SEL flush. A
+    wedged disk therefore delays neither the loop nor the exit.
+
+    Never raises: a hard exit must not be blocked, or replaced, by logging.
+    """
+    from kiro_crew.executors import subprocess_executor
+
+    try:
+        await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(
+                subprocess_executor(), _stop_log_queue_listener, timeout
+            ),
+            timeout=timeout + 1.0,
+        )
+    except Exception:
+        pass  # includes TimeoutError: reaching the exit is what matters
+
+
 def _setup_cli_logging(command: str | None, verbose: int) -> None:
     """Configure console echo + persistent ``gateway.log`` logging.
 
@@ -806,10 +1033,18 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
 
     - the console echo is skipped entirely;
     - the file handler attaches to the ROOT logger instead, so third-party
-      WARNINGs that previously reached the file only through the stderr
-      redirect still land, now formatted and PID-stamped;
+      WARNINGs reach the file formatted and PID-stamped rather than only as
+      raw stderr;
     - after the boot rotation, fds 1/2 are re-pointed at the live log so raw
       writes (uncaught tracebacks, child stderr) do not land in ``.prev``.
+
+    In BOTH modes, for LONG-LIVED commands (``_LONG_LIVED_COMMANDS``) the file
+    handler is not attached to a logger directly: the logger gets a
+    ``QueueHandler`` and the file handler lives on a ``QueueListener`` thread,
+    so no file I/O (rollover included) ever runs on the event-loop thread.
+    Short-lived commands attach the file handler synchronously — they run no
+    event loop, and several exec-over-self (skipping atexit), where a queued
+    tail would be lost. See the inline comment at the attach site.
     """
     if verbose >= 2:
         level = logging.DEBUG
@@ -818,7 +1053,17 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     else:
         level = logging.WARNING
 
-    log_file = config_dir() / "gateway.log"
+    from kiro_crew.config.paths import private_runtime_log_dir
+
+    log_home = config_dir()
+    private_logs = private_runtime_log_dir()
+    if private_logs is not None:
+        # A private namespace deliberately seals loose data-home files. Keep
+        # durable rotating logs in the live directory prepared by its launcher;
+        # never reopen the root or silently drop MCP diagnostics.
+        log_file = private_logs / f"member-{os.getpid()}.log"
+    else:
+        log_file = log_home / "gateway.log"
     # Detect BEFORE the boot rotation below: rotation renames the file, and
     # the inode comparison must see the file stderr actually inherited.
     detached = _fd_targets_file(2, log_file)
@@ -883,20 +1128,84 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     )
     if detached:
         # Root attach: kiro_crew records arrive once via propagation, and
-        # third-party WARNINGs land formatted — replacing what the accidental
-        # stderr echo used to provide unformatted.
-        logging.getLogger().addHandler(fh)
+        # third-party WARNINGs land formatted rather than as an unformatted
+        # stderr echo.
+        target_logger = logging.getLogger()
     else:
-        logging.getLogger("kiro_crew").addHandler(fh)
+        target_logger = logging.getLogger("kiro_crew")
+
+    # Never run file-handler I/O on the caller's thread of a LONG-LIVED
+    # command: the gateway invokes this from the thread that will run the
+    # asyncio event loop, and an inline emit contends for Handler.lock with
+    # every worker thread — while a size-based rollover runs the WHOLE rename
+    # chain plus the dup2 fd re-point on the loop. Blocking past the
+    # loop-stall watchdog's ``exit_after`` hard-exits the gateway mid-turn
+    # and orphans every in-flight subagent. A QueueHandler makes emit a
+    # non-blocking put; the QueueListener's thread owns the file handler, so
+    # ALL file I/O — ``doRollover()`` and ``_redirect_fds_to()`` included —
+    # happens off the loop. Secret redaction is unaffected: it hooks the
+    # log-record FACTORY (creation time, producer thread), upstream of any
+    # handler.
+    #
+    # Short-lived commands keep the synchronous handler on purpose: none of
+    # them runs an event loop (nothing to stall), and several replace the
+    # process via ``os.exec*`` (``logs -f``, ``config edit``, ``pod exec``),
+    # which skips atexit — a queue there would strand its tail records, while
+    # a sync handler has already written them by the time exec runs. See
+    # ``_LONG_LIVED_COMMANDS``.
+    if command in _LONG_LIVED_COMMANDS:
+        global _LOG_QUEUE_LISTENER
+        _stop_log_queue_listener()  # re-entrant call (tests): retire the old thread
+        for lgr in (logging.getLogger(), logging.getLogger("kiro_crew")):
+            for stale in [h for h in lgr.handlers if isinstance(h, _CliLogQueueHandler)]:
+                lgr.removeHandler(stale)  # re-entrant call: orphaned producer
+        log_queue: "queue.SimpleQueue[logging.LogRecord]" = queue.SimpleQueue()
+        queue_handler = _CliLogQueueHandler(log_queue)
+        # Gate at the producer: records the file handler would drop must not
+        # transit the queue at all.
+        queue_handler.setLevel(fh.level)
+        _LOG_QUEUE_LISTENER = QueueListener(log_queue, fh, respect_handler_level=True)
+        _LOG_QUEUE_LISTENER.start()
+        atexit.register(_stop_log_queue_listener)
+        target_logger.addHandler(queue_handler)
+    else:
+        target_logger.addHandler(fh)
 
     # Install secret redaction filter — scrubs Bearer tokens from all kiro_crew
     # log output before it reaches any handler. The filter also accepts literal
     # secret values to redact, but none are passed here: wiring resolved vault
     # secret values into the filter is a follow-up PR. Bearer token redaction is
     # active immediately with zero vault I/O.
-    _LONG_LIVED_COMMANDS = {"serve", "gateway", "chat", None}
     if command in _LONG_LIVED_COMMANDS:
         install_log_redaction([])
+
+
+def _builtin_mcp_server_available(name: str) -> bool:
+    """True when ``kiro_crew.apps.builtins.<name>.mcp_server`` resolves.
+
+    ``_BUILTIN_NAMES`` answers two different questions: which builtins get HTTP
+    routes (all of them) and which get an ``mcp-<name>`` CLI verb (only those
+    that actually ship an ``mcp_server`` module). Gating the verb on this
+    predicate keeps the two decoupled — a builtin without the module is simply
+    not registered, instead of advertising a command that dies with a raw
+    ``ModuleNotFoundError`` traceback.
+
+    Resolution deliberately uses ``PathFinder`` rather than
+    ``importlib.util.find_spec``: ``find_spec`` IMPORTS the parent package as a
+    side effect, and every builtin's ``__init__`` pulls in its whole
+    ``backend.routes`` chain — which would execute all builtin apps at
+    parser-build time on every CLI invocation, including the gateway boot path.
+    ``PathFinder`` walks the same import machinery (source, bytecode, extension
+    loaders) without executing anything. Worst-case boot cost is bounded by
+    ``len(BUILTIN_NAMES)``: one directory listing per builtin package
+    (mtime-cached by the import system), independent of user data or profile
+    size.
+    """
+    finder = importlib.machinery.PathFinder
+    pkg_spec = finder.find_spec(name, list(_builtins_pkg.__path__))
+    if pkg_spec is None or not pkg_spec.submodule_search_locations:
+        return False
+    return finder.find_spec("mcp_server", list(pkg_spec.submodule_search_locations)) is not None
 
 
 def main() -> None:
@@ -1034,6 +1343,40 @@ Examples:
         help="Collect logs + crash reports into a redacted diagnostics zip",
     )
 
+    # ledger-sweep -- its own command, NOT a ``doctor`` mode. ``doctor`` is
+    # read-only by its own contract (a diagnostic you run because something
+    # broke must not unlink files), and ``--purge`` is irreversible; hosting the
+    # purge there also gave every modifier a way to be parsed without its mode.
+    ls_parser = cli_help.add_command(
+        sub,
+        "ledger-sweep",
+        description=(
+            "List the session and conductor-work ledgers that look finished. A dry "
+            "run by default: nothing is deleted without --purge, and --purge is a "
+            "second, separate invocation over the report the dry run printed."
+        ),
+    )
+    ls_parser.add_argument(
+        "--purge",
+        action="store_true",
+        help="Actually delete the listed ledgers (irreversible)",
+    )
+    ls_parser.add_argument(
+        "--older-than-days",
+        type=float,
+        default=None,
+        metavar="N",
+        help="Idle window before a ledger qualifies (default: 30)",
+    )
+    ls_parser.add_argument(
+        "--purge-unreadable",
+        action="store_true",
+        help=(
+            "With --purge: also delete records this sweep could not parse "
+            "(they are listed but kept by default)"
+        ),
+    )
+
     # gateway
     gw_parser = cli_help.add_command(sub, "gateway")
     gw_parser.add_argument(
@@ -1045,6 +1388,18 @@ Examples:
         "--no-crons",
         action="store_true",
         help="Skip cron scheduler — use when another instance handles cron execution",
+    )
+    gw_parser.add_argument(
+        "--no-tunnel",
+        action="store_true",
+        help=(
+            "Never publish a tunnel — this process refuses to start or provision "
+            "one for its whole life, whatever tunnel.enabled says. Scoped to "
+            "TUNNELS: it does not change where the dashboard binds, so a config "
+            "that widens dashboard.url off loopback still does. Use for an "
+            "instance that must not publish a tunnel (a Dev Fleet pod passes "
+            "this); reach it with `ssh -L` instead."
+        ),
     )
     gw_parser.add_argument(
         "--seed",
@@ -1202,6 +1557,12 @@ Examples:
         "--silent",
         action="store_true",
         help="Suppress auto-delivery; agent controls notifications",
+    )
+    cron_add.add_argument(
+        "--folder",
+        default="",
+        help="Schedule-page folder to file the job in (existing folder name or id). "
+        "The CLI does not create folders — create them in the dashboard's Schedule page.",
     )
     cron_add.add_argument(
         "--approval-mode",
@@ -1363,6 +1724,29 @@ Examples:
             "MANIFEST.json records that it was staged unpinned."
         ),
     )
+    snap_parser.add_argument(
+        "--components",
+        default=None,
+        help="Comma-separated components to include (default: all); see restore --list-components",
+    )
+    snap_parser.add_argument(
+        "--purpose",
+        default="backup",
+        choices=("backup", "share"),
+        help=(
+            "backup = restoring onto a host you control, keeps credential-bearing "
+            "components (the default, and the only one that produces a bundle today); "
+            "share = leaves your control, so it carries only components certified free "
+            "of credential material — no component is certified yet, so this currently "
+            "refuses rather than emitting a bundle that has not been checked"
+        ),
+    )
+
+    # Retired, and defined only so it fails with a pointer instead of a bare argparse
+    # error. Dropping it entirely would still fail loudly ("unrecognized arguments"), but
+    # an operator whose muscle memory or old cron line still says `--to s3://bucket/prefix`
+    # is better served by being told where that capability went than by exit 2.
+    snap_parser.add_argument("--to", default=None, help=argparse.SUPPRESS)
 
     rest_parser = cli_help.add_command(sub, "restore")
     rest_parser.add_argument("snapshot", nargs="?", help="Path to snapshot .tar.gz")
@@ -1425,9 +1809,9 @@ Examples:
     sel_parser = sec_sub.add_parser("events", help="Show recent security event log entries")
     sel_parser.add_argument("-n", "--limit", type=int, default=20, help="Number of entries")
     # A count alone cannot express "what happened around 14:05" — on a busy log
-    # 6000 entries reached only 15 minutes back, so answering a question about a
-    # two-hour-old event meant pulling ~90k entries and filtering by hand
-    # (issue #4843). Reading the file directly is correctly refused by the
+    # 6000 entries reach only 15 minutes back, so answering a question about a
+    # two-hour-old event means pulling ~90k entries and filtering by hand.
+    # Reading the file directly is correctly refused by the
     # credential-path gate, so the time selector has to live here.
     _time_help = (
         "a relative age (30m, 2h, 7d) or an ISO 8601 instant " "(2026-08-21, 2026-08-21T04:00:00Z)"
@@ -1495,6 +1879,20 @@ Examples:
     explain_parser.add_argument("--app", default="", help="App slug (optional)")
     profile_show = policy_sub.add_parser("profile", help="Show a profile by name")
     profile_show.add_argument("name", help="Profile file stem (without .json)")
+    policy_sub.add_parser(
+        "source", help="Show whether this host fetches its policy from a central source"
+    )
+    policy_fetch = policy_sub.add_parser(
+        "fetch", help="Fetch the central policy now and apply it if it is usable"
+    )
+    policy_fetch.add_argument(
+        "--force",
+        action="store_true",
+        # Skips the conditional-request validators. An operator running this by
+        # hand wants to prove the round trip end to end; a 304 tells them nothing
+        # about whether the document they just published reads correctly.
+        help="Ignore the cached validators and re-download the whole document",
+    )
 
     register_perf_parser(sub)
     register_bench_parser(sub)
@@ -1510,12 +1908,32 @@ Examples:
         action="store_true",
         help="Apply the deletions (default: dry-run preview that changes nothing)",
     )
+    kn_stats = kn_sub.add_parser(
+        "stats", help="Count sources, documents and items in the knowledge library (read-only)"
+    )
+    kn_stats.add_argument(
+        "--json", action="store_true", help="Emit the counts as JSON instead of a table"
+    )
+
+    # secrets — encrypted vault maintenance. Only the migration importer lives
+    # here; the set/list/rm surface is owned by a separate change.
+    secrets_parser = sub.add_parser("secrets", help="Encrypted secret vault")
+    secrets_sub = secrets_parser.add_subparsers(dest="secrets_action")
+    secrets_import = secrets_sub.add_parser(
+        "import",
+        help="Migrate plaintext .env credentials into the vault (dry-run unless --apply)",
+    )
+    secrets_import.add_argument(
+        "--apply",
+        action="store_true",
+        help="Store the secrets and rewrite .env to secret:// refs (default: dry-run)",
+    )
 
     # pod — isolated, throwaway, full-stack test instances per worktree (kubectl-style)
     pod_parser = cli_help.add_command(sub, "pod")
     pod_sub = pod_parser.add_subparsers(
         dest="pod_action",
-        metavar="{up,down,ls,prune,status,token,url,logs,exec,provision,install}",
+        metavar="{up,down,ls,prune,status,token,url,scenarios,api,logs,exec,provision,install}",
     )
     pod_up = pod_sub.add_parser("up", help="Schedule an isolated pod for a worktree")
     pod_up.add_argument("name", help="Worktree name")
@@ -1526,7 +1944,16 @@ Examples:
         help="Provision (venv + SPA dist) if needed before bringing the pod up",
     )
     pod_up.add_argument("--ttl", default="2h", help="Token TTL (default: 2h)")
-    pod_up.add_argument("--seed", default="", help="Seed config dir (tunnel is forced off)")
+    pod_up.add_argument(
+        "--seed",
+        default="",
+        help=(
+            "Pre-populate the isolated home. A bare NAME is a shipped seed scenario "
+            "and populates the whole home; unknown names are refused with the "
+            "available list. A PATH (a separator or leading ~ or .) contributes only "
+            "its sanitized config.json. Populated homes are never re-seeded."
+        ),
+    )
     pod_up.add_argument(
         "--approval",
         # Literal mirrors kiro_crew.pod.runtime.APPROVAL_MODES, which is the
@@ -1544,10 +1971,37 @@ Examples:
         "--crons",
         action="store_true",
         help=(
-            "Run the pod's cron scheduler. Pods boot with --no-crons by default. A "
-            "pod's HOME starts with no cron definitions (only a sanitized config is "
-            "seeded), so this enables an empty scheduler for testing cron behavior "
-            "inside the pod. Persisted per pod; applies at boot."
+            "Run the pod's cron scheduler. Pods boot with --no-crons by default. "
+            "Without --seed the HOME starts with no cron definitions; a named "
+            "scenario may provide them. Persisted per pod; applies at boot."
+        ),
+    )
+    pod_up.add_argument(
+        "--no-embeddings",
+        dest="no_embeddings",
+        action="store_true",
+        help=(
+            "Boot without the embedding model: the pod never downloads it and "
+            "memory/knowledge search falls back to keyword matching (a documented "
+            "mode). Use it to load-test ingestion without paying per-chunk embed "
+            "compute. Affects the pod's env only, never your own home. Persisted "
+            "per pod as EMBEDDINGS='0' in its env file (hand-edit that line to flip "
+            "a kept pod); applies at boot. The switch is subsystem-wide, so the pod "
+            "skips its speech-to-text (whisper) model download too."
+        ),
+    )
+    pod_up.add_argument(
+        "--wait-secs",
+        dest="wait_secs",
+        type=int,
+        metavar="SECS",
+        default=None,
+        help=(
+            "Health-wait budget in seconds before `pod up` gives up on the "
+            "gateway answering /api/health (default: 90; a first boot does "
+            "migration and staging work, so slow hosts may need more). Also "
+            "settable via KIROCREW_POD_HEALTH_SECS; the flag wins. Values "
+            "below 5 are raised to 5, values above 3600 are capped at 3600."
         ),
     )
     pod_down = pod_sub.add_parser("down", help="Evict a pod (zero residue)")
@@ -1589,6 +2043,59 @@ Examples:
     pod_token.add_argument("--ttl", default="2h", help="Token TTL (default: 2h)")
     pod_url = pod_sub.add_parser("url", help="Print a pod's base URL")
     pod_url.add_argument("name", help="Worktree name")
+    pod_scenarios = pod_sub.add_parser(
+        "scenarios",
+        help="List the seed scenarios `pod up --seed <scenario>` accepts",
+    )
+    pod_scenarios.add_argument("--json", action="store_true", help="Emit rows as JSON")
+    pod_api = pod_sub.add_parser(
+        "api",
+        help="Call a running pod's HTTP API with its own token",
+        description=(
+            "Make one authenticated request against a running pod and print a "
+            "fixed-key JSON document: {name, method, path, status, ok, body}. "
+            "GET and HEAD are permitted by default; other methods require "
+            "--allow-write."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  kirocrew pod api my-wt GET sessions\n"
+            "  kirocrew pod api my-wt GET /api/health\n"
+            '  kirocrew pod api my-wt POST config --data \'{"key":"agent.model"}\' '
+            "--allow-write\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    pod_api.add_argument("name", help="Worktree name")
+    pod_api.add_argument(
+        "method",
+        # No `choices=`: argparse would reject an unrecognised method with its own
+        # usage prose on stderr and exit 2, escaping the fixed-key JSON envelope
+        # this command promises on EVERY exit. `pod.runtime.pod_api` validates the
+        # method against API_METHODS and raises PodError, which the envelope
+        # reports as a status-0 document an agent can parse. `type=str.upper` stays
+        # so a lowercase method still normalises.
+        type=str.upper,
+        metavar="METHOD",
+        help="HTTP method: GET, HEAD, POST, PUT, PATCH or DELETE (case-insensitive)",
+    )
+    pod_api.add_argument(
+        "path",
+        help=(
+            "API path; /api/ is prepended when absent. Existing query parameters "
+            "are preserved, but caller-supplied token parameters are refused."
+        ),
+    )
+    pod_api.add_argument(
+        "--data",
+        default="",
+        help="Request body, sent verbatim as application/json",
+    )
+    pod_api.add_argument(
+        "--allow-write",
+        action="store_true",
+        help="Permit POST, PUT, PATCH, or DELETE (off by default)",
+    )
     pod_logs = pod_sub.add_parser("logs", help="Tail a pod's journal")
     pod_logs.add_argument("name", help="Worktree name")
     pod_logs.add_argument("-n", "--lines", type=int, default=50, help="Lines to tail (default: 50)")
@@ -1621,6 +2128,12 @@ Examples:
     pod_cleanup.add_argument("name")
 
     update_parser = cli_help.add_command(sub, "update")
+    update_parser.add_argument(
+        "action",
+        nargs="?",
+        choices=["approve"],
+        help="approve: approve a pending in-app update armed from the dashboard",
+    )
     update_parser.add_argument(
         "--force",
         action="store_true",
@@ -1812,6 +2325,22 @@ Examples:
     _c_login.add_argument(
         "--no-browser", action="store_true", help="Print the device URL but don't open a browser"
     )
+    _c_login.add_argument(
+        "--identity-provider",
+        default="",
+        help="IAM Identity Center start URL (for enterprise SSO login)",
+    )
+    _c_login.add_argument(
+        "--license",
+        default="",
+        choices=["", "free", "pro"],
+        help="Kiro license tier (pro for Identity Center, free for Builder ID/social)",
+    )
+    _c_login.add_argument(
+        "--idp-region",
+        default="",
+        help="IAM Identity Center region (e.g. us-east-1), NOT the EC2 instance region",
+    )
     _c_logout = cloud_sub.add_parser(
         "logout", help="Sign kiro-cli out on the instance (to switch Kiro account)"
     )
@@ -1922,10 +2451,27 @@ Examples:
     # Mounted only for an agent whose spec grants it, so an unassigned set costs
     # a session nothing: kiro-cli loads a server only when `tools` names it.
     sub.add_parser("mcp-dashboard")
+    # mcp-work (MCP server — the conductor work ledger's four tools). Opt-in
+    # like mcp-dashboard: mounted only for an agent whose spec grants it, so a
+    # session that is neither a conductor nor a worker spends nothing on it.
+    sub.add_parser("mcp-work")
 
-    # Builtin app MCP servers (spawned by the agent backend, not user-facing)
+    # Builtin app MCP servers (spawned by the agent backend, not user-facing).
+    # Only builtins that actually ship an ``mcp_server`` module get a verb —
+    # ``_BUILTIN_NAMES`` is load-bearing for HTTP route registration and lists
+    # every builtin, so registering unconditionally would advertise commands
+    # that crash with a raw ModuleNotFoundError traceback. A builtin that
+    # gains an ``mcp_server.py`` gains its verb automatically.
+    #
+    # The probe only runs when the invocation actually names an ``mcp-*``
+    # command: registration precision is unobservable otherwise (the verbs are
+    # hidden from help/choices by hide_internal_commands, and dispatch cannot
+    # reach them), so every other command — including the gateway boot path —
+    # pays nothing for it.
+    _probe_mcp_verbs = any(_a.startswith("mcp-") for _a in sys.argv[1:])
     for _bname in _BUILTIN_NAMES:
-        sub.add_parser(f"mcp-{_bname}")
+        if not _probe_mcp_verbs or _builtin_mcp_server_available(_bname):
+            sub.add_parser(f"mcp-{_bname}")
 
     # them in the ``kirocrew-computer`` MCP server instead.
     computer_parser = cli_help.add_command(
@@ -1973,6 +2519,18 @@ Examples:
     learn_sub.add_parser("list", help="List all lessons")
     learn_rm = learn_sub.add_parser("remove", help="Remove lessons matching a substring")
     learn_rm.add_argument("query", help="Substring to match against lesson rules")
+    learn_rm.add_argument(
+        "--repo-scope",
+        dest="repo_scope",
+        default=None,
+        help=(
+            "Only remove lessons carrying this repo scope. A lesson's "
+            "identity is (rule, repo_scope), so a scoped and a global lesson can "
+            "share rule text; without this flag a matching substring removes both. "
+            "Omit to match every scope (the default). Pass an empty string to "
+            'target only the unscoped (global) rows: --repo-scope "".'
+        ),
+    )
 
     # artifact
     art_parser = cli_help.add_command(
@@ -2016,6 +2574,15 @@ Examples:
     art_save = art_sub.add_parser("save", help="Save a new artifact")
     art_save.add_argument("--name", required=True, help="Human-readable name")
     art_save.add_argument(
+        "--slug",
+        help=(
+            "Explicit slug instead of one derived from --name. A taken or "
+            "malformed slug is REFUSED, never renamed: use 'artifact update "
+            "<slug>' to version one in place. Omit to let a collision resolve "
+            "by suffixing (-2, -3, ...)"
+        ),
+    )
+    art_save.add_argument(
         "--kind",
         choices=["widget", "html", "markdown", "svg", "json", "text", "image"],
         default=None,
@@ -2044,8 +2611,18 @@ Examples:
     mem_parser = cli_help.add_command(sub, "memory")
     mem_sub = mem_parser.add_subparsers(dest="mem_action")
     mem_sub.add_parser("list", help="Show semantic memory entries")
-    mem_search = mem_sub.add_parser("search", help="Search episodic memories")
+    mem_search = mem_sub.add_parser("search", help="Search memory (vector + markdown layers)")
     mem_search.add_argument("query", help="Search query text")
+    mem_search.add_argument(
+        "--layer",
+        choices=["vector", "history", "all"],
+        default="all",
+        help=(
+            "Which memory to search: vector (episodic semantic recall), "
+            "history (keyword FTS over preferences/projects/daily history), "
+            "or all (default)"
+        ),
+    )
     mem_show = mem_sub.add_parser(
         "show", help="Show the markdown memory layer (preferences, projects, daily history)"
     )
@@ -2075,6 +2652,71 @@ Examples:
         help="Also include the markdown layer (preferences, projects, daily history)",
     )
     mem_sub.add_parser("migrate", help="Migrate legacy markdown memory to vector store")
+    mem_backup = mem_sub.add_parser("backup", help="Back up active memory stores now")
+    mem_backup.add_argument(
+        "--keep", type=int, default=None, help="How many backups to keep per store"
+    )
+    mem_backups = mem_sub.add_parser("backups", help="List memory backups, newest first")
+    mem_backups.add_argument("--store", default=None, help="Only this store")
+    mem_restore = mem_sub.add_parser("restore", help="Restore a memory store from a backup")
+    mem_restore.add_argument(
+        "--store", default=None, help="Store to restore (default: the default store)"
+    )
+    mem_restore_choice = mem_restore.add_mutually_exclusive_group()
+    mem_restore_choice.add_argument(
+        "--from",
+        dest="from_backup",
+        default=None,
+        help="Backup file to restore (default: the newest for that store)",
+    )
+    mem_restore_choice.add_argument(
+        "--cancel-pending",
+        action="store_true",
+        help="Cancel a staged memory restore without changing active memory",
+    )
+    mem_carve = mem_sub.add_parser(
+        "carve", help="Filter or count a crew store's memory by its carve facets"
+    )
+    mem_carve.add_argument(
+        "--store",
+        default=None,
+        help="Memory store to read (default: the default store, which carries no facets)",
+    )
+    # One flag per field of memory_schema.MemoryFacets, and each argparse dest IS the
+    # column name, so `_memory_carve` reads them by facet name instead of restating the
+    # list. The flag spellings and the two closed choice sets are LITERAL here rather
+    # than derived from memory_schema: this parser is built on `kirocrew gateway`'s
+    # boot path, where an import of the schema module is work every launch pays for
+    # a verb it never runs. Drift is caught instead, not prevented -- the rendered
+    # `memory carve --help` is checked against memory_schema.ALL_KINDS and
+    # GROUPABLE_COLUMNS, so a sixth axis added to the dataclass without a flag or a
+    # choice here fails that check rather than silently going unfilterable.
+    mem_carve.add_argument("--scope", default=None, help="Only rows carved to this repo scope")
+    mem_carve.add_argument("--surface", default=None, help="Only rows from this surface")
+    mem_carve.add_argument("--crew", default=None, help="Only rows this crew produced")
+    mem_carve.add_argument("--session-key", default=None, help="Only rows from this conversation")
+    mem_carve.add_argument(
+        "--derived-from", default=None, help="Only rows synthesized from this item id"
+    )
+    mem_carve.add_argument(
+        "--kind",
+        default=None,
+        choices=["directive", "fact", "episode"],
+        help="Only rows of this kind",
+    )
+    mem_carve.add_argument(
+        "--count-by",
+        default=None,
+        choices=["scope", "surface", "crew", "session_key", "derived_from", "kind"],
+        help="Report counts grouped by this axis instead of listing rows",
+    )
+    mem_carve.add_argument("--limit", type=int, default=50, help="How many rows to list")
+    mem_carve.add_argument("--offset", type=int, default=0, help="Rows to skip when listing")
+    mem_retired = mem_sub.add_parser(
+        "retired", help="List episodes a semantic write superseded, and restore one"
+    )
+    mem_retired.add_argument("--restore", dest="restore_id", default=None, help="Restore this id")
+    mem_retired.add_argument("--limit", type=int, default=20, help="How many to list")
     mem_import = mem_sub.add_parser("import", help="Import memory from JSON file")
     mem_import.add_argument("file", help="Path to JSON file (export format)")
 
@@ -2086,12 +2728,23 @@ Examples:
     agent_create.add_argument("--name", required=True, help="Agent name")
     agent_create.add_argument("--kiro-agent", default="kirocrew", help="Kiro agent name")
     agent_create.add_argument("--workspace", default="default", help="Workspace name")
-    agent_create.add_argument("--memory-store", default="default", help="Memory store name")
+    agent_create.add_argument(
+        "--memory-store",
+        default="default",
+        help="Compatibility flag; private memory is allocated automatically",
+    )
     agent_update = agent_sub.add_parser("update", help="Update a Kiro Crew agent")
     agent_update.add_argument("name", help="Agent name to update")
     agent_update.add_argument("--kiro-agent", help="New kiro agent name")
     agent_update.add_argument("--workspace", help="New workspace name")
-    agent_update.add_argument("--memory-store", help="New memory store name")
+    agent_update.add_argument(
+        "--memory-store", help="Existing memory store identity (cannot be changed)"
+    )
+    agent_update.add_argument(
+        "--provision-memory",
+        action="store_true",
+        help="Initialize empty private V2 memory for a legacy member; never copies V1",
+    )
     agent_delete = agent_sub.add_parser("delete", help="Delete a Kiro Crew agent")
     agent_delete.add_argument("name", help="Agent name to delete")
     agent_reset_model = agent_sub.add_parser(
@@ -2176,10 +2829,25 @@ Examples:
     app_info = app_sub.add_parser("info", help="Show app details")
     app_info.add_argument("name", help="App name")
     app_dev = app_sub.add_parser(
-        "dev", help="Toggle dev mode (no-store UI serving + live reload on file change)"
+        "dev",
+        help="Toggle dev mode (no-store UI serving + live reload on file change)",
+        # No flag abbreviations: --confirm-out-of-install-root is the
+        # operator's out-of-install attestation and the builtin agent deny
+        # rule matches its LITERAL text, so an accepted abbreviation
+        # (`--confirm`, `--c`) would sail past the rule and let an agent
+        # shell self-supply the attestation. Only the exact flag parses.
+        allow_abbrev=False,
     )
     app_dev.add_argument("name", help="App name")
     app_dev.add_argument("--off", action="store_true", help="Turn dev mode off")
+    app_dev.add_argument(
+        "--confirm-out-of-install-root",
+        action="store_true",
+        help=(
+            "Confirm enabling dev mode on a ui root that resolves outside the "
+            "app's install directory (e.g. a ui/ symlinked to your source tree)"
+        ),
+    )
     app_init = app_sub.add_parser("init", help="Scaffold a new app")
     app_init.add_argument("name", help="App name (kebab-case)")
     app_init.add_argument("--dir", default=".", help="Output directory (default: current)")
@@ -2197,6 +2865,9 @@ Examples:
   kirocrew config get agent.provider    # Get a specific value
   kirocrew config set dashboard.url http://localhost:5476
   kirocrew config edit                  # Open in $EDITOR
+  kirocrew config defaults              # Stored values holding a superseded default
+  kirocrew config defaults --adopt      # Take the current defaults for all of them
+  kirocrew config defaults --keep session.autocompact_pct   # Affirm one as intentional
 
 The dashboard port is set with the KIROCREW_PORT env var, not a config key.
 """,
@@ -2215,6 +2886,26 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         help="Save to config.local.json (persists across upgrades)",
     )
     cfg_sub.add_parser("edit", help="Open config in $EDITOR")
+    cfg_defaults = cfg_sub.add_parser(
+        "defaults",
+        help="Review stored values that still hold a superseded default",
+    )
+    cfg_defaults.add_argument(
+        "keys",
+        nargs="*",
+        help="Limit to these dotted keys (default: every drifted key)",
+    )
+    _cfg_def_mode = cfg_defaults.add_mutually_exclusive_group()
+    _cfg_def_mode.add_argument(
+        "--adopt",
+        action="store_true",
+        help="Remove the stored keys so the current defaults apply",
+    )
+    _cfg_def_mode.add_argument(
+        "--keep",
+        action="store_true",
+        help="Record the stored values as intentional and stop reporting them",
+    )
 
     environment_parser = cli_help.add_command(sub, "environment")
     environment_sub = environment_parser.add_subparsers(dest="environment_action")
@@ -2288,7 +2979,6 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
     # which call config_dir(). Skipped for the seed path above, which set up its
     # own $KIROCREW_HOME (an override → migration is a no-op there anyway).
     ensure_data_home()
-
     # Console + gateway.log logging. Extracted to a helper because the
     # detach-spawned gateway needs double-write protection (stderr IS
     # gateway.log in that mode) — see _setup_cli_logging.
@@ -2360,6 +3050,14 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         # DashboardContributor.start_services (which never fires for `token`
         # and only inside gateway async startup). Public default = no checks.
         run_preflight_checks()
+        # Under the desktop shell this process inherited Electron's Crashpad
+        # exception port, and so would every child it spawns (kiro-cli, MCP
+        # servers, and whatever THEY run). Their crashes would then land in
+        # OUR Crashpad database as foreign dumps nobody prunes. Cleared here,
+        # before the first child, so children fall back to the OS default.
+        from kiro_crew.crashpad_inherit import detach_inherited_crash_handler
+
+        detach_inherited_crash_handler()
         # Enable faulthandler for the long-lived gateway process: it makes
         # `kill -ABRT <pid>` dump every thread's stack to stderr (the gateway
         # log) on demand, and it is the signal the dashboard's stall watchdog
@@ -2371,7 +3069,7 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         # The asyncio loop handler is installed later inside run().
         _install_crash_guard()
         gw_kwargs = _resolve_gateway_args(args)
-        # Deferred imports (issue #3504): ``dashboard.state`` pulls
+        # Deferred imports: ``dashboard.state`` pulls
         # vector_memory → numpy (~56 MB) and ``cli_server`` pulls
         # slack.gateway (~549 ms) — only the gateway command needs either,
         # so no other subcommand (and no MCP stdio server) pays for them.
@@ -2409,7 +3107,18 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
             whatsapp=getattr(args, "whatsapp", False),
         )
     elif args.command == "doctor":
-        _doctor(platform_boot_error=_platform_boot_error, bundle=getattr(args, "bundle", False))
+        _doctor(
+            platform_boot_error=_platform_boot_error,
+            bundle=getattr(args, "bundle", False),
+        )
+    elif args.command == "ledger-sweep":
+        # Lazy on purpose, through ``importlib`` like ``secrets`` above: the
+        # store modules behind the sweep are not part of the CLI's start-up cost.
+        importlib.import_module("kiro_crew.ledger_sweep").run_command(
+            purge=args.purge,
+            older_than_days=args.older_than_days,
+            purge_unreadable=args.purge_unreadable,
+        )
     elif args.command == "manifest":
         _manifest(
             alias=getattr(args, "alias", None),
@@ -2457,9 +3166,20 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         # below: `kirocrew gateway` boots through this module, and a default-off
         # optional subsystem must not be imported to start it.
         importlib.import_module("kiro_crew.mcp_dashboard").run_mcp_server()
+    elif args.command == "mcp-work":
+        # Same importlib form and the same reason as mcp-dashboard above: a
+        # default-off optional subsystem must not be imported to start the gateway.
+        importlib.import_module("kiro_crew.mcp_work").run_mcp_server()
     elif args.command.startswith("mcp-") and args.command[4:] in _BUILTIN_NAMES:
-        _mod = importlib.import_module(f"kiro_crew.apps.builtins.{args.command[4:]}.mcp_server")
-        _mod.run_mcp_server()
+        # Registration gates this verb on _builtin_mcp_server_available, and
+        # _run_app_mcp_server is the ONE dispatch-time spelling of "import the
+        # builtin's mcp_server and run it or refuse cleanly" — the same helper
+        # the `kirocrew app mcp <name>` manifest path uses (clean stderr line +
+        # exit 1 on ImportError or a missing run_mcp_server entrypoint), so an
+        # unresolvable module cannot reach a raw traceback here.
+        from kiro_crew.cli_commands import _run_app_mcp_server
+
+        _run_app_mcp_server(args.command[4:])
     elif args.command == "computer":
         # Deferred import: ``computer_use.cli`` reaches the driver seam, and the
         # macOS driver loads native frameworks on first use. Keeping it out of
@@ -2490,14 +3210,27 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         _policy(args)
     elif args.command == "knowledge":
         _knowledge(args)
+    elif args.command == "secrets":
+        # Dispatch through the module-level `importlib` rather than a
+        # function-local `from kiro_crew.cli_commands import …`: the latter trips
+        # the `top-level-imports` lint, while a module-scope import of
+        # `cli_commands` is deliberately avoided (it costs ~556 ms
+        # on every CLI start). `importlib.import_module` keeps the load lazy AND
+        # satisfies the linter.
+        importlib.import_module("kiro_crew.cli_commands")._handle_secrets(args)
     elif args.command == "pod":
         from kiro_crew.cli_commands import _pod
 
         _pod(args)
     elif args.command == "update":
-        from kiro_crew.cli_server import _update
+        if getattr(args, "action", None) == "approve":
+            from kiro_crew.cli_server import _update_approve
 
-        _update(force=args.force)
+            _update_approve()
+        else:
+            from kiro_crew.cli_server import _update
+
+            _update(force=args.force)
     elif args.command == "stop":
         from kiro_crew.cli_server import _stop
 
@@ -2584,7 +3317,7 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
 # ── Config ──
 
 
-# NOTE (issue #3504): ``cli_commands`` and ``cli_server`` are deliberately NOT
+# NOTE: ``cli_commands`` and ``cli_server`` are deliberately NOT
 # imported at module scope. ``cli_commands`` costs ~556 ms and ``cli_server``
 # ~549 ms (it pulls ``slack.gateway``), and the MCP stdio servers
 # (``kirocrew mcp-core`` / ``mcp-cron`` / ``mcp-computer``) — which dispatch

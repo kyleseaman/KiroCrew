@@ -17,6 +17,7 @@ Tools:
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import os
 import platform
@@ -28,13 +29,14 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from kiro_crew import platform_compat
 from kiro_crew.agent_discovery import list_agents
-from kiro_crew.autonudge import binding_key_for
+from kiro_crew.autonudge import binding_key_for, structured_monitor_binding_key_for
 from kiro_crew.config.loader import (
     KiroCrewConfig,
     config_dir,
@@ -48,26 +50,31 @@ from kiro_crew.history import _SEARCH_SCAN_WINDOW as SEARCH_SCAN_WINDOW
 from kiro_crew.history import ConversationLog, is_incognito_transcript, snippet_needles
 from kiro_crew.knowledge.dedup import dedup_sweep
 from kiro_crew.knowledge.embedder import create_embedder_from_config
-from kiro_crew.knowledge.retrieval import HybridRetriever
+from kiro_crew.knowledge.retrieval import HybridRetriever, vector_leg
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.loopback_http import loopback_urlopen
-from kiro_crew.mcp_caller import current_caller
+from kiro_crew.mcp_caller import CallerContext, current_caller, set_current_caller
 from kiro_crew.mcp_shared import (
     call_tool_with_logging,
     internal_caller,
+    member_proof_header_value,
     run_mcp_stdio_loop,
 )
 from kiro_crew.mcp_tools import build_tool_list, dispatch
 from kiro_crew.members import record_activity
+from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging.link import is_legacy_slack_key, legacy_key
 from kiro_crew.platform import redact_via_context as redact
-from kiro_crew.port_resolution import resolve_client_port_src
+from kiro_crew.port_resolution import port_is_gateway_owned, resolve_client_port_src
 from kiro_crew.security import (
     redact_credentials,
     redact_exfiltration_urls,
+    redact_local_paths,
 )
 from kiro_crew.sel import sel
+from kiro_crew.session_directive import DIRECTIVE_TOOLS, refuse_if_markerless
 from kiro_crew.skills import SkillsLoader
+from kiro_crew.trigger_match import rank_triggered
 from kiro_crew.validation import (
     MCP_CORE_SCHEMAS,
     validate_tool_args,
@@ -88,6 +95,7 @@ _HANDLER_SURFACE = (
     sel,
     summarize_result,
     time,
+    vector_leg,
 )
 
 
@@ -299,6 +307,136 @@ def _invalidate_api_base() -> None:
     _API_PORT = None
     _API = None
     _API_UNIX_SOCKET = None
+
+
+def _replay_target(refused_base: str) -> tuple[str, str] | None:
+    """The fresh ``(base, socket_path)`` to replay a refused request to, or ``None``.
+
+    THE replay rule, owned here. A refused connection usually means the resolved
+    base is stale — the gateway came up, or moved, after this tool server booted,
+    and the new port is recorded only in the run marker — so one re-resolution
+    and one replay are worth it. Two conditions end the attempt instead, and both
+    answer ``None``:
+
+    * the re-resolution fell through to the DEFAULT port, which is no evidence at
+      all. A listener there could be any local process, and the request carries
+      the internal secret; the replay exists to chase POSITIVE evidence of a
+      moved gateway, so a no-evidence fall-through never gets to dial.
+    * the re-resolution named the base that was just refused. Replaying an
+      unchanged dead port only doubles the caller's latency to reach the
+      identical failure, and nothing was handed to a live gateway — so the
+      caller's first-attempt error stands as a definite rejection.
+
+    Both halves of the returned pair come from the very resolution whose source
+    was checked (same shape as :func:`_resolve_api_target`): re-resolving again
+    could race a marker disappearing between the check and the dial, and
+    deriving the socket separately let the replay's two transports name
+    different gateways. It is always a FRESH pair, never the refused one — the
+    ownership proof is per attempt.
+
+    Callers keep their own error wording; this owns only the rule, so the two
+    request paths (:func:`_send` and ``mcp_computer._invoke``) cannot drift on
+    when a replay is allowed. ``None`` means "do not replay", not "report this
+    particular text".
+    """
+    _invalidate_api_base()
+    port, source = _resolve_api_port()
+    if source == "default":
+        return None
+    base = f"http://127.0.0.1:{port}"
+    if base == refused_base:
+        return None
+    return base, _socket_path_for(port)
+
+
+def _secret_for_base(base: str) -> str:
+    """The internal-API credential belonging to the gateway on *base*.
+
+    ``read_local_secret`` resolves per LISTENER (``run/gateway-<port>.secret``)
+    before the shared file, because the credential identifies ONE gateway
+    GENERATION — its docstring is explicit that authenticating for a different
+    generation than the one owning the dialled port earns a 403 on every
+    internal call. A restarted gateway is a new generation, so a retry that
+    re-proves the target must re-read the credential for it too; carrying the
+    pre-restart secret is the desync that helper exists to close.
+
+    The port comes from the base being dialled rather than a fresh resolution,
+    so the credential and the target cannot name different gateways.
+    """
+    try:
+        return read_local_secret(int(base.rsplit(":", 1)[-1]))
+    except Exception:
+        return ""
+
+
+def _reverify_refused_target(refused_base: str) -> tuple[str, str] | None:
+    """The FRESH pair for *refused_base*, or ``None`` if it is no longer proven.
+
+    :func:`_replay_target`'s sibling, and the inverse test. That one answers
+    "has the gateway MOVED, so is there a new base worth dialling"; this one
+    answers "does re-resolution still positively identify the SAME base, so is
+    re-dialling it still addressed to the gateway proved to own it".
+
+    Why a same-base retry needs this at all: the ownership proof is per
+    ATTEMPT, not per process (see :func:`_resolve_api_target`). A marker
+    resolution is never pinned precisely because the gateway can exit and
+    something else can take the port — and a retry that SLEEPS first is exactly
+    that window. Re-dialling the cached pair would hand the internal secret and
+    the session key to whatever now listens there, which is the same exposure
+    the ``source == "default"`` rule above refuses, for the same reason.
+
+    Three outcomes answer ``None``, so the caller stops instead of dialling:
+
+    * the re-resolution fell through to the DEFAULT port — no evidence at all,
+      so the listener could be any local process.
+    * the re-resolution names a DIFFERENT base. The gateway moved mid-backoff,
+      so the refused base is no longer owned and this retry is over. Chasing the
+      new base is :func:`_replay_target`'s job on the caller's next attempt, not
+      a second replay smuggled into a retry loop.
+    * the port is not PROVEN to be held by this user's gateway. The source
+      label alone cannot carry that proof: ``KIROCREW_BOUND_PORT`` is
+      inherited process state naming the gateway that SPAWNED us, exported
+      once its site was listening (``dashboard.server._export_bound_port``),
+      and it ranks above the marker step — so ``bound``, not ``marker``, is
+      the source for every gateway-spawned process, and it is never
+      ownership-checked. A refusal is affirmative evidence the previous owner
+      is gone, and a retry that SLEEPS first is exactly the window in which
+      another local user can rebind the port, so the proof is re-earned here
+      via :func:`port_is_gateway_owned` before the secret is dialled anywhere.
+      A ``marker`` resolution already ran that proof inside its own step, so it
+      is not re-run for one.
+
+    Gating on the proof rather than on a list of trusted labels is deliberate.
+    Trusting ``bound`` because it is "stable for the process lifetime" (which is
+    what :data:`_STABLE_PORT_SOURCES` means, and all it means) confuses a value
+    that does not change with a gateway that is still there; refusing it instead
+    would have disabled this retry for the deployment it exists to serve, since
+    ``bound`` is the only source that ever fires there. Verifying the port keeps
+    the retry working when the gateway really did come back on it, and refuses
+    only when something else answers.
+
+    On non-POSIX the proof denies outright, so the retry is unavailable rather
+    than approximated — the same trade :func:`_gateway_owns_port` already makes
+    for marker discovery, and for the same reason: the file-permission argument
+    that carries it does not hold there. ``--port`` / ``KIROCREW_PORT`` users on
+    Windows get the actionable exhaustion message instead of a silent re-dial.
+
+    Both halves of the returned pair come from the one resolution whose source
+    was checked, keeping :func:`_resolve_api_target`'s "both transports derive
+    from one resolution" invariant.
+    """
+    _invalidate_api_base()
+    port, source = _resolve_api_port()
+    if source == "default":
+        return None
+    base = f"http://127.0.0.1:{port}"
+    if base != refused_base:
+        return None
+    # Cheapest checks first: the two above are string work, this one forks a
+    # port lookup, and it is only worth paying when a dial is otherwise due.
+    if source != "marker" and not port_is_gateway_owned(port):
+        return None
+    return base, _socket_path_for(port)
 
 
 # How often a sleeping `wait` polls /api/session-keepalive.
@@ -584,6 +722,11 @@ def _resolve_session_key() -> str:
     ctx = current_caller()
     if ctx is not None and ctx.session_key:
         return ctx.session_key
+    from kiro_crew.member_memory_auth import protected_member_session_for_pid
+
+    protected = protected_member_session_for_pid(os.getpid())
+    if protected is not None:
+        return protected
     sk = os.environ.get("KIROCREW_SESSION_KEY", "")
     if sk:
         return sk
@@ -662,6 +805,11 @@ def _resolve_session_key_strict() -> str:
     ctx = current_caller()
     if ctx is not None and ctx.session_key:
         return ctx.session_key
+    from kiro_crew.member_memory_auth import protected_member_session_for_pid
+
+    protected = protected_member_session_for_pid(os.getpid())
+    if protected is not None:
+        return protected
     sk = os.environ.get("KIROCREW_SESSION_KEY", "")
     if sk:
         return sk
@@ -674,6 +822,106 @@ def _resolve_session_key_strict() -> str:
     except Exception:
         pass
     return ""
+
+
+def strict_identity_diagnosis(server: str = "kirocrew-core") -> str:
+    """Return the machine-specific reason strict identity is unavailable, or "".
+
+    Every strict refusal already says *what* was refused; none of them says why
+    THIS install cannot answer "which session is calling", so the reader has no
+    next step. This inspects the same three sources
+    :func:`_resolve_session_key_strict` accepts and names the missing channel.
+
+    The distinction that matters to an operator: on the kiro backend a session's
+    kiro-cli process is an ``AcpRuntime``, which is deliberately
+    session-UNBOUND (one process multiplexes N sessions, so it cannot carry a
+    single session's key in its environment — ``acp/runtime.py`` injects none).
+    The gateway's per-call caller injection is therefore the ONLY identity
+    channel for that backend, and it exists only for servers listed in
+    ``mcp_gateway.stub_servers``. An unrouted server on kiro has no channel at
+    all, which is a topology gap an operator can close in one line — not a bug
+    in the calling session.
+
+    Returns "" when identity IS resolvable (the caller should not be refusing),
+    so a caller can append this unconditionally.
+    """
+    if _resolve_session_key_strict():
+        return ""
+    if os.environ.get("KIROCREW_HOST_PID", "").isdigit():
+        # The sandbox launcher declared a host pid, so the channel exists and
+        # the sidecar is what failed — a signing/trust-root problem, not routing.
+        return (
+            f" No identity channel: the signed pid mapping for this session did not "
+            f"verify. Check `kirocrew doctor` (trust root) — {server} does not need "
+            f"routing when this channel works."
+        )
+    return (
+        f" No identity channel on this install: {server} is not in "
+        f"mcp_gateway.stub_servers, so the gateway injects no per-call caller, and "
+        f"the kiro backend's AcpRuntime is session-unbound (it carries no session "
+        f"key in its environment by design). Route {server} from MCP Management "
+        f"(or add it to mcp_gateway.stub_servers and restart) to give this session "
+        f"a verifiable identity. `kirocrew doctor` reports the same check."
+    )
+
+
+#: The REFLEXIVE tool surface: every module whose MCP tools embed "my session"
+#: in their semantics (ledger writes, monitor loops, session-scoped control,
+#: attributed channel sends, crew/app state, cron ownership). These operations
+#: resolve the caller STRICTLY through :func:`require_strict_session_key`, never
+#: the lenient resolver whose ``/proc`` ancestor walk can return a parent slot.
+#: Shared protocol-log access is conditional: private memory boundaries require
+#: strict Global identity; pure V1 keeps read-only diagnostics attribution.
+#: The registry includes every module with a strict operation. This is data:
+#: ``test/test_identity_topology.py`` scans the source tree and fails when a
+#: module calls the strict resolver directly (bypassing the gate) or calls the
+#: gate without being registered here, so the NEXT reflexive tool cannot skip
+#: the gate silently. Paths are relative to ``src/kiro_crew``.
+REFLEXIVE_TOOL_MODULES: frozenset[str] = frozenset(
+    {
+        "mcp_computer.py",
+        "mcp_cron.py",
+        "mcp_dashboard.py",
+        "mcp_work.py",
+        "mcp_tools/apps.py",
+        "mcp_tools/control.py",
+        "mcp_tools/learn.py",
+        "mcp_tools/ledger.py",
+        "mcp_tools/logs.py",
+        "mcp_tools/messaging.py",
+        "mcp_tools/sessions.py",
+        "mcp_tools/workflows.py",
+    }
+)
+
+
+def require_strict_session_key(refusal: str, server: str = "kirocrew-core") -> tuple[str, str]:
+    """The ONE fail-closed identity gate every reflexive tool routes through.
+
+    Returns ``(key, "")`` when the caller is strictly identified, and
+    ``("", error)`` otherwise, where ``error`` is the caller-supplied
+    ``refusal`` text with :func:`strict_identity_diagnosis` appended so the
+    operator learns why THIS install cannot answer "which session is calling".
+
+    Resolution is :func:`_resolve_session_key_strict` — gateway-injected
+    caller context, ``KIROCREW_SESSION_KEY``, or the HMAC-verified host-pid
+    sidecar; never the lenient ``/proc`` ancestor walk, under which a subagent
+    resolves to its PARENT slot and could read or mutate the parent's state.
+
+    The tuple shape is deliberate: each call site keeps its own arm. Most
+    refuse with the ``error`` half; tools that legitimately degrade instead
+    (``autonudge_stop`` short-circuits, ``ask_question`` gates on the
+    dashboard surface, computer-use falls back to an unresolved placeholder)
+    use the resolve half only and ignore ``error``. What no call site may do
+    is resolve identity for a reflexive tool through anything but this gate —
+    the ratchet test over :data:`REFLEXIVE_TOOL_MODULES` enforces exactly
+    that. Callers must send the KEY THIS GATE RETURNED on the wire:
+    re-resolving at the write would check one identity and act as another.
+    """
+    sk = _resolve_session_key_strict()
+    if sk:
+        return sk, ""
+    return "", refusal + strict_identity_diagnosis(server)
 
 
 def _deny_channel_agent_messaging(caller_session: str, tool_name: str) -> str | None:
@@ -840,7 +1088,9 @@ def _vet_browse_governance(caller_session: str) -> str | None:
         return None
 
 
-def _vet_channel_governance(caller_session: str, transport: str) -> str | None:
+def _vet_channel_governance(
+    caller_session: str, transport: str, tool_name: str = "send_message"
+) -> str | None:
     """Return a denial reason if governance forbids messaging *via transport*.
 
     The ``channels`` scope (a ScopedMap) is the per-transport allowlist: which
@@ -850,8 +1100,14 @@ def _vet_channel_governance(caller_session: str, transport: str) -> str | None:
     generally but restrict it to specific transports (e.g. Slack only).  We
     query the ScopedMap ``members`` allowlist for *transport*.  ``posture`` (the
     per-transport identity ceiling, policy-only) is enforced at the transport's
-    own admission path, not here.  Same stdio-silent, fail-closed-CPP discipline
-    as :func:`_vet_messaging_governance`.
+    own admission path, not here.
+
+    ``tool_name`` attributes the SEL audit records (denial / degraded) to the
+    actual calling tool — the gate is shared by ``send_message`` and
+    ``update_message``, and the persisted audit trail must name the real caller.
+
+    Same stdio-silent, fail-closed-CPP discipline as
+    :func:`_vet_messaging_governance`.
     """
     from kiro_crew.platform.context import PlatformCompositionError
 
@@ -867,9 +1123,7 @@ def _vet_channel_governance(caller_session: str, transport: str) -> str | None:
             log_warning=False,
         )
         if not getattr(decision, "permitted", True):
-            _audit_governance_deny(
-                caller_session, f"send_message:{transport}", "channels", decision
-            )
+            _audit_governance_deny(caller_session, f"{tool_name}:{transport}", "channels", decision)
             return f"messaging via transport {transport!r} blocked by governance policy"
         return None
     except PlatformCompositionError:
@@ -880,7 +1134,7 @@ def _vet_channel_governance(caller_session: str, transport: str) -> str | None:
             from kiro_crew.platform.governance_profiles import audit_governance_degraded
 
             audit_governance_degraded(
-                f"send_message:{transport}",
+                f"{tool_name}:{transport}",
                 session_key=caller_session,
                 scope="channels",
                 app=_governance_app(),
@@ -997,20 +1251,36 @@ def _session_key_header_error(sk: str) -> str | None:
 
 
 def _caller_header() -> dict[str, str]:
-    """``X-Internal-Caller`` for this process, when it has declared one.
+    """Component attribution plus this invocation's private-member authority.
 
     MCP stdio servers declare their component name via
     ``mcp_shared.set_internal_caller`` (done centrally in
     ``run_mcp_stdio_loop``), and every loopback request from these helpers
     carries it so the gateway's audit log can attribute an internal write to
     the actual component instead of inferring "some internal caller" from the
-    secret's mere presence (#3503). Attribution only — the gateway
+    secret's mere presence. Attribution only — the gateway
     authenticates on ``X-Internal-Secret`` and validates this name against a
     known set before trusting it into an audit line. Processes that never
     declared an identity (CLI, tests) send no header rather than a guess.
+
+    A pooled backend additionally forwards the current caller's short-lived
+    member proof. It is independent of component attribution and is verified
+    against the live runtime binding by the private-memory HTTP authorizer.
     """
+    from kiro_crew.mcp_caller import current_caller
+    from kiro_crew.member_memory_auth import PROOF_HEADER
+
     name = internal_caller()
-    return {"X-Internal-Caller": name} if name else {}
+    headers = {"X-Internal-Caller": name} if name else {}
+    caller = current_caller()
+    if caller is not None and caller.from_gateway and caller.member_memory_proof:
+        # Only this invocation's gateway-minted proof may cross the pooled
+        # backend boundary. Environment and process-lifetime identity caches do
+        # not establish member authority. Malformed metadata earns no header.
+        proof = member_proof_header_value(caller.member_memory_proof)
+        if proof:
+            headers[PROOF_HEADER] = proof
+    return headers
 
 
 def _transport_failure(message: str, mark: bool) -> dict:
@@ -1029,6 +1299,36 @@ def _transport_failure(message: str, mark: bool) -> dict:
     return out
 
 
+# Extra attempts a REFUSED target gets, and the pause before each.
+#
+# A refusal is the one failure where nothing reached the gateway, so re-dialling
+# the identical request cannot double-execute a verb — that invariant is what
+# makes this retry legal (see ``_retry_refused`` inside :func:`_send`). Two extra
+# dials, pausing ~250ms then ~500ms, cover the sub-second window in which a
+# restarting gateway is rebinding its port, without making a genuinely-down
+# gateway feel hung.
+_REFUSED_RETRY_BACKOFFS: tuple[float, ...] = (0.25, 0.5)
+
+
+def _refused_message(refused_base: str, exc: BaseException) -> str:
+    """Actionable text for a base that refused every attempt.
+
+    A bare ``<urlopen error [Errno 61] Connection refused>`` tells the caller
+    nothing it can act on, so name the address that was dialled and the likely
+    reason (the gateway is down, or restarting) together with the advice that
+    follows from it. The raw error is appended so the original diagnostic
+    survives for a bug report.
+
+    The address comes from the base that was actually refused; re-resolving here
+    would name a port nobody dialled.
+    """
+    host = refused_base.split("//", 1)[-1].rstrip("/") or refused_base
+    return (
+        f"Kiro Crew gateway not reachable on {host} — it may be down or "
+        f"restarting; retry shortly ({exc})"
+    )
+
+
 def _send(
     path: str,
     *,
@@ -1038,25 +1338,108 @@ def _send(
     timeout: float = 30,
     mark_transport_error: bool = False,
 ) -> dict:
-    """Send one gateway request, re-resolving the base once if it is refused.
+    """Send one gateway request, recovering from a refused connection.
 
-    A refused connection usually means the resolved base is stale: the gateway
-    came up, or moved to another port, after this tool server booted, and that
-    port is recorded only in the run marker. The replay runs only when
-    re-resolution actually produced a different base — retrying an unchanged
-    dead port just doubles the caller's latency to reach the identical failure.
+    Two layers, in order. A refused connection may mean the resolved base is
+    stale: the gateway came up, or moved to another port, after this tool server
+    booted, and that port is recorded only in the run marker — so the base is
+    re-resolved and the request replayed once, but only when re-resolution
+    actually produced a different base (the rule lives in
+    :func:`_replay_target`). When there is no moved gateway to chase, the base
+    that refused is the only candidate, and a gateway RESTARTING on its own port
+    lands there: it gets a short bounded retry of the same target
+    (``_retry_refused``) before the caller is told, actionably, that the gateway
+    is unreachable.
 
-    Every verb goes through here. Keeping the replay in one place is what stops
+    Every verb goes through here. Keeping both layers in one place is what stops
     PATCH-shaped calls from staying pinned to a base that POST already learned
     was wrong.
     """
 
-    def _once(target: tuple[str, str]) -> dict:
+    def _once(target: tuple[str, str], hdrs: dict[str, str] | None = None) -> dict:
         base, socket_path = target
-        req = urllib.request.Request(f"{base}{path}", data=data, headers=headers, method=method)
+        req = urllib.request.Request(
+            f"{base}{path}", data=data, headers=hdrs if hdrs is not None else headers, method=method
+        )
         # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- URL is the loopback gateway (_resolve_api_target(): 127.0.0.1 plus a port from config/env or a run-marker whose ownership is re-verified per request) + a fixed internal path; never user-controlled  # noqa: E501
         with _api_urlopen(req, timeout=timeout, unix_socket_path=socket_path) as resp:
             return json.loads(resp.read())
+
+    def _refreshed_headers(base: str) -> dict[str, str]:
+        """*headers* with the credential re-read for *base*, caller's dict intact.
+
+        A copy, never an in-place edit: ``headers`` belongs to the caller and is
+        reused for its own error reporting. An unreadable secret leaves the
+        original value rather than sending an empty one, so a transient read
+        failure cannot turn a retry into a guaranteed 403.
+        """
+        fresh = dict(headers)
+        secret = _secret_for_base(base)
+        if secret:
+            fresh["X-Internal-Secret"] = secret
+        return fresh
+
+    def _retry_refused(refused: tuple[str, str], refusal: urllib.error.URLError) -> dict:
+        """Re-dial the SAME refused target a few times, then report it actionably.
+
+        A refusal is the one failure that is safe to replay: the connect itself
+        never completed, so nothing was handed to the gateway and the request
+        cannot have been executed — an identical retry therefore cannot
+        double-execute a verb. That invariant is why this loop retries ONLY
+        ``ConnectionRefusedError`` / ``socket.gaierror``; every other failure
+        keeps its existing route, because an ``HTTPError`` carries a real
+        response and any post-connect failure leaves acceptance undetermined,
+        and spawn_run's reconcile depends on that ambiguity being reported
+        rather than retried.
+
+        The window this covers is a gateway restarting on its own port, which
+        :func:`_replay_target` deliberately declines to chase — there is no
+        moved base to find, so before this the caller got the raw errno with no
+        retry at all. On exhaustion it gets the port and the restart hypothesis
+        instead, with the raw error appended.
+
+        Sleeping does NOT let the target go unproven. The ownership proof is per
+        ATTEMPT, so every re-dial re-resolves through
+        :func:`_reverify_refused_target` and proceeds only while positive
+        evidence still names this same base — otherwise the port could have been
+        taken by another local process during the backoff, and the retry would
+        hand it the internal secret.
+
+        A check that cannot prove the target consumes one step of the budget
+        rather than ending it. "Not proven" is the EXPECTED reading mid-restart:
+        between the old process releasing the port and the new one binding it
+        nothing is listening, so no ownership can be shown — and that is the very
+        window this retry exists to cover. Abandoning the schedule on the first
+        such reading would have limited recovery to a gateway that rebinds inside
+        the FIRST backoff, discarding the longer half of the budget for the case
+        it was sized for. The schedule stays the bound: when the last step is
+        still unproven, the caller gets the same actionable message as a
+        dialled-and-refused exhaustion.
+        """
+        for backoff in _REFUSED_RETRY_BACKOFFS:
+            time.sleep(backoff)
+            # Re-prove ownership AFTER the sleep, never before it: the whole
+            # point is that the gateway may have gone during the pause.
+            proven = _reverify_refused_target(refused[0])
+            if proven is None:
+                # Spend the next step rather than the whole schedule: a gateway
+                # part-way through rebinding is unprovable but about to be back.
+                continue
+            # The target was re-proven; the CREDENTIAL has to be re-read for it
+            # too. A gateway that restarted on this port is a new generation with
+            # a new per-listener secret, so replaying the header this request was
+            # built with would earn a 403 instead of the retry this exists for.
+            try:
+                return _once(proven, _refreshed_headers(proven[0]))
+            except urllib.error.HTTPError as exc:
+                return _http_error_body(exc)
+            except urllib.error.URLError as exc:
+                if not isinstance(exc.reason, (ConnectionRefusedError, socket.gaierror)):
+                    return _transport_failure(str(exc), mark_transport_error)
+                refusal = exc
+            except Exception as exc:
+                return _transport_failure(str(exc), mark_transport_error)
+        return {"error": _refused_message(refused[0], refusal)}
 
     # ONE resolution for this attempt; both transports derive from it.
     target = _resolve_api_target()
@@ -1072,34 +1455,28 @@ def _send(
     except urllib.error.URLError as e:
         if not isinstance(e.reason, (ConnectionRefusedError, socket.gaierror)):
             return _transport_failure(str(e), mark_transport_error)
-        _invalidate_api_base()
-        retry_port, retry_source = _resolve_api_port()
-        if retry_source == "default":
-            # Re-resolution produced NO evidence — the default port is an
-            # unverified guess, and a listener there could be any local
-            # process. Replaying would hand it the internal secret and the
-            # request payload; the replay exists to chase POSITIVE evidence
-            # of a moved gateway, so a no-evidence fall-through ends here.
-            return {"error": str(e)}
-        # Build BOTH halves from the very resolution whose source was just
-        # checked (same shape as _resolve_api_target) — re-resolving again
-        # could race a marker disappearing between the check and the dial, and
-        # deriving the socket separately let the replay's two transports name
-        # different gateways. This is a FRESH pair, never the refused one: the
-        # ownership proof is per attempt.
-        retry_target = (f"http://127.0.0.1:{retry_port}", _socket_path_for(retry_port))
-        retry_base = retry_target[0]
-        if retry_base == base:
-            # Nothing was ever handed to a live gateway, so this is a definite
-            # rejection: no transport ambiguity to report.
-            return {"error": str(e)}
+        # THE replay rule lives in _replay_target, shared with
+        # mcp_computer._invoke: None means "do not replay" (no evidence, or the
+        # re-resolution named the same dead base). Nothing was handed to a live
+        # gateway in either case, so no refusal below carries transport
+        # ambiguity — the outcome is a definite rejection once the retry window
+        # for the refused target is spent.
+        retry_target = _replay_target(base)
+        if retry_target is None:
+            # No moved gateway to chase, so the base that refused is the only
+            # candidate — the same-port restart case. Give it the short retry
+            # window rather than surfacing a bare errno.
+            return _retry_refused(target, e)
         try:
             return _once(retry_target)
         except urllib.error.HTTPError as retry_exc:
             return _http_error_body(retry_exc)
         except urllib.error.URLError as retry_exc:
             if isinstance(retry_exc.reason, (ConnectionRefusedError, socket.gaierror)):
-                return {"error": str(e)}
+                # Both bases refused. The re-resolved one is the fresher
+                # evidence of where the gateway lives, so the retry window
+                # applies to it.
+                return _retry_refused(retry_target, retry_exc)
             return _transport_failure(str(retry_exc), mark_transport_error)
         except Exception as retry_exc:
             # The replay reached the gateway and failed afterwards (a read timeout
@@ -1196,9 +1573,7 @@ def _http_error_body(exc: urllib.error.HTTPError) -> dict:
                 # content, so only a short identifier-shaped value survives —
                 # anything else is dropped rather than echoed onward.
                 raw_code = parsed.get("code")
-                if isinstance(raw_code, str) and _re.fullmatch(
-                    r"[a-z0-9_.-]{1,64}", raw_code
-                ):
+                if isinstance(raw_code, str) and _re.fullmatch(r"[a-z0-9_.-]{1,64}", raw_code):
                     code = raw_code
         except Exception:
             pass
@@ -1221,6 +1596,23 @@ def _http_error_body(exc: urllib.error.HTTPError) -> dict:
             "the instance you meant) and retry; the gateway's security event log "
             "records both credential fingerprints for the mismatch."
         )
+    elif code == "caller_record_missing":
+        message = (
+            "this session's cron or subagent record no longer exists; start a new "
+            "session before retrying the tool."
+        )
+    elif code == "unix_peer_unverified":
+        message = (
+            "the gateway could not verify this Unix-socket caller as the same local "
+            "user. Restart the gateway and start a new session; if the error persists, "
+            "make sure the client and gateway run as the same OS user."
+        )
+    elif code == "peer_session_mismatch":
+        message = (
+            "this Unix-socket caller is bound to a different session than the "
+            "X-Session-Key it declared. Restart the affected session, or start a new "
+            "one, before retrying the tool."
+        )
     out: dict = {"error": message}
     if counted:
         out["counted"] = True
@@ -1229,7 +1621,7 @@ def _http_error_body(exc: urllib.error.HTTPError) -> dict:
     return out
 
 
-def _get(path: str, session_key: str | None = None) -> dict:
+def _get(path: str, session_key: str | None = None, *, timeout: float = 10) -> dict:
     """GET a loopback gateway path with the internal-secret handshake.
 
     ``session_key`` exists so a caller that has ALREADY verified its identity can
@@ -1241,6 +1633,11 @@ def _get(path: str, session_key: str | None = None) -> dict:
     whatever the lenient walk answers at request time, which need not be the same
     session. Passing the verified key makes the value that was checked the value
     that is used. It is still validated by ``_session_key_header_error``.
+
+    ``timeout`` defaults to the 10s a telemetry read needs. A route that does real
+    work behind the GET raises it — the Dev Fleet pod reads spawn a
+    ``python -m kiro_crew pod`` subprocess in the gateway, so they pay a cold
+    interpreter start that 10s cannot cover on a loaded host.
     """
     headers = {"X-Internal-Secret": _internal_secret(), **_caller_header()}
     sk = _resolve_session_key() if session_key is None else session_key
@@ -1249,7 +1646,7 @@ def _get(path: str, session_key: str | None = None) -> dict:
         return {"error": _sk_err}
     if sk:
         headers["X-Session-Key"] = sk
-    return _send(path, headers=headers, timeout=10)
+    return _send(path, headers=headers, timeout=timeout)
 
 
 def _patch(path: str, body: dict | None = None, *, session_key: str | None = None) -> dict:
@@ -1329,6 +1726,11 @@ def _autonudge_binding_key(sk: str) -> str | None:
     ``ctx.nudge`` port share one definition of "nudge-able".
     """
     return binding_key_for(sk)
+
+
+def _structured_monitor_binding_key(sk: str) -> str | None:
+    """Map a session key only when structured wake delivery is supported."""
+    return structured_monitor_binding_key_for(sk)
 
 
 def _artifact_ref_link(slug: str, name: str) -> str:
@@ -1517,17 +1919,137 @@ def _classify_slack_identity() -> tuple[str, str | None]:
     return ("non_slack", None)
 
 
+#: The ``tools/call`` name and RAW (pre-validation) arguments of the call in
+#: flight, installed by :func:`_call_tool` and cleared on its exit. Read by
+#: ``mcp_tools.control._emit_directive`` to report the CALL to the gateway, which
+#: derives the directive from it (see :func:`derive_directive`). ContextVars so a
+#: pooled server handling concurrent calls never reports one call under another.
+_CURRENT_CALL_NAME: ContextVar[str] = ContextVar("kirocrew_current_call_name", default="")
+_CURRENT_CALL_RAW_ARGS: ContextVar[dict[str, Any]] = ContextVar(
+    "kirocrew_current_call_raw_args", default={}
+)
+
+
+def current_call_name() -> str:
+    """The ``tools/call`` name of the call in flight, or ``""``."""
+    return _CURRENT_CALL_NAME.get()
+
+
+def current_call_raw_args() -> dict[str, Any]:
+    """The RAW ``tools/call`` arguments of the call in flight (pre-validation)."""
+    return copy.deepcopy(_CURRENT_CALL_RAW_ARGS.get())
+
+
+#: When set, ``mcp_tools.control._emit_directive`` records its validated
+#: ``(kind, args)`` here INSTEAD of POSTing it. This is how the gateway derives a
+#: directive's payload itself: it re-runs the directive tool on the raw call
+#: arguments the MCP stub reported, so the applied payload is a function of the
+#: victim's own call and never of a caller-supplied body. ``None`` = normal mode.
+_DIRECTIVE_CAPTURE: ContextVar[list[tuple[str, dict[str, Any]]] | None] = ContextVar(
+    "kirocrew_directive_capture", default=None
+)
+
+
+def capture_directive(kind: str, args: dict[str, Any]) -> bool:
+    """Record ``(kind, args)`` into the active capture slot; True if captured."""
+    sink = _DIRECTIVE_CAPTURE.get()
+    if sink is None:
+        return False
+    sink.append((kind, dict(args)))
+    return True
+
+
+def derive_directive(
+    tool: str, raw_args: dict[str, Any], session_key: str
+) -> tuple[str, dict[str, Any]] | None:
+    """Re-run directive tool *tool* on *raw_args* AS *session_key* and return the
+    ``(kind, args)`` it would have published, or None if it published nothing
+    (refused, not a directive tool, or raised).
+
+    Runs in the GATEWAY process. *session_key* is the caller's ``X-Session-Key``
+    as the gateway verified it -- kernel-attested on the unix socket, bearer-token
+    ``internal_auth`` on TCP -- and is installed as the call's :class:`CallerContext` for the
+    duration -- source 0 of ``_resolve_session_key_strict`` -- so a handler that
+    refuses without a strict identity (``monitor_watch``, ``monitor_stop``,
+    ``monitor_update``) sees the same session the stub would have and derives
+    rather than short-circuiting. That is the identity gatewayd injects for a
+    pooled backend, arrived at by the same verification. Every write the handler
+    would perform is the POST, and capture mode intercepts exactly that.
+
+    The replay goes through :func:`_call_tool_body`, which in capture mode runs
+    validation and the handler DIRECTLY rather than through
+    ``call_tool_with_logging``: the stub already wrote the invocation's SEL audit
+    row when the model's call ran, and a second "completed" row for the same call
+    -- attributed to the same session, from the gateway process -- would double
+    every directive in the audit trail. Derivation is a read of what the call
+    means, not a second invocation, and leaves no record of its own.
+    """
+    if tool not in DIRECTIVE_TOOLS or not isinstance(raw_args, dict) or not session_key:
+        return None
+    sink: list[tuple[str, dict[str, Any]]] = []
+    token = _DIRECTIVE_CAPTURE.set(sink)
+    prior = current_caller()
+    set_current_caller(CallerContext(session_key=session_key, from_gateway=True))
+    try:
+        # Deep copy for the same reason _call_tool snapshots deeply: the handler
+        # may mutate nested objects, and the caller digests *raw_args* after.
+        _call_tool(tool, copy.deepcopy(raw_args))
+    except Exception:
+        return None
+    finally:
+        set_current_caller(prior)
+        _DIRECTIVE_CAPTURE.reset(token)
+    return sink[0] if len(sink) == 1 else None
+
+
 def _call_tool(name: str, raw_args: dict[str, Any]) -> str:
-    return call_tool_with_logging(
+    # Call-in-flight record for control._emit_directive: the tool name and the
+    # RAW arguments (pre-validation), which is what the gateway is told so it can
+    # re-derive the directive itself. Cleared on exit so a direct handler call in
+    # the same thread later (a test, a nested helper) never reports a stale call.
+    _t_name = _CURRENT_CALL_NAME.set(name)
+    # DEEP copy: validation mutates nested argument objects in place
+    # (suggest_followup pops an empty ``branch`` off each item), and the
+    # gateway must digest what the model SENT -- the same bytes the consumer
+    # digests off the tool_call frame -- not what validation left behind.
+    _t_args = _CURRENT_CALL_RAW_ARGS.set(
+        copy.deepcopy(raw_args) if isinstance(raw_args, dict) else {}
+    )
+    try:
+        return _call_tool_body(name, raw_args)
+    finally:
+        _CURRENT_CALL_NAME.reset(_t_name)
+        _CURRENT_CALL_RAW_ARGS.reset(_t_args)
+
+
+def _call_tool_body(name: str, raw_args: dict[str, Any]) -> str:
+    if _DIRECTIVE_CAPTURE.get() is not None:
+        # Gateway-side derivation (derive_directive): the handler's only write is
+        # the directive it publishes, which capture_directive intercepts, and the
+        # returned text is discarded. No SEL row -- the stub logged the real
+        # invocation -- and no refusal tagging, since nothing reads the result.
+        # A validation error is a refusal here too: the handler never ran, the
+        # sink stays empty, and derive_directive answers None.
+        return _call_tool_inner(name, _validate_args(name, raw_args))
+    # Tag a directive tool's marker-less result as a refusal at the OUTERMOST
+    # return, which is the only point that sees every way such a tool can
+    # decline — argument validation runs inside the wrapper below, ahead of the
+    # handler, so a schema rejection never reaches code that could tag itself.
+    # Without the tag the consumer reads a decline as a LOST directive
+    # marker and fires a WARNING meant for a transport regression.
+    return refuse_if_markerless(
         name,
-        raw_args,
-        _validate_args,
-        _call_tool_inner,
-        # Real caller identity when resolvable (per-call caller context in
-        # pooled backends, env/PID otherwise) — a hardcoded "mcp_core" lost
-        # attribution for every standard tool audit in shared backends.
-        session_key=_resolve_session_key() or "mcp_core",
-        downstream_service="kirocrew-core",
+        call_tool_with_logging(
+            name,
+            raw_args,
+            _validate_args,
+            _call_tool_inner,
+            # Real caller identity when resolvable (per-call caller context in
+            # pooled backends, env/PID otherwise) — a hardcoded "mcp_core" lost
+            # attribution for every standard tool audit in shared backends.
+            session_key=_resolve_session_key() or "mcp_core",
+            downstream_service="kirocrew-core",
+        ),
     )
 
 
@@ -1723,6 +2245,71 @@ def _format_anchor(anchor: dict) -> str:
     return f' [on: "{head}" [TRUNCATED: {omitted} chars omitted' f'{offset_info}] "{tail}"]'
 
 
+def _crew_memory_unavailable_reason(error: UnknownMemoryStore) -> str:
+    return redact_local_paths(redact(str(error)))[0][:1000]
+
+
+def _do_route_crew(task: str) -> str:
+    """Rank the crews whose triggers match *task* (the route_crew tool body).
+
+    The SCORED half of routing, next to ``select_crew``'s roster. Both exist
+    because they answer different questions: the roster asks the model to judge,
+    which is right when the task is prose and the crews are described in prose;
+    this ranks the same triggers mechanically, which is right when a caller wants
+    the same task to reach the same crew every time.
+
+    Shares ``trigger_match`` with the skills loader rather than scoring its own
+    way, so "this phrasing matches" cannot mean two things in one product. A
+    crew with no triggers is not a candidate — that is the operator's opt-out,
+    and it is the same rule the roster applies.
+
+    Reports rather than binds. Binding happens where a run is created
+    (``spawn_run(crew=...)``), because that is the only place the decision can be
+    honoured on both halves the caller cares about, memory and template.
+    """
+    if not task or not task.strip():
+        return json.dumps({"error": "task must be a non-empty string"}, ensure_ascii=False)
+    cfg = KiroCrewConfig.load()
+    default = cfg.default_agent
+    candidates = [(n, c.triggers) for n, c in cfg.agents.items() if n != default]
+    ranked = rank_triggered(task, candidates)
+    matches = []
+    unavailable = []
+    for name, score in ranked:
+        try:
+            binding = resolve_agent_bindings(cfg, name, validate_memory_files=False)
+        except UnknownMemoryStore as exc:
+            unavailable.append({"crew": name, "reason": _crew_memory_unavailable_reason(exc)})
+            continue
+        matches.append(
+            {
+                "crew": name,
+                "score": round(score, 3),
+                "description": (cfg.agents[name].description or "").strip(),
+                "memory_store": binding.memory_store_name,
+            }
+        )
+    return json.dumps(
+        {
+            "task": task[:200],
+            "default_agent": default,
+            "matches": matches,
+            "unavailable": unavailable,
+            "guidance": (
+                "Ranked by trigger overlap, best first. If both matches and "
+                "unavailable are empty, no crew claims this task -- handle it "
+                "on the default crew rather than picking the least-bad match. "
+                "Unavailable crews matched but their memory binding was refused: "
+                "report that refusal; do not substitute Global memory for them. "
+                "To act on a healthy match, spawn with "
+                "crew=<name>: that is what gives the run that crew's memory and "
+                "template, and what keeps another crew's memory out of it."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
 def _do_select_crew(crew: str) -> str:
     """Orchestrator crew routing (the select_crew tool body).
 
@@ -1762,7 +2349,13 @@ def _do_select_crew(crew: str) -> str:
             {"error": f"unknown crew '{crew}'", "available": available},
             ensure_ascii=False,
         )
-    b = resolve_agent_bindings(cfg, crew)
+    try:
+        b = resolve_agent_bindings(cfg, crew, validate_memory_files=False)
+    except UnknownMemoryStore as exc:
+        return json.dumps(
+            {"crew": crew, "error": _crew_memory_unavailable_reason(exc)},
+            ensure_ascii=False,
+        )
     # Routing-decision pointer. This is the one place a member's identity is
     # unambiguous on the delegation path: `spawn_run`'s `agent` is validated
     # against the installed TEMPLATES, so by the time a sub-agent starts the
@@ -2007,11 +2600,10 @@ def run_mcp_core_server() -> None:
         _call_tool,
         # Pooled-operation opt-in: kirocrew-core consumes the per-call
         # ``kirocrew.caller`` identity (see _resolve_session_key*), so it is
-        # safe to share one backend across sessions. kirocrew-cron advertises
-        # too, for the same reason. The two managed servers that do not --
-        # kirocrew-computer and kirocrew-dashboard -- are pooled all the same
-        # (nothing declines to pool an unadvertised backend; see
-        # ``rewriter.UNPOOLABLE_SERVERS``), so what they lack is the injected
-        # block, not co-tenancy.
+        # safe to share one backend across sessions. All four managed servers
+        # advertise, and what advertising buys is the injected block, not
+        # co-tenancy: a backend that does NOT advertise is
+        # pooled all the same (nothing declines to pool one; see
+        # ``rewriter.UNPOOLABLE_SERVERS``) and simply never receives an identity.
         advertise_caller_identity=ADVERTISE_CALLER_IDENTITY,
     )

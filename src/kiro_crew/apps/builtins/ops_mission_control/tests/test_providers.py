@@ -9,6 +9,7 @@ or hanging provider must degrade to a per-source error, never take down the poll
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -925,10 +926,10 @@ class TestSuppressionIsAlwaysBounded(unittest.IsolatedAsyncioTestCase):
     """A suppression with no expiry hides a live fault until a human remembers it.
 
     This is the property that makes ``act`` a bounded bet rather than an
-    all-or-nothing one: a WRONG silence expires by itself. The shipped Datadog sink
-    used to POST ``/mute`` with ``body={}``, and Datadog reads a missing ``end`` as
-    "mute forever" — so the board showed the incident resolved while the metric stayed
-    bad, with no way back but a human noticing.
+    all-or-nothing one: a WRONG silence expires by itself. POSTing ``/mute`` with
+    ``body={}`` leaves Datadog reading the missing ``end`` as "mute forever" — the
+    board shows the incident resolved while the metric stays bad, with no way back
+    but a human noticing.
     """
 
     def test_a_requested_window_is_clamped_not_honoured_blindly(self):
@@ -1396,13 +1397,11 @@ class TestTheCloudWatchConsoleLinkCannotBeRedirected(unittest.IsolatedAsyncioTes
         from kiro_crew.apps.builtins.ops_mission_control.backend.providers import cloudwatch
 
         source = inspect.getsource(cloudwatch)
-        code = "\n".join(
-            line for line in source.splitlines() if not line.lstrip().startswith("#")
-        )
+        code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
         raw_reads = [
             line.strip()
             for line in code.splitlines()
-            if 'region = ' in line and "_validated_region" not in line and "_region()" not in line
+            if "region = " in line and "_validated_region" not in line and "_region()" not in line
         ]
         self.assertEqual(
             raw_reads,
@@ -1606,7 +1605,9 @@ class TestConcurrentStoreWritesDoNotLoseData(unittest.TestCase):
             backend.delete("pagerduty")
             backend.delete("datadog")
         self.assertEqual(
-            losses, 0, f"{losses}/30 secret rounds lost a credential — a lost update here is a lost secret"
+            losses,
+            0,
+            f"{losses}/30 secret rounds lost a credential — a lost update here is a lost secret",
         )
 
     def test_no_module_open_codes_a_config_read_modify_write(self):
@@ -1902,8 +1903,14 @@ class TestPollersMarkTruncationSoAbsenceIsNotRecovery(unittest.IsolatedAsyncioTe
         def _issues(n: int) -> str:
             return json.dumps(
                 [
-                    {"number": i, "title": f"#{i}", "labels": [], "createdAt": "", "url": "",
-                     "assignees": []}
+                    {
+                        "number": i,
+                        "title": f"#{i}",
+                        "labels": [],
+                        "createdAt": "",
+                        "url": "",
+                        "assignees": [],
+                    }
                     for i in range(n)
                 ]
             )
@@ -1921,3 +1928,312 @@ class TestPollersMarkTruncationSoAbsenceIsNotRecovery(unittest.IsolatedAsyncioTe
         with mock.patch.object(github_issues, "_run_gh", side_effect=_fake_under):
             result = await github_issues.GitHubIssuesAdapter().poll()
         self.assertNotIsInstance(result, TruncatedSignals)
+
+
+class TestRunGhTimeoutReapsChild(unittest.IsolatedAsyncioTestCase):
+    """A timed-out ``gh`` must be tree-killed and reaped by draining pipes.
+
+    After ``wait_for`` cancels ``communicate()``, a killed child blocked
+    writing into a full stderr pipe makes a bare ``wait()`` hang the polling
+    task forever — the reap must be a SECOND ``communicate()``.
+    """
+
+    async def test_timeout_reaps_child_via_communicate_not_wait(self):
+        from kiro_crew import platform_compat
+        from kiro_crew.apps.builtins.ops_mission_control.backend.providers import (
+            github_issues,
+        )
+
+        class HangProc:
+            # No supported OS can allocate this PID, so the host process table cannot
+            # make the fake child look like it shares the test runner's process group.
+            pid = 99_999_999_999
+            returncode: int | None = None
+            kill_calls = 0
+            wait_calls = 0
+            communicate_calls = 0
+
+            async def communicate(self):
+                HangProc.communicate_calls += 1
+                if HangProc.communicate_calls == 1:
+                    raise asyncio.TimeoutError
+                HangProc.returncode = -9
+                return b"", b""
+
+            def kill(self):
+                HangProc.kill_calls += 1
+
+            async def wait(self):
+                HangProc.wait_calls += 1
+                return -9
+
+        async def fake_spawn(*argv, **kwargs):
+            return HangProc()
+
+        killed: list[tuple[int, int]] = []
+
+        async def fake_tree_kill(pid, sig):
+            killed.append((pid, sig))
+            return True
+
+        with (
+            mock.patch.object(
+                github_issues,
+                "sandboxed_spawn_argv",
+                lambda argv, **kw: (argv, {}, None),
+            ),
+            mock.patch.object(github_issues, "create_subprocess_limited", fake_spawn),
+            mock.patch.object(platform_compat, "kill_process_tree_async", fake_tree_kill),
+        ):
+            rc, out, err = await github_issues._run_gh(["issue", "list"])
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertIn("timed out", err)
+        self.assertEqual(killed, [(HangProc.pid, platform_compat.SIGKILL)])
+        self.assertEqual(HangProc.kill_calls, 1)
+        self.assertEqual(HangProc.communicate_calls, 2)
+        self.assertEqual(HangProc.wait_calls, 0)
+
+
+class TestTheAppConfigIsNeverPublishedOverAFailedRead(unittest.TestCase):
+    """The BASE read of a read-modify-write may not fail open.
+
+    ``read_config`` collapses every failure to ``{}``, which is right for the
+    accessors above it — each resolves to the caller's default, so an unreadable
+    config reads as "nothing configured" and the Settings page still renders. It
+    is wrong as the base of ``merge_provider_config``/``set_top_level``, which
+    rewrite the WHOLE file: the merge is per-FIELD within one provider slot, not
+    per-file, so ``{}`` means "drop every other provider's configuration and every
+    top-level key".
+
+    The loss is quiet and it disables detection. ``provider_enabled`` defaults to
+    ``False``, so a wiped config does not error — it just stops polling every
+    provider the operator switched on, while their tokens remain in the keystone
+    store so the Settings page still shows each provider as credentialed. The
+    operator is left with an app that reports no signals and looks configured.
+
+    Isolates ``KIROCREW_HOME`` for the same reason the sibling classes here do:
+    these tests WRITE provider config.
+    """
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp())
+        # addCleanup on the line after mkdtemp: unittest skips tearDown when setUp
+        # raises, so cleaning up there leaks the directory on every setUp failure
+        # (and trips the temp-residue guard). Same reasoning as `_HomeIsolated` in
+        # test_policy_store.py, which carries this note too.
+        self.addCleanup(shutil.rmtree, self._tmp, ignore_errors=True)
+        self._prev_home = os.environ.get("KIROCREW_HOME")
+        self.addCleanup(self._restore_home)
+        os.environ["KIROCREW_HOME"] = str(self._tmp)
+
+    def _restore_home(self):
+        if self._prev_home is None:
+            os.environ.pop("KIROCREW_HOME", None)
+        else:
+            os.environ["KIROCREW_HOME"] = self._prev_home
+
+    @staticmethod
+    def _config_path() -> Path:
+        from kiro_crew.apps.builtins.ops_mission_control.backend import providers
+        from kiro_crew.apps.manager import app_data_dir
+
+        return app_data_dir(providers.APP_NAME) / providers.CONFIG_FILENAME
+
+    def _unreadable_config(self):
+        """Fail ONLY the app config's read, as a transient EACCES would.
+
+        Scoped by path: a blanket ``read_text`` failure would also break home
+        resolution and the app manifest, and the test would pass for the wrong
+        reason.
+        """
+        target = self._config_path()
+        real_read_text = Path.read_text
+
+        def _guarded(path_self, *args, **kwargs):
+            if Path(path_self) == target:
+                raise PermissionError(13, "Permission denied")
+            return real_read_text(path_self, *args, **kwargs)
+
+        return mock.patch.object(Path, "read_text", _guarded)
+
+    def test_a_read_that_failed_never_truncates_the_config(self):
+        """The durable harm, asserted directly: the OTHER providers the operator
+        configured must still be enabled afterwards."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import providers
+
+        providers.merge_provider_config("pagerduty", {"enabled": True})
+        providers.merge_provider_config("datadog", {"enabled": True, "site": "datadoghq.eu"})
+        providers.set_top_level("stale_after_secs", 1800)
+        before = self._config_path().read_bytes()
+
+        with self._unreadable_config():
+            with contextlib.suppress(OSError):
+                providers.merge_provider_config("cloudwatch", {"enabled": True})
+            with contextlib.suppress(OSError):
+                providers.set_top_level("stale_after_secs", 60)
+
+        self.assertEqual(
+            self._config_path().read_bytes(),
+            before,
+            "a failed read was published back over the config",
+        )
+        self.assertTrue(
+            providers.provider_enabled("pagerduty"),
+            "a failed read silently switched off a provider the operator enabled",
+        )
+        self.assertEqual(
+            providers.config_value("datadog", "site"),
+            "datadoghq.eu",
+            "a failed read dropped another provider's configuration",
+        )
+        self.assertEqual(providers.read_config().get("stale_after_secs"), 1800)
+
+    def test_an_unreadable_config_refuses_the_merge(self):
+        """A settings save that was not recorded must not answer as though it
+        were — and must not report back a slot it never persisted."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import providers
+
+        with self._unreadable_config():
+            with self.assertRaises(OSError):
+                providers.merge_provider_config("pagerduty", {"enabled": True})
+
+    def test_an_unreadable_config_refuses_a_top_level_write(self):
+        """``set_top_level`` rewrites the same whole file, so it needs the same
+        refusal."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import providers
+
+        with self._unreadable_config():
+            with self.assertRaises(OSError):
+                providers.set_top_level("stale_after_secs", 60)
+
+    def test_a_missing_config_is_still_a_first_write(self):
+        """Absent is the one failure where ``{}`` is the truth. The guard must
+        not turn the operator's very first provider save into an error."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import providers
+
+        self.assertFalse(self._config_path().exists())
+        slot = providers.merge_provider_config("pagerduty", {"enabled": True})
+        self.assertEqual(slot, {"enabled": True})
+        self.assertTrue(providers.provider_enabled("pagerduty"))
+
+    def test_a_corrupt_config_refuses_the_merge_instead_of_replacing_it(self):
+        """Refusal, not repair-on-write.
+
+        A half-written or hand-broken config still names every provider the operator
+        enabled. Replacing it discards that and leaves them re-entering settings they
+        already chose, so the merge refuses and surfaces the corruption instead. See
+        `store._read_index_for_update` for why this diverges from the four merged
+        siblings of the idiom. Found in review (GPT 5.6).
+        """
+        import json as _json
+
+        from kiro_crew.apps.builtins.ops_mission_control.backend import providers
+
+        path = self._config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"providers": {"datadog": {"enabled": true}', encoding="utf-8")
+
+        with self.assertRaises(_json.JSONDecodeError):
+            providers.merge_provider_config("pagerduty", {"enabled": True})
+
+    def test_a_corrupt_config_is_left_exactly_as_it_was(self):
+        """The point of refusing: the operator's settings must survive on disk."""
+        import contextlib
+        import json as _json
+
+        from kiro_crew.apps.builtins.ops_mission_control.backend import providers
+
+        truncated = '{"providers": {"datadog": {"enabled": true, "site": "datadoghq.eu"}'
+        path = self._config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(truncated, encoding="utf-8")
+
+        with contextlib.suppress(_json.JSONDecodeError):
+            providers.set_top_level("stale_after_secs", 60)
+
+        self.assertEqual(
+            path.read_text(encoding="utf-8"),
+            truncated,
+            "the refused write still overwrote the recoverable config",
+        )
+
+    def test_the_display_read_logs_a_non_object_root(self):
+        """The last silent branch, and the docstring promised it was not silent.
+
+        A non-object root parses fine, so no `except` fires, and this branch answered `{}`
+        without a word -- while the paragraph above it argued that THIS degradation must not be
+        quiet, because every provider stops polling while Settings still shows them
+        configured. Found in review (GPT 5.6); the index display read grew the same warning a
+        head earlier and this is its twin.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import providers
+
+        providers._config_path().write_text("[]", encoding="utf-8")
+        with self.assertLogs("kiro_crew", level="WARNING") as caught:
+            self.assertEqual(providers.read_config(), {})
+        self.assertTrue(any("root is not an object" in m for m in caught.output))
+
+    def test_a_config_that_is_valid_json_but_not_an_object_refuses_the_merge(self):
+        """The normalization door, config side.
+
+        `[]` parses without raising, so the strict reader's `except FileNotFoundError`
+        never fires -- but coercing it to `{}` would let the merge rewrite the whole file
+        from empty and drop every provider the operator enabled. Valid JSON is not the
+        same as a usable document. Found in review (GPT 5.6).
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import providers
+
+        providers._config_path().write_text("[]", encoding="utf-8")
+
+        with self.assertRaises(json.JSONDecodeError):
+            providers.merge_provider_config("datadog", {"enabled": True})
+
+        self.assertEqual(providers._config_path().read_text(encoding="utf-8"), "[]")
+
+    def test_a_providers_key_of_the_wrong_shape_refuses_the_merge(self):
+        """The per-slot half of the wrong-shape door, which was still open.
+
+        The strict read refuses a bad ROOT, but `merge_provider_config` normalized a
+        `providers` key that was not an object straight to `{}` -- and since it rewrites the
+        whole file, that wiped every provider slot on the next merge. Same loss the index
+        side closed with `strict=True`, one level down. Found in review (Design Review),
+        which spotted that the description claimed per-row refusal while the config had it
+        only at the root.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import models, providers
+
+        for label, doc in (
+            ("providers is a list", '{"providers": ["pagerduty"]}'),
+            ("providers is a string", '{"providers": "pagerduty"}'),
+            ("one slot is a string", '{"providers": {"datadog": "enabled"}}'),
+        ):
+            with self.subTest(shape=label):
+                providers._config_path().write_text(doc, encoding="utf-8")
+                with self.assertRaises(models.CorruptDocumentError):
+                    providers.merge_provider_config("datadog", {"enabled": True})
+                self.assertEqual(
+                    providers._config_path().read_text(encoding="utf-8"),
+                    doc,
+                    "the refused merge still rewrote the file",
+                )
+
+    def test_a_missing_providers_key_is_still_a_normal_first_write(self):
+        """The absent case stays absent-means-empty; only a WRONG shape refuses."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import providers
+
+        providers._config_path().write_text('{"stale_after_secs": 1800}', encoding="utf-8")
+        saved = providers.merge_provider_config("datadog", {"enabled": True})
+        self.assertIs(saved["enabled"], True)
+        self.assertEqual(providers.read_config()["stale_after_secs"], 1800)
+
+    def test_the_display_read_still_tolerates_corruption(self):
+        """The asymmetry, pinned. Only the MUTATION base got strict -- the Settings
+        page must still render on a config it cannot parse."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import providers
+
+        path = self._config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{ not json", encoding="utf-8")
+        self.assertEqual(providers.read_config(), {})

@@ -100,7 +100,27 @@ export const WidgetFrame: React.FC<WidgetFrameProps> = ({ html, title = 'Widget'
         ref={iframeRef}
         srcDoc={srcdoc}
         sandbox="allow-scripts"
-        style={{ width: '100%', height, border: 'none', background: '#fff', display: 'block' }}
+        // NO clipboard-write delegation here, deliberately. These frames host
+        // agent-generated HTML whose scripts run on load, so a delegated
+        // permission would let one overwrite the user's clipboard with no Copy
+        // action at all. Copying still works: lib/widgetSrcdoc.ts injects an
+        // execCommand fallback that a real button press satisfies and a
+        // gesture-less on-load script does not.
+        style={{
+          width: '100%',
+          height,
+          border: 'none',
+          background: '#fff',
+          display: 'block',
+          // Same compositing promotion every sandbox-doc frame carries (see the
+          // dashboard WidgetFrame): an engine can lay this document out, run its
+          // scripts and report a correct height while never rasterizing it,
+          // which presents as an empty box rather than an error. Promoting the
+          // frame to its own layer is the one remedy that needs no timing. This
+          // frame builds its document inline (srcDoc, outside the sandbox-doc
+          // mint), so it was left out when the mint's consumers were promoted.
+          transform: 'translateZ(0)',
+        }}
         title={title}
       />
     </div>

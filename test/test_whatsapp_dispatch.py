@@ -15,7 +15,9 @@ from typing import Any
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.messaging.driver import APPROVAL_AUTO
 from kiro_crew.messaging.transport import InboundMessage
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.whatsapp.commands import (
+    COMPACT_AUTO_MANAGED_TEXT,
     COMPACT_AUTO_TEXT,
     COMPACT_BUSY_TEXT,
     COMPACT_FAILED_TEXT,
@@ -92,11 +94,16 @@ class FakeSessions:
         persisted_generations: dict[str, int] | None = None,
     ) -> None:
         self.provider = provider or FakeProvider()
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
         #: What ``max_generation`` reports per durable bucket, standing in for the
         #: session map on disk. Empty means a machine that has never run this
         #: channel, which is the only case an unseeded counter gets right.
         self.persisted_generations = dict(persisted_generations or {})
         self.generation_lookups: list[str] = []
+        self.reserved_generations: list[str] = []
         self._busy = busy
         self.released = 0
         self.successes = 0
@@ -125,12 +132,24 @@ class FakeSessions:
     def has_session(self, key: str) -> bool:
         return self._session_exists
 
+    def reserve_generation(self, session_key: str) -> None:
+        self.reserved_generations.append(session_key)
+
+    async def aflush(self) -> None:
+        return None
+
     def max_generation(self, bucket: str) -> int:
         self.generation_lookups.append(bucket)
         return self.persisted_generations.get(bucket, 0)
 
     async def get_or_create(self, key, agent=None, channel_id=None):
         return self.provider, True, False
+
+    def begin_turn(self, key: str) -> None:
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key, channel_id):
         self.channels[key] = channel_id
@@ -201,6 +220,7 @@ class FakeTransport:
         self.pending_verdicts: dict[int, GroupVerdict] = {}
         self.group_gate = FakeGroupGate()
         self.pending_message_id: dict[int, str] = {}
+        self.pending_original: dict[int, tuple[str, int]] = {}
         #: Phase reactions go through the TRANSPORT, not the client: it owns the
         #: echo tracker, because a reaction is a message and echoes back.
         self.reactions: list[tuple[str, str]] = []
@@ -252,6 +272,8 @@ def _make(provider=None, busy=False, transport_fail=False, **session_kwargs):
 
 
 _DM = "447700900000@s.whatsapp.net"
+
+
 _GROUP = "12345-67890@g.us"
 
 
@@ -293,14 +315,43 @@ def test_group_scope_uses_forum_chat_type_in_session_key():
 # ── dispatcher: commands ────────────────────────────────────────────────────
 def test_new_command_starts_a_fresh_session_without_a_turn():
     provider = FakeProvider()
-    d, _client, _sessions, transport = _make(provider=provider)
+    d, _client, sessions, transport = _make(provider=provider)
     before = d._session_key(_DM)
     asyncio.run(d.handle_message(_msg("/new")))
     after = d._session_key(_DM)
 
     assert provider.prompts == []  # no LLM turn for a command
     assert before != after  # generation advanced
+    assert sessions.reserved_generations == [after]
     assert any("fresh session" in t.lower() for _, t in transport.sent)
+
+
+def test_update_pause_spools_dm_new_before_generation_side_effects(monkeypatch):
+    import kiro_crew.messaging.dispatch as dispatch
+
+    d, _client, sessions, transport = _make(provider=FakeProvider())
+    sessions.reserve_inbound_callback = lambda: None
+    inbound = _msg("/new")
+    transport.pending_original[id(inbound)] = ("/new", 0)
+    spooled: list[tuple[str, Any]] = []
+
+    async def capture(*, channel_type, route):
+        spooled.append((channel_type, route))
+
+    monkeypatch.setattr(dispatch, "spool_refused_turn", capture)
+    before = d._session_key(_DM)
+
+    asyncio.run(d.handle_message(inbound))
+
+    assert d._session_key(_DM) == before
+    assert sessions.reserved_generations == []
+    assert transport.sent == []
+    assert len(spooled) == 1
+    channel_type, refused = spooled[0]
+    assert channel_type == "whatsapp"
+    assert refused is not None
+    assert refused.conversation_id == _DM
+    assert refused.text == "/new"
 
 
 def test_compact_command_compacts_in_place_without_a_turn():
@@ -311,6 +362,49 @@ def test_compact_command_compacts_in_place_without_a_turn():
     assert (provider.compacts, provider.waits) == (1, 1)
     assert [t for _, t in transport.sent] == [COMPACTED_TEXT]
     assert sessions.released == 1, "the turn semaphore must always be handed back"
+
+
+def test_compact_command_declined_on_auto_managed_backend():
+    # A backend that cannot serve /compact gets the informational reply and
+    # compact() is NEVER dispatched.
+    provider = FakeProvider()
+    provider.manual_compact_unsupported_backend = "kas"
+    d, _client, sessions, transport = _make(provider=provider)
+    asyncio.run(d.handle_message(_msg("/compact")))
+    assert (provider.compacts, provider.waits) == (0, 0)
+    assert [t for _, t in transport.sent] == [COMPACT_AUTO_MANAGED_TEXT]
+    assert sessions.released == 1, "the turn semaphore must always be handed back"
+
+
+def test_compact_none_capability_preserves_dispatch():
+    # The ABC's None (supported) default keeps the existing dispatch.
+    provider = FakeProvider()
+    provider.manual_compact_unsupported_backend = None
+    d, _client, _sessions, transport = _make(provider=provider)
+    asyncio.run(d.handle_message(_msg("/compact")))
+    assert (provider.compacts, provider.waits) == (1, 1)
+    assert [t for _, t in transport.sent] == [COMPACTED_TEXT]
+
+
+def test_the_hard_threshold_declines_silently_on_auto_managed_backend():
+    # No /compact to dispatch and no notice: the backend compacts on its own
+    # as context fills.
+    provider = FakeProvider("answered")
+    provider.manual_compact_unsupported_backend = "kas"
+    d, _client, _sessions, transport = _make(provider=provider, context_pct=96.0)
+    asyncio.run(d.handle_message(_msg("a long conversation")))
+    assert (provider.compacts, provider.waits) == (0, 0)
+    assert [t for _, t in transport.sent] == ["answered"]
+
+
+def test_the_soft_nudge_is_suppressed_on_auto_managed_backend():
+    # The nudge advises /compact, which this backend refuses — it compacts on
+    # its own, so there is nothing for the user to act on.
+    provider = FakeProvider("answered")
+    provider.manual_compact_unsupported_backend = "kas"
+    d, _client, _sessions, transport = _make(provider=provider, context_pct=85.0)
+    asyncio.run(d.handle_message(_msg("first")))
+    assert [t for _, t in transport.sent] == ["answered"]
 
 
 # ── dispatcher: busy / steering ─────────────────────────────────────────────
@@ -412,7 +506,7 @@ def test_persist_turn_writes_user_and_assistant_rows():
             self.rows: list[tuple[str, str]] = []
             self.title = ""
 
-        def append(self, key, role, text):
+        def append(self, key, role, text, mid=None):
             self.rows.append((role, text))
 
         def set_title(self, key, title):
@@ -586,6 +680,51 @@ def _captured_turn(monkeypatch, dispatcher, inbound):
     monkeypatch.setattr(mod, "drive_turn", fake_drive_turn)
     asyncio.run(dispatcher.handle_message(inbound))
     return seen.get("turn")
+
+
+# ── durable inbound spool route ──────────────────────────────────────────────
+
+
+def test_dm_route_spools_the_pre_ingestion_original_not_the_prompt(monkeypatch):
+    """The route text is what the user SENT, read from ``pending_original``.
+
+    By the time the dispatcher runs, ``inbound.text`` has been rewritten by
+    ``receive`` with attachment context and temp paths, and ``user_text`` may
+    carry the group's private rules. The restart notice quotes the spooled text,
+    so only the pre-ingestion original may be spooled.
+    """
+    d, _client, _sessions, transport = _make()
+    inbound = _msg("look at this\n\n/tmp/kc-att/img-1.jpg")
+    inbound.attachments = ["/tmp/kc-att/img-1.jpg"]
+    transport.pending_original[id(inbound)] = ("look at this", 1)
+
+    turn = _captured_turn(monkeypatch, d, inbound)
+
+    assert turn is not None and turn.inbound_route is not None
+    assert turn.inbound_route.text == "look at this", "the ingested prompt was spooled"
+    assert turn.inbound_route.attachments_dropped == 1
+    assert turn.inbound_route.conversation_id == _DM
+
+
+def test_dm_route_is_not_declared_without_a_captured_original(monkeypatch):
+    """No fallback to ``inbound.text``: an envelope that skipped ``receive`` is not spooled."""
+    d, _client, _sessions, _transport = _make()
+
+    turn = _captured_turn(monkeypatch, d, _msg("hi"))
+
+    assert turn is not None and turn.inbound_route is None
+
+
+def test_group_route_is_never_declared(monkeypatch):
+    """``may_send_to`` knows nothing of the group roster, so groups are not spooled."""
+    d, _client, _sessions, transport = _make()
+    inbound = _msg("hi group", conv=_GROUP)
+    transport.pending_original[id(inbound)] = ("hi group", 0)
+    transport.pending_verdicts[id(inbound)] = GroupVerdict(respond=True)
+
+    turn = _captured_turn(monkeypatch, d, inbound)
+
+    assert turn is not None and turn.inbound_route is None
 
 
 def test_a_non_operator_turn_never_inherits_auto_approval(monkeypatch):

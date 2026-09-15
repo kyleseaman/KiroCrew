@@ -14,10 +14,10 @@ Whose credits are these?
 ------------------------
 Several credentials can be readable at once (an IDE cache, a kiro-cli store, a
 leftover file from a profile the user has since signed out of), and "unexpired"
-does not mean "the one kiro-cli is actually using": a token for the previous
-profile stays valid at the API until it expires on its own. Picking by fixed
-path order therefore showed the OLD profile's credits after a profile switch,
-and a gateway restart did not help because the order was the same on boot.
+does not mean "the one kiro-cli is actually using": a token for a signed-out
+profile stays valid at the API until it expires on its own. Picking by fixed path
+order therefore reports that profile's credits after a profile switch, and a
+gateway restart does not help because the order is the same on boot.
 
 So the caller passes ``expected_arn`` — the profile ARN ``kiro-cli whoami``
 reports for itself — and a candidate is only used when its own
@@ -63,7 +63,8 @@ The HTTP call uses the Python standard library (``urllib``) rather than a
 third-party client, so this module adds no new dependency to the public repo.
 
 Security controls (fixed as acceptance criteria):
-  1. Endpoint is hardcoded to AWS prod — never config-derived.
+  1. Endpoint is a hardcoded AWS prod host from a region table keyed by the
+     whoami profile ARN — never config-derived.
   2. TLS verification is always on (default ``ssl`` context: cert chain +
      hostname).
   3. Redirects are disabled (see ``_NoRedirect``) so the token can never be
@@ -91,12 +92,20 @@ from pathlib import Path
 from typing import NamedTuple
 
 from kiro_crew import hooks
+from kiro_crew.identity_stores import Trust, sqlite_dbs
 
 logger = logging.getLogger(__name__)
 
-# RTS / CodeWhisperer runtime endpoint (prod, IAD) — hardcoded, never derived
-# from config or the token file (control 1).
-_RTS_ENDPOINT = "https://codewhisperer.us-east-1.amazonaws.com"
+# Commercial RTS hosts (control 1): literals in this file, never config-derived.
+# eu-central-1 is a different hostname, not a regional spelling of the
+# us-east-1 one — ``codewhisperer.eu-central-1.amazonaws.com`` does not resolve.
+# A missing ARN or a region outside this table falls back to us-east-1.
+_RTS_ENDPOINTS = {
+    "us-east-1": "https://codewhisperer.us-east-1.amazonaws.com",
+    "eu-central-1": "https://q.eu-central-1.amazonaws.com",
+}
+_DEFAULT_RTS_REGION = "us-east-1"
+_RTS_ENDPOINT = _RTS_ENDPOINTS[_DEFAULT_RTS_REGION]
 _SVC = "com.amazon.aws.codewhisperer.runtime.AmazonCodeWhispererService"
 _TARGET_GET_USAGE = f"{_SVC}.GetUsageLimits"
 _TARGET_LIST_PROFILES = f"{_SVC}.ListAvailableProfiles"
@@ -140,29 +149,37 @@ _JSON_TOKEN_READ_IDS = (
 # running OS is inert, and a platform-independent module constant is what lets
 # tests patch the tuple without becoming host-dependent.
 #
-# The Windows entry is the fixed default Roaming location, NOT resolved from
-# ``%APPDATA%``. Membership here is a trust claim (``from_cli_store=True``)
-# that rests on agent file tools being unable to write the store, and that
-# fence (``_SENSITIVE_HOME_DIRS``) is home-anchored at exactly this path — so
-# an APPDATA-resolved location either equals this entry or falls outside the
-# fence and must not be trusted. A redirected Roaming profile therefore keeps
-# the text-scrape fallback rather than gaining a forgeable trusted path; the
-# same posture as the Linux entry, which does not follow ``XDG_DATA_HOME``
-# redirection either.
-_CLI_SQLITE_DBS = (
-    Path.home() / ".local" / "share" / "kiro-cli" / "data.sqlite3",
-    Path.home() / "Library" / "Application Support" / "kiro-cli" / "data.sqlite3",
-    Path.home() / "AppData" / "Roaming" / "kiro-cli" / "data.sqlite3",
-)
+# The Windows entries are the fixed default locations, NOT resolved from
+# ``%LOCALAPPDATA%`` / ``%APPDATA%``. Membership here is a trust claim
+# (``from_cli_store=True``) that rests on agent file tools being unable to
+# write the store, and that fence (``_SENSITIVE_HOME_DIRS``) is home-anchored
+# at exactly these paths -- so an env-resolved location either equals an entry
+# or falls outside the fence and must not be trusted. A redirected profile
+# therefore keeps the text-scrape fallback rather than gaining a forgeable
+# trusted path; the same posture as the Linux entry, which does not follow
+# ``XDG_DATA_HOME`` redirection either.
+#
+# ``AppData/Local`` is where current kiro-cli actually writes on Windows (its
+# data dir resolves to the local, non-roaming app-data directory -- the same
+# resolver family that yields ``~/.local/share`` on Linux and
+# ``~/Library/Application Support`` on macOS, both matching the entries
+# above). ``AppData/Roaming`` is retained for layouts that used the roaming
+# location; a path that does not exist on the running host is inert.
+_CLI_SQLITE_DBS = sqlite_dbs(Trust.TRUSTED)
 
 # Auth stores belonging to OTHER products (amazon-q). Readable, and often the same
 # account, but NOT kiro-cli's own credential — so a token from here can only be
 # used when a matching profile ARN proves the account independently. It can never
 # satisfy the source-anchored path.
-_OTHER_SQLITE_DBS = (
-    Path.home() / ".local" / "share" / "amazon-q" / "data.sqlite3",
-    Path.home() / "Library" / "Application Support" / "amazon-q" / "data.sqlite3",
-)
+#
+# The Windows entries mirror the kiro-cli tuple above rather than stopping at the
+# POSIX layouts: the fence (``_SENSITIVE_HOME_DIRS``) and sign-in staging both
+# already name ``AppData/{Local,Roaming}/amazon-q``, so omitting them here made
+# an amazon-q token unreadable for usage on exactly the platform where it is
+# fenced -- a store every writer treats as a secret and this reader treats as
+# absent. Untrusted either way (``from_cli_store=False``), so this widens what
+# can be READ for credit reporting, never what is believed.
+_OTHER_SQLITE_DBS = sqlite_dbs(Trust.OTHER)
 _SQLITE_TOKEN_KEYS = ("kirocli:odic:token", "codewhisperer:odic:token", "kirocli:social:token", "kirocli:external-idp:token")
 
 # SEL audit label for the SQLite live-token read. Not an allowlist entry (that
@@ -182,9 +199,12 @@ _MAX_BONUS_NAME_CHARS = 100
 # a few KB; 1 MB is comfortably above any real response.
 _MAX_RESP_BYTES = 1_000_000
 
-# Memoized account profile ARN (stable per account). Populated only from a
-# definitive ListAvailableProfiles 200 (the value may be None for individual
-# accounts); transient failures are never cached. See _list_profile_arn.
+# Memoized account profile ARN (stable per account). Keyed by
+# (token digest, expected-ARN digest) -- see _profile_cache_key -- so two probes
+# with the same token but different expected ARNs never serve each other's
+# answer. Populated only from a definitive ListAvailableProfiles 200 that
+# yielded an ARN; transient failures, empty lists, and anchored misses are
+# never cached. See _list_profile_arn.
 _PROFILE_ARN_CACHE: dict[str, str | None] = {}
 
 # Size cap for the two profile caches below. They are keyed by token digest and
@@ -486,17 +506,39 @@ def _load_bearer_token() -> str | None:
     return candidates[0].token if candidates else None
 
 
-def _post(token: str, target: str, payload: dict) -> _Resp:
+def _region_from_arn(arn: str | None) -> str:
+    """Return the CodeWhisperer region in ``arn``, or the commercial default.
+
+    Profile ARNs are ``arn:aws:codewhisperer:<region>:<account>:profile/<name>``.
+    A missing or malformed ARN, or a region not in :data:`_RTS_ENDPOINTS`,
+    falls back to us-east-1 so the request still goes to a known AWS prod host.
+    """
+    if not isinstance(arn, str) or not arn:
+        return _DEFAULT_RTS_REGION
+    parts = arn.split(":")
+    if len(parts) < 6 or parts[2] != "codewhisperer":
+        return _DEFAULT_RTS_REGION
+    region = parts[3]
+    return region if region in _RTS_ENDPOINTS else _DEFAULT_RTS_REGION
+
+
+def _rts_endpoint(arn: str | None = None) -> str:
+    """Hardcoded RTS host for ``arn``'s region (control 1)."""
+    return _RTS_ENDPOINTS[_region_from_arn(arn)]
+
+
+def _post(token: str, target: str, payload: dict, *, endpoint: str | None = None) -> _Resp:
     """POST an AWS-JSON request to the hardcoded RTS endpoint over urllib.
 
     TLS verification (control 2) and no-redirect (control 3) come from
     :func:`_build_opener`. A non-2xx HTTP *response* is returned as a ``_Resp``
     (requests parity — the caller branches on ``status_code``); only a
-    transport-level failure raises :class:`_RequestError`.
+    transport-level failure raises :class:`_RequestError`. ``endpoint`` selects
+    the regional host; omitted, it is the us-east-1 default.
     """
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        _RTS_ENDPOINT,
+        endpoint or _RTS_ENDPOINT,
         data=body,
         method="POST",
         headers={
@@ -538,26 +580,53 @@ def _read_capped(fp: object) -> str:
     return data.decode("utf-8", "replace")
 
 
-def _list_profile_arn(token: str) -> str | None:
-    """Return the account's profile ARN, or None for non-enterprise accounts.
+def _profile_cache_key(token: str, expected_arn: str | None) -> str:
+    """Cache key for the profile caches: token digest + expected-ARN digest.
+
+    Keyed by BOTH so two probes with the same token but different expected
+    ARNs can never serve each other's answer — one memoized ARN per token
+    digest is what made a wrong first selection sticky for the process
+    lifetime. Never the raw token (control 5); the ARN is digested too so the
+    key shape stays uniform. A falsy anchor ("" or None) means "no question
+    asked" and maps to one shared key.
+    """
+    tok = hashlib.sha256(token.encode()).hexdigest()[:16]
+    anchor = hashlib.sha256((expected_arn or "").encode()).hexdigest()[:16]
+    return f"{tok}:{anchor}"
+
+
+def _list_profile_arn(
+    token: str, *, expected_arn: str | None = None, endpoint: str | None = None
+) -> str | None:
+    """Return the profile ARN this token should use, or None.
 
     Enterprise/IdC accounts (KIRO POWER etc.) must pass ``profileArn`` to
     GetUsageLimits or it returns 403 FEATURE_NOT_SUPPORTED.
 
-    The ARN is account-stable per token, so a found ARN is memoized in
-    ``_PROFILE_ARN_CACHE`` keyed by a token digest (never the token itself) to
-    save one RTS round-trip per refresh. Two things are deliberately NOT
-    cached: transient failures (network error, non-200), and a 200 with no
-    profiles — an empty list can be post-login propagation lag on an
-    enterprise account, so pinning arn=None would strand that account on the
-    text fallback until restart. Both are re-probed on the next refresh, and
-    each candidate token is probed for its own account (no cross-token reuse).
+    ``expected_arn`` is the question being asked: when supplied, the answer
+    is that ARN if it is present in THIS token's own ListAvailableProfiles
+    list, else None. Presence in the token's own list is what proves the
+    credential belongs to the signed-in account — position proves nothing,
+    because a token entitled to several profiles returns them in an order the
+    caller does not control. When no anchor is supplied (source-anchored
+    mode) the first entry carrying an ARN is the answer.
+
+    The answer is account-stable per (token, question), so a found ARN is
+    memoized in ``_PROFILE_ARN_CACHE`` keyed by :func:`_profile_cache_key`
+    (never the token itself) to save one RTS round-trip per refresh. Three
+    things are deliberately NOT cached: transient failures (network error,
+    non-200), a 200 with no profiles, and an anchored miss (expected ARN
+    absent from the list) — an empty or incomplete list can be post-login
+    propagation lag on an enterprise account, so pinning the miss would
+    strand that account on the text fallback until restart. All are re-probed
+    on the next refresh, and each candidate token is probed for its own
+    account (no cross-token reuse).
     """
-    key = hashlib.sha256(token.encode()).hexdigest()[:16]
+    key = _profile_cache_key(token, expected_arn)
     if key in _PROFILE_ARN_CACHE:
         return _PROFILE_ARN_CACHE[key]
     try:
-        r = _post(token, _TARGET_LIST_PROFILES, {})
+        r = _post(token, _TARGET_LIST_PROFILES, {}, endpoint=endpoint)
     except _RequestError:
         return None
     if r.status_code != 200:
@@ -577,15 +646,19 @@ def _list_profile_arn(token: str) -> str | None:
         if not isinstance(p, dict):
             continue
         candidate = p.get("arn") or p.get("profileArn")
-        if candidate:
-            arn = candidate
-            # Human label for the signed-in account. Bounded like the plan name
-            # so a hostile/oversized value can't reach the cache/UI unbounded;
-            # only a non-empty string qualifies.
-            pname = p.get("profileName") or p.get("profileDisplayName")
-            if isinstance(pname, str) and pname:
-                name = pname[:100]
-            break
+        if not candidate:
+            continue
+        if expected_arn and candidate != expected_arn:
+            # Anchored mode: only the asked-about profile is an answer.
+            continue
+        arn = candidate
+        # Human label for the signed-in account. Bounded like the plan name
+        # so a hostile/oversized value can't reach the cache/UI unbounded;
+        # only a non-empty string qualifies.
+        pname = p.get("profileName") or p.get("profileDisplayName")
+        if isinstance(pname, str) and pname:
+            name = pname[:100]
+        break
     if arn is not None:
         _remember_profile(key, arn, name)
     return arn
@@ -609,14 +682,15 @@ def _remember_profile(key: str, arn: str, name: str | None) -> None:
     _PROFILE_NAME_CACHE[key] = name
 
 
-def _account_name(token: str) -> str | None:
+def _account_name(token: str, expected_arn: str | None = None) -> str | None:
     """Return the cached profile display name for ``token``, or None.
 
     Populated as a side effect of :func:`_list_profile_arn`; this getter never
     issues a request itself, so the ARN probe must have run first (it always
-    does in ``fetch_usage_limits``). Keyed by the same token digest (never the
-    token itself)."""
-    return _PROFILE_NAME_CACHE.get(hashlib.sha256(token.encode()).hexdigest()[:16])
+    does in ``fetch_usage_limits``), and ``expected_arn`` must be the same
+    anchor that probe was asked about. Keyed by :func:`_profile_cache_key`
+    (never the token itself)."""
+    return _PROFILE_NAME_CACHE.get(_profile_cache_key(token, expected_arn))
 
 
 def _bounded(value: object) -> float | None:
@@ -671,6 +745,27 @@ def _map_response(data: dict) -> dict | None:
                 break
     if not credit:
         return None
+
+    # Ambiguity probe (observation only — selection above is unchanged). The
+    # plan-pool picker takes the FIRST entry that is exactly resourceType
+    # "CREDIT", so a second CREDIT-typed pool (e.g. a promotional/welcome grant
+    # typed literally "CREDIT" rather than a bonus marker) can win the plan slot
+    # by list order and displace the real plan pool — a latent, unobserved case
+    # with no captured payload. When more than one entry satisfies the plan-pool
+    # test we record the SHAPE so a maintainer can choose a remedy (fail-closed
+    # vs deterministic pick) against real evidence. Log resource types and
+    # counts only, never balances or identifiers (billing-adjacent). Additive:
+    # nothing about which pool wins changes.
+    _credit_typed = [b for b in breakdowns if b.get("resourceType") == "CREDIT"]
+    if len(_credit_typed) > 1:
+        logger.warning(
+            "Kiro usage API: %d CREDIT-typed pools in usageBreakdownList "
+            "(resource types %s); plan pool selected by list order at index %d "
+            "— a second CREDIT-typed pool may be displacing the real plan pool",
+            len(_credit_typed),
+            [str(b.get("resourceType")) for b in breakdowns],
+            breakdowns.index(credit),
+        )
 
     # Prefer the *-WithPrecision fields only when they are valid numbers; a
     # present-but-null/malformed precision value must fall back to the legacy
@@ -814,6 +909,10 @@ def fetch_usage_limits(expected_arn: str | None) -> dict | None:
     if not candidates:
         logger.debug("Kiro usage API: no live bearer token available")
         return None
+    # Resolve once from the whoami ARN so ListAvailableProfiles and
+    # GetUsageLimits hit the same regional host. Unknown/absent region stays
+    # on the us-east-1 default (control 1: the URL is still a file literal).
+    endpoint = _rts_endpoint(expected_arn)
     reason = "unknown"
     deadline = time.monotonic() + _TOTAL_DEADLINE_SECS
     for candidate in candidates:
@@ -835,14 +934,18 @@ def fetch_usage_limits(expected_arn: str | None) -> dict | None:
                     "kiro-cli's own auth store"
                 )
                 continue
-            arn = _list_profile_arn(token)
+            arn = _list_profile_arn(token, expected_arn=expected_arn, endpoint=endpoint)
             if expected_arn and (not arn or arn != expected_arn):
-                # ARN-anchored mode: not provably the signed-in account. Skip
-                # WITHOUT calling GetUsageLimits. A null ``arn`` is rejected rather
-                # than compared, because None carries no identity — it is what a
-                # transient profile lookup returns AND what every profile-less
-                # account returns, so comparing it would match one account's
-                # leftover credential against a different one.
+                # ARN-anchored mode: the expected profile is genuinely absent
+                # from this token's own profile list (or the probe failed), so
+                # nothing proves the credential belongs to the signed-in
+                # account. Skip WITHOUT calling GetUsageLimits. The probe was
+                # asked about ``expected_arn`` and answers with that ARN or
+                # None; a null answer is rejected rather than compared, because
+                # None carries no identity — it is what a transient profile
+                # lookup returns AND what every profile-less account returns,
+                # so comparing it would match one account's leftover credential
+                # against a different one.
                 #
                 # ARNs are not secret, but they identify an account, so only the
                 # outcome is logged.
@@ -856,7 +959,7 @@ def fetch_usage_limits(expected_arn: str | None) -> dict | None:
             if arn:
                 payload["profileArn"] = arn
             try:
-                r = _post(token, _TARGET_GET_USAGE, payload)
+                r = _post(token, _TARGET_GET_USAGE, payload, endpoint=endpoint)
             except _RequestError as e:
                 reason = f"request failed: {type(e).__name__}"
                 logger.debug("Kiro usage API %s", reason)
@@ -877,7 +980,7 @@ def fetch_usage_limits(expected_arn: str | None) -> dict | None:
                 # Tag the usage with WHO the plan belongs to (profile display
                 # name from the ListAvailableProfiles probe above). Absent for
                 # individual Builder ID accounts, which have no profile.
-                account = _account_name(token)
+                account = _account_name(token, expected_arn)
                 if account:
                     mapped["account"] = account
                 # Coupling metadata for the caller's identity check (private —

@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew.cron import (
     CronStoreBusy,
+    CronStoreUnreadable,
     compute_next_run_ts,
     format_schedule,
     get_local_tz,
@@ -317,6 +318,39 @@ def format_ttl(ttl_secs: int) -> str:
     return f"{mins}m"
 
 
+def compact_unsupported_backend(provider: Any) -> str | None:
+    """Backend id when *provider* cannot serve a manual ``/compact``, else ``None``.
+
+    The channel half of the dashboard's manual-``/compact`` capability gate:
+    a backend outside ``ACP_BACKENDS_COMPACT`` treats the ``/compact``
+    prompt as ordinary text and never emits a compaction status, so dispatching
+    it strands ``wait_for_compaction()`` for its whole deadline. The capability
+    is read off the LIVE provider — ``manual_compact_unsupported_backend`` is
+    declared on the ``LLMProvider`` ABC with a ``None`` (supported) default per
+    harness-parity H14 — and only a non-empty ``str`` (the ABC's stated
+    contract) reads as a refusal, so a mocked or duck-typed provider's truthy
+    attribute never blocks a compaction.
+    """
+    value = getattr(provider, "manual_compact_unsupported_backend", None)
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def compact_unsupported_reply(backend: str) -> str:
+    """Informational reply for a manual ``/compact`` on an unsupported *backend*.
+
+    Mirrors the dashboard's wording: the backend manages compaction
+    automatically (the same relationship the ``cc_managed`` decline encodes),
+    so the refusal is information, never an error.
+    """
+    return (
+        f"ℹ️ The `{backend}` backend manages compaction automatically — it "
+        "summarizes the conversation on its own as context fills, so manual "
+        "`/compact` isn't needed (and isn't supported) here."
+    )
+
+
 #: How much of a cron job's message body a list row shows.
 _CRON_MESSAGE_PREVIEW_CHARS = 50
 #: How much of a subagent's task a list row shows.
@@ -328,6 +362,23 @@ _SPAWN_ECHO_CHARS = 100
 #: because a caller that sees a different wording per verb cannot tell "retry
 #: this" from "this failed".
 _CRON_BUSY = "⏳ Cron store busy — try again in a moment."
+
+
+def _cron_unreadable(exc: CronStoreUnreadable) -> str:
+    """The NON-retryable answer for a store whose last read failed.
+
+    A helper rather than a sibling constant of :data:`_CRON_BUSY` for one
+    reason: busy is one fixed sentence, but this message names the unreadable
+    path and the remediation, both of which the exception already carries — so
+    a constant could not hold them and restating them here would let the two
+    copies drift. The "one wording per store fault, not per verb" rule
+    _CRON_BUSY documents still applies, which is why the formatting lives in a
+    single place instead of at each call site.
+
+    Distinct from busy on purpose: a client that retries a contended store must
+    NOT retry this one, because an unreadable file does not heal on its own.
+    """
+    return f"⚠️ {exc}"
 
 
 def _redact(text: str) -> str:
@@ -485,11 +536,25 @@ async def cron_remove_all_reply(
     Public for the same reason as :func:`spawn_task_reply`: a channel that
     parsed ``remove all`` itself should not have to rebuild the sentence.
 
-    *source* is the channel name and *caller* the person who typed it, both for the
-    SEL audit below. They default empty so a caller that has neither still gets the
-    record with the surface unnamed, which is worth more than no record.
+    *source* is the channel name and *caller* the person who typed it. Both are
+    forwarded to the service so the persisted mutation and its audit cannot drift.
     """
     jobs = cron_service.list_jobs(include_disabled=True)
+    # Refuse an unreadable store BEFORE the "nothing to do" answer below.
+    # `list_jobs` degrades a corrupt store to an EMPTY list without raising, so
+    # without this the reply for a corrupt store is byte-identical to the reply
+    # for an honestly empty one -- and the `except CronStoreUnreadable` on the
+    # removal never runs, because with no jobs no removal is attempted. That is
+    # the quiet-versus-broken conflation, reached by omission rather than by a
+    # wrong branch. `getattr` because `cron_service` is duck-typed and a fake
+    # need not carry the probe. The freshness this inherits is the reply's own:
+    # `list_jobs` is cache-only, so the latch is as current as the last sync.
+    probe = getattr(cron_service, "raise_if_store_unreadable", None)
+    if callable(probe):
+        try:
+            probe()
+        except CronStoreUnreadable as exc:
+            return _cron_unreadable(exc)
     if not jobs:
         return "No cron jobs to remove."
     # ``job.name`` is free-form user/LLM text reaching a chat reply and the
@@ -498,30 +563,15 @@ async def cron_remove_all_reply(
     # One batch lock/reload/save, offloaded by the service itself, so a chat
     # gateway's loop is never parked on the store lock.
     try:
-        removed_ids, missing_ids = await cron_service.remove_jobs([job.id for job in jobs])
+        await cron_service.remove_jobs(
+            [job.id for job in jobs],
+            actor=caller or source or "system",
+            source=source or "messaging",
+        )
     except CronStoreBusy:
         return _CRON_BUSY
-    # SEL audit: every plural delete path leaves the same ``cron.batch_delete``
-    # record the dashboard's does (MCP's ``cron_remove_all`` logs its own
-    # authz-scoped tool event instead). Once the jobs are gone from crons.json the
-    # trail is the only way to tell a deliberate remove-all from data loss, and this
-    # is the SHARED path now, so every channel gets it rather than only the one
-    # whose copy carried the audit. Best-effort and exception-contained: the first
-    # ``sel()`` of a process CONSTRUCTS the log and can raise, and the jobs are
-    # already removed -- audit unavailability must not fail the command.
-    try:
-        sel().log_api_access(
-            caller=caller or source or "system",
-            operation="cron.batch_delete",
-            outcome="ok" if removed_ids else "failed",
-            source=source or "messaging",
-            resources=(
-                f"requested={[job.id for job in jobs]} "
-                f"deleted={removed_ids} failed={missing_ids}"
-            ),
-        )
-    except Exception:
-        logger.warning("SEL audit for cron remove-all failed", exc_info=True)
+    except CronStoreUnreadable as exc:
+        return _cron_unreadable(exc)
     return f"✅ Removed {len(lines)} cron job(s):\n" + "\n".join(lines)
 
 
@@ -534,9 +584,8 @@ async def cron_command_reply(
     ``*_async`` variants; a contended store answers "busy, retry" rather than
     parking the caller's loop on the lock.
 
-    *source* and *caller* name the channel and the person for the remove-all SEL
-    audit; both are keyword-only with empty defaults so every existing positional
-    call site is unchanged.
+    *source* and *caller* name the channel and person for removal attribution;
+    both are keyword-only with empty defaults so existing positional calls work.
     """
     parts = text.strip().lower().split()
     if len(parts) < 2 or parts[0] != "cron":
@@ -551,27 +600,19 @@ async def cron_command_reply(
         if job_id == "all":
             return await cron_remove_all_reply(cron_service, source=source, caller=caller)
         try:
-            removed = await cron_service.remove_job_async(job_id)
+            removed = await cron_service.remove_job_async(
+                job_id,
+                actor=caller or source or "system",
+                source=source or "messaging",
+            )
         except CronStoreBusy:
             # A contended store means the delete never happened, so there is no
             # mutation to audit -- matching the dashboard's single-delete busy path.
             return _CRON_BUSY
-        # SEL audit on the single delete, on the same reasoning as the batch one
-        # below it: once the job is gone from crons.json the trail is the only way to
-        # tell a deliberate removal from data loss. Emitted for a MISSING id too,
-        # because "someone asked to delete a job that was not there" is exactly the
-        # shape worth being able to see. Exception-contained: the first ``sel()`` of a
-        # process constructs the log and can raise, and the job is already removed.
-        try:
-            sel().log_api_access(
-                caller=caller or source or "system",
-                operation="cron.remove",
-                outcome="allowed" if removed else "not_found",
-                source=source or "messaging",
-                resources=f"job_id={job_id}",
-            )
-        except Exception:
-            logger.warning("SEL audit for cron remove failed", exc_info=True)
+        except CronStoreUnreadable as exc:
+            # Same "nothing happened, so nothing to audit" reasoning, minus the
+            # retry: the store will not become readable by itself.
+            return _cron_unreadable(exc)
         return f"✅ Removed cron job `{job_id}`" if removed else f"❌ Job `{job_id}` not found"
     if action in ("pause", "resume"):
         enabled = action == "resume"
@@ -579,6 +620,8 @@ async def cron_command_reply(
             changed = await cron_service.enable_job_async(job_id, enabled=enabled)
         except CronStoreBusy:
             return _CRON_BUSY
+        except CronStoreUnreadable as exc:
+            return _cron_unreadable(exc)
         if not changed:
             return f"❌ Job `{job_id}` not found"
         return f"▶️ Resumed cron job `{job_id}`" if enabled else f"⏸️ Paused cron job `{job_id}`"

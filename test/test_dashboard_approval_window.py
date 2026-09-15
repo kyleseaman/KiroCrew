@@ -2,8 +2,8 @@
 
 Three properties, one per failure mode observed in production:
 
-1. The window is CONFIGURABLE and short by default. It used to be a literal
-   ``7200.0`` in ``chat_runner``, identical to the turn ceiling.
+1. The window is CONFIGURABLE and short by default, not a literal
+   ``7200.0`` in ``chat_runner`` equal to the turn ceiling.
 2. It is CLAMPED below the turn ceiling. A window at or above the ceiling can
    never fire — the turn is cut first — so it is not a longer wait, it is a
    wait that never reports.
@@ -17,6 +17,7 @@ import asyncio
 import inspect
 import logging
 import re
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -51,6 +52,52 @@ def cfg(monkeypatch: pytest.MonkeyPatch):
         )
 
     return _apply
+
+
+@pytest.fixture(autouse=True)
+def _isolate_turn_deadline():
+    """Give every test a clean ``_TURN_DEADLINE`` and put the outside value back.
+
+    Residue travels through the main-thread context: an un-reset ``set()`` made
+    there is inherited by every later test in the worker, because each async
+    test's task context is copied from it (an async test's own writes die with
+    its task copy — a leak seen at test start was already in the parent
+    context). Baselining to ``None`` here is what makes this module's
+    ``get() is None`` assertions deterministic under any ordering; restoring
+    the snapshot afterwards keeps the fixture honest about state it did not
+    create. Deliberately a sync fixture: an async one would run inside a copied
+    task context and its writes would be discarded with it.
+
+    Save/restore is by VALUE, not ``reset(token)``, mirroring
+    ``turn_dispatch._bounded_turn``: test and shutdown harnesses may resume
+    finalization in a copied Context (notably Windows xdist); ``reset(token)``
+    then raises and can take down the whole worker because tokens are
+    context-bound. The sites below follow the same pattern for the same reason.
+    """
+    prev = td._TURN_DEADLINE.get()
+    td._TURN_DEADLINE.set(None)
+    try:
+        yield
+    finally:
+        td._TURN_DEADLINE.set(prev)
+
+
+def test_token_based_restore_stays_banned_in_this_module() -> None:
+    """No test here may restore ``_TURN_DEADLINE`` through a ContextVar token.
+
+    The isolation fixture above masks exactly the failure it fixes: with every
+    test baselined to ``None``, the ``get() is None`` assertions cannot
+    catch a reintroduced token-based restore — the pattern that leaves the var
+    set (or kills the worker) when finalization resumes in a copied Context,
+    per the rationale at turn_dispatch.py:350-356. Pin the ban at the source
+    level instead of relying on convention.
+    """
+    src = inspect.getsource(sys.modules[__name__])
+    needle = "_TURN_DEADLINE" + ".reset("
+    assert needle not in src, (
+        "restore _TURN_DEADLINE by value (set the captured previous value), "
+        "never through a ContextVar token"
+    )
 
 
 class TestDefaultsAreShort:
@@ -115,9 +162,7 @@ class TestPerSlotWindowIsAlsoBudgetBounded:
         return min(state.approval_timeout_for(slot), td.tool_approval_timeout_secs())
 
     @pytest.mark.asyncio
-    async def test_attended_window_is_the_configured_one_not_the_flat_constant(
-        self, cfg
-    ) -> None:
+    async def test_attended_window_is_the_configured_one_not_the_flat_constant(self, cfg) -> None:
         # 7200 is what `approval_timeout_for` returns for an attended slot; the
         # window that actually applies is the configurable, bounded one.
         cfg(window=600, turn=7200)
@@ -139,11 +184,12 @@ class TestPerSlotWindowIsAlsoBudgetBounded:
         cfg(window=600, turn=7200)
         loop = asyncio.get_running_loop()
         state = SimpleNamespace(approval_timeout_for=lambda _s: 7200.0)
-        token = td._TURN_DEADLINE.set(loop.time() + 300.0)
+        prev = td._TURN_DEADLINE.get()
+        td._TURN_DEADLINE.set(loop.time() + 300.0)
         try:
             got = self._window(state, object())
         finally:
-            td._TURN_DEADLINE.reset(token)
+            td._TURN_DEADLINE.set(prev)
         assert got == pytest.approx(300.0 - APPROVAL_TURN_MARGIN_SECS, abs=1.0)
 
     @pytest.mark.asyncio
@@ -153,11 +199,12 @@ class TestPerSlotWindowIsAlsoBudgetBounded:
         cfg(window=600, turn=7200)
         loop = asyncio.get_running_loop()
         state = SimpleNamespace(approval_timeout_for=lambda _s: 180.0)
-        token = td._TURN_DEADLINE.set(loop.time() + 5.0)
+        prev = td._TURN_DEADLINE.get()
+        td._TURN_DEADLINE.set(loop.time() + 5.0)
         try:
             assert self._window(state, object()) == 0.0
         finally:
-            td._TURN_DEADLINE.reset(token)
+            td._TURN_DEADLINE.set(prev)
 
 
 class TestStallSignalReachesTheLoop:
@@ -220,6 +267,162 @@ class TestStallSignalReachesTheLoop:
         )
 
 
+class TestTimeoutTellsTheAgentInBand:
+    """The timeout branch must correct the agent's "user denied" attribution.
+
+    kiro-cli reports the auto-decline below as its generic "User denied tool
+    execution", so without an in-band notice the agent concludes the human
+    actively refused a call nobody answered, and changes course on a decision
+    that was never made. The policy-deny paths already steer their reason into
+    the running turn before rejecting; this pins the same wiring — same helper,
+    same before-the-reject ordering — onto the approval-timeout branch.
+    """
+
+    @staticmethod
+    def _timeout_branch() -> list[str]:
+        from kiro_crew.dashboard import chat_runner
+
+        lines = inspect.getsource(chat_runner._run_chat).split("\n")
+        start = next(
+            i for i, ln in enumerate(lines) if ln.strip() == "except asyncio.TimeoutError:"
+        )
+        indent = len(lines[start]) - len(lines[start].lstrip())
+        body = []
+        for ln in lines[start + 1 :]:
+            if ln.strip() and (len(ln) - len(ln.lstrip())) <= indent:
+                break
+            body.append(ln)
+        return body
+
+    @staticmethod
+    def _shared_steer_block() -> str:
+        """The provenance-gated steer at the shared reject branch.
+
+        The timeout arm records its cause and the correction is steered ONCE
+        where every host auto-decline funnels — immediately before the shared
+        ``reject_tool`` — so the block under ``if _host_deny_cause:`` is the
+        wiring these tests pin.
+        """
+        from kiro_crew.dashboard import chat_runner
+
+        src = inspect.getsource(chat_runner._run_chat)
+        gate = "if _host_deny_cause:"
+        assert gate in src, "the shared provenance-gated steer is gone"
+        block = src.split(gate, 1)[1]
+        end = block.index("await client.reject_tool(")
+        return block[:end]
+
+    def test_the_branch_records_the_timeout_cause(self) -> None:
+        body = "\n".join(self._timeout_branch())
+        assert "_host_deny_cause = DENY_CAUSE_APPROVAL_TIMEOUT" in body, (
+            "the approval-timeout branch no longer records its cause; the agent "
+            "is left holding kiro-cli's generic 'User denied tool execution'"
+        )
+        assert (
+            "_host_deny_reason = (" in body
+        ), "the approval-timeout branch no longer records a reason sentence"
+        # The correction itself is folded into the shared reject branch — a
+        # second steer here would tell the model the same fact twice.
+        assert "_steer_policy_notice(" not in body, (
+            "the timeout arm steers its own notice again — the shared "
+            "provenance-gated steer now double-steers"
+        )
+
+    def test_the_shared_branch_steers_the_recorded_cause(self) -> None:
+        block = self._shared_steer_block()
+        assert "_steer_policy_notice(" in block
+        assert "cause=_host_deny_cause" in block, (
+            "the notice must carry the arm's recorded cause, not inherit the "
+            "policy wording — 'blocked by a safety policy' is false here"
+        )
+        # BOTH attended and unattended slots get the notice: the shared site
+        # must gate on provenance alone, never on attendedness.
+        assert "_unattended_wait" not in block, (
+            "the shared steer is gated on the unattended flag — an attended "
+            "slot's agent would never be corrected"
+        )
+
+    def test_the_notice_stays_out_of_the_turn_ledger(self) -> None:
+        """The steer must NOT thread `_refusal_notices`.
+
+        `should_queue_refusal_recovery` compares that list against
+        `_refusal_reasons` by COUNT, and this path deliberately appends no
+        reasons entry (an expired prompt is answered as an ordinary rejection,
+        never by a recovery continuation). Threading the shared ledger would
+        let an unsettled timeout notice force a duplicate recovery turn — or
+        let a settled one mask a real deny whose own steer failed.
+        """
+        # Scanned over CODE lines only: the comment above the call site names
+        # _refusal_notices while explaining why it is NOT used, and a comment
+        # must neither satisfy nor trip a wiring assertion.
+        code = "\n".join(
+            ln for ln in self._shared_steer_block().splitlines() if not ln.lstrip().startswith("#")
+        )
+        assert "[]," in code, "expected a throwaway notice list for the shared host-decline steer"
+        assert "_refusal_notices" not in code, (
+            "the host-decline steer must not participate in the recovery-fallback "
+            "accounting — it pairs with no _refusal_reasons entry"
+        )
+
+    def test_the_cause_is_not_gated_on_the_unattended_flag(self) -> None:
+        """BOTH attended and unattended slots get the notice.
+
+        The unattended transcript line stays unattended-only, but an attended
+        slot's AGENT is handed the exact same generic denial string — recording
+        the cause under the flag would leave the attended case exactly as
+        broken as before this change. The shared steer is gated ONLY on the
+        recorded provenance, so the cause assignment is what must stay outside
+        the unattended gate.
+        """
+        body = self._timeout_branch()
+        gate = next(i for i, ln in enumerate(body) if ln.strip() == "if _unattended_wait:")
+        cause = next(
+            i for i, ln in enumerate(body) if "_host_deny_cause = DENY_CAUSE_APPROVAL_TIMEOUT" in ln
+        )
+        assert cause < gate, (
+            "the timeout cause is recorded inside (or after) the unattended "
+            "gate — an attended slot's agent would never be corrected"
+        )
+
+    def test_the_steer_is_bounded_so_reject_and_audit_cannot_be_skipped(self) -> None:
+        """The steer await must be bounded INSIDE the helper.
+
+        Every deny path runs reject_tool + a SEL audit write after
+        `_steer_policy_notice`; unbounded, a backpressured ACP stdin could hold
+        the await until the turn deadline cancelled it — skipping both, so the
+        UI would read rejected while the wire and the audit trail never heard
+        about it. The bound lives in the helper (not per call site) so all
+        five deny paths inherit it and a sixth cannot be added without it.
+        """
+        from kiro_crew.dashboard import chat_runner
+
+        helper = inspect.getsource(chat_runner._steer_policy_notice)
+        assert "asyncio.wait_for(" in helper, "the steer notice is awaited unbounded"
+        assert "_STEER_NOTICE_BOUND_SECS" in helper
+        # The call site itself must NOT re-wrap the call: a second, per-site
+        # bound is exactly the duplication moving it into the helper removed.
+        code = "\n".join(
+            ln for ln in self._shared_steer_block().splitlines() if not ln.lstrip().startswith("#")
+        )
+        assert "asyncio.wait_for(" not in code
+
+    def test_the_reject_still_happens_after_the_steer(self) -> None:
+        """The notice explains the decline; it must not replace it.
+
+        Ordering is the mechanism: the steer is written while the permission
+        request is still unanswered, and the generic rejected branch (the one
+        a timed-out approval falls into, identified by its ``_reject_label``
+        append) answers it afterwards.
+        """
+        from kiro_crew.dashboard import chat_runner
+
+        src = inspect.getsource(chat_runner._run_chat)
+        steer = src.index("cause=_host_deny_cause")
+        reject = src.index('slot.append("tool", _reject_label, "msg msg-tool")')
+        assert steer < reject, "the steer must precede the rejection going on the wire"
+        assert "await client.reject_tool(event.request_id)" in src[steer:reject]
+
+
 class TestResolver:
     def test_reads_config(self, cfg) -> None:
         cfg(window=300)
@@ -275,11 +478,19 @@ class TestLoadTimeClamp:
         _clamp_security_bounds(data)
         assert data["agent"]["tool_approval_timeout_secs"] == 600
 
-    def test_absent_ceiling_uses_the_field_default(self) -> None:
-        """Omitting the ceiling must not disable the cross-field clamp."""
+    def test_absent_ceiling_uses_the_field_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Omitting the ceiling must not disable the cross-field clamp.
+
+        With the shipped default ceiling the static ``TOOL_APPROVAL_TIMEOUT_MAX``
+        binds first, so the cross-field clamp can only be SEEN to consult the
+        field default by lowering that default below the static max.
+        """
+        from kiro_crew.config import loader as loader_mod
+
+        monkeypatch.setattr(loader_mod, "_DEFAULT_CHAT_TURN_TIMEOUT_SECS", 1200)
         data = {"agent": {"tool_approval_timeout_secs": 7200}}
         _clamp_security_bounds(data)
-        assert data["agent"]["tool_approval_timeout_secs"] == 7200 - APPROVAL_TURN_MARGIN_SECS
+        assert data["agent"]["tool_approval_timeout_secs"] == 1200 - APPROVAL_TURN_MARGIN_SECS
 
     def test_static_bounds_applied_first(self) -> None:
         """The generic range clamp still runs on this field."""
@@ -289,8 +500,18 @@ class TestLoadTimeClamp:
 
         data = {"agent": {"tool_approval_timeout_secs": TOOL_APPROVAL_TIMEOUT_MAX * 10}}
         _clamp_security_bounds(data)
-        # Static ceiling first, then the cross-field margin under the default
-        # turn ceiling (both 7200, so the margin binds).
+        # Static ceiling first. The default turn ceiling sits above the static
+        # max by more than the margin, so the cross-field clamp leaves the
+        # statically-clamped value alone.
+        assert data["agent"]["tool_approval_timeout_secs"] == TOOL_APPROVAL_TIMEOUT_MAX
+        # With a ceiling INSIDE the static max the cross-field margin binds after it.
+        data = {
+            "agent": {
+                "tool_approval_timeout_secs": TOOL_APPROVAL_TIMEOUT_MAX * 10,
+                "chat_turn_timeout_secs": TOOL_APPROVAL_TIMEOUT_MAX,
+            }
+        }
+        _clamp_security_bounds(data)
         assert (
             data["agent"]["tool_approval_timeout_secs"]
             == TOOL_APPROVAL_TIMEOUT_MAX - APPROVAL_TURN_MARGIN_SECS
@@ -322,10 +543,17 @@ class TestLoadTimeClamp:
         _clamp_security_bounds(data)
         assert data["agent"]["tool_approval_timeout_secs"] is True
 
-    def test_non_int_ceiling_falls_back_to_the_default(self) -> None:
+    def test_non_int_ceiling_falls_back_to_the_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.config import loader as loader_mod
+
+        # Lowered below the static max so the fallback is observable (see
+        # test_absent_ceiling_uses_the_field_default).
+        monkeypatch.setattr(loader_mod, "_DEFAULT_CHAT_TURN_TIMEOUT_SECS", 1200)
         data = {"agent": {"tool_approval_timeout_secs": 7200, "chat_turn_timeout_secs": "lots"}}
         _clamp_security_bounds(data)
-        assert data["agent"]["tool_approval_timeout_secs"] == 7200 - APPROVAL_TURN_MARGIN_SECS
+        assert data["agent"]["tool_approval_timeout_secs"] == 1200 - APPROVAL_TURN_MARGIN_SECS
 
 
 class TestArmTimeBudget:
@@ -341,11 +569,12 @@ class TestArmTimeBudget:
         cfg(window=600, turn=7200)
         loop = asyncio.get_running_loop()
         # 300s left of a 2h turn: a 600s window would outlive it.
-        token = td._TURN_DEADLINE.set(loop.time() + 300.0)
+        prev = td._TURN_DEADLINE.get()
+        td._TURN_DEADLINE.set(loop.time() + 300.0)
         try:
             got = td.tool_approval_timeout_secs()
         finally:
-            td._TURN_DEADLINE.reset(token)
+            td._TURN_DEADLINE.set(prev)
         assert got == pytest.approx(300.0 - APPROVAL_TURN_MARGIN_SECS, abs=1.0)
 
     @pytest.mark.asyncio
@@ -353,21 +582,23 @@ class TestArmTimeBudget:
         """Under the margin there is no window that can both wait and report."""
         cfg(window=600, turn=7200)
         loop = asyncio.get_running_loop()
-        token = td._TURN_DEADLINE.set(loop.time() + 5.0)
+        prev = td._TURN_DEADLINE.get()
+        td._TURN_DEADLINE.set(loop.time() + 5.0)
         try:
             assert td.tool_approval_timeout_secs() == 0.0
         finally:
-            td._TURN_DEADLINE.reset(token)
+            td._TURN_DEADLINE.set(prev)
 
     @pytest.mark.asyncio
     async def test_early_prompt_keeps_the_configured_window(self, cfg) -> None:
         cfg(window=600, turn=7200)
         loop = asyncio.get_running_loop()
-        token = td._TURN_DEADLINE.set(loop.time() + 7200.0)
+        prev = td._TURN_DEADLINE.get()
+        td._TURN_DEADLINE.set(loop.time() + 7200.0)
         try:
             assert td.tool_approval_timeout_secs() == 600.0
         finally:
-            td._TURN_DEADLINE.reset(token)
+            td._TURN_DEADLINE.set(prev)
 
     def test_absent_deadline_falls_back_to_the_ceiling_bound(self, cfg) -> None:
         """Paths that don't go through _bounded_turn must still get a window."""
@@ -379,7 +610,7 @@ class TestArmTimeBudget:
     async def test_bounded_turn_publishes_then_clears_the_deadline(self) -> None:
         """The turn's own coroutine sees a deadline; the caller's context does not.
 
-        The reset matters: `chat_orchestrator` awaits `_bounded_turn` directly,
+        The restore matters: `chat_orchestrator` awaits `_bounded_turn` directly,
         so a leaked spent deadline would starve every later approval dispatched
         in that same context.
         """
@@ -406,6 +637,30 @@ class TestArmTimeBudget:
         with pytest.raises(ValueError):
             await td._bounded_turn(_boom(), 120.0)
         assert td._TURN_DEADLINE.get() is None
+
+    @pytest.mark.asyncio
+    async def test_bounded_turn_restores_the_previous_deadline_by_value(self) -> None:
+        """A non-None prior deadline comes back after the turn — not None.
+
+        Pins the restore-by-value contract documented in ``_bounded_turn``
+        (turn_dispatch.py): the finally writes back the CAPTURED previous
+        value. No other test armed a non-None prior value, so the two
+        ``get() is None`` neighbours above only ever exercised the None case —
+        which is how a residue inherited from another test's context read as
+        this module's product bug.
+        """
+        prev = td._TURN_DEADLINE.get()
+        armed = asyncio.get_running_loop().time() + 999.0
+        td._TURN_DEADLINE.set(armed)
+        try:
+
+            async def _turn() -> str:
+                return "done"
+
+            assert await td._bounded_turn(_turn(), 120.0) == "done"
+            assert td._TURN_DEADLINE.get() == armed
+        finally:
+            td._TURN_DEADLINE.set(prev)
 
 
 class TestNoBudgetCard:

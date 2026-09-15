@@ -37,7 +37,19 @@ SIGNED_FIELDS = {
     "version",
     "wheel_url",
 }
+#: Signed fields a manifest MAY carry. ``min_version`` is the fleet floor for a
+#: breaking release: a running install below it must treat this update as
+#: mandatory. Optional so schema v1 stays backward compatible — every already
+#: published manifest omits it, and consumers that predate the field ignore
+#: unknown keys rather than validating an exact field set (``cli.sh`` is the
+#: one exact-set consumer and tolerates exactly this key).
+OPTIONAL_SIGNED_FIELDS = {"min_version"}
 _VERSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+]{0,127}\Z")
+#: A floor must be a BARE release (``0.6.0``), never a prerelease: it names the
+#: oldest build still supported, and prerelease ordering subtleties (rc vs dev
+#: vs channel stamps) have no place in a value every consumer must compare the
+#: same way.
+_MIN_VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _PUB_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
 _KEY_BITS_RE = re.compile(r"Public-Key:\s*\((\d+)\s+bit\)")
@@ -112,6 +124,16 @@ def _canonical_json(value: dict[str, str]) -> bytes:
     ).encode("ascii")
 
 
+# Shared with the feature-videos publisher (``scripts/feature-videos/_manifest.py``),
+# which loads this file by path and signs a different document with the same key,
+# canonical form, runners and KMS flow. Public names, so the sharing is a stated
+# contract rather than a reach into module internals.
+canonical_json = _canonical_json
+public_key_der = _public_key_der
+run_openssl = _run_openssl
+MAX_SIGNATURE_BYTES = _MAX_SIGNATURE_BYTES
+
+
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -143,11 +165,25 @@ def _require_text(payload: dict[str, Any], key: str, *, max_len: int = 2048) -> 
     return value
 
 
+def _release_core(version: str) -> tuple[int, ...]:
+    """The leading numeric release tuple of *version* (``0.6.0rc3`` -> ``(0, 6, 0)``).
+
+    Used only for the publisher-side coherence check ordering ``min_version``
+    against ``version``; runtime comparison lives in the gateway, which owns the
+    full PEP 440 ordering.
+    """
+    match = re.match(r"[0-9]+(?:\.[0-9]+)*", version)
+    if match is None:
+        raise ManifestError("CLI manifest version has no numeric release core")
+    return tuple(int(chunk) for chunk in match.group().split("."))
+
+
 def _validate_signed_payload(payload: dict[str, Any]) -> dict[str, str]:
-    if set(payload) != SIGNED_FIELDS:
+    present = set(payload)
+    if not SIGNED_FIELDS <= present or present - SIGNED_FIELDS - OPTIONAL_SIGNED_FIELDS:
         raise ManifestError("CLI manifest signed field set does not match schema v1")
 
-    normalized = {key: _require_text(payload, key) for key in SIGNED_FIELDS}
+    normalized = {key: _require_text(payload, key) for key in present}
     if normalized["schema"] != SCHEMA:
         raise ManifestError("unsupported CLI manifest schema")
     if normalized["algorithm"] != ALGORITHM:
@@ -165,6 +201,14 @@ def _validate_signed_payload(payload: dict[str, Any]) -> dict[str, str]:
     ):
         raise ManifestError("invalid CLI manifest key id")
     _require_text(payload, "python_requires", max_len=128)
+    if "min_version" in normalized:
+        floor = normalized["min_version"]
+        if _MIN_VERSION_RE.fullmatch(floor) is None:
+            raise ManifestError("CLI manifest min_version must be a bare release like 0.6.0")
+        # A floor above the very build this manifest offers would demand an
+        # update the feed cannot satisfy — always a publisher typo.
+        if _release_core(floor) > _release_core(normalized["version"]):
+            raise ManifestError("CLI manifest min_version exceeds the manifest version")
 
     wheel_name = f"kirocrew-{normalized['version']}-py3-none-any.whl"
     parsed = urlsplit(normalized["wheel_url"])
@@ -203,9 +247,7 @@ def _validate_target_binding(
 
     version = payload["version"]
     wheel_name = f"kirocrew-{version}-py3-none-any.whl"
-    expected_url = (
-        f"{normalized_base}/cli/{expected_channel}/{version}/{wheel_name}"
-    )
+    expected_url = f"{normalized_base}/cli/{expected_channel}/{version}/{wheel_name}"
     if payload["wheel_url"] != expected_url:
         raise ManifestError("CLI manifest wheel URL does not match the artifact base")
 
@@ -236,6 +278,10 @@ def _payload_command(args: argparse.Namespace) -> None:
         "version": args.version,
         "wheel_url": args.wheel_url,
     }
+    # Absent, not empty: an empty-string field would fail the non-empty text
+    # rule, and the canonical bytes must not change for the no-floor case.
+    if args.min_version:
+        payload["min_version"] = args.min_version
     normalized = _validate_signed_payload(payload)
     _atomic_write(args.output, _canonical_json(normalized))
 
@@ -323,19 +369,16 @@ def _verify_command(args: argparse.Namespace) -> None:
     print(f"verified: {args.manifest} signed by {expected_key_id}")
 
 
-def _kms_sign_command(args: argparse.Namespace) -> None:
-    payload_any = _load_json(args.payload)
-    payload = _validate_signed_payload(payload_any)
-    canonical = _canonical_json(payload)
-    if args.payload.read_bytes() != canonical:
-        raise ManifestError("CLI manifest payload is not canonical JSON")
+def kms_sign_digest(key_arn: str, pinned_der: bytes, digest: bytes) -> bytes:
+    """Sign a SHA-256 *digest* with the KMS key at *key_arn*, pinned to *pinned_der*.
 
-    pinned_der = _public_key_der(args.public_key)
-    expected_key_id = f"sha256:{hashlib.sha256(pinned_der).hexdigest()}"
-    if payload["key_id"] != expected_key_id:
-        raise ManifestError("CLI manifest payload does not name the committed public key")
-
-    public_response = _run_aws_json(["kms", "get-public-key", "--key-id", args.key_arn])
+    The KMS key's public half must byte-match the committed one before anything
+    is signed: a mistyped ARN would otherwise sign with some other key and
+    produce an envelope every consumer refuses. Shared by the CLI manifest
+    signer and the feature-videos publisher (``scripts/feature-videos``), which
+    sign different documents with the same key and the same checks.
+    """
+    public_response = _run_aws_json(["kms", "get-public-key", "--key-id", key_arn])
     if public_response.get("KeyUsage") != "SIGN_VERIFY":
         raise ManifestError("CLI manifest KMS key must have SIGN_VERIFY usage")
     if public_response.get("KeySpec") not in {"RSA_3072", "RSA_4096"}:
@@ -353,13 +396,12 @@ def _kms_sign_command(args: argparse.Namespace) -> None:
     if not hmac.compare_digest(kms_der, pinned_der):
         raise ManifestError("configured KMS key does not match the committed public key")
 
-    digest = hashlib.sha256(canonical).digest()
     sign_response = _run_aws_json(
         [
             "kms",
             "sign",
             "--key-id",
-            args.key_arn,
+            key_arn,
             "--message",
             base64.b64encode(digest).decode("ascii"),
             "--message-type",
@@ -374,9 +416,24 @@ def _kms_sign_command(args: argparse.Namespace) -> None:
     if not isinstance(encoded_signature, str):
         raise ManifestError("AWS KMS did not return a signature")
     try:
-        signature = base64.b64decode(encoded_signature, validate=True)
+        return base64.b64decode(encoded_signature, validate=True)
     except ValueError as exc:
         raise ManifestError("AWS KMS returned an invalid signature") from exc
+
+
+def _kms_sign_command(args: argparse.Namespace) -> None:
+    payload_any = _load_json(args.payload)
+    payload = _validate_signed_payload(payload_any)
+    canonical = _canonical_json(payload)
+    if args.payload.read_bytes() != canonical:
+        raise ManifestError("CLI manifest payload is not canonical JSON")
+
+    pinned_der = _public_key_der(args.public_key)
+    expected_key_id = f"sha256:{hashlib.sha256(pinned_der).hexdigest()}"
+    if payload["key_id"] != expected_key_id:
+        raise ManifestError("CLI manifest payload does not name the committed public key")
+
+    signature = kms_sign_digest(args.key_arn, pinned_der, hashlib.sha256(canonical).digest())
 
     with tempfile.TemporaryDirectory(prefix="kirocrew-cli-manifest-") as temporary:
         signature_path = Path(temporary) / "signature.bin"
@@ -411,6 +468,11 @@ def _parser() -> argparse.ArgumentParser:
     payload.add_argument("--sha256", required=True)
     payload.add_argument("--python-requires", required=True)
     payload.add_argument("--pub-date", required=True)
+    payload.add_argument(
+        "--min-version",
+        default="",
+        help="optional fleet floor: installs below this bare release must update",
+    )
     payload.add_argument("--public-key", type=Path, required=True)
     payload.add_argument("--output", type=Path, required=True)
     payload.set_defaults(handler=_payload_command)

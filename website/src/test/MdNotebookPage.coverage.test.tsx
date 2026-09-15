@@ -21,7 +21,7 @@ import { render, screen, waitFor, within, fireEvent, act } from '@testing-librar
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
-import { SAVE_DEBOUNCE_MS } from '../apps/md-notebook/constants'
+import { COLUMN_MAX_WIDTH, COLUMN_PAD_X, HEADER_CONTROLS_GAP, SAVE_DEBOUNCE_MS } from '../apps/md-notebook/constants'
 import type { Note, Vault } from '../apps/md-notebook/types'
 
 // Every capability the page requires. Kept as a literal rather than imported so
@@ -77,6 +77,11 @@ vi.mock('../apps/md-notebook/api', async () => {
   return { ...actual, notesApi: mockApi }
 })
 
+// Load the page during test-module collection, not inside every test's 15-second
+// budget. Under a loaded full-suite worker, the first dynamic import alone could
+// consume that budget before the loading-state assertion ran.
+const MdNotebookPage = (await import('../apps/md-notebook/MdNotebookPage')).default
+
 function vault(over: Partial<Vault> = {}): Vault {
   return {
     id: 'v1',
@@ -117,8 +122,15 @@ const DOC = {
   backlinks: [{ sourcePath: 'folder/Two.md', line: 3, context: 'see [[One]]' }],
 }
 
-async function renderPage() {
-  const { default: MdNotebookPage } = await import('../apps/md-notebook/MdNotebookPage')
+/**
+ * Ceiling for the first wait on the note tree: health -> listVaults -> listNotes
+ * resolve in sequence before the tree commits, a chain that ran past the 1000ms
+ * default under load in one of four full runs (website/docs/testing.md, "a real
+ * async chain behind the 1000ms default needs a named ceiling").
+ */
+const TREE_READY = { timeout: 5000 }
+
+function renderPage() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, refetchInterval: false } },
   })
@@ -132,7 +144,7 @@ async function renderPage() {
 /** Render, wait for the panel, then open `One.md`. */
 async function renderWithOpenNote() {
   const view = await renderPage()
-  await userEvent.click(await screen.findByRole('button', { name: 'One' }))
+  await userEvent.click(await screen.findByRole('button', { name: 'One' }, TREE_READY))
   await screen.findByText('Body text')
   return view
 }
@@ -206,11 +218,20 @@ describe('MdNotebookPage', () => {
   // ── boot states ───────────────────────────────────────────────────────────
 
   it('shows a loading line until the vault list arrives', async () => {
-    // Never resolves: the point is the state BEFORE any reply, which the page
-    // reaches by `vaults === null` rather than a separate flag.
-    mockApi.listVaults.mockReturnValue(new Promise(() => {}))
-    await renderPage()
-    expect(await screen.findByText('Loading…')).toBeTruthy()
+    // Hold the reply only until the loading state is observed, then settle it so
+    // this test owns and drains every promise it creates before teardown.
+    let resolveVaults!: (value: { vaults: Vault[]; hasPat: boolean; hasGhAuth: boolean }) => void
+    const pending = new Promise<{ vaults: Vault[]; hasPat: boolean; hasGhAuth: boolean }>((resolve) => {
+      resolveVaults = resolve
+    })
+    mockApi.listVaults.mockReturnValue(pending)
+    renderPage()
+    expect(screen.getByText('Loading…')).toBeTruthy()
+    await act(async () => {
+      resolveVaults({ vaults: [], hasPat: false, hasGhAuth: false })
+      await pending
+    })
+    expect(screen.getByText('Clone a repo')).toBeTruthy()
   })
 
   it('names the backend as unreachable when the vault list fails', async () => {
@@ -235,7 +256,7 @@ describe('MdNotebookPage', () => {
 
   it('renders the vault name, its notes in a folder tree, and the empty-body prompt', async () => {
     await renderPage()
-    expect(await screen.findByRole('button', { name: 'One' })).toBeTruthy()
+    expect(await screen.findByRole('button', { name: 'One' }, TREE_READY)).toBeTruthy()
     // Folders view is the default, so the nested note sits under a folder row.
     expect(screen.getByRole('button', { name: 'folder' })).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Two' })).toBeTruthy()
@@ -315,7 +336,7 @@ describe('MdNotebookPage', () => {
   it('does not restore a remembered note the vault no longer has', async () => {
     localStorage.setItem('mdnb-open-note', '"Deleted.md"')
     await renderPage()
-    await screen.findByRole('button', { name: 'One' })
+    await screen.findByRole('button', { name: 'One' }, TREE_READY)
     expect(mockApi.readNote).not.toHaveBeenCalled()
   })
 
@@ -331,6 +352,133 @@ describe('MdNotebookPage', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Rendered' }))
     expect(screen.queryByRole('textbox', { name: 'Markdown source' })).toBeNull()
     expect(localStorage.getItem('mdnb-view')).toBe('"rendered"')
+  })
+
+  // The cap is asserted on the RENDERED body's wrapper, not the raw editor's
+  // padding: the raw measure is a `max(...)` expression and jsdom drops those,
+  // so a padding assertion would read as '' and pass without proving anything.
+  const renderedColumn = () => {
+    let el: HTMLElement | null = screen.getByText('Hello')
+    while (el && el.style.margin !== '0px auto') el = el.parentElement
+    return el as HTMLElement
+  }
+
+  it('lifts the reading column to full width, remembering the choice', async () => {
+    await renderWithOpenNote()
+    expect(renderedColumn().style.maxWidth).toBe(`${COLUMN_MAX_WIDTH}px`)
+
+    await userEvent.click(screen.getByRole('button', { name: 'Medium width' }))
+    expect(renderedColumn().style.maxWidth).toBe('')
+    expect(localStorage.getItem('mdnb-full-width')).toBe('true')
+    // Same convention as ReadingWidthToggle: the control names the width in
+    // force, and pressed state goes with it.
+    expect(screen.getByRole('button', { name: 'Full width' }).getAttribute('aria-pressed')).toBe('true')
+  })
+
+  it('restores the full-width choice on mount', async () => {
+    localStorage.setItem('mdnb-full-width', 'true')
+    await renderWithOpenNote()
+    expect(renderedColumn().style.maxWidth).toBe('')
+    // The raw editor loses the centring padding in the same state.
+    await userEvent.click(screen.getByRole('button', { name: 'Markdown source' }))
+    const ta = screen.getByRole('textbox', { name: 'Markdown source' }) as HTMLTextAreaElement
+    expect(ta.style.paddingLeft).toBe(`${COLUMN_PAD_X}px`)
+  })
+
+  it('returns to the reading column, and remembers that too', async () => {
+    localStorage.setItem('mdnb-full-width', 'true')
+    await renderWithOpenNote()
+    await userEvent.click(screen.getByRole('button', { name: 'Full width' }))
+    expect(renderedColumn().style.maxWidth).toBe(`${COLUMN_MAX_WIDTH}px`)
+    expect(localStorage.getItem('mdnb-full-width')).toBe('false')
+  })
+
+  // happy-dom has no layout, so both boxes the title clearance is computed from
+  // are stubbed. The two are told apart by their inline position, which is what
+  // the page sets on each: the control cluster floats (absolute) inside the
+  // header band (relative).
+  const stubHeaderLayout = ({ band, controls }: { band: number; controls: number }) => {
+    const w = vi
+      .spyOn(HTMLElement.prototype, 'offsetWidth', 'get')
+      .mockImplementation(function (this: HTMLElement) {
+        if (this.style.position === 'absolute') return controls
+        if (this.style.position === 'relative') return band
+        return 0
+      })
+    const h = vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(34)
+    return () => {
+      w.mockRestore()
+      h.mockRestore()
+    }
+  }
+
+  const titleBlock = () => {
+    let el: HTMLElement | null = screen.getByLabelText('Click to rename this note')
+    while (el && el.style.margin !== '0px auto') el = el.parentElement
+    return el as HTMLElement
+  }
+
+  it('keeps the title clear of the floating header controls at full width', async () => {
+    const restore = stubHeaderLayout({ band: 1200, controls: 208 })
+    try {
+      localStorage.setItem('mdnb-full-width', 'true')
+      await renderWithOpenNote()
+      // Edge to edge, so the title reserves the whole cluster: column pad +
+      // measured cluster + breathing gap.
+      expect(titleBlock().style.paddingRight).toBe(`${COLUMN_PAD_X + 208 + HEADER_CONTROLS_GAP}px`)
+      expect(titleBlock().style.paddingTop).toBe('24px')
+    } finally {
+      restore()
+    }
+  })
+
+  it('reserves only the overlap in the reading column', async () => {
+    const restore = stubHeaderLayout({ band: 1200, controls: 208 })
+    try {
+      await renderWithOpenNote()
+      // The centred 800px column stops 200px short of the pane edge, which
+      // already covers most of the cluster: only the remainder is reserved.
+      const overlap = (1200 + COLUMN_MAX_WIDTH) / 2 - COLUMN_PAD_X + HEADER_CONTROLS_GAP
+        - (1200 - COLUMN_PAD_X - 208)
+      expect(titleBlock().style.paddingRight).toBe(`${COLUMN_PAD_X + overlap}px`)
+    } finally {
+      restore()
+    }
+  })
+
+  it('drops the title below the controls when the pane cannot seat both', async () => {
+    const restore = stubHeaderLayout({ band: 320, controls: 208 })
+    try {
+      await renderWithOpenNote()
+      // Reserving here would leave the title 60px wide, and it wraps on any
+      // character, so it would render as a column of single letters. It takes
+      // its own row under the cluster instead: no clearance, and a top pad
+      // carrying the cluster's height.
+      expect(titleBlock().style.paddingRight).toBe(`${COLUMN_PAD_X}px`)
+      expect(titleBlock().style.paddingTop).toBe(`${24 + 34 + 8}px`)
+    } finally {
+      restore()
+    }
+  })
+
+  it('caps the control cluster to the pane and wraps it on a narrow pane', async () => {
+    const restore = stubHeaderLayout({ band: 320, controls: 208 })
+    try {
+      await renderWithOpenNote()
+      // A long locale's sync label can make the cluster wider than the pane
+      // itself; uncapped, its left edge pokes past the pane and
+      // `overflow-x-hidden` clips the view controls. The cap holds it to the
+      // band minus both pads (a plain pixel value, since happy-dom drops
+      // max()/calc() expressions), and wrap keeps every control reachable.
+      let cluster: HTMLElement | null = screen.getByRole('button', { name: 'Medium width' })
+      while (cluster && cluster.style.position !== 'absolute') cluster = cluster.parentElement
+      expect(cluster).not.toBeNull()
+      expect(cluster!.style.maxWidth).toBe(`${320 - COLUMN_PAD_X * 2}px`)
+      expect(cluster!.style.flexWrap).toBe('wrap')
+      expect(cluster!.style.justifyContent).toBe('flex-end')
+    } finally {
+      restore()
+    }
   })
 
   it('debounces an edit before persisting it, and does not save on the keystroke', async () => {
@@ -444,7 +592,7 @@ describe('MdNotebookPage', () => {
 
   it('runs a sync from the keyboard shortcut', async () => {
     await renderPage()
-    await screen.findByRole('button', { name: 'One' })
+    await screen.findByRole('button', { name: 'One' }, TREE_READY)
     fireEvent.keyDown(window, { key: 's', metaKey: true })
     await waitFor(() => expect(mockApi.sync).toHaveBeenCalledWith('v1'))
   })
@@ -482,7 +630,7 @@ describe('MdNotebookPage', () => {
     expect(screen.queryByRole('button', { name: 'folder' })).toBeNull()
 
     await userEvent.clear(box)
-    expect(await screen.findByRole('button', { name: 'One' })).toBeTruthy()
+    expect(await screen.findByRole('button', { name: 'One' }, TREE_READY)).toBeTruthy()
   })
 
   it('says so when a search matches nothing', async () => {
@@ -556,14 +704,14 @@ describe('MdNotebookPage', () => {
     await renderPage()
     // A corrupt width must not collapse or overflow the panel — the list still
     // renders at the default width.
-    expect(await screen.findByRole('button', { name: 'One' })).toBeTruthy()
+    expect(await screen.findByRole('button', { name: 'One' }, TREE_READY)).toBeTruthy()
   })
 
   // ── settings ──────────────────────────────────────────────────────────────
 
   it('opens Settings as a page in the note pane', async () => {
     await renderPage()
-    await screen.findByRole('button', { name: 'One' })
+    await screen.findByRole('button', { name: 'One' }, TREE_READY)
     // Two controls carry this name — the whole row and the gear pinned inside it.
     // The row is the one a user aims at.
     await userEvent.click(screen.getAllByRole('button', { name: 'Settings' })[0])
@@ -591,7 +739,7 @@ describe('MdNotebookPage', () => {
 
   it('duplicates a note and opens the copy', async () => {
     await renderPage()
-    await screen.findByRole('button', { name: 'One' })
+    await screen.findByRole('button', { name: 'One' }, TREE_READY)
     clickRowAction('One', 'Duplicate note')
     await waitFor(() => expect(mockApi.duplicateNote).toHaveBeenCalledWith('v1', 'One.md'))
     await waitFor(() => expect(mockApi.readNote).toHaveBeenCalledWith('v1', 'One 1.md'))
@@ -599,7 +747,7 @@ describe('MdNotebookPage', () => {
 
   it('pins a note, persists the pin per vault, and offers to unpin', async () => {
     await renderPage()
-    await screen.findByRole('button', { name: 'One' })
+    await screen.findByRole('button', { name: 'One' }, TREE_READY)
     clickRowAction('One', 'Pin note')
     expect(localStorage.getItem('mdnb-pinned-v1')).toBe('["One.md"]')
     expect(within(row('One')).getByRole('button', { name: 'Unpin note' })).toBeTruthy()
@@ -622,7 +770,7 @@ describe('MdNotebookPage', () => {
 
   it('strips path separators from a rename so a title edit cannot move the note', async () => {
     await renderPage()
-    await screen.findByRole('button', { name: 'One' })
+    await screen.findByRole('button', { name: 'One' }, TREE_READY)
     clickRowAction('One', 'Rename note')
     const field = await screen.findByRole('textbox', { name: 'Note name' })
     await userEvent.clear(field)
@@ -652,7 +800,7 @@ describe('MdNotebookPage', () => {
 
   it('confirms before trashing a note, then removes it from the listing', async () => {
     await renderPage()
-    await screen.findByRole('button', { name: 'One' })
+    await screen.findByRole('button', { name: 'One' }, TREE_READY)
     clickRowAction('One', 'Delete note')
     expect(await screen.findByRole('dialog')).toBeTruthy()
     expect(screen.getByText(/to trash\?/)).toBeTruthy()
@@ -664,7 +812,7 @@ describe('MdNotebookPage', () => {
 
   it('cancels the confirmation without deleting anything', async () => {
     await renderPage()
-    await screen.findByRole('button', { name: 'One' })
+    await screen.findByRole('button', { name: 'One' }, TREE_READY)
     clickRowAction('One', 'Delete note')
     await userEvent.click(await screen.findByRole('button', { name: 'Cancel' }))
     expect(screen.queryByRole('dialog')).toBeNull()
@@ -674,7 +822,7 @@ describe('MdNotebookPage', () => {
   it('says nothing has been trashed yet rather than opening an empty folder', async () => {
     mockApi.openTrash.mockResolvedValue({ opened: false, empty: true, path: '' })
     await renderPage()
-    await screen.findByRole('button', { name: 'One' })
+    await screen.findByRole('button', { name: 'One' }, TREE_READY)
     clickRowAction('One', 'Delete note')
     await userEvent.click(await screen.findByRole('button', { name: '.trash' }))
     expect(
@@ -691,7 +839,7 @@ describe('MdNotebookPage', () => {
       Object.assign(new Error('nope'), { body: { code: 'folder_open_unsupported' } }),
     )
     await renderPage()
-    await screen.findByRole('button', { name: 'One' })
+    await screen.findByRole('button', { name: 'One' }, TREE_READY)
     clickRowAction('One', 'Delete note')
     await userEvent.click(await screen.findByRole('button', { name: '.trash' }))
     expect(
@@ -702,7 +850,7 @@ describe('MdNotebookPage', () => {
   it('reports a failed delete instead of leaving the row pending forever', async () => {
     mockApi.deleteNote.mockRejectedValue(new Error('permission denied'))
     await renderPage()
-    await screen.findByRole('button', { name: 'One' })
+    await screen.findByRole('button', { name: 'One' }, TREE_READY)
     clickRowAction('One', 'Delete note')
     await userEvent.click(await screen.findByRole('button', { name: 'Delete' }))
     const alert = await screen.findByRole('alert')
@@ -742,7 +890,7 @@ describe('MdNotebookPage', () => {
   it('ticks a task checkbox in the rendered view', async () => {
     mockApi.readNote.mockResolvedValue({ ...DOC, content: '- [ ] water the plants' })
     await renderPage()
-    await userEvent.click(await screen.findByRole('button', { name: 'One' }))
+    await userEvent.click(await screen.findByRole('button', { name: 'One' }, TREE_READY))
     const box = (await screen.findByRole('checkbox')) as HTMLInputElement
     expect(box.checked).toBe(false)
     fireEvent.click(box)

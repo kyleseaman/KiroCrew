@@ -1,6 +1,16 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { waitForGateway, describeGatewayFailure, tailLines, isPortInUse } = require("../gateway-wait");
+const fs = require("node:fs");
+const path = require("node:path");
+const {
+  DEFAULT_GATEWAY_WAIT_MS,
+  WINDOWS_LOCAL_GATEWAY_WAIT_MS,
+  gatewayWaitTimeoutMs,
+  waitForGateway,
+  describeGatewayFailure,
+  tailLines,
+  isPortInUse,
+} = require("../gateway-wait");
 
 // Synchronous fake clock + timer so poll loops resolve instantly and
 // deterministically (no real waiting). setTimeoutFn advances the clock by the
@@ -42,6 +52,48 @@ test("waitForGateway resolves after a few unhealthy polls", async () => {
   });
   await p;
   assert.strictEqual(n, 3);
+});
+
+test("Windows local cold start stays on the splash past the ordinary deadline", async () => {
+  let polls = 0;
+  const maxWaitMs = gatewayWaitTimeoutMs({ platform: "win32", watchSpawn: true });
+  const { p } = harness({
+    // 110 failed 500ms polls model a 55-second packaged cold start.
+    checkBackend: () => (++polls <= 110
+      ? Promise.reject(new Error("not yet"))
+      : Promise.resolve()),
+    maxWaitMs,
+  });
+
+  await p;
+  assert.strictEqual(polls, 111);
+  assert.ok(maxWaitMs > DEFAULT_GATEWAY_WAIT_MS);
+});
+
+test("gateway wait policy extends only the primary Windows gateway", () => {
+  assert.strictEqual(
+    gatewayWaitTimeoutMs({ platform: "win32", watchSpawn: true }),
+    WINDOWS_LOCAL_GATEWAY_WAIT_MS,
+  );
+  assert.strictEqual(
+    gatewayWaitTimeoutMs({ platform: "win32", watchSpawn: false }),
+    DEFAULT_GATEWAY_WAIT_MS,
+  );
+  assert.strictEqual(
+    gatewayWaitTimeoutMs({ platform: "darwin", watchSpawn: true }),
+    DEFAULT_GATEWAY_WAIT_MS,
+  );
+});
+
+test("the supervisor extends the Windows deadline only for a gateway it spawned", () => {
+  const supervisor = fs.readFileSync(
+    path.join(__dirname, "..", "gateway-supervisor.js"),
+    "utf8",
+  );
+  assert.match(
+    supervisor,
+    /watchSpawn: watchSpawn && gatewayOwnership === "spawned"/,
+  );
 });
 
 test("waitForGateway fails fast when the spawned gateway exited (no health polling)", async () => {
@@ -118,6 +170,88 @@ test("describeGatewayFailure: the disabled case names the port and both ways out
   // Nothing was launched, so wording that sends the user hunting a crash or a
   // launch log is wrong for this case.
   assert.doesNotMatch(s, /could not be launched|exited on launch|failed to start/);
+});
+
+// #6138: with the launch aimed at a configured remote crew, this text must name
+// that target and must NOT offer to start a gateway here -- the spawn binds the
+// crew's own port, so the offer the dialog hides cannot be promised in words.
+test("describeGatewayFailure: a remote target is named and no local start offered", () => {
+  const s = describeGatewayFailure({ disabled: true, port: 7778, remoteHost: "a.example.com" });
+  assert.match(s, /a\.example\.com/);
+  assert.match(s, /7778/);
+  assert.match(s, /set not to start a gateway on this machine/);
+  assert.doesNotMatch(s, /start one here/);
+  assert.doesNotMatch(s, /Settings/);
+  assert.doesNotMatch(s, /could not be launched|exited on launch|failed to start/);
+});
+
+// The dialog withholds its start-a-gateway button on a crew's port, and the page
+// that owns the choice is served by a gateway, so this sentence is the only exit
+// the state has. Without it the user is left with a Retry that cannot succeed.
+test("describeGatewayFailure: a remote target names a way to run one here anyway", () => {
+  const s = describeGatewayFailure({ disabled: true, port: 7778, remoteHost: "a.example.com" });
+  assert.match(s, /KIROCREW_PORT/);
+  assert.match(s, /no remote host configured/);
+  // BOTH steps, or the instruction under-promises: an explicit port re-aims the
+  // launch, but the opt-out is still in force, so that launch stops at this same
+  // state -- on a port where the withheld button is offered again. A user told
+  // only the first step reads the second dialog as "it did not work".
+  assert.match(s, /then choose Start Local Gateway when prompted/);
+});
+
+test("describeGatewayFailure: the remote-side instruction names the tunnel", () => {
+  // "the connection that reaches it" is vague at the moment of failure.
+  const s = describeGatewayFailure({ disabled: true, port: 7778, remoteHost: "a.example.com" });
+  assert.match(s, /tunnel or port-forward/);
+});
+
+test("describeGatewayFailure: title and body agree on 'answering at'", () => {
+  // The dialog title reads "nothing answering at host:port"; the body said
+  // "for", which reads as two different facts about the same target.
+  const s = describeGatewayFailure({ disabled: true, port: 7778, remoteHost: "a.example.com" });
+  assert.match(s, /answering at a\.example\.com/);
+  assert.doesNotMatch(s, /answering for/);
+});
+
+test("describeGatewayFailure: an empty remoteHost keeps the local-start wording", () => {
+  // The field is absent on every pre-existing caller, and a cleared host entry
+  // stores "", so neither may change which of the two texts is chosen.
+  for (const failure of [
+    { disabled: true, port: 5476 },
+    { disabled: true, port: 5476, remoteHost: "" },
+  ]) {
+    assert.match(describeGatewayFailure(failure), /start one here/);
+  }
+});
+
+// #6138: the crew binds its OWN port on its own machine (effectivePort =
+// remotePort || tokenPort || PORT), so naming the local end would send the user
+// to check a port nothing over there was ever expected to serve.
+test("describeGatewayFailure: a distinct remote port is the one to go and check", () => {
+  const s = describeGatewayFailure({
+    disabled: true,
+    port: 5477,
+    remoteHost: "a.example.com",
+    remotePort: "9000",
+  });
+  assert.match(s, /a\.example\.com:9000/);
+  // The local end stays visible, because that is the port the tunnel must land on.
+  assert.match(s, /local port 5477/);
+  assert.doesNotMatch(s, /a\.example\.com:5477/);
+  assert.doesNotMatch(s, /start one here/);
+});
+
+test("describeGatewayFailure: no remotePort falls back to the shared port form", () => {
+  // The field is optional and a cleared entry stores "", so both must read as
+  // "the crew is on this same port" rather than rendering an empty target.
+  for (const remotePort of [undefined, ""]) {
+    const s = describeGatewayFailure({
+      disabled: true, port: 7778, remoteHost: "a.example.com", remotePort,
+    });
+    assert.match(s, /a\.example\.com on port 7778/);
+    assert.doesNotMatch(s, /local port/);
+    assert.doesNotMatch(s, /:undefined|: ,|::/);
+  }
 });
 
 test("describeGatewayFailure: disabled wins over a stale error field", () => {

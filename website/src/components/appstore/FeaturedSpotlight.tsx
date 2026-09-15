@@ -27,7 +27,7 @@ import Clickable from '../Clickable'
 import AppIcon from '../AppIcon'
 import { gradientFor } from './gradient'
 import { categoryFor } from './categories'
-import { useHeroArt } from './useHeroArt'
+import { useHeroArt, type InstalledArtSource } from './useHeroArt'
 import { useEditorialArt, type EditorialArtwork } from './useEditorialArt'
 import { sourceLabel, isVerified, type RegistryApp } from './types'
 import { appDisplayName, appDescription } from './appManifest'
@@ -168,6 +168,7 @@ export default function FeaturedSpotlight({
   curated = false,
   layout = 'stacked',
   compact = false,
+  leadInstalled,
   onOpenApp,
   onGet,
   onEnable,
@@ -221,6 +222,15 @@ export default function FeaturedSpotlight({
    * fallback row reads as secondary beside the lead.
    */
   compact?: boolean
+  /**
+   * The LEAD app's installed record, when it is installed — the local
+   * second-chance art source for `useHeroArt` (#6887): a registry hero that
+   * fails to LOAD swaps once to the app's own on-disk art instead of
+   * degrading straight to the gradient. Only the lead's art fills the band,
+   * so only the lead's record is threaded. Omitted (a non-installed lead, or
+   * a caller that has no installed list), the hook stays behaviour-identical.
+   */
+  leadInstalled?: InstalledArtSource
   onOpenApp: (name: string, e?: React.MouseEvent | React.KeyboardEvent) => void
   onGet: (name: string) => void
   onEnable: (name: string) => void
@@ -236,7 +246,7 @@ export default function FeaturedSpotlight({
   // app rather than being skipped -- React forbids the skip, and `useHeroArt`
   // answers "no art" for no app, which is the same answer it gives for an app
   // shipping none.
-  const hero = useHeroArt(lead)
+  const hero = useHeroArt(lead, leadInstalled)
   const editorial = useEditorialArt(artwork)
   // Unconditional like the art hooks above: the early return below sits between
   // this and the compact branch that reads it, and React forbids the skip.
@@ -305,6 +315,7 @@ export default function FeaturedSpotlight({
       style={artSrc ? { background: 'var(--bg-elevated)' } : { background: gradientFor(lead.name) }}
     >
       {artSrc ? (
+        // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onError is an image-load lifecycle hook (it retires unreachable art in favour of the gradient plate), not a user interaction; the card's activation lives on the Clickable that wraps it
         <img
           src={artSrc}
           alt={editorial.src ? editorial.alt : ''}
@@ -312,8 +323,14 @@ export default function FeaturedSpotlight({
           onError={onArtError}
         />
       ) : (
-        <div className="w-[92px] h-[92px] rounded-3xl bg-white/15 border border-white/25 backdrop-blur-sm grid place-items-center text-white">
-          {(lead.iconUrl || lead.iconUrlDark || lead.icon) ? <AppIcon icon={lead.icon} iconUrl={lead.iconUrl} iconUrlDark={lead.iconUrlDark} size={56} /> : <Package size={44} />}
+        /* `relative overflow-hidden` are both load-bearing here. `rasterFill`
+           absolutely insets the image, and this plate's own wrapper is the
+           `relative aspect-[16/9]` art panel — so without `relative` on THIS box
+           the icon would fill the whole 16:9 panel and read as hero art rather
+           than as an icon. `overflow-hidden` is what makes it take the
+           `rounded-3xl`, which this plate did not need while the icon was inset. */
+        <div className="w-[92px] h-[92px] rounded-3xl bg-white/15 border border-white/25 backdrop-blur-sm grid place-items-center text-white relative overflow-hidden">
+          {(lead.iconUrl || lead.iconUrlDark || lead.icon) ? <AppIcon icon={lead.icon} iconUrl={lead.iconUrl} iconUrlDark={lead.iconUrlDark} size={56} rasterFill /> : <Package size={44} />}
         </div>
       )}
 
@@ -475,6 +492,7 @@ export default function FeaturedSpotlight({
                 className="relative aspect-[16/9] md:aspect-auto overflow-hidden"
                 style={{ background: 'var(--bg-elevated)' }}
               >
+                {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onError is an image-load lifecycle hook (retire unreachable art), not a user interaction; the collection face's activation is the Clickable above */}
                 <img
                   src={artSrc}
                   alt={editorial.src ? editorial.alt : ''}
@@ -508,6 +526,7 @@ export default function FeaturedSpotlight({
           <DialogContent maxWidth={560} aria-label={title}>
             {artSrc && (
               <div className="relative aspect-[16/9] shrink-0 overflow-hidden" style={{ background: 'var(--bg-elevated)' }}>
+                {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onError is an image-load lifecycle hook (retire unreachable art), not a user interaction; this art is decoration inside the dialog and offers nothing to activate */}
                 <img
                   src={artSrc}
                   alt={editorial.src ? editorial.alt : ''}

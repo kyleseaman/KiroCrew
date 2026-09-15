@@ -33,6 +33,29 @@ class TestRepoSettings(unittest.TestCase):
         self.assertEqual(s["triage_labels"], [])
         self.assertEqual(s["good_first_issue_labels"], [])
 
+    def test_non_object_config_degrades_to_empty_repo_list(self):
+        store.config_path(self.tmp).write_text("null", encoding="utf-8")
+        self.assertEqual(store.list_connected_repos(self.tmp), [])
+        store.add_connected_repo("o", "r", root=self.tmp)
+        self.assertTrue(store.is_repo_connected("o", "r", self.tmp))
+
+    def test_bad_repo_row_does_not_hide_valid_repo(self):
+        store.config_path(self.tmp).write_text(
+            json.dumps({"repos": [None, {"owner": "o", "repo": "r"}, 42]}),
+            encoding="utf-8",
+        )
+        self.assertTrue(store.is_repo_connected("o", "r", self.tmp))
+        self.assertEqual(len(store.list_connected_repos(self.tmp)), 1)
+        store.add_connected_repo("other", "repo", root=self.tmp)
+        self.assertTrue(store.is_repo_connected("o", "r", self.tmp))
+        self.assertTrue(store.is_repo_connected("other", "repo", self.tmp))
+
+    def test_non_list_repos_degrades_to_empty_list(self):
+        store.config_path(self.tmp).write_text('{"repos": {"owner": "o"}}', encoding="utf-8")
+        self.assertEqual(store.list_connected_repos(self.tmp), [])
+        store.add_connected_repo("o", "r", root=self.tmp)
+        self.assertTrue(store.is_repo_connected("o", "r", self.tmp))
+
     def test_defaults_for_unconnected_repo(self):
         s = store.read_repo_settings("no", "pe", self.tmp)
         self.assertEqual(s, store.DEFAULT_REPO_SETTINGS)
@@ -169,6 +192,45 @@ class TestRecommendationsAndLabelCache(unittest.TestCase):
         assert got is not None
         self.assertEqual(got["recommendations"][0]["name"], "priority: high")
         self.assertEqual(got["generated_at"], "2026-07-23T00:00:00Z")
+
+    def test_two_languages_do_not_evict_each_other(self):
+        """The partition is what makes a per-browser output language safe.
+
+        `rationale` prose is written in one language, so a set is only meaningful
+        for that language. With ONE shared slot, two browsers resolving different
+        languages would each read the other's set as absent and each regenerate
+        would overwrite it -- paid model output discarded back and forth, with the
+        panel just showing "none generated yet". Separate partitions remove it.
+        """
+        store.add_connected_repo("o", "r", root=self.tmp)
+        de = {"recommendations": [{"name": "bereich: auth"}], "generated_at": "t1"}
+        pt = {"recommendations": [{"name": "area: auth"}], "generated_at": "t2"}
+        store.write_recommendations_cache("o", "r", de, root=self.tmp, ui_language="de")
+        store.write_recommendations_cache("o", "r", pt, root=self.tmp, ui_language="pt")
+
+        got_de = store.read_recommendations_cache("o", "r", self.tmp, ui_language="de")
+        got_pt = store.read_recommendations_cache("o", "r", self.tmp, ui_language="pt")
+        assert got_de is not None and got_pt is not None
+        # The pt write did not destroy the de set.
+        self.assertEqual(got_de["recommendations"][0]["name"], "bereich: auth")
+        self.assertEqual(got_pt["recommendations"][0]["name"], "area: auth")
+        # A language with nothing generated reads as absent, not as another's set.
+        self.assertIsNone(store.read_recommendations_cache("o", "r", self.tmp, ui_language="ja"))
+
+    def test_an_unconfigured_install_keeps_the_legacy_path(self):
+        # "" is the no-language-known case and must land on the ORIGINAL filename,
+        # so a cache written before partitioning is still found with no migration.
+        store.add_connected_repo("o", "r", root=self.tmp)
+        legacy = store.recommendations_cache_path("o", "r", self.tmp)
+        self.assertEqual(legacy.name, "recommendations-cache.json")
+        self.assertEqual(
+            store.recommendations_cache_path("o", "r", self.tmp, ui_language="").name,
+            legacy.name,
+        )
+        self.assertEqual(
+            store.recommendations_cache_path("o", "r", self.tmp, ui_language="zh-CN").name,
+            "recommendations-cache-zh-CN.json",
+        )
 
     def test_add_label_to_cache_appends_when_cache_exists(self):
         store.add_connected_repo("o", "r", root=self.tmp)

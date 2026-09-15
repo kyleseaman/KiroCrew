@@ -76,8 +76,12 @@ import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
-from kiro_crew.platform_compat import SIGKILL, kill_process_tree_async
-from kiro_crew.sandbox import create_subprocess_limited, sandboxed_spawn_argv
+from kiro_crew.platform_compat import kill_and_reap
+from kiro_crew.sandbox import (
+    create_subprocess_limited,
+    sandboxed_spawn_argv,
+    sandboxed_spawn_argv_async,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -419,11 +423,11 @@ def _bin_relpath(manifest: dict[str, Any], name: str) -> Optional[str]:
     matches the package's own last path segment, or a table with exactly one
     entry. Everything else returns ``None`` and misses to ``npx``.
 
-    An earlier version fell back to first-by-sort-order for an ambiguous table
-    and to ``main`` when ``bin`` was absent. Both were wrong in the same
+    Deliberately NO fallback to first-by-sort-order for an ambiguous table, and
+    none to ``main`` when ``bin`` is absent. Both would be wrong in the same
     direction, and the direction is what matters: ``npx`` ERRORS on an ambiguous
-    table and never runs ``main``, so those fallbacks made a successful
-    pre-resolution launch a DIFFERENT program than the launch it replaced. That
+    table and never runs ``main``, so such a fallback would make a successful
+    pre-resolution launch a DIFFERENT program than the launch it replaces. That
     inverts this module's whole contract -- a miss is free, but a hit that runs
     the wrong binary is a failure the user only sees after a prefetch succeeds.
     """
@@ -534,12 +538,12 @@ def _sweep_old_resolutions(
     Blocking (it walks and unlinks a populated ``node_modules``), so callers on
     the event loop must hand it to a thread.
 
-    Deliberately NOT prompt. An earlier version deleted every other tree the
-    moment the record was committed, reasoning that a launch which had already
-    read the old path "keeps its open files" -- which is false. A launch holds a
+    Deliberately NOT prompt. Deleting every other tree the moment the record is
+    committed would assume a launch which had already read the old path "keeps
+    its open files" -- which is false. A launch holds a
     PATH, not a descriptor, and execs it a moment later, so a refresh landing in
-    between removed the file out from under a session that was starting. That
-    turned a refresh into a failed backend, which is exactly the failure this
+    between removes the file out from under a session that is starting. That
+    turns a refresh into a failed backend, which is exactly the failure this
     module promises it cannot cause.
     """
     current = now or time.time()
@@ -575,11 +579,14 @@ async def _reap_install_tree(proc: "asyncio.subprocess.Process") -> None:
     Escalates straight to SIGKILL: this path is only reached when the install has
     already blown its deadline or the broker is going away, so there is nothing
     left to salvage by asking politely.
+
+    The reap is bounded and drains the pipes. This path is reached with the
+    ``_drain_capped`` reader already cancelled by ``wait_for`` (timeout) or by
+    broker shutdown (cancellation), so the stdout pipe is undrained: npm blocked
+    writing into a full pipe -- or a lifecycle-script grandchild still holding it
+    open -- would make a bare ``await proc.wait()`` hang forever.
     """
-    with contextlib.suppress(ProcessLookupError, OSError, ValueError):
-        await kill_process_tree_async(proc.pid, SIGKILL)
-    with contextlib.suppress(Exception):
-        await proc.wait()
+    await kill_and_reap(proc)
 
 
 async def _rmtree_off_loop(path: str) -> None:
@@ -697,24 +704,23 @@ async def install(
     # other one: OS-level isolation plus a credential-scrubbed environment. The
     # mode matches what the probe and the launch already use for the very same
     # npm launcher, so a registry reachable for those is reachable here -- and
-    # one that is not was already unreachable before this module existed, where
-    # the fallback lands anyway.
-    wrapped_argv, spawn_env, sandbox_cleanup = sandboxed_spawn_argv(
-        argv, mode="standard", strip_python_env=True
+    # one that is not is unreachable for those too, where the fallback lands
+    # anyway.
+    wrapped_argv, spawn_env, sandbox_cleanup = await sandboxed_spawn_argv_async(
+        argv, mode="standard", strip_python_env=True, _prepare=sandboxed_spawn_argv
     )
     try:
         # Limits are applied AFTER exec by the spawn shim rather than by a
         # ``preexec_fn``: an install runs third-party lifecycle scripts, so it
         # gets the same fork-bomb / FD / memory / CPU cap every other routed
-        # spawn does, without forking the multi-thread gateway to deliver it
-        # (issue #935).
+        # spawn does, without forking the multi-thread gateway to deliver it.
         #
         # ``start_new_session`` puts npm in its OWN process group so the whole
         # tree can be reaped. npm is a parent, not the worker: an install runs
         # third-party ``postinstall`` scripts as grandchildren, and killing only
         # npm on a timeout would leave those running with filesystem and network
         # access and no one waiting on them. Same reasoning as the pooled
-        # handshake deadline (#4509), which killpg's for exactly this.
+        # handshake deadline, which killpg's for exactly this.
         proc = await create_subprocess_limited(
             *wrapped_argv,
             env=spawn_env,

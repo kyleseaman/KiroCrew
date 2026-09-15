@@ -33,13 +33,13 @@ from aiohttp.test_utils import TestClient, TestServer
 from kiro_crew.apps.builtins.auto_research import handlers as h
 from kiro_crew.apps.builtins.auto_research.handlers import (
     CampaignStatus,
-    OnLoopDBError,
     _get_db,
     create_campaign,
     get_campaign,
     register_routes,
     update_campaign_status,
 )
+from kiro_crew.on_loop_db import OnLoopDBGuard, OnLoopStoreError
 
 
 @pytest.fixture(autouse=True)
@@ -64,7 +64,7 @@ class TestOnLoopGuard:
     @pytest.mark.asyncio
     async def test_on_loop_get_db_raises_under_strict(self, monkeypatch):
         monkeypatch.setenv("KIROCREW_STRICT_ON_LOOP_PERSIST", "1")
-        with pytest.raises(OnLoopDBError):
+        with pytest.raises(OnLoopStoreError):
             _get_db()
 
     def test_off_loop_get_db_allowed_under_strict(self, monkeypatch):
@@ -82,8 +82,8 @@ class TestOnLoopGuard:
         """Strict off (production): the on-loop entry proceeds but logs loudly,
         so a mis-wired call-site is never silent."""
         monkeypatch.setenv("KIROCREW_STRICT_ON_LOOP_PERSIST", "0")
-        monkeypatch.setattr(h, "_on_loop_db_warn_last", 0.0)  # reset throttle window
-        with caplog.at_level("WARNING", logger=h.logger.name):
+        h._ON_LOOP_DB_GUARD.reset_throttle()  # reset throttle window
+        with caplog.at_level("WARNING", logger="kiro_crew.on_loop_db"):
             conn = _get_db()
             conn.close()
         assert any("event loop" in r.message for r in caplog.records)
@@ -91,8 +91,8 @@ class TestOnLoopGuard:
     @pytest.mark.asyncio
     async def test_on_loop_warning_is_throttled(self, monkeypatch, caplog):
         monkeypatch.setenv("KIROCREW_STRICT_ON_LOOP_PERSIST", "0")
-        monkeypatch.setattr(h, "_on_loop_db_warn_last", 0.0)
-        with caplog.at_level("WARNING", logger=h.logger.name):
+        h._ON_LOOP_DB_GUARD.reset_throttle()
+        with caplog.at_level("WARNING", logger="kiro_crew.on_loop_db"):
             for _ in range(3):
                 conn = _get_db()
                 conn.close()
@@ -103,12 +103,12 @@ class TestOnLoopGuard:
         silently disarms every other protection here — pin the call."""
         tree = ast.parse(inspect.getsource(h._get_db))
         fn = tree.body[0]
-        calls = [
-            n.func.id
+        attrs = [
+            n.func.attr
             for n in ast.walk(fn)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
         ]
-        assert "_check_on_loop_db_discipline" in calls
+        assert "check" in attrs
 
 
 # Functions that open (or transitively open) the campaigns DB. A direct call
@@ -398,7 +398,7 @@ class TestGuardedTransition:
 
     @pytest.mark.asyncio
     async def test_refused_expiry_leaves_no_question_file(self, tmp_path):
-        """GPT round-2 scenario: 24h expiry races a user Stop. When the guarded
+        """24h expiry races a user Stop. When the guarded
         transition is refused, no synthetic question file may remain — it would
         drag a later Resume straight back into NEEDS_INPUT."""
         cid = create_campaign({"question": "Does edge caching reduce latency?", "sources": ["web"]})["id"]
@@ -426,7 +426,7 @@ class TestGuardedTransition:
 
     @pytest.mark.asyncio
     async def test_expiry_prompt_survives_a_directory_squatting_on_its_path(self, tmp_path):
-        """GPT round-7: the agent controls the research dir and can leave a
+        """The agent controls the research dir and can leave a
         directory (or link) at questions.json. The expiry write must clear it
         and publish the prompt — and even if the write fails, the audit + SSE
         for the already-persisted NEEDS_INPUT must not be suppressed."""
@@ -485,7 +485,7 @@ class TestGuardedTransition:
 
     @pytest.mark.asyncio
     async def test_stale_workflow_poll_writes_nothing_into_a_replacement_run(self):
-        """GPT round-5 F1: a poll that read its snapshot against generation A
+        """A poll that read its snapshot against generation A
         must abort at lock entry when generation B replaced it — no cycle
         files, no bookkeeping, no terminal state may land in the new run."""
         from types import SimpleNamespace
@@ -523,7 +523,7 @@ class TestGuardedTransition:
 
     @pytest.mark.asyncio
     async def test_stale_generation_is_refused_even_when_status_matches(self):
-        """GPT round-4 ABA scenario: a Pause→Resume mints a NEW started_at, so
+        """An ABA scenario: a Pause→Resume mints a NEW started_at, so
         the status is RUNNING again — but an old run's verdict carrying the OLD
         generation must not terminate the replacement run."""
         cid = create_campaign({"question": "Does edge caching reduce latency?", "sources": ["web"]})["id"]
@@ -626,7 +626,7 @@ class TestBriefTransactionality:
         )
 
     def test_emergent_ledger_persists_before_the_brief_publish(self):
-        """GPT round-6: the dedup ledger (mark_analyzed + save_queue) must be
+        """The dedup ledger (mark_analyzed + save_queue) must be
         persisted BEFORE the brief write — a failing brief write must not lose
         the activation record, or the same items are re-activated (duplicated)
         next cycle. Pinned structurally: source order within _activate_emergent
@@ -663,6 +663,16 @@ class TestWarnThrottleClock:
     def test_throttle_uses_monotonic_clock(self):
         """The warn throttle must use time.monotonic (wall-clock jumps must not
         re-open or permanently close the throttle window)."""
-        src = inspect.getsource(h._check_on_loop_db_discipline)
+        src = inspect.getsource(OnLoopDBGuard.check)
         assert "time.monotonic()" in src
         assert time.monotonic  # imported and real
+
+    def test_this_surface_stays_on_the_shared_switch(self):
+        """All six call sites here are offloaded, so this surface keeps the
+        shared ``KIROCREW_STRICT_ON_LOOP_PERSIST`` switch and the dev-mode arm --
+        a raise means genuinely new drift. The knowledge store deliberately
+        differs (its offload backlog is separate); pin that this one does not."""
+        from kiro_crew.on_loop_db import STRICT_ENV
+
+        assert h._ON_LOOP_DB_GUARD._strict_env == STRICT_ENV
+        assert h._ON_LOOP_DB_GUARD._include_dev_mode is True

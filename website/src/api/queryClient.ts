@@ -18,9 +18,24 @@ export const isThrottleError = (error: unknown): boolean =>
   typeof error === 'object' && error !== null
   && (error as { status?: unknown }).status === 429
 
-/** Retry up to 4 times on 429 throttles; keep the previous single retry otherwise. */
+/** True when the failure is a deadline WE set (lib/withDeadline's reason). */
+export const isDeadlineError = (error: unknown): boolean =>
+  typeof error === 'object' && error !== null
+  && (error as { name?: unknown }).name === 'TimeoutError'
+
+/**
+ * Retry up to 4 times on 429 throttles; never retry a deadline we set ourselves;
+ * keep the previous single retry otherwise.
+ *
+ * The deadline clause binds HERE rather than per query, for the same reason the
+ * deadline itself binds inside `api.skills`: react-query dedupes on the key, so a
+ * per-initiator rule is only as strong as the weakest initiator of a shared key.
+ * Retrying a deadline also doubles the wait it exists to bound — a 15s bound
+ * settles at ~31s once the single retry and its backoff are counted.
+ */
 export const retryPolicy = (failureCount: number, error: unknown): boolean =>
-  isThrottleError(error) ? failureCount < 4 : failureCount < 1
+  isDeadlineError(error) ? false
+    : isThrottleError(error) ? failureCount < 4 : failureCount < 1
 
 /**
  * Jittered exponential backoff for throttles (1s → 2s → 4s → 8s, ±500ms so
@@ -53,3 +68,80 @@ export const queryClient = new QueryClient({
     },
   },
 })
+
+type DefaultMemoryMode = 'persistent' | 'incognito' | 'temporary'
+type DashboardConfigMemoryMode = { default_memory_mode?: unknown }
+
+const DEFAULT_MEMORY_MODES: ReadonlySet<DefaultMemoryMode> = new Set([
+  'persistent',
+  'incognito',
+  'temporary',
+])
+let pendingDefaultMemoryMode: { token: symbol; value: DefaultMemoryMode } | undefined
+let defaultMemoryModeGeneration = 0
+let defaultMemoryModeWriteTail: Promise<void> = Promise.resolve()
+
+function beginDefaultMemoryModeUpdate(value: DefaultMemoryMode): symbol {
+  const token = Symbol('default-memory-mode-update')
+  defaultMemoryModeGeneration += 1
+  pendingDefaultMemoryMode = { token, value }
+  return token
+}
+
+function finishDefaultMemoryModeUpdate(token: symbol): void {
+  if (pendingDefaultMemoryMode?.token === token) pendingDefaultMemoryMode = undefined
+}
+
+/** Queue mode PUTs in selection order, even across Settings unmount/remount. */
+export function serializeDefaultMemoryModeUpdate<T>(
+  value: DefaultMemoryMode,
+  write: () => Promise<T>,
+): Promise<T> {
+  const token = beginDefaultMemoryModeUpdate(value)
+  const run = defaultMemoryModeWriteTail.then(write)
+  defaultMemoryModeWriteTail = run.then(() => undefined, () => undefined)
+  return run.finally(() => finishDefaultMemoryModeUpdate(token))
+}
+
+function currentPendingDefaultMemoryMode(): DefaultMemoryMode | undefined {
+  return pendingDefaultMemoryMode?.value
+}
+
+function normalizeDefaultMemoryMode(value: unknown): DefaultMemoryMode {
+  // Older backends omit the field and retain the historical Persistent default.
+  if (value === undefined) return 'persistent'
+  return DEFAULT_MEMORY_MODES.has(value as DefaultMemoryMode)
+    ? value as DefaultMemoryMode
+    : 'temporary'
+}
+
+/**
+ * Resolve the mode for a new dashboard chat. A same-tab choice whose save is
+ * still in flight wins. Otherwise verify the server: React Query caches are
+ * process-local, so another tab or device can change this privacy boundary
+ * without invalidating the cache in the process creating the next chat.
+ * A response overlapping a mode write is stale by construction and is retried
+ * once; repeated churn fails closed to Temporary.
+ */
+export async function resolveDefaultMemoryMode(
+  load: () => Promise<DashboardConfigMemoryMode>,
+): Promise<DefaultMemoryMode> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const generation = defaultMemoryModeGeneration
+    const pending = currentPendingDefaultMemoryMode()
+    if (pending) return pending
+    try {
+      const loaded = await load()
+      const latest = currentPendingDefaultMemoryMode()
+      if (latest) return latest
+      if (generation !== defaultMemoryModeGeneration) continue
+      return normalizeDefaultMemoryMode(loaded.default_memory_mode)
+    } catch {
+      const latest = currentPendingDefaultMemoryMode()
+      if (latest) return latest
+      if (generation !== defaultMemoryModeGeneration) continue
+      return 'temporary'
+    }
+  }
+  return 'temporary'
+}

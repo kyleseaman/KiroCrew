@@ -2,6 +2,7 @@ import { useContext, useMemo, useSyncExternalStore } from 'react'
 import { QueryClient, QueryClientContext } from '@tanstack/react-query'
 import type { KiroPrerequisiteStatus } from '../api/client'
 
+/** The query the prerequisite gate owns; this hook subscribes without driving it. */
 const PREREQUISITE_QUERY_KEY = ['kiro-prerequisite'] as const
 
 /** What the gateway host is, for copy that names an OS feature by its real name. */
@@ -24,10 +25,18 @@ export type GatewayPlatform = 'darwin' | 'windows' | 'other'
  */
 export function classifyPlatform(raw: string | undefined | null): GatewayPlatform {
   const platform = raw ?? ''
-  if (platform === 'darwin') return 'darwin'
-  // Matches the backend's own `sys.platform.startswith("win")` test, so the two
-  // sides cannot disagree about what counts as Windows.
-  if (platform.startsWith('win')) return 'windows'
+  // The gateway sends a human DISPLAY label, not `sys.platform`: the prerequisite
+  // snapshot reports `"macOS"` and `"Windows"` (see `_platform_label` in
+  // kiro_prerequisite.py), while Mochi's shell hands us raw `process.platform`
+  // values (`"darwin"`, `"win32"`). BOTH spellings have to classify the same way
+  // or an affordance is worded and gated by which surface asked: matching only
+  // `"darwin"` collapsed every macOS gateway to `'other'`, so a Mac user was
+  // offered the generic "Show in file manager" instead of Finder.
+  const lower = platform.toLowerCase()
+  if (lower === 'darwin' || lower === 'macos') return 'darwin'
+  // A lowercase-only `startsWith('win')` would likewise collapse the display
+  // label to `'other'` and mis-gate every Windows-only affordance.
+  if (lower.startsWith('win')) return 'windows'
   return 'other'
 }
 
@@ -91,6 +100,15 @@ function platformCacheStore(queryClient: QueryClient) {
  * re-renders when the gate refreshes it. Reading through the cache subscription
  * is important: a second useQuery observer with skipToken can replace the owning
  * query's fetch options while React Strict Mode remounts the tree.
+ *
+ * This is why the hook subscribes instead of registering an observer at all.
+ * React Query keeps a single options object per query, so whichever observer
+ * mounted last decides what a refetch driven through the CLIENT — rather than
+ * through an observer — runs. An observer registered here with a fetch-less
+ * `queryFn` therefore surfaced as `Missing queryFn` on the gate's query the next
+ * time something invalidated it (the token-refresh scheduler does), stranding the
+ * whole dashboard behind the gate's error screen. Holding no observer cannot
+ * replace those options, and reading latched cache state costs no `kiro-cli` spawn.
  *
  * See `classifyPlatform` for why anything unrecognised is generic wording.
  */

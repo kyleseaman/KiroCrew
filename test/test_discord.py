@@ -10,6 +10,7 @@ turn + interaction routing (transport_dispatch.py). Mirrors test_telegram.py.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import threading
 import time
@@ -21,11 +22,19 @@ from unittest import mock
 import pytest
 
 import kiro_crew.discord.transport_dispatch as td_mod
+from kiro_crew import session_directive
 from kiro_crew.acp.types import (
     EVENT_COMPACTION_STATUS,
     EVENT_COMPLETE,
     EVENT_TEXT_CHUNK,
+    EVENT_TOOL_CALL,
+    EVENT_TOOL_RESULT,
+    AcpEvent,
+    TurnUsage,
 )
+from kiro_crew.autonudge import AutoNudgeService
+from kiro_crew.config import KiroCrewConfig
+from kiro_crew.discord import renderer as discord_renderer
 from kiro_crew.discord.attachments import process_discord_attachments
 from kiro_crew.discord.client import (
     _INTENT_DIRECT_MESSAGES,
@@ -50,6 +59,7 @@ from kiro_crew.discord.renderer import (
     _extract_options,
     _strip_steering,
     build_option_components,
+    session_provenance_tag,
 )
 from kiro_crew.discord.transport import (
     DISCORD_CAPABILITIES,
@@ -60,6 +70,7 @@ from kiro_crew.discord.transport_dispatch import (
     _STEER_ACK_EMOJI,
     DiscordDispatcher,
 )
+from kiro_crew.messaging import driver as messaging_driver
 from kiro_crew.messaging.attachments import cleanup
 from kiro_crew.messaging.link import (
     UNBIND_REASON_UNSPECIFIED,
@@ -69,7 +80,16 @@ from kiro_crew.messaging.link import (
 from kiro_crew.messaging.queue_receipt import receipt_text as _receipt_text
 from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.messaging.transport import InboundMessage
-from kiro_crew.session import _opt_out_key
+from kiro_crew.monitoring.completion import MonitorCompletionHook
+from kiro_crew.monitoring.models import (
+    MonitorActionCompletion,
+    MonitorActionDisposition,
+    MonitorBudgets,
+    MonitorDispatchResult,
+    MonitorOutcome,
+)
+from kiro_crew.session import SessionManager, _opt_out_key
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.session_map import ConversationOwnershipConflict
 
 _PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
@@ -98,6 +118,24 @@ class MultipartFake:
         return await self.send_message(  # type: ignore[attr-defined]
             channel_id, text, components=components, reply_to_message_id=reply_to_message_id
         )
+
+    async def send_document(
+        self,
+        channel_id: str,
+        document: Any,
+        *,
+        caption: Any = None,
+        reply_to_message_id: Any = None,
+    ) -> str | None:
+        """Record the destination alongside the file: the document verb routes a
+        thread to its own channel id, which is the part a caller can get wrong."""
+        getattr(self, "uploads", []).append(("document", [document]))
+        getattr(self, "documents", []).append((channel_id, document, caption))
+        if getattr(self, "raise_uploads", False):
+            raise RuntimeError("document send exploded")
+        if getattr(self, "fail_uploads", False):
+            return None
+        return await self.send_message(channel_id, caption or "")  # type: ignore[attr-defined]
 
     async def edit_message_with_files(
         self,
@@ -135,6 +173,8 @@ class FakeClient(MultipartFake):
         self.attachment_bodies: dict[str, bytes] = {}
         self.attachment_downloads: list[str] = []
         self.uploads: list[tuple[str, list[Any]]] = []
+        #: (channel_id, document, caption) per name-preserving document send.
+        self.documents: list[tuple[str, Any, Any]] = []
         self.edit_ok = True
         #: When set, every send returns None, which is what the real client does
         #: for a revoked token or a dead network.
@@ -239,6 +279,8 @@ class _Ev:
         self.tool_call_id = ""
         self.title = title
         self.context_usage_pct = 0.0
+        self.usage = None
+        self.synthetic_completion = False
 
 
 class FakeProvider:
@@ -312,6 +354,10 @@ class FakeSessions:
         self.last_model: Any = None
         self.last_provider: Any = None
         self.raise_on_get = raise_on_get
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
         self._busy = False
         self._has = True
         self.queued: list = []
@@ -337,7 +383,13 @@ class FakeSessions:
         return (key, origin) in self.paused_deliveries
 
     async def get_or_create(
-        self, key: str, *, agent: Any = None, channel_id: Any = None, model: Any = None
+        self,
+        key: str,
+        *,
+        agent: Any = None,
+        channel_id: Any = None,
+        model: Any = None,
+        wait_if_busy: bool = True,
     ) -> Any:
         self.last_agent = agent
         self.last_model = model
@@ -347,6 +399,12 @@ class FakeSessions:
         # rather than merely handing on something.
         self.last_provider = FakeProvider()
         return self.last_provider, True, False
+
+    def begin_turn(self, key: str) -> None:
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key: str, channel: str) -> None:
         return None
@@ -513,6 +571,82 @@ def _cfg(soft: int = 80, default_agent: str = "", dm_scope: str = "per-channel-p
     )
 
 
+def _prime_live(cfg: Any) -> None:
+    """Publish *cfg*'s ``discord`` and ``messaging`` fields as the live snapshot.
+
+    The dispatcher reads those two sections at POINT OF USE from the config
+    watcher rather than from the ``cfg=`` copy it was constructed with, so a
+    test that varies one of them has to put the value where the turn actually
+    looks for it. Every field the test's SimpleNamespace carries is copied onto
+    a real ``KiroCrewConfig``, so the production readers see real sections and
+    the loader's own defaults fill the rest.
+
+    Call it again after mutating ``d.cfg`` mid-test -- the snapshot is a copy,
+    not a view.
+    """
+    import dataclasses
+
+    from kiro_crew.config import live
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    base = KiroCrewConfig()
+    sections = {}
+    for name in ("discord", "messaging"):
+        section = getattr(cfg, name, None)
+        if section is None:
+            continue
+        overrides = {
+            f.name: getattr(section, f.name)
+            for f in dataclasses.fields(getattr(base, name))
+            if hasattr(section, f.name)
+        }
+        sections[name] = dataclasses.replace(getattr(base, name), **overrides)
+    live.reset_for_tests()
+    live.watch().prime(dataclasses.replace(base, **sections))
+
+
+@pytest.fixture(autouse=True)
+def _drop_live_config_snapshot():
+    """Leave no primed config snapshot behind for the next test.
+
+    ``_prime_live`` (and ``_dispatcher``, which calls it) publishes into the
+    process-global config watcher, so without this the last test to prime would
+    set the live config for every test after it in the same worker.
+    """
+    yield
+    from kiro_crew.config import live
+
+    live.reset_for_tests()
+
+
+@contextlib.contextmanager
+def _live_discord(**discord_kw: Any):
+    """Put ``discord.*`` overrides in force for the body, then restore.
+
+    For a field the dispatcher reads per TURN off the live snapshot rather than
+    off its boot copy: the override has to be visible where the turn looks, and
+    it has to be a real section so every other live read in the same turn still
+    resolves.
+    """
+    import dataclasses
+
+    from kiro_crew.config import live
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    previous = live.snapshot()
+    base = previous if previous is not None else KiroCrewConfig()
+    live.reset_for_tests()
+    try:
+        live.watch().prime(
+            dataclasses.replace(base, discord=dataclasses.replace(base.discord, **discord_kw))
+        )
+        yield
+    finally:
+        live.reset_for_tests()
+        if previous is not None:
+            live.watch().prime(previous)
+
+
 def _inbound_with_id(text: str, *, message_id: str, **kw: Any) -> InboundMessage:
     """An inbound message carrying Discord's raw message id, which is what the
     steer-ack reaction and the phase ladder both key on."""
@@ -552,10 +686,12 @@ def _dispatcher(
     dm_scope: str = "per-channel-peer",
 ) -> tuple[DiscordDispatcher, FakeClient, FakeSessions]:
     sess = FakeSessions(raise_on_get=raise_on_get)
+    cfg = _cfg(default_agent=default_agent, dm_scope=dm_scope)
+    _prime_live(cfg)
     d = DiscordDispatcher(
         sessions=sess,  # type: ignore[arg-type]
         ctx_builder=FakeCtx(),  # type: ignore[arg-type]
-        cfg=_cfg(default_agent=default_agent, dm_scope=dm_scope),
+        cfg=cfg,
         allowed_user_ids=allowed,
         allowed_thread_ids=allowed_threads,
         agent=None,
@@ -650,7 +786,7 @@ _FENCE_SHAPES = [
     "```py\n" + _ORACLE_CODE * 20 + "```\n\n```sh\nls\n" + _ORACLE_CODE * 20,  # two fences
     "````md\n" + _ORACLE_CODE * 20 + "```\n" + _ORACLE_CODE * 20 + "\n\n\n",  # ws tail
     # Blank code lines INSIDE a fence with more code after them -- the shape the
-    # remainder used to delete, swept at every limit so the cut lands on each
+    # remainder would delete, swept at every limit so the cut lands on each
     # newline of the run in turn.
     "```py\n" + _ORACLE_CODE * 20 + "\n\n" + _ORACLE_CODE * 20,
     "```py\n" + (_ORACLE_CODE + "\n\n\n") * 12,  # 4-newline runs throughout
@@ -731,7 +867,7 @@ class TestRotationSplitting:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Nothing appended and nothing to undo, including for the shapes the
-        # deleted tail-closer strip used to have to reason about.
+        # deleted tail-closer strip would have to reason about.
         for text in ["```py\nx = 1\n", "type ``` here", "plain prose"]:
             assert await self._rotate(monkeypatch, text, 1900) == ([], text)
 
@@ -961,7 +1097,7 @@ class TestRotationSplitting:
     ) -> None:
         """Swept oracle: a rotation IS the splitter's output, verbatim.
 
-        The renderer used to carry its own splitter and then undo part of it, and
+        The renderer must not carry its own splitter and then undo part of it, since
         every defect in that cluster was the append and the strip disagreeing on
         one shape. There is nothing left to disagree about, and this pins that:
         each chunk but the last is sealed exactly once, in order, and the last is
@@ -1022,6 +1158,17 @@ class TestOptionComponents:
         total = sum(len(r["components"]) for r in comps)
         assert total == 25
 
+    def test_origin_tag_suffixes_every_custom_id(self) -> None:
+        """The provenance tag rides the custom_id; bare ids are the legacy shape.
+
+        ``opt:<i>:<tag>`` is what the press-side gate parses back out, so the
+        two halves meet exactly here.
+        """
+        comps = build_option_components(["a", "b"], "deadbeefcafe")
+        assert comps is not None
+        ids = [b["custom_id"] for row in comps for b in row["components"]]
+        assert ids == ["opt:0:deadbeefcafe", "opt:1:deadbeefcafe"]
+
 
 class TestExtractOptions:
     def test_no_options(self) -> None:
@@ -1073,6 +1220,78 @@ class TestStripSteering:
     def test_an_unclosed_marker_cannot_span_table_rows(self) -> None:
         text = "[STEERING steer-deadbeef |\n| --- | --- |"
         assert _strip_steering(text) == text
+
+    def test_removes_a_marker_whose_summary_wrapped(self) -> None:
+        """kiro-cli's rephrase is free to wrap, and the frame is still a frame.
+
+        Every other reader of this frame says so: ``messaging.driver`` matches it
+        with ``re.DOTALL``, ``constants._STEERING_TAIL_PREFIX_RE`` closes the same
+        grammar's prefix with ``re.DOTALL``, and the dashboard's parser spells the
+        summary ``[\\s\\S]*?``. A class that stopped at the first line end left the
+        marker in the delivered Discord message.
+        """
+        text = "before [STEERING steer-ab12: switching to the job id\nand re-running it] after"
+        out = _strip_steering(text)
+        assert "STEERING" not in out
+        assert out.startswith("before") and out.endswith("after")
+
+    def test_the_chip_summary_survives_a_wrapped_marker(self) -> None:
+        """``_rotate_at_markers`` reads the summary at the offset the marker
+        pattern chose, so the two must agree on the same frame: a summary the
+        marker matched but this one did not leaves the steer chip blank."""
+        text = "[STEERING steer-ab12: switching to the job id\nand re-running it]"
+        marker = discord_renderer._STEER_MARKER_RE.search(text)
+        assert marker is not None
+        summary = discord_renderer._STEER_SUMMARY_RE.match(text, marker.start())
+        assert summary is not None
+        assert summary.group(1) == "switching to the job id\nand re-running it"
+
+    def test_a_dashed_steer_id_is_one_frame_to_both_patterns(self) -> None:
+        """``messaging.driver`` accepts ``[0-9a-f-]+`` for the id, so a dashed id
+        is a real frame; the two patterns here have to agree about it."""
+        text = "[STEERING steer-a180-ae7f: checked] tail"
+        marker = discord_renderer._STEER_MARKER_RE.search(text)
+        assert marker is not None
+        summary = discord_renderer._STEER_SUMMARY_RE.match(text, marker.start())
+        assert summary is not None and summary.group(1) == "checked"
+        assert _strip_steering(text).strip() == "tail"
+
+    def test_prose_that_merely_opens_with_the_sentinel_stays(self) -> None:
+        """The counterpart to allowing newlines, and the reason it is safe.
+
+        ``messaging.driver`` already rules that opening with the sentinel is not
+        being a marker. Without the id requirement, a class that spans lines would
+        swallow from ``[STEERING`` to any later ``]`` -- here a Markdown link two
+        lines down.
+        """
+        text = "[STEERING is the feature I mean\n\nsee the [docs](x) for it"
+        assert _strip_steering(text) == text
+
+    def test_the_grammar_agrees_with_the_messaging_driver(self) -> None:
+        """One frame, two readers: a corpus both must classify the same way.
+
+        This renderer is defence for callers that bypass ``TurnDriver``, so the
+        two spellings answer the same question about the same bytes; a divergence
+        is how one surface starts delivering what the other removes.
+        """
+        frames = [
+            "[STEERING steer-ab12: checked]",
+            "[STEERING steer-a180ae7f: 已并行查询悉尼天气,一并答复。]",
+            "[STEERING steer-a180-ae7f: checked]",
+            "[STEERING steer-ab12: line one\nline two]",
+            "[STEERING steer-ab12]",
+        ]
+        not_frames = [
+            "[STEERING is the feature I mean]",
+            "[STEERING steer-: empty id]",
+            "[STEERING steer-zzzz: not hex]",
+        ]
+        for text in frames:
+            assert discord_renderer._STEER_MARKER_RE.fullmatch(text), text
+            assert messaging_driver._STEER_MARKER_RE.match(text), text
+        for text in not_frames:
+            assert discord_renderer._STEER_MARKER_RE.fullmatch(text) is None, text
+            assert messaging_driver._STEER_MARKER_RE.match(text) is None, text
 
 
 class TestFindButtonLabel:
@@ -1656,6 +1875,16 @@ class TestRenderer:
         labels = [b["label"] for row in comps for b in row["components"]]
         assert labels == ["A", "B"]
         assert "[OPTIONS" not in cli.final_text()
+        # The sealed row is PROVENANCE-STAMPED with this renderer's session key —
+        # the producer half of the stale-press fix. Without this pin, reverting
+        # the call sites to untagged build_option_components(opts) keeps the
+        # whole suite green while every new button falls back to the legacy
+        # current-binding path, silently reopening cross-session injection.
+        ids = [b["custom_id"] for row in comps for b in row["components"]]
+        assert ids == [
+            f"opt:0:{session_provenance_tag('sk')}",
+            f"opt:1:{session_provenance_tag('sk')}",
+        ]
 
     @pytest.mark.asyncio
     async def test_long_options_before_streamed_steer_ack_become_buttons(self) -> None:
@@ -1713,7 +1942,7 @@ class TestRenderer:
         final = cli.final_text()
         assert final.count("```") % 2 == 0  # balanced -> no stray backticks
         # The fence must CLOSE, which the balance check above already proves;
-        # the message no longer ENDS on the closer because the turn footer is
+        # the message does not END on the closer because the turn footer is
         # appended as a trailing subtext line after it.
         assert final.startswith("```")
         assert final.split("-# Finished in ")[0].rstrip().endswith("```")
@@ -2062,6 +2291,29 @@ class TestDispatcher:
         return InboundMessage(channel_type="discord", user_id=user, conversation_id=chan, text=text)
 
     @pytest.mark.asyncio
+    async def test_member_memory_refusal_redacts_before_posting(self, monkeypatch) -> None:
+        from unittest.mock import AsyncMock
+
+        from kiro_crew.memory_stores import UnknownMemoryStore
+
+        private_path = "/home/alice/.kiro/crew/memory_stores/member-one/memory.db"
+        credential = "AKIAIOSFODNN7EXAMPLE"
+        failure = UnknownMemoryStore(
+            f"memory_unavailable: cannot open {private_path}; {credential}"
+        )
+        monkeypatch.setattr(
+            "kiro_crew.discord.transport_dispatch.session_store_for_turn",
+            AsyncMock(side_effect=failure),
+        )
+        dispatcher, client, sessions = _dispatcher({"u1"})
+        await dispatcher.handle_message(self._msg("hello"))
+        posted = "\n".join(text for text, _ in client.sent)
+        assert "memory_unavailable:" in posted
+        assert private_path not in posted and "alice" not in posted
+        assert credential not in posted
+        assert sessions.released == []
+
+    @pytest.mark.asyncio
     async def test_a_disconnected_conversation_gets_no_reply(self) -> None:
         """Disconnecting Discord in the dashboard must actually stop the replies.
 
@@ -2116,8 +2368,8 @@ class TestDispatcher:
         ACP session. ``on_turn_start`` does not send the indicator inline -- it
         spawns a refresh task -- so it must be called BEFORE the cold start, or
         the task is not even created until the cold start has finished and the
-        user sees several seconds of dead air. That regressed when attachment
-        ingestion was inserted ahead of ``on_turn_start`` (#1053). The shared
+        user sees several seconds of dead air. Inserting attachment ingestion
+        ahead of ``on_turn_start`` reintroduces exactly that. The shared
         skeleton in messaging/dispatch.py documents this order as "typing
         indicator before cold start"; telegram/transport_dispatch.py follows it.
 
@@ -2158,6 +2410,553 @@ class TestDispatcher:
         await d.handle_message(self._msg("hello world"))
         assert "Answer: hello world" in (cli.final_text() or "")
         assert sess.successes and sess.released
+        # Pins that the pre-dispatch closing gate is consulted on the normal
+        # path, so it cannot be dropped or renamed into a no-op unnoticed.
+        assert sess.begin_turns == 1
+
+    @pytest.mark.asyncio
+    async def test_a_shutdown_between_the_claim_and_the_dispatch_never_opens_the_turn(
+        self,
+    ) -> None:
+        """The lease-dispatch race gate.
+
+        ``get_or_create`` guards the CLAIM, but the turn only opens at
+        ``driver.run``, and the context build between them is wide enough for a
+        gateway restart to land in. Opening a turn then registers it behind the
+        drain snapshot ``close_all`` has already taken, so it is killed
+        mid-flight holding its native lock and reaches the user as an empty
+        response instead of this channel's notice.
+        """
+        d, cli, sess = _dispatcher({"u1"})
+        # get_or_create deliberately ignores `closing`, so the CLAIM still
+        # succeeds here. That is the race being pinned: a refused claim was
+        # always handled, an accepted claim whose DISPATCH loses was not.
+        sess.closing = True
+
+        await d.handle_message(self._msg("hello world"))
+
+        assert "Answer: hello world" not in (
+            cli.final_text() or ""
+        ), "the turn must not open behind close_all's drain snapshot"
+        assert sess.begin_turns == 1
+        # A restart is neither a success nor a session fault: charging it to the
+        # circuit breaker would count toward resetting a session that never
+        # misbehaved.
+        assert not sess.successes
+        assert not sess.failures
+        # Refused is not leaked -- the session-keyed semaphore still comes back.
+        assert sess.released
+
+    @pytest.mark.asyncio
+    async def test_a_shutdown_refusal_is_not_spooled_for_a_restricted_session(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """An incognito or temporary conversation persists nothing, the spool included.
+
+        RED-BEFORE: without the restricted-session gate at the refusal point the
+        private message is written verbatim to ``refused.jsonl``.
+        """
+        from kiro_crew.messaging import inbound_spool as S
+
+        monkeypatch.setattr(S, "data_home", lambda: tmp_path)
+        d, _cli, sess = _dispatcher({"u1"})
+        sess.closing = True
+        spool = tmp_path / "inbound-spool" / "refused.jsonl"
+
+        # Persistent: the refusal is spooled.
+        await d.handle_message(self._msg("keep me"))
+        assert spool.exists() and "keep me" in spool.read_text(encoding="utf-8")
+        spool.unlink()
+        sess.reserve_inbound_callback = lambda: None
+
+        d._session_resume.route = mock.AsyncMock(
+            return_value=td_mod.RoutingDecision(resumed_key="dashboard:restricted")
+        )
+
+        async def _restricted(key: str) -> bool:
+            return key == "dashboard:restricted"
+
+        monkeypatch.setattr(d, "_session_restricted", _restricted)
+        await d.handle_message(self._msg("my secret"))
+
+        assert not spool.exists(), "an incognito message was persisted to the spool"
+
+    @pytest.mark.asyncio
+    async def test_monitor_wake_busy_at_dispatch_boundary_is_not_steered_or_queued(
+        self,
+    ) -> None:
+        d, cli, sess = _dispatcher({"u1"})
+        sess._busy = True
+        completions: list[MonitorActionCompletion] = []
+
+        async def _complete(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        result = await d.handle_message(
+            self._msg("[Monitor wake]"),
+            interpret_commands=False,
+            monitor_completion=MonitorCompletionHook("mon-1", "failure-a", _complete),
+        )
+
+        assert result is MonitorDispatchResult.BUSY
+        assert sess._gp.steered == []
+        assert sess.queued == []
+        assert cli.reactions == []
+        assert completions == []
+
+    @pytest.mark.asyncio
+    async def test_monitor_wake_losing_race_at_session_claim_returns_busy(
+        self,
+    ) -> None:
+        """A user turn winning after the advisory check must not make the wake wait."""
+
+        class _LiveProvider(FakeProvider):
+            async def start(self) -> None:
+                return None
+
+            async def shutdown(self) -> None:
+                return None
+
+            def is_process_alive(self) -> bool:
+                return True
+
+            def is_alive(self) -> bool:
+                return True
+
+            def context_usage_pct(self) -> float:
+                return 0.0
+
+        provider = _LiveProvider()
+
+        def _factory(*_args: Any, **_kwargs: Any) -> _LiveProvider:
+            return provider
+
+        manager = SessionManager(KiroCrewConfig(), provider_factory=_factory)
+        boundary_reached = asyncio.Event()
+        resume_monitor = asyncio.Event()
+
+        class _PausingSessions:
+            def __init__(self) -> None:
+                self.pause_next_claim = True
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(manager, name)
+
+            async def get_or_create(self, *args: Any, **kwargs: Any) -> Any:
+                if self.pause_next_claim:
+                    self.pause_next_claim = False
+                    boundary_reached.set()
+                    await resume_monitor.wait()
+                return await manager.get_or_create(*args, **kwargs)
+
+        sessions = _PausingSessions()
+        dispatcher = DiscordDispatcher(
+            sessions=sessions,  # type: ignore[arg-type]
+            ctx_builder=FakeCtx(),  # type: ignore[arg-type]
+            cfg=_cfg(),
+            allowed_user_ids={"u1"},
+        )
+        client = FakeClient()
+        dispatcher.client = client  # type: ignore[assignment]
+        key = dispatcher._session_key("u1")
+        await manager.get_or_create(key)
+        manager.release(key)
+        completions: list[MonitorActionCompletion] = []
+
+        async def _complete(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        monitor_task = asyncio.create_task(
+            dispatcher.handle_message(
+                self._msg("[Monitor wake]"),
+                interpret_commands=False,
+                monitor_completion=MonitorCompletionHook("mon-1", "failure-a", _complete),
+            )
+        )
+        try:
+            await asyncio.wait_for(boundary_reached.wait(), timeout=5)
+            await manager.get_or_create(key)  # A user turn wins the actual semaphore.
+            resume_monitor.set()
+
+            # Await completion while the user still owns the semaphore. Real
+            # off-loop metadata reads may need more than a few scheduler turns;
+            # a blocking claim cannot finish before finally releases the user.
+            result = await asyncio.wait_for(asyncio.shield(monitor_task), timeout=5)
+            assert result is MonitorDispatchResult.BUSY
+            assert provider.steered == []
+            assert manager.dequeue(key) is None
+            assert completions == []
+        finally:
+            resume_monitor.set()
+            if manager.is_busy(key):
+                manager.release(key)
+            if not monitor_task.done():
+                monitor_task.cancel()
+            await asyncio.gather(monitor_task, return_exceptions=True)
+            await manager.close_all()
+
+    @pytest.mark.asyncio
+    async def test_monitor_wake_pre_turn_refusal_is_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+        completions: list[MonitorActionCompletion] = []
+
+        async def _complete(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        async def _denied(_channel_type: str) -> bool:
+            return False
+
+        monkeypatch.setattr(
+            "kiro_crew.discord.transport_dispatch.channel_inbound_permitted", _denied
+        )
+        result = await d.handle_message(
+            self._msg("[Monitor wake]"),
+            interpret_commands=False,
+            monitor_completion=MonitorCompletionHook("mon-1", "failure-a", _complete),
+        )
+
+        assert result is MonitorDispatchResult.UNAVAILABLE
+        assert sess.released == []
+        assert sess.failures == []
+        assert completions == []
+
+    @pytest.mark.asyncio
+    async def test_monitor_wake_cold_start_failure_is_unavailable(self) -> None:
+        d, _cli, sess = _dispatcher({"u1"}, raise_on_get=True)
+        completions: list[MonitorActionCompletion] = []
+
+        async def _complete(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        result = await d.handle_message(
+            self._msg("[Monitor wake]"),
+            interpret_commands=False,
+            monitor_completion=MonitorCompletionHook("mon-1", "failure-a", _complete),
+        )
+
+        assert result is MonitorDispatchResult.UNAVAILABLE
+        assert sess.released == []
+        assert sess.failures == []
+        assert completions == []
+
+    @pytest.mark.asyncio
+    async def test_monitor_wake_transient_setup_failure_retries_as_busy(self) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+        d._render_config = mock.MagicMock(side_effect=OSError("temporary read failure"))
+        completion = MonitorCompletionHook("mon-1", "failure-a", mock.AsyncMock())
+
+        result = await d.handle_message(
+            self._msg("[Monitor wake]"),
+            interpret_commands=False,
+            monitor_completion=completion,
+        )
+
+        assert result is MonitorDispatchResult.BUSY
+        assert not completion.accepted
+        assert sess.released == [d._session_key("u1")]
+
+    @pytest.mark.asyncio
+    async def test_monitor_wake_shutdown_during_session_claim_is_busy(self) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+
+        async def _closing_claim(*_args: Any, **_kwargs: Any) -> Any:
+            raise SessionClosingError("closing")
+
+        sess.get_or_create = _closing_claim  # type: ignore[method-assign]
+        completion = MonitorCompletionHook(
+            "mon-1",
+            "failure-a",
+            mock.AsyncMock(),
+        )
+
+        result = await d.handle_message(
+            self._msg("[Monitor wake]"),
+            interpret_commands=False,
+            monitor_completion=completion,
+        )
+
+        assert result is MonitorDispatchResult.BUSY
+        assert not completion.accepted
+
+    @pytest.mark.asyncio
+    async def test_monitor_wake_preserves_validated_generation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+        original_key = d._session_key("u1")
+        acquired: list[str] = []
+        real_get_or_create = sess.get_or_create
+
+        async def _capture(key: str, **kwargs: Any) -> Any:
+            acquired.append(key)
+            return await real_get_or_create(key, **kwargs)
+
+        rotate = mock.MagicMock(
+            side_effect=lambda scope_id, *_args, **_kwargs: d._conv.bump_gen(scope_id)
+        )
+        monkeypatch.setattr(sess, "get_or_create", _capture)
+        monkeypatch.setattr(d._conv, "maybe_rotate", rotate)
+
+        result = await d.handle_message(
+            self._msg("[Monitor wake]"),
+            interpret_commands=False,
+            monitor_completion=MonitorCompletionHook("mon-1", "failure-a", mock.AsyncMock()),
+        )
+
+        assert result is MonitorDispatchResult.DISPATCHED
+        rotate.assert_not_called()
+        assert acquired == [original_key]
+
+    @pytest.mark.asyncio
+    async def test_monitor_wake_refuses_generation_rotated_after_gateway_validation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+        validated_key = d._session_key("u1")
+        d._conv.bump_gen(d._scope_id("u1", ""))
+        current_key = d._session_key("u1")
+        get_or_create = mock.AsyncMock(wraps=sess.get_or_create)
+        monkeypatch.setattr(sess, "get_or_create", get_or_create)
+
+        result = await d.handle_message(
+            self._msg("[Monitor wake]"),
+            interpret_commands=False,
+            monitor_completion=MonitorCompletionHook("mon-1", "failure-a", mock.AsyncMock()),
+            monitor_session_key=validated_key,
+        )
+
+        assert current_key != validated_key
+        assert result is MonitorDispatchResult.UNAVAILABLE
+        get_or_create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_monitor_wake_refuses_generation_rotated_after_session_claim(self) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+        validated_key = d._session_key("u1")
+
+        class _RefusingProvider(FakeProvider):
+            async def stream(self, message: str) -> Any:
+                raise AssertionError("abandoned Discord generation reached the provider")
+                yield
+
+        provider = _RefusingProvider()
+
+        async def _get_or_create(*args: Any, **kwargs: Any) -> Any:
+            return provider, False, False
+
+        async def _rotate_after_claim(_monitor_id: str, _fingerprint: str) -> bool:
+            d._conv.bump_gen(d._scope_id("u1", ""))
+            return True
+
+        sess.get_or_create = _get_or_create  # type: ignore[method-assign]
+        completion = MonitorCompletionHook(
+            "mon-1",
+            "failure-a",
+            mock.AsyncMock(),
+            authorization_callback=_rotate_after_claim,
+        )
+
+        result = await d.handle_message(
+            self._msg("[Monitor wake]"),
+            interpret_commands=False,
+            monitor_completion=completion,
+            monitor_session_key=validated_key,
+        )
+
+        assert result is MonitorDispatchResult.UNAVAILABLE
+        assert not completion.accepted
+        assert sess.successes == []
+        assert sess.released == [validated_key]
+
+    @pytest.mark.asyncio
+    async def test_monitor_wake_dispatches_with_correlated_safe_completion(self) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+        completions: list[MonitorActionCompletion] = []
+
+        class _SafeProvider(FakeProvider):
+            async def stream(self, message: str) -> Any:
+                yield _Ev(EVENT_TEXT_CHUNK, text=f"{self._reply}: {message[:16]}")
+                yield _Ev(EVENT_COMPLETE, stop_reason="max_tokens")
+
+        async def _get_or_create(*args: Any, **kwargs: Any) -> Any:
+            return _SafeProvider(), False, False
+
+        sess.get_or_create = _get_or_create  # type: ignore[method-assign]
+
+        async def _complete(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        completion = MonitorCompletionHook("mon-1", "failure-a", _complete)
+        result = await d.handle_message(
+            self._msg("[Monitor wake]"),
+            interpret_commands=False,
+            monitor_completion=completion,
+        )
+
+        assert result is MonitorDispatchResult.DISPATCHED
+        assert completion.accepted
+        assert len(completions) == 1
+        assert completions[0].monitor_id == "mon-1"
+        assert completions[0].fingerprint == "failure-a"
+        assert completions[0].disposition is MonitorActionDisposition.FAILURE
+        assert sess.successes and sess.released
+
+    @pytest.mark.asyncio
+    async def test_monitor_wake_refuses_shutdown_before_provider_stream(self) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+        sess.closing = True
+        completion = MonitorCompletionHook(
+            "mon-1",
+            "failure-a",
+            mock.AsyncMock(),
+        )
+
+        result = await d.handle_message(
+            self._msg("[Monitor wake]"),
+            interpret_commands=False,
+            monitor_completion=completion,
+        )
+
+        assert result is MonitorDispatchResult.BUSY
+        assert not completion.accepted
+        assert sess.successes == []
+        assert sess.failures == []
+        assert sess.released == [d._session_key("u1")]
+
+    @pytest.mark.asyncio
+    async def test_monitor_wake_rechecks_claim_before_discord_provider_stream(self) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+
+        class _RefusingProvider(FakeProvider):
+            async def stream(self, message: str) -> Any:
+                raise AssertionError("revoked monitor claim reached the provider")
+                yield
+
+        provider = _RefusingProvider()
+
+        async def _get_or_create(*args: Any, **kwargs: Any) -> Any:
+            return provider, False, False
+
+        async def _authorize(_monitor_id: str, _fingerprint: str) -> bool:
+            return False
+
+        sess.get_or_create = _get_or_create  # type: ignore[method-assign]
+        completion = MonitorCompletionHook(
+            "mon-1",
+            "failure-a",
+            mock.AsyncMock(),
+            authorization_callback=_authorize,
+        )
+
+        result = await d.handle_message(
+            self._msg("[Monitor wake]"),
+            interpret_commands=False,
+            monitor_completion=completion,
+        )
+
+        assert result is MonitorDispatchResult.UNAVAILABLE
+        assert not completion.accepted
+        assert sess.successes == []
+        assert sess.released == [d._session_key("u1")]
+
+    @pytest.mark.asyncio
+    async def test_monitor_stop_directive_before_safe_completion_keeps_accounting(
+        self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The stop tool result must not erase the wake claimed by this turn."""
+        d, _cli, sess = _dispatcher({"u1"})
+        session_key = d._session_key("u1")
+        service = AutoNudgeService(base_dir=tmp_path)
+        loop = await service.add_monitor(
+            slot_key=session_key,
+            kind="github_pull_request",
+            target="https://github.com/acme/widgets/pull/7",
+            objective="review_ready",
+            cadence_secs=60,
+            budgets=MonitorBudgets(),
+            now=100.0,
+        )
+        assert await service.mark_monitor_action_in_flight(loop.id, "failure-a", now=120.0)
+
+        class _DirectiveProvider(FakeProvider):
+            async def stream(self, message: str) -> Any:
+                yield AcpEvent(
+                    kind=EVENT_TOOL_CALL,
+                    tool_call_id="stop-1",
+                    title="autonudge_stop",
+                    tool_name="autonudge_stop",
+                    mcp_server_name=session_directive.CORE_MCP_SERVER,
+                )
+                yield AcpEvent(
+                    kind=EVENT_TOOL_RESULT,
+                    tool_call_id="stop-1",
+                    tool_output=session_directive.encode(
+                        "autonudge_stop",
+                        {"reason": "objective complete"},
+                        "Monitor stop requested.",
+                    ),
+                    tool_final=True,
+                )
+                yield AcpEvent(
+                    kind=EVENT_COMPLETE,
+                    stop_reason="max_tokens",
+                    usage=TurnUsage(input_tokens=11, output_tokens=7),
+                )
+
+        provider = _DirectiveProvider()
+
+        async def _get_or_create(*args: Any, **kwargs: Any) -> Any:
+            return provider, False, False
+
+        sess.get_or_create = _get_or_create  # type: ignore[method-assign]
+        monkeypatch.setattr("kiro_crew.autonudge.get_instance", lambda: service)
+        monkeypatch.setattr(
+            "kiro_crew.autonudge_authz.sel",
+            lambda: SimpleNamespace(log_tool_invocation=lambda **_kwargs: None),
+        )
+        completion = MonitorCompletionHook(
+            loop.id,
+            "failure-a",
+            service.record_monitor_turn_completion,
+            acceptance_callback=lambda: service.mark_monitor_turn_accepted(loop.id, "failure-a"),
+        )
+
+        result = await d.handle_message(
+            self._msg("[Monitor wake]"),
+            interpret_commands=False,
+            monitor_completion=completion,
+        )
+
+        assert result is MonitorDispatchResult.DISPATCHED
+        assert loop.monitor is not None
+        assert loop.monitor.outcome is MonitorOutcome.USER_STOP
+        assert not loop.active
+        assert not loop.monitor.wake_in_flight
+        assert loop.monitor.agent_turns == 1
+        assert loop.monitor.wake_count == 1
+        assert loop.monitor.input_tokens == 11
+        assert loop.monitor.output_tokens == 7
+        assert loop.monitor.last_completion_fingerprint == "failure-a"
+        assert loop.next_due_ts == 0.0
+
+        # A duplicate completion frame/callback cannot charge the retained
+        # terminal record a second time.
+        await completion.complete(
+            MonitorActionDisposition.SUCCESS,
+            TurnUsage(input_tokens=100, output_tokens=200),
+            completed_ts=140.0,
+        )
+        assert loop.monitor.agent_turns == 1
+        assert loop.monitor.wake_count == 1
+        assert loop.monitor.input_tokens == 11
+        assert loop.monitor.output_tokens == 7
+        service.stop()
 
     @pytest.mark.asyncio
     async def test_cold_start_failure_releases_nothing_but_closes_renderer(
@@ -2234,6 +3033,7 @@ class TestDispatcher:
     ) -> None:
         d, cli, sess = _dispatcher({"u1"})
         d.cfg.messaging.queue_mode = "queue"
+        _prime_live(d.cfg)
         download_started = asyncio.Event()
         finish_download = asyncio.Event()
         url = "https://cdn.discordapp.com/attachments/c/m/slow.png"
@@ -2321,8 +3121,11 @@ class TestDispatcher:
         assert "Kiro Crew — Discord" not in "\n".join(text for text, _ in cli.sent)
 
     @pytest.mark.asyncio
-    async def test_attachment_rejection_is_not_silent(self) -> None:
+    async def test_opaque_attachment_download_is_not_silent(self) -> None:
         d, cli, _ = _dispatcher({"u1"})
+        url = "https://cdn.discordapp.com/a.bin"
+        payload = b"complete opaque bytes"
+        cli.attachment_bodies[url] = payload
         await d.handle_message(
             InboundMessage(
                 channel_type="discord",
@@ -2333,16 +3136,20 @@ class TestDispatcher:
                     {
                         "filename": "archive.bin",
                         "content_type": "application/octet-stream",
-                        "size": 10,
-                        "url": "https://cdn.discordapp.com/a.bin",
+                        "size": len(payload),
+                        "url": url,
                     }
                 ],
             )
         )
         await asyncio.sleep(0)
 
-        assert "unsupported type" in d.ctx_builder.messages[-1]
-        assert cli.attachment_downloads == []
+        prompt = d.ctx_builder.messages[-1]
+        paths = [line for line in prompt.splitlines() if line.endswith(".bin")]
+        assert "[Attached file: archive.bin]" in prompt
+        assert cli.attachment_downloads == [url]
+        assert len(paths) == 1
+        assert not os.path.exists(paths[0])
 
     @pytest.mark.asyncio
     async def test_busy_attachment_waits_for_queued_turn_before_cleanup(self) -> None:
@@ -2456,6 +3263,32 @@ class TestDispatcher:
         d, cli, sess = _dispatcher({"u1"})
         await d.handle_message(self._msg("!compact"))
         assert sess.acquired and sess.released
+        visible = " ".join([text for text, _ in cli.sent] + [text for _, text, _ in cli.edits])
+        assert "Context compacted" in visible
+
+    @pytest.mark.asyncio
+    async def test_compact_declined_on_auto_managed_backend(self) -> None:
+        # A backend that cannot serve /compact gets the informational reply and
+        # compact() is NEVER dispatched.
+        d, cli, sess = _dispatcher({"u1"})
+        calls: list[int] = []
+
+        async def _compact(context: str = "") -> None:
+            calls.append(1)
+
+        sess._gp.compact = _compact
+        sess._gp.manual_compact_unsupported_backend = "kas"
+        await d.handle_message(self._msg("!compact"))
+        visible = " ".join([text for text, _ in cli.sent] + [text for _, text, _ in cli.edits])
+        assert "manages compaction automatically" in visible
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_compact_none_capability_preserves_dispatch(self) -> None:
+        # The ABC's None (supported) default keeps the existing dispatch.
+        d, cli, sess = _dispatcher({"u1"})
+        sess._gp.manual_compact_unsupported_backend = None
+        await d.handle_message(self._msg("!compact"))
         visible = " ".join([text for text, _ in cli.sent] + [text for _, text, _ in cli.edits])
         assert "Context compacted" in visible
 
@@ -2712,7 +3545,7 @@ class TestDispatcher:
     async def test_unlink_clears_binding_stranded_by_generation_rotation(self) -> None:
         # THE stale-mirror regression: a binding written at one DM generation,
         # then the conversation rotates (!new / idle / daily reset). The row's
-        # key spelling no longer derives from the current session key, so the
+        # key spelling does not derive from the current session key, so the
         # key-addressed clears cannot reach it — yet it still occupies the
         # location and blocks `!session` resume. Unlink must free it by value.
         d, cli, sess = _dispatcher({"u1"})
@@ -2909,7 +3742,7 @@ class TestInteractions:
 
     @pytest.mark.asyncio
     async def test_channels_deny_still_resolves_reject_interaction(self, tmp_path, monkeypatch):
-        # MEDIUM (GPT round-13 #3): a REJECT press ("a:...:0") on a denied channel
+        # A REJECT press ("a:...:0") on a denied channel
         # must STILL resolve the pending approval as refused (False) — a reject is a
         # denial, exactly what a channels-deny wants, and silently dropping it would
         # strand the pending future until timeout (~300s). Only APPROVE is gated out.
@@ -3006,7 +3839,8 @@ class TestInteractions:
     @pytest.mark.asyncio
     async def test_option_choice_reinjects_as_turn(self) -> None:
         d, cli, sess = _dispatcher({"u1"})
-        await d.on_interaction(self._itx("opt:0", label="Choice A"))
+        tag = session_provenance_tag(d.current_session_key("u1"))
+        await d.on_interaction(self._itx(f"opt:0:{tag}", label="Choice A"))
         # Buttons retired without clobbering the answer text.
         assert cli.component_edits == [("m1", [])]
         # Choice echoed as a quote, then answered as a fresh turn.
@@ -3016,9 +3850,19 @@ class TestInteractions:
         )
 
     @pytest.mark.asyncio
+    async def test_untagged_option_press_fails_closed(self) -> None:
+        """A pre-provenance button press is refused — its origin is unprovable."""
+        d, cli, sess = _dispatcher({"u1"})
+        await d.on_interaction(self._itx("opt:0", label="Choice A"))
+        assert cli.component_edits == [("m1", [])]
+        assert any("predate" in t for t, _ in cli.sent)
+        assert sess.successes == []
+
+    @pytest.mark.asyncio
     async def test_option_without_label_asks_to_type(self) -> None:
         d, cli, _ = _dispatcher({"u1"})
-        await d.on_interaction(self._itx("opt:0", label=""))
+        tag = session_provenance_tag(d.current_session_key("u1"))
+        await d.on_interaction(self._itx(f"opt:0:{tag}", label=""))
         assert any("type it instead" in t for t, _ in cli.sent)
 
 
@@ -3041,6 +3885,18 @@ class TestContextThresholdNotices:
         await d._maybe_notice("chan1", "scope1", "key", object())
 
         assert any("!compact" in s[0] for s in cli.sent)
+
+    @pytest.mark.asyncio
+    async def test_soft_nudge_suppressed_on_auto_managed_backend(self) -> None:
+        # The nudge advises !compact, which this backend refuses — it compacts
+        # on its own, so there is nothing for the user to act on.
+        d, cli, sess = _dispatcher({"u1"})
+        sess.check_context_usage = lambda key, provider: 85.0
+        provider = SimpleNamespace(manual_compact_unsupported_backend="kas")
+
+        await d._maybe_notice("chan1", "scope1", "key", provider)
+
+        assert cli.sent == []
 
     @pytest.mark.asyncio
     async def test_below_soft_threshold_stays_silent(self) -> None:
@@ -3320,11 +4176,8 @@ class TestRenderTogglesAreWiredPerTurn:
 
         with (
             mock.patch.object(td_mod, "DiscordRenderer", _spy),
-            mock.patch("kiro_crew.config.loader.KiroCrewConfig.load") as load,
+            _live_discord(reactions_enabled=False, show_thinking=True),
         ):
-            load.return_value = SimpleNamespace(
-                discord=SimpleNamespace(reactions_enabled=False, show_thinking=True)
-            )
             await d.handle_message(_inbound("hi"))
         # Read per TURN, not off the boot config, so the dashboard toggle takes
         # effect on the next message instead of the next restart.
@@ -3499,7 +4352,7 @@ class TestOptionChoiceIsNeverACommand:
                 channel_id="c1",
                 user_id="u1",
                 message_id="m1",
-                custom_id="opt:0",
+                custom_id=f"opt:0:{session_provenance_tag(before)}",
                 label="!new",
             )
         )

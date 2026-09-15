@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from kiro_crew import extras
 from kiro_crew.feishu.client import LarkClient
 from kiro_crew.feishu.transport import FeishuTransport
 from kiro_crew.feishu.transport_dispatch import FeishuDispatcher
@@ -87,12 +88,47 @@ async def maybe_start_feishu(orch: "GatewayOrchestrator") -> "LarkClient | None"
         # set_message_handler avoids the client<->transport construction cycle.
         client.set_message_handler(transport.receive)
         dispatcher.client = client
+        # The dispatcher's config applier pushes reloaded authorization fields at
+        # the transport; wired after construction, like ``client``.
+        dispatcher.transport = transport
+
+        # Keep the settings badge truthful: connect() only SPAWNS the receiver
+        # thread, so "started" proves nothing about the credentials. The client
+        # reports liveness transitions through on_state_change; start
+        # not-connected and let the first transition flip it. Wired BEFORE
+        # connect() so the very first transition cannot fire into a missing
+        # callback (the dedupe would then swallow the re-report forever).
+        if orch.dashboard_state is not None:
+            state = orch.dashboard_state
+            state.feishu_connected = False
+            state.feishu_connect_error = ""
+
+            def _on_status(healthy: bool, reason: str) -> None:
+                state.feishu_connected = healthy
+                state.feishu_connect_error = "" if healthy else reason[:120]
+
+            client.on_state_change = _on_status
 
         await transport.connect()  # spawns the WS daemon thread
         if orch.dashboard_state is not None:
             orch.dashboard_state.register_channel_transport(transport)
         logger.info("Feishu (飞书/Lark) channel started (app_id=%s).", orch._feishu_app_id)
         return client
-    except Exception:
+    except ImportError as exc:
+        # The one failure a user can fix without reading a log: lark-oapi is an
+        # optional extra, and without it LarkClient's constructor raises here
+        # before anything else runs. Name the install command in the badge
+        # instead of leaving Settings to report a bare "not connected".
+        if orch.dashboard_state is not None:
+            orch.dashboard_state.feishu_connected = False
+            orch.dashboard_state.feishu_connect_error = (
+                f"lark-oapi is not installed — run: {extras.install_hint('feishu')}"
+            )
+        logger.error("Feishu channel needs the lark-oapi extra; continuing without it: %s", exc)
+        return None
+    except Exception as exc:
+        if orch.dashboard_state is not None:
+            orch.dashboard_state.feishu_connected = False
+            orch.dashboard_state.feishu_connect_error = f"{type(exc).__name__}: {exc}"[:120]
         logger.exception("Failed to start Feishu channel; continuing without it.")
         return None

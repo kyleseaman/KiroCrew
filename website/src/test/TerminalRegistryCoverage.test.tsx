@@ -25,6 +25,8 @@ import {
   useTerminalEnabled,
   useTerminalTitle,
   getTerminalCwd,
+  getTerminalShell,
+  getTerminalFenceShells,
   registerTerminalWs,
   unregisterTerminalWs,
   getTerminalWs,
@@ -33,6 +35,9 @@ import {
   sendRawToTerminalSession,
   ensureTerminalConnection,
   disposeTerminalConnection,
+  useTerminalConnStatus,
+  useTerminalManualRetry,
+  retryTerminalConnection,
 } from '../utils/terminalRegistry'
 
 const WS_INSTANCES: MockWebSocket[] = []
@@ -179,6 +184,68 @@ describe('terminalRegistry', () => {
       openSocket(id)
       unregisterTerminalWs(id)
       expect(getTerminalWs(id)).toBeNull()
+    })
+  })
+
+  describe('getTerminalShell', () => {
+    it('records the shell the backend reports in its ready frame', () => {
+      const id = session('shell-report')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+
+      expect(getTerminalShell(id)).toBeUndefined()
+      act(() => { ws.simulateJson({ type: 'ready', shell: '/usr/bin/fish' }) })
+      expect(getTerminalShell(id)).toBe('/usr/bin/fish')
+    })
+
+    it('stays unknown when the ready frame reports no shell', () => {
+      const id = session('shell-absent')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+
+      act(() => { ws.simulateJson({ type: 'ready' }) })
+      expect(getTerminalShell(id)).toBeUndefined()
+    })
+
+    it('has the shell recorded before ready listeners run', () => {
+      const id = session('shell-order')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+
+      // Run-in-terminal reads the shell from inside its ready callback, so a
+      // shell recorded after the drain would arrive too late to be used.
+      let seenFromListener: string | undefined = 'listener did not run'
+      onTerminalReady(id, () => { seenFromListener = getTerminalShell(id) })
+      act(() => { ws.simulateJson({ type: 'ready', shell: '/usr/bin/zsh' }) })
+      expect(seenFromListener).toBe('/usr/bin/zsh')
+    })
+
+    it('records the fence-shell paths the backend resolved', () => {
+      const id = session('fence-shells')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+
+      expect(getTerminalFenceShells(id)).toEqual({})
+      act(() => {
+        ws.simulateJson({
+          type: 'ready',
+          shell: '/usr/bin/bash',
+          fence_shells: { bash: '/usr/bin/bash', fish: '/usr/bin/fish' },
+        })
+      })
+      expect(getTerminalFenceShells(id)).toEqual({
+        bash: '/usr/bin/bash',
+        fish: '/usr/bin/fish',
+      })
+    })
+
+    it('reports no fence shells when the ready frame carries none', () => {
+      const id = session('fence-shells-absent')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+
+      act(() => { ws.simulateJson({ type: 'ready', shell: '/usr/bin/bash' }) })
+      expect(getTerminalFenceShells(id)).toEqual({})
     })
   })
 
@@ -480,12 +547,90 @@ describe('terminalRegistry', () => {
 
       // Ten drops with no successful open in between: the tenth schedules a
       // redial that then refuses to dial, so the socket count stops at ten.
-      for (let attempt = 0; attempt < 11; attempt += 1) {
+      for (let close = 1; close <= 10; close += 1) {
         const latest = WS_INSTANCES[WS_INSTANCES.length - 1]
         if (latest.readyState !== MockWebSocket.CLOSED) latest.simulateClose()
         vi.advanceTimersByTime(60_000)
       }
       expect(WS_INSTANCES).toHaveLength(10)
+    })
+  })
+
+  describe('displacement by a newer window', () => {
+    // The server closes a displaced socket on purpose after one
+    // `{type:'error', code:'displaced'}` frame. Redialing would take the PTY
+    // straight back from the window that just claimed it, so the session parks.
+    it('parks as disconnected without a redial when the server reports displacement', () => {
+      const id = session('displaced-park')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const { result } = renderHook(() => useTerminalConnStatus(id))
+      const ws = WS_INSTANCES[0]
+      act(() => { ws.simulateOpen(); ws.simulateJson({ type: 'ready' }) })
+      expect(result.current).toBe('connected')
+
+      act(() => {
+        ws.simulateJson({ type: 'error', code: 'displaced', message: 'Another connection owns this terminal session' })
+        ws.simulateClose()
+      })
+      expect(result.current).toBe('disconnected')
+      act(() => { vi.advanceTimersByTime(120_000) })
+      expect(WS_INSTANCES).toHaveLength(1)
+      expect(getTerminalWs(id)).toBeNull()
+    })
+
+    it('ignores online and visibility revives while displaced', () => {
+      const id = session('displaced-revive')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+      ws.simulateOpen()
+      ws.simulateJson({ type: 'error', code: 'displaced' })
+      ws.simulateClose()
+
+      window.dispatchEvent(new Event('online'))
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true })
+      document.dispatchEvent(new Event('visibilitychange'))
+      vi.advanceTimersByTime(60_000)
+      expect(WS_INSTANCES).toHaveLength(1)
+    })
+
+    it('lets a manual Reconnect take the terminal back and clears the parked state', () => {
+      const id = session('displaced-manual')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const { result } = renderHook(() => useTerminalConnStatus(id))
+      const ws = WS_INSTANCES[0]
+      act(() => {
+        ws.simulateOpen()
+        ws.simulateJson({ type: 'error', code: 'displaced' })
+        ws.simulateClose()
+      })
+      expect(result.current).toBe('disconnected')
+
+      act(() => { retryTerminalConnection(id) })
+      expect(WS_INSTANCES).toHaveLength(2)
+      act(() => { WS_INSTANCES[1].simulateOpen() })
+      expect(result.current).toBe('connected')
+
+      // An ordinary drop afterwards redials normally again: the parked state
+      // did not outlive the manual retry.
+      act(() => { WS_INSTANCES[1].simulateClose() })
+      expect(result.current).toBe('reconnecting')
+      act(() => { vi.advanceTimersByTime(1000) })
+      expect(WS_INSTANCES).toHaveLength(3)
+    })
+
+    it('treats an error frame without the displaced code as an ordinary drop', () => {
+      const id = session('displaced-other-error')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+      ws.simulateOpen()
+      ws.simulateJson({ type: 'error', message: 'Terminal reconnect failed' })
+      ws.simulateClose()
+      vi.advanceTimersByTime(1000)
+      expect(WS_INSTANCES).toHaveLength(2)
     })
   })
 
@@ -541,6 +686,264 @@ describe('terminalRegistry', () => {
 
     it('is a no-op for a session that never had a connection', () => {
       expect(() => disposeTerminalConnection(session('dispose-unknown'))).not.toThrow()
+    })
+  })
+
+  describe('connection status', () => {
+    it('starts reconnecting, flips to connected on open, and publishes through the hook', () => {
+      const id = session('status-open')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const ws = WS_INSTANCES[0]
+
+      const { result, rerender } = renderHook(() => useTerminalConnStatus(id))
+      expect(result.current).toBe('reconnecting')
+
+      act(() => { ws.simulateOpen() })
+      rerender()
+      expect(result.current).toBe('connected')
+    })
+
+    it('goes disconnected only after the retry ceiling, and reconnecting on each drop before it', () => {
+      const id = session('status-ceiling')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      // Observe status through the public hook, not the (now module-internal)
+      // imperative getter.
+      const { result } = renderHook(() => useTerminalConnStatus(id))
+
+      // Each drop before the ceiling schedules a redial and stays reconnecting.
+      // After the tenth socket's close, its scheduled redial runs connect() with
+      // retries at the ceiling, which is what flips the status to disconnected.
+      for (let close = 1; close <= 10; close += 1) {
+        const latest = WS_INSTANCES[WS_INSTANCES.length - 1]
+        act(() => {
+          if (latest.readyState !== MockWebSocket.CLOSED) latest.simulateClose()
+        })
+        expect(result.current).toBe('reconnecting')
+        act(() => { vi.advanceTimersByTime(60_000) })
+      }
+      expect(result.current).toBe('disconnected')
+      expect(WS_INSTANCES).toHaveLength(10)
+    })
+
+    it('drops the status listener set on dispose', () => {
+      const id = session('status-dispose')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      disposeTerminalConnection(id)
+      const { result } = renderHook(() => useTerminalConnStatus(id))
+      expect(result.current).toBeUndefined()
+    })
+  })
+
+  describe('retryTerminalConnection', () => {
+    it('re-arms a dead socket at the retry ceiling and dials again', () => {
+      const id = session('retry-dead')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const { result } = renderHook(() => useTerminalConnStatus(id))
+
+      // Drive the backoff chain to exhaustion: ten drops, each followed by its
+      // redial timer, ends with the ceiling reached and no socket left dialing.
+      for (let close = 1; close <= 10; close += 1) {
+        const latest = WS_INSTANCES[WS_INSTANCES.length - 1]
+        act(() => {
+          if (latest.readyState !== MockWebSocket.CLOSED) latest.simulateClose()
+          vi.advanceTimersByTime(60_000)
+        })
+      }
+      expect(WS_INSTANCES).toHaveLength(10)
+      expect(result.current).toBe('disconnected')
+
+      act(() => { retryTerminalConnection(id) })
+      expect(WS_INSTANCES).toHaveLength(11)
+      expect(result.current).toBe('reconnecting')
+    })
+
+    it('cancels a pending backoff timer and dials immediately', () => {
+      const id = session('retry-pending')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      WS_INSTANCES[0].simulateClose() // schedules a backoff redial
+
+      retryTerminalConnection(id)
+      expect(WS_INSTANCES).toHaveLength(2)
+      // The cancelled timer must not fire a third dial later.
+      vi.advanceTimersByTime(60_000)
+      expect(WS_INSTANCES).toHaveLength(2)
+    })
+
+    it('is a no-op while the socket is OPEN or CONNECTING', () => {
+      const id = session('retry-live')
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      // CONNECTING right after ensure.
+      retryTerminalConnection(id)
+      expect(WS_INSTANCES).toHaveLength(1)
+      WS_INSTANCES[0].simulateOpen()
+      retryTerminalConnection(id)
+      expect(WS_INSTANCES).toHaveLength(1)
+    })
+
+    it('defers to the imminent onclose while the socket is CLOSING', () => {
+      const id = session('retry-closing')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      const { result } = renderHook(() => useTerminalConnStatus(id))
+      // Exhaust the budget so onclose alone would give up, then put the
+      // socket in CLOSING: the revive must not dial alongside the pending
+      // onclose (two competing PTY attachments), but its budget reset must
+      // still let that onclose schedule the redial.
+      for (let close = 1; close <= 10; close += 1) {
+        const latest = WS_INSTANCES[WS_INSTANCES.length - 1]
+        act(() => {
+          if (latest.readyState !== MockWebSocket.CLOSED) latest.simulateClose()
+          vi.advanceTimersByTime(60_000)
+        })
+      }
+      expect(result.current).toBe('disconnected')
+      retryTerminalConnection(id) // dials socket #11
+      const latest = WS_INSTANCES[WS_INSTANCES.length - 1]
+      latest.readyState = MockWebSocket.CLOSING
+      const before = WS_INSTANCES.length
+
+      retryTerminalConnection(id)
+      // No competing dial while CLOSING.
+      expect(WS_INSTANCES).toHaveLength(before)
+
+      // The deferred close now fires; the reset budget redials on schedule.
+      latest.simulateClose()
+      vi.advanceTimersByTime(60_000)
+      expect(WS_INSTANCES.length).toBeGreaterThan(before)
+    })
+
+    it('is a no-op for a disposed or unmanaged session', () => {
+      const id = session('retry-none')
+      expect(() => retryTerminalConnection(id)).not.toThrow()
+      expect(WS_INSTANCES).toHaveLength(0)
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      disposeTerminalConnection(id)
+      retryTerminalConnection(id)
+      // Only the pre-dispose dial exists; nothing new after dispose.
+      expect(WS_INSTANCES).toHaveLength(1)
+    })
+  })
+
+  describe('manual retry state (useTerminalManualRetry)', () => {
+    it('marks a user-initiated retry, then clears it when the socket connects', () => {
+      const id = session('manual-connect')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      // Exhaust to the ceiling so the session is genuinely disconnected.
+      for (let close = 1; close <= 10; close += 1) {
+        const latest = WS_INSTANCES[WS_INSTANCES.length - 1]
+        act(() => {
+          if (latest.readyState !== MockWebSocket.CLOSED) latest.simulateClose()
+          vi.advanceTimersByTime(60_000)
+        })
+      }
+      const { result } = renderHook(() => useTerminalManualRetry(id))
+      expect(result.current).toBe(false)
+
+      // User clicks Reconnect: the flag flips on while the dial is in flight.
+      act(() => { retryTerminalConnection(id) })
+      expect(result.current).toBe(true)
+
+      // A successful open resolves the attempt and clears the flag.
+      act(() => { WS_INSTANCES[WS_INSTANCES.length - 1].simulateOpen() })
+      expect(result.current).toBe(false)
+    })
+
+    it('clears the manual flag when the manual dial fails all the way to the ceiling', () => {
+      const id = session('manual-fail')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      for (let close = 1; close <= 10; close += 1) {
+        const latest = WS_INSTANCES[WS_INSTANCES.length - 1]
+        act(() => {
+          if (latest.readyState !== MockWebSocket.CLOSED) latest.simulateClose()
+          vi.advanceTimersByTime(60_000)
+        })
+      }
+      const { result } = renderHook(() => useTerminalManualRetry(id))
+
+      act(() => { retryTerminalConnection(id) })
+      expect(result.current).toBe(true)
+
+      // The redialled socket never opens; the chain runs back to the ceiling
+      // and flips to disconnected, which clears the manual flag.
+      for (let close = 1; close <= 10; close += 1) {
+        const latest = WS_INSTANCES[WS_INSTANCES.length - 1]
+        act(() => {
+          if (latest.readyState !== MockWebSocket.CLOSED) latest.simulateClose()
+          vi.advanceTimersByTime(60_000)
+        })
+      }
+      expect(result.current).toBe(false)
+    })
+
+    it('does NOT mark an automatic revive as a manual retry', () => {
+      const id = session('manual-auto')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      for (let close = 1; close <= 10; close += 1) {
+        const latest = WS_INSTANCES[WS_INSTANCES.length - 1]
+        act(() => {
+          if (latest.readyState !== MockWebSocket.CLOSED) latest.simulateClose()
+          vi.advanceTimersByTime(60_000)
+        })
+      }
+      const { result } = renderHook(() => useTerminalManualRetry(id))
+      expect(result.current).toBe(false)
+
+      // The 'online' revive redials but must stay bannerless (no manual flag).
+      act(() => { window.dispatchEvent(new Event('online')) })
+      expect(result.current).toBe(false)
+    })
+
+    it('is false for an unmanaged session', () => {
+      const { result } = renderHook(() => useTerminalManualRetry(session('manual-none')))
+      expect(result.current).toBe(false)
+    })
+  })
+
+  describe('revive listeners', () => {
+    it('redials a dead session when the tab regains network', () => {
+      const id = session('revive-online')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      // Drive the backoff chain to exhaustion: ten drops, each followed by its
+      // redial timer, ends with the ceiling reached and no socket left dialing.
+      for (let close = 1; close <= 10; close += 1) {
+        const latest = WS_INSTANCES[WS_INSTANCES.length - 1]
+        if (latest.readyState !== MockWebSocket.CLOSED) latest.simulateClose()
+        vi.advanceTimersByTime(60_000)
+      }
+      expect(WS_INSTANCES).toHaveLength(10)
+
+      window.dispatchEvent(new Event('online'))
+      expect(WS_INSTANCES).toHaveLength(11)
+    })
+
+    it('redials when a backgrounded tab returns to the foreground', () => {
+      const id = session('revive-visible')
+      vi.useFakeTimers()
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon())
+      // Drive the backoff chain to exhaustion: ten drops, each followed by its
+      // redial timer, ends with the ceiling reached and no socket left dialing.
+      for (let close = 1; close <= 10; close += 1) {
+        const latest = WS_INSTANCES[WS_INSTANCES.length - 1]
+        if (latest.readyState !== MockWebSocket.CLOSED) latest.simulateClose()
+        vi.advanceTimersByTime(60_000)
+      }
+      expect(WS_INSTANCES).toHaveLength(10)
+
+      // Hidden → no revive; visible → revive.
+      Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true })
+      document.dispatchEvent(new Event('visibilitychange'))
+      expect(WS_INSTANCES).toHaveLength(10)
+
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true })
+      document.dispatchEvent(new Event('visibilitychange'))
+      expect(WS_INSTANCES).toHaveLength(11)
     })
   })
 })

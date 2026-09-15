@@ -31,9 +31,20 @@ trigger macOS Gatekeeper warnings).
   the freshly-copied app and can hold the volume against ejection ("Resource
   busy") — the same transient class electron-builder retries on. The script
   layers its defenses: `-nobrowse` keeps the volume out of Finder, and the
-  eject gets bounded retries with a synced force fallback. hdiutil calls run without `-quiet`, because
+  eject gets bounded retries with a synced force fallback (see
+  `hdiutil-detach.sh`). hdiutil calls run without `-quiet`, because
   that flag suppresses stderr too and previously reduced failures of this
   script to bare exit codes.
+- `hdiutil-detach.sh` — the detach retry loop `build-dmg.sh` sources. It
+  addresses the device node (`/dev/diskN`, read from `hdiutil attach -plist`)
+  rather than the mount path, and after every failed attempt asks `hdiutil info`
+  whether the device is still attached instead of trusting the exit status.
+  `hdiutil detach` unmounts and then ejects, and reports "Resource busy" when
+  only the eject is held — at which point the mount path is already gone, so a
+  path-addressed retry can only ever answer "No such file or directory". A
+  device that is no longer attached counts as detached however that came about;
+  a device that survives `-force` is still a hard failure. `test/test_hdiutil_detach.py`
+  drills the loop against a scripted fake `hdiutil`.
 
   The branded background is a **volume-bound alias recorded inside `.DS_Store`**,
   which is why the image is reused rather than rebuilt from a folder: recreating
@@ -84,6 +95,14 @@ publisher role remain trusted. The publisher role holds `kms:Sign`, so its
 compromise can produce a valid manifest and is explicitly out of scope; the
 signature does not create a separate trust boundary from that role.
 
+The same key, algorithm and canonical form sign the feature-videos release
+manifest (`scripts/feature-videos/`, schema
+`kirocrew-feature-videos-manifest-v1`). That tool loads `cli-manifest.py` by path
+and uses its canonical JSON, key-id derivation, runners and `kms_sign_digest`
+rather than carrying copies, so there is one signer to audit. The two schemas
+keep the two verifiers apart; the key grant is one grant, and a principal that
+may sign videos may sign a CLI manifest.
+
 ### Repository bootstrap state
 
 The repository intentionally carries `UNCONFIGURED` in both
@@ -127,4 +146,7 @@ therefore fail closed under the new installer unless an authorized backfill sign
 the already-published digest. Do not replace the KMS key in place: schema v1 pins
 one key. For rotation, first ship an installer revision that trusts both old and
 new public keys, then switch the publisher, and retire the old key only after the
-overlap window.
+overlap window. The same key also verifies the gateway's feature-video manifest
+(`src/kiro_crew/platform/feed_trust.py`), so the overlap window has a third
+party in it: the feature-video publisher re-signs every hosted manifest a
+shipped release still reads back before the old key is retired.

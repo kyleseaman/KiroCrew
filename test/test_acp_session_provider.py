@@ -241,8 +241,7 @@ class TestAcpSessionProviderStream:
     async def test_stream_command_routes_through_handle_stream_command(self):
         """Slash commands go through the handle's NATIVE commands/execute path,
         never through prompt() — a prompt round-trip would hand the command to
-        the model, which summarizes kiro-cli's output instead of returning it
-        (issue #4972)."""
+        the model, which summarizes kiro-cli's output instead of returning it."""
         handle = _make_handle()
         events = [
             AcpEvent(kind=EVENT_TEXT_CHUNK, text="13 tools"),
@@ -724,7 +723,7 @@ class TestAcpSessionProviderRound4Parity:
         assert runtime._crew_agent == ""
 
     def test_rekey_resets_context_state(self):
-        """#2932 -- the handoff must drop the previous session's context state
+        """The handoff must drop the previous session's context state
         (mirror of AcpClient.rekey): _make_handle seeds pct=42/5000/200000, so
         a leak here would hand those numbers to the claiming session and let
         check_context_usage compact its empty conversation."""
@@ -1145,6 +1144,10 @@ class TestLivePathModelEntitlement:
         handle = _make_handle()
         handle.available_models = [{"modelId": m, "name": m} for m in advertised]
         handle.set_model = AsyncMock()
+        # Default: the revalidation probe cannot confirm anything (returns []),
+        # so a stale-snapshot refusal stands. Tests exercising the heal path
+        # override this with a side_effect that also updates available_models.
+        handle.refresh_available_models = AsyncMock(return_value=[])
         return AcpSessionProvider(handle, MagicMock()), handle
 
     @pytest.mark.asyncio
@@ -1188,6 +1191,73 @@ class TestLivePathModelEntitlement:
 
         await provider.set_model("claude-opus-4.8")
 
+        handle.set_model.assert_awaited_once_with("claude-opus-4.8")
+
+    @pytest.mark.asyncio
+    async def test_stale_refusal_revalidates_and_allows(self):
+        """A would-be refusal on the session-init snapshot is revalidated
+        against a fresh probe; when the fresh answer advertises the model, the
+        switch proceeds instead of freezing a false 'not entitled' verdict."""
+        provider, handle = self._provider(["claude-sonnet-4", "claude-sonnet-4.5"])
+        fresh = [
+            {"modelId": "auto", "name": "auto", "description": ""},
+            {"modelId": "claude-opus-5", "name": "claude-opus-5", "description": ""},
+        ]
+
+        async def _refresh():
+            handle.available_models = fresh
+            return fresh
+
+        handle.refresh_available_models = AsyncMock(side_effect=_refresh)
+
+        await provider.set_model("claude-opus-5")
+
+        handle.refresh_available_models.assert_awaited_once()
+        handle.set_model.assert_awaited_once_with("claude-opus-5")
+
+    @pytest.mark.asyncio
+    async def test_refusal_stands_when_fresh_probe_still_lacks_model(self):
+        """A real downgrade survives revalidation — and the error names the
+        FRESH advertised set, not the stale one."""
+        from kiro_crew.acp.client import AcpModelUnavailable
+
+        provider, handle = self._provider(["claude-sonnet-4.6"])
+        handle.refresh_available_models = AsyncMock(
+            return_value=[
+                {"modelId": "claude-sonnet-4", "name": "s4", "description": ""},
+                {"modelId": "claude-sonnet-4.5", "name": "s45", "description": ""},
+            ]
+        )
+
+        with pytest.raises(AcpModelUnavailable) as excinfo:
+            await provider.set_model("claude-opus-4.8")
+
+        handle.set_model.assert_not_awaited()
+        assert "claude-sonnet-4.5" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_refusal_names_stale_set_when_probe_fails(self):
+        """An empty probe result is not evidence: the stale verdict stands and
+        the error names the only set we actually have."""
+        from kiro_crew.acp.client import AcpModelUnavailable
+
+        provider, handle = self._provider(["claude-sonnet-4.6"])
+
+        with pytest.raises(AcpModelUnavailable) as excinfo:
+            await provider.set_model("claude-opus-4.8")
+
+        handle.refresh_available_models.assert_awaited_once()
+        assert "claude-sonnet-4.6" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_advertised_pick_never_probes(self):
+        """The probe runs only on a would-be refusal — an allowed switch costs
+        no extra round-trip."""
+        provider, handle = self._provider(["claude-opus-4.8"])
+
+        await provider.set_model("claude-opus-4.8")
+
+        handle.refresh_available_models.assert_not_awaited()
         handle.set_model.assert_awaited_once_with("claude-opus-4.8")
 
 

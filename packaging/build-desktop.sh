@@ -121,6 +121,101 @@ esac
 
 log() { printf '\n\033[1;36m▶ %s\033[0m\n' "$*"; }
 
+is_macos_intel_backend() {
+  local want_arch="$1"
+  [ "$OS" = "darwin" ] && {
+    [ "$want_arch" = "x86_64" ] ||
+      { [ -z "$want_arch" ] && [ "$HOST_ARCH" = "x86_64" ]; }
+  }
+}
+
+# NOTE ON THE APPLE-SILICON DECODER -- do NOT re-introduce a compressed payload.
+#
+# The arm64 imageio-ffmpeg executable ships as a PLAIN Mach-O under
+# Contents/Resources, exactly like its x86_64 sibling, so the app signer signs it
+# with Developer ID + hardened runtime + secure timestamp along with every other
+# nested binary (packaging/signing/generate-manifest.py enumerates it).
+#
+# #6746 instead stored it as inert gzip data, to keep the bytes byte-identical to
+# the pinned upstream wheel across signing. The Apple notary service DECOMPRESSES
+# archive members and scans what is inside them, so that made notarization fail
+# closed on the whole release (submission 3dbd3c7d, three `error` issues on
+# .../binaries/ffmpeg-macos-aarch64-v7.1.gz/ffmpeg-macos-aarch64-v7.1: not signed
+# with a valid Developer ID certificate / no secure timestamp / hardened runtime
+# not enabled). The x86_64 copy of the same wheel, shipped raw in the same
+# submission, drew no issue at all -- that is the working shape.
+#
+# The runtime consequence is handled in kiro_crew.transcribe: the packaged decoder
+# is accepted either at the pinned upstream digest (local builds and the build gate
+# below, which run BEFORE signing) or on a valid Developer ID signature from our
+# team (the released app, whose bytes signing necessarily rewrote).
+
+# Prove that the installed native wheel, audio decoder, and their transitive
+# libraries can actually run from the pruned bundle. A successful pip resolution
+# is not enough: an ABI mismatch or missing executable otherwise reaches every
+# user as an unusable Download button. Model weights are deliberately not involved
+# in this gate.
+#
+# THREE outcomes, not two, because the decoder answers two independent questions
+# (see transcribe.PackagedDecoderProbe):
+#
+#   exit 0  everything loaded and ran
+#   exit 1  the recogniser is broken, OR no decoder AUTHENTICATED -- a defect in
+#           what we are about to publish, so the build stops
+#   exit 2  the decoder authenticated but this HOST would not run it
+#
+# Exit 2 is a warning and not a failure, and that is the whole point of splitting
+# them. Authenticity is a property of the artifact and is gated everywhere;
+# executability is a property of the build machine. A build image missing an OS
+# library the pinned executable load-time imports refuses it before its entry
+# point runs -- Windows Server Core, which every CodeBuild Windows image is built
+# on, ships no Video for Windows components and so cannot load an ffmpeg that
+# imports AVICAP32.dll -- while the identical bytes run correctly on a user's
+# machine. Blocking a release on that withholds a correct artifact because the
+# machine that assembled it was not the machine that runs it.
+#   $1 = bundled interpreter
+local_voice_runtime_gate() {
+  local python="$1" report status
+  log "Verifying bundled local voice runtime…"
+  # `if` rather than a bare assignment: under `set -e` a command substitution that
+  # exits non-zero aborts the script, which would make exit 2 a hard failure again.
+  if report="$(env PYTHONNOUSERSITE=1 PYTHONPATH= "$python" -s -c '
+import sys
+
+from kiro_crew.stt.engine import probe
+from kiro_crew.transcribe import _packaged_ffmpeg_version_probe
+
+state = probe()
+if not state.ok:
+    sys.stderr.write(f"{state.code}: {state.detail}\n")
+    raise SystemExit(1)
+
+decoder = _packaged_ffmpeg_version_probe()
+if decoder.ok:
+    raise SystemExit(0)
+sys.stderr.write(f"{decoder.code}: {decoder.detail}\n")
+raise SystemExit(1 if not decoder.authentic else 2)
+' 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ -n "$report" ]; then
+    printf '    %s\n' "$report"
+  fi
+  case "$status" in
+    0) ;;
+    2)
+      echo "  ⚠ the bundled decoder authenticated but does not run on THIS host." >&2
+      echo "    Its bytes are the pinned payload, so the bundle is shipped as-is." >&2
+      ;;
+    *)
+      echo "ERROR: bundled local voice runtime cannot load" >&2
+      exit 1
+      ;;
+  esac
+}
+
 # Re-stamp every staged backend tree with <dist>, for the Linux multi-format
 # path (see LINUX_TARGET_DISTS). Rewrites one generated module per tree, so it
 # is cheap enough to run between electron-builder invocations. Finding the trees
@@ -170,6 +265,80 @@ rm_rf_resilient() {
     fi
     attempt=$((attempt + 1))
     sleep 1
+  done
+}
+
+# Invoke electron-builder. Split into its own function purely so a test can
+# shadow it with a stub -- CSC_IDENTITY_AUTO_DISCOVERY=false disables macOS
+# codesign identity auto-discovery for local/CI builds.
+_eb_invoke() {
+  CSC_IDENTITY_AUTO_DISCOVERY=false ./node_modules/.bin/electron-builder "$@"
+}
+
+# Run electron-builder (EB_ARGS as "$@"), retrying a bounded number of times
+# on two transient failure classes -- and still failing the build on anything
+# else, or once the retry budget is exhausted:
+#
+#   - macOS .DS_Store/ENOTEMPTY temp-dir race (electron-userland/electron-builder#6890):
+#     the universal build's lipo-merge stage removes dist/mac-universal-<arch>-temp
+#     dirs with a recursive fs.rm that has no retries of its own, and Desktop
+#     Services (Finder/Spotlight) can drop a fresh .DS_Store into one mid-removal.
+#   - transient network/TLS failures in electron-builder's OWN mid-build
+#     fetches: the AppImage and NSIS/Squirrel targets pull their own tooling
+#     through `got` AFTER the electron zip has already reported
+#     progress=100%. A dropped connection ("socket hang up"), a
+#     TLS-intercepted response ("self-signed certificate"), or an HTTP-level
+#     answer from the artifact CDN that is retryable rather than final
+#     ("Response code 504") aborts the whole build there. These are
+#     per-execution network events, not build errors -- the same commit
+#     passes on a plain re-run, and one matrix leg can fail while its
+#     siblings go green in the same attempt (#3088, #6795).
+#
+# Split out of the packaging step (rather than left inline) so the
+# retry/classification logic is testable in isolation, mirroring
+# rm_rf_resilient above: a test extracts this function's body, shadows
+# _eb_invoke with a stub that fails N times, and asserts the real retry/
+# classification logic here recovers (or correctly gives up).
+run_electron_builder_with_retry() {
+  local attempt=1 max_attempts=3 eb_log eb_transient eb_backoff
+  while : ; do
+    eb_log="$(mktemp "${TMPDIR:-/tmp}/kc-eb.XXXXXX")"
+    if _eb_invoke "$@" 2>&1 | tee "$eb_log"; then
+      rm -f "$eb_log"; return 0
+    fi
+    # Classify the failure before deciding: each transient class needs its
+    # own cleanup, and anything unrecognised must still abort on the first
+    # failure.
+    eb_transient=""
+    if grep -q "ENOTEMPTY" "$eb_log"; then
+      eb_transient="ds_store"
+    # Socket-level errno strings and HTTP-level statuses share ONE class
+    # because the class boundary here is cleanup, not protocol layer (see the
+    # header comment): both arise in the same `got` fetches, and both recover
+    # by simply re-fetching on the next attempt with nothing to sweep first.
+    # A 5xx is transient by definition and a 429 is a rate limit that clears;
+    # every OTHER 4xx (401/403/404/400) is a configuration or authorisation
+    # fault that would fail identically on all three attempts, so it stays
+    # unrecognised and still aborts on the first one.
+    elif grep -qE "socket hang up|self[- ]signed certificate|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND" "$eb_log" \
+      || grep -qE "Response code (429|5[0-9][0-9])" "$eb_log"; then
+      eb_transient="network"
+    fi
+    if [ -n "$eb_transient" ] && [ "$attempt" -lt "$max_attempts" ]; then
+      if [ "$eb_transient" = "ds_store" ]; then
+        echo "  ⚠ macOS .DS_Store/ENOTEMPTY temp-dir race (attempt $attempt/$max_attempts); sweeping .DS_Store and retrying…" >&2
+        find dist -name .DS_Store -delete 2>/dev/null || true
+        rm -rf dist/*-temp 2>/dev/null || true
+        eb_backoff=2
+      else
+        echo "  ⚠ transient network/TLS/HTTP failure in an electron-builder fetch (attempt $attempt/$max_attempts); retrying…" >&2
+        eb_backoff=$((attempt * 10))
+      fi
+      rm -f "$eb_log"; attempt=$((attempt + 1)); sleep "$eb_backoff"; continue
+    fi
+    rm -f "$eb_log"
+    echo "❌ electron-builder failed (not a known transient class, or retries exhausted)." >&2
+    return 1
   done
 }
 
@@ -252,6 +421,41 @@ build_backend() {
     "$out/bin/python3.12" -m pip install --prefer-binary \
     --no-warn-script-location --disable-pip-version-check "$ROOT"
 
+  # The voice extras, in TWO steps.
+  #
+  # They have to be in the bundle at all because `local` is the default
+  # speech-to-text provider and nothing in the app can install it later: the
+  # pip-invoking endpoint was deliberately removed, so a bundle without them
+  # reports the default provider as unavailable with no in-app way to fix it.
+  #
+  # Two steps because pip resolves an extra ATOMICALLY, and this bundle is
+  # UNIVERSAL on macOS where Intel has no published pywhispercpp wheel. A single
+  # `[voice]` install there fails as a whole and omits boto3 and amazon-transcribe
+  # with it, taking the `transcribe` provider down alongside the `local` one it has
+  # nothing to do with. So the cloud half goes in first and unconditionally, then
+  # the recogniser is attempted on its own.
+  #
+  # `--only-binary pywhispercpp` (scoped to that one name, so kirocrew itself still
+  # installs from this checkout) prevents a surprise CMake/C++ source build. Missing
+  # recogniser wheels fail every supported desktop build: local dictation is the
+  # default and must be usable immediately. macOS Intel is the sole legacy exception.
+  env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
+    "$out/bin/python3.12" -m pip install --prefer-binary \
+    --no-warn-script-location --disable-pip-version-check \
+    "$ROOT[voice-aws]" "imageio-ffmpeg==0.6.0"
+  if ! env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
+      "$out/bin/python3.12" -m pip install --prefer-binary \
+      --only-binary pywhispercpp \
+      --no-warn-script-location --disable-pip-version-check "$ROOT[voice]"; then
+    if is_macos_intel_backend "$want_arch"; then
+      log "No prebuilt speech recogniser for macOS Intel — leaving that legacy backend unsupported."
+    else
+      echo "ERROR: no prebuilt speech recogniser for supported target ${OS}/${want_arch:-$HOST_ARCH}" >&2
+      echo "       Refusing to ship a desktop app whose default local voice provider is unusable." >&2
+      exit 1
+    fi
+  fi
+
   # Stage the dashboard dist into the package's static dir.
   sp="$out/lib/python3.12/site-packages"
   log "Staging dashboard dist into kiro_crew/static/dist…"
@@ -301,8 +505,13 @@ LAUNCH
   fi
 
   # Self-containment gate: the full import chain must resolve with no user-site.
+  # Bare `--version` is a pre-dispatch fast-path that skips `kiro_crew.cli`'s
+  # heavy imports, so it cannot prove the chain alone: the import probe below
+  # restores the gate's meaning.
   log "Verifying self-containment ($(basename "$out"))…"
   PYTHONNOUSERSITE=1 "$out/bin/python3.12" -m kiro_crew --version >/dev/null \
+    || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
+  PYTHONNOUSERSITE=1 "$out/bin/python3.12" -c 'import kiro_crew.cli' \
     || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
 
   # Prune to shrink the bundle.
@@ -313,8 +522,79 @@ LAUNCH
     rm -rf lib/python3.12/test lib/python3.12/idlelib lib/python3.12/tkinter \
            lib/python3.12/turtledemo lib/python3.12/ensurepip lib/python3.12/lib2to3 2>/dev/null || true )
 
+  if ! is_macos_intel_backend "$want_arch"; then
+    local_voice_runtime_gate "$out/bin/python3.12"
+  fi
+
   # After pruning, so it validates what actually ships.
   stdlib_probe_gate "$out"
+
+  # Compile the WHOLE shipped tree as checked-hash pycs, then let the runtime
+  # forbid writing any.
+  #
+  # This is what keeps the signed .app's seal intact. codesign seals every file
+  # under Contents/, so bytecode written there after signing invalidates the
+  # signature and Gatekeeper refuses the app as "damaged" -- which is what
+  # managed Macs report, because their policy re-evaluates instead of reusing a
+  # cached accept verdict.
+  #
+  # Deliberately the whole tree, not the traced startup closure the Windows lane
+  # ships. The pipeline signs a COMPLETE bundle, so nothing on a user's machine
+  # has any business writing into it -- and a module left uncompiled is exactly
+  # what creates the reason to. Windows can afford the narrower closure because
+  # Authenticode seals no resource tree, so a later write there is harmless; on
+  # macOS an uncovered module is a latent signature break, so coverage has to be
+  # total rather than measured.
+  #
+  # The MODE is the other half. The prune above deletes the TIMESTAMP pycs pip
+  # left behind, and deleting them is not squeamishness -- a timestamp pyc
+  # records the mtime of the source it was built from, `ditto` restamps sources
+  # at extraction, so every shipped timestamp pyc is guaranteed to look stale on
+  # the user's machine and be rewritten in place. That rewrite IS the corruption.
+  # CHECKED_HASH validates against contents, so an extraction-restamped source
+  # still matches.
+  #
+  # `-q -f`: quiet, and force so nothing is skipped on a stale timestamp cache.
+  # A failure to compile one module must not fail the build -- compileall exits
+  # non-zero on a syntax error in any file it walks, including vendored samples
+  # that are not importable on this interpreter -- so the exit code is reported
+  # and tolerated while the coverage assertion below is what actually gates.
+  log "Precompiling the shipped tree as checked-hash pycs ($(basename "$out"))…"
+  env PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH= \
+    "$out/bin/python3.12" -s -m compileall -q -f \
+    --invalidation-mode checked-hash "$out/lib" \
+    || echo "    compileall reported errors (unimportable vendored samples are expected)"
+
+  # Coverage gate: the point of the exercise is that the runtime never needs to
+  # write, so a tree that shipped without caches would silently reintroduce the
+  # defect the moment PYTHONDONTWRITEBYTECODE is honoured.
+  "$out/bin/python3.12" -s - "$out/lib" <<'COVERAGE'
+import os, sys
+root = sys.argv[1]
+missing = []
+for dirpath, dirnames, filenames in os.walk(root):
+    if os.path.basename(dirpath) == "__pycache__":
+        continue
+    cache = os.path.join(dirpath, "__pycache__")
+    for name in filenames:
+        if not name.endswith(".py"):
+            continue
+        stem = name[:-3]
+        if not any(
+            f.startswith(stem + ".") and f.endswith(".pyc")
+            for f in (os.listdir(cache) if os.path.isdir(cache) else ())
+        ):
+            missing.append(os.path.join(dirpath, name))
+if missing:
+    print(f"    {len(missing)} module(s) shipped without a bytecode cache", file=sys.stderr)
+    for path in missing[:10]:
+        print(f"      {os.path.relpath(path, root)}", file=sys.stderr)
+    # A handful of unimportable vendored samples is tolerable; a wholesale miss
+    # means compileall did not run and every launch would want to write.
+    if len(missing) > 50:
+        print("ERROR: bytecode coverage is too low to forbid runtime writes", file=sys.stderr)
+        raise SystemExit(1)
+COVERAGE
 
   echo "    $(basename "$out") size: $(du -sh "$out" 2>/dev/null | cut -f1)"
 }
@@ -327,7 +607,7 @@ LAUNCH
 # python.exe directly -- see main.js).
 #   $1 = PBS interpreter dir   $2 = output dir
 build_backend_windows() {
-  local pbs_dir="$1" out="$2" sp
+  local pbs_dir="$1" out="$2" sp root_uri
 
   log "Installing kiro_crew into the bundled interpreter ($(basename "$out"))…"
   mkdir -p "$(dirname "$out")"
@@ -337,6 +617,35 @@ build_backend_windows() {
   env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
     "$out/python.exe" -m pip install --prefer-binary \
     --no-warn-script-location --disable-pip-version-check "$ROOT"
+
+  # Git Bash normally rewrites a plain /d/a/... argument for a native Windows
+  # process, which is why the core install above works. Appending `[voice]`
+  # defeats that MSYS path conversion and pip receives the literal POSIX path,
+  # then rejects it as an invalid requirement. Derive a real file URI from the
+  # native interpreter's cwd and use explicit PEP 508 direct references for both
+  # extras, so spaces and the drive-letter boundary are unambiguous too.
+  root_uri="$(cd "$ROOT" && "$out/python.exe" -c \
+    'import sys; from pathlib import Path; sys.stdout.write(Path.cwd().as_uri())')"
+
+  # The voice extras, in two steps so an independent AWS-provider dependency
+  # cannot be omitted by recogniser resolution. Windows is a supported local-
+  # dictation target, so the recogniser is a hard gate. Model weights remain an
+  # explicit one-click download after installation.
+  #
+  # They have to be in the bundle at all because `local` is the default
+  # speech-to-text provider and nothing in the app can install it later: the
+  # pip-invoking endpoint was deliberately removed, so a bundle without them
+  # reports the default provider as unavailable with no in-app way to fix it.
+  #
+  env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
+    "$out/python.exe" -m pip install --prefer-binary \
+    --no-warn-script-location --disable-pip-version-check \
+    "kirocrew[voice-aws] @ $root_uri" "imageio-ffmpeg==0.6.0"
+  env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
+    "$out/python.exe" -m pip install --prefer-binary \
+    --only-binary pywhispercpp \
+    --no-warn-script-location --disable-pip-version-check \
+    "kirocrew[voice] @ $root_uri"
 
   sp="$out/Lib/site-packages"
   log "Staging dashboard dist into kiro_crew/static/dist…"
@@ -360,15 +669,42 @@ build_backend_windows() {
   log "Verifying self-containment ($(basename "$out"))…"
   PYTHONNOUSERSITE=1 "$out/python.exe" -s -m kiro_crew --version >/dev/null \
     || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
+  PYTHONNOUSERSITE=1 "$out/python.exe" -s -c 'import kiro_crew.cli' \
+    || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
 
   log "Pruning bundle ($(basename "$out"))…"
   ( cd "$out"
     find . -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
     find Lib/site-packages -type d \( -name tests -o -name test \) -prune -exec rm -rf {} + 2>/dev/null || true
-    rm -rf Lib/test Lib/idlelib Lib/tkinter Lib/turtledemo Lib/ensurepip Lib/lib2to3 2>/dev/null || true )
+    rm -rf Lib/test Lib/idlelib Lib/tkinter Lib/turtledemo Lib/ensurepip Lib/lib2to3 \
+           include libs tcl \
+           Lib/site-packages/kiro_crew/_vendor/llama_cpp_libs/linux_aarch64 \
+           Lib/site-packages/kiro_crew/_vendor/llama_cpp_libs/linux_x86_64 \
+           Lib/site-packages/kiro_crew/_vendor/llama_cpp_libs/macos_arm64 \
+           Lib/site-packages/kiro_crew/_vendor/llama_cpp_libs/macos_x86_64 \
+           2>/dev/null || true
+    rm -f DLLs/_tkinter.pyd DLLs/tcl*.dll DLLs/tk*.dll 2>/dev/null || true )
+
+  local_voice_runtime_gate "$out/python.exe"
 
   # After pruning, so it validates what actually ships.
   stdlib_probe_gate "$out"
+
+  # Trace the real gateway import after the final prune and ship hash-based
+  # (UNCHECKED) pycs for exactly that closure. Windows can consume these beside
+  # the source without invalidating an Authenticode signature, avoiding the first
+  # launch's thousand-file cache write while keeping unrelated modules out of the
+  # bundle. Unchecked, not checked, and the difference is load-bearing: a
+  # checked-hash pyc makes the loader read and hash each .py in ADDITION to the
+  # .pyc, which measured 43.55 MB and 1639 extra cold file opens per boot -- a
+  # median 12.5 s on a cold file cache. Both hash modes ignore mtime, which is
+  # the property this needs; only the re-read is dropped. The posix tree above
+  # stays checked-hash: it is a different mechanism (whole tree, codesigned) and
+  # does not show the symptom.
+  log "Precompiling Windows gateway startup modules ($(basename "$out"))…"
+  env PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH= \
+    "$out/python.exe" -s "$ROOT/packaging/precompile_windows.py" \
+    --root "$out" --module kiro_crew.cli_server
 
   echo "    $(basename "$out") size: $(du -sh "$out" 2>/dev/null | cut -f1)"
 }
@@ -480,9 +816,73 @@ else
   fi
 fi
 
+# A leftover staged marker from an earlier interrupted build is removed on
+# EVERY run, before any early exit: step 3b re-stages it when asked. This sits
+# ahead of the SKIP_ELECTRON return so a backend-only build cannot leave a
+# stale declaration behind for a hand-run electron-builder to pack.
+rm -f "$ELECTRON_DIR/EXTERNALLY-MANAGED"
+
 if [ "${SKIP_ELECTRON:-0}" = "1" ]; then
   log "SKIP_ELECTRON=1 — backend(s) ready under $ELECTRON_DIR/backend-dist/"
   exit 0
+fi
+
+# --- 3b. Baked EXTERNALLY-MANAGED marker (optional) --------------------------
+# An edition whose installs are owned by an external package manager (a Toolbox,
+# a corporate installer) declares that at BUILD time by naming its marker here.
+# The file is copied to $ELECTRON_DIR/EXTERNALLY-MANAGED, which package.json's
+# `files` list packs INTO app.asar next to main.js -- so the running app reads
+# it as its own code, on every platform, with no ownership probe (see
+# readExternallyManaged in website/electron/auto-update.js). A marker dropped
+# beside the app after the build (`<resources>/EXTERNALLY-MANAGED`) is the
+# repackager affordance and stays gated on file provenance; that gate refuses
+# every user-owned install and can never pass on Windows, which is why an
+# edition bakes instead of dropping.
+#
+# The copy is validated as the JSON object the reader accepts -- string fields
+# only, under the reader's 8 KiB read cap -- and the build FAILS on anything
+# else: the reader treats a malformed marker as "managed, nothing to run", so a
+# typo here would silently ship an app that can neither self-update nor be
+# updated from its About panel. Unset, nothing is staged: the unconditional
+# cleanup above (ahead of the SKIP_ELECTRON exit) already removed any leftover
+# from a previous local build, so a stale declaration cannot ride along.
+if [ -n "${KIROCREW_MANAGED_INSTALL_MARKER:-}" ]; then
+  MARKER_SRC="$KIROCREW_MANAGED_INSTALL_MARKER"
+  test -f "$MARKER_SRC" || { echo "❌ KIROCREW_MANAGED_INSTALL_MARKER does not name a file: $MARKER_SRC" >&2; exit 1; }
+  node -e '
+    const fs = require("fs");
+    const [src] = process.argv.slice(1);
+    const buf = fs.readFileSync(src);
+    if (buf.length > 8192) { console.error(`marker is ${buf.length} bytes; the reader caps at 8192`); process.exit(1); }
+    let parsed;
+    try { parsed = JSON.parse(buf.toString("utf8")); } catch (e) { console.error(`marker is not JSON: ${e.message}`); process.exit(1); }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) { console.error("marker must be a JSON object"); process.exit(1); }
+    const allowed = ["managedBy", "updateCommand", "checkCommand"];
+    // The reader TRIMS each field and slices it to a cap (auto-update.js:
+    // MANAGED_BY_MAX_CHARS / UPDATE_COMMAND_MAX_CHARS / CHECK_COMMAND_MAX_CHARS).
+    // Validate the value the reader will actually see: a whitespace-only
+    // command would trim to nothing and turn the marker bare, and an over-cap
+    // one would be truncated into a DIFFERENT command. Both are refused here.
+    const caps = { managedBy: 128, updateCommand: 512, checkCommand: 512 };
+    for (const k of Object.keys(parsed)) {
+      if (!allowed.includes(k)) { console.error(`marker has unknown field "${k}" (allowed: ${allowed.join(", ")})`); process.exit(1); }
+      if (typeof parsed[k] !== "string") { console.error(`marker field "${k}" must be a string`); process.exit(1); }
+      if (parsed[k].trim() !== parsed[k]) { console.error(`marker field "${k}" has leading/trailing whitespace the reader would trim`); process.exit(1); }
+      if (parsed[k].length > caps[k]) { console.error(`marker field "${k}" is ${parsed[k].length} chars; the reader caps at ${caps[k]} and would truncate the command`); process.exit(1); }
+    }
+    if (!parsed.updateCommand) { console.error("marker has no updateCommand: it would disable updates without offering any"); process.exit(1); }
+  ' "$MARKER_SRC" || { echo "❌ KIROCREW_MANAGED_INSTALL_MARKER rejected: $MARKER_SRC" >&2; exit 1; }
+  # Staged for THIS build only: electron-builder packs it below, and the copy
+  # must not outlive the run -- a later build of a different edition from the
+  # same tree (or a hand-run electron-builder) would otherwise pack the previous
+  # edition's commands. The unconditional rm above covers the next
+  # build-desktop.sh run; this covers every other exit path. The trap is armed
+  # BEFORE the copy so there is no instant at which the file exists without
+  # its cleanup -- an interrupt between the two would leave a stale marker for
+  # a hand-run `npm run dist` to pack.
+  trap 'rm -f "$ELECTRON_DIR/EXTERNALLY-MANAGED"' EXIT
+  cp "$MARKER_SRC" "$ELECTRON_DIR/EXTERNALLY-MANAGED"
+  log "Baking EXTERNALLY-MANAGED marker into the app from $MARKER_SRC"
 fi
 
 # --- 4. Package the desktop app with electron-builder -----------------------
@@ -598,40 +998,18 @@ log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
   # per target, and clearing between them would delete the previous artifact.
   rm_rf_resilient dist
 
-  # One electron-builder invocation, with the macOS .DS_Store/ENOTEMPTY retry:
-  # electron-builder's universal step stages each arch into
-  # dist/mac-universal-<arch>-temp, lipo-merges them, then removes the temp
-  # dirs with a recursive fs.rm. If macOS Desktop Services (Finder/Spotlight)
-  # drops a .DS_Store into a temp dir *during* that removal, Node's fs.rm --
-  # which performs no retries -- fails the final rmdir with ENOTEMPTY and the
-  # whole build aborts (electron-userland/electron-builder#6890). It is a
-  # transient race, so retry from a swept, clean dir a bounded number of times.
-  eb_run() {
-    local attempt=1 max_attempts=3 eb_log
-    while : ; do
-      eb_log="$(mktemp "${TMPDIR:-/tmp}/kc-eb.XXXXXX")"
-      if CSC_IDENTITY_AUTO_DISCOVERY=false ./node_modules/.bin/electron-builder "$@" 2>&1 | tee "$eb_log"; then
-        rm -f "$eb_log"; return 0
-      fi
-      if grep -q "ENOTEMPTY" "$eb_log" && [ "$attempt" -lt "$max_attempts" ]; then
-        echo "  ⚠ macOS .DS_Store/ENOTEMPTY temp-dir race (attempt $attempt/$max_attempts); sweeping .DS_Store and retrying…" >&2
-        find dist -name .DS_Store -delete 2>/dev/null || true
-        rm -rf dist/*-temp 2>/dev/null || true
-        rm -f "$eb_log"; attempt=$((attempt + 1)); sleep 2; continue
-      fi
-      rm -f "$eb_log"
-      echo "❌ electron-builder failed (not the .DS_Store race, or retries exhausted)." >&2
-      exit 1
-    done
-  }
-
+  # Each electron-builder invocation below goes through
+  # run_electron_builder_with_retry (defined above, alongside rm_rf_resilient)
+  # so the macOS .DS_Store/ENOTEMPTY race AND transient network/TLS failures
+  # in electron-builder's own mid-build fetches are both retried, not just
+  # the former.
   if [ "$OS" = "darwin" ]; then
     EB_ARGS+=( --mac )
     [ "$UNIVERSAL" = "1" ] && EB_ARGS+=( --universal )
-    eb_run "${EB_ARGS[@]}"
+    run_electron_builder_with_retry "${EB_ARGS[@]}"
   elif [ "$OS" = "windows" ]; then
     EB_ARGS+=( --win )
-    eb_run "${EB_ARGS[@]}"
+    run_electron_builder_with_retry "${EB_ARGS[@]}"
   else
     # One invocation PER FORMAT, each preceded by its own beacon stamp, so the
     # AppImage and the deb do not both claim the label of whichever was built
@@ -642,7 +1020,7 @@ log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
       target="${pair%%:*}"; dist="${pair##*:}"
       log "Packaging Linux ${target} (dist=${dist})…"
       restamp_backends "$dist"
-      eb_run "${EB_ARGS[@]}" --linux "$target"
+      run_electron_builder_with_retry "${EB_ARGS[@]}" --linux "$target"
     done
   fi
 )

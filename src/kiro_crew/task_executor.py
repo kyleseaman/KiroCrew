@@ -12,7 +12,7 @@ import time as _time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from kiro_crew import git_coord, platform_compat, shutdown_event
+from kiro_crew import git_coord, name_grant, platform_compat, shutdown_event
 from kiro_crew.acp.client import AcpProcessDied
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.executors import run_in_embed_pool
@@ -27,7 +27,11 @@ from kiro_crew.providers.base import (
     LLMEvent,
 )
 from kiro_crew.safety_override import safety_override
-from kiro_crew.sandbox import create_subprocess_limited, sandboxed_spawn_argv
+from kiro_crew.sandbox import (
+    create_subprocess_limited,
+    sandboxed_spawn_argv,
+    sandboxed_spawn_argv_async,
+)
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.task_models import (
@@ -210,7 +214,7 @@ async def execute_single_task(
                 logger.debug("Git commit failed for task %d", task.index, exc_info=True)
 
         task.status = TaskStatus.REVIEWING
-        review_ok = await self_review(run, task, sessions, agent, session_key)
+        review_ok = await self_review(run, task, sessions, agent, session_key, ctx=ctx)
         if not review_ok:
             if committed and run.branch_name:
                 try:
@@ -316,8 +320,12 @@ async def execute_task(
 
         _acquired = False
         try:
-            await check_context(session_key, sessions)
+            from kiro_crew.context import inherit_session_memory
 
+            memory_store = await inherit_session_memory(
+                ctx, f"{SESSION_PREFIX}:{run.task_id}:runtime", session_key
+            )
+            await check_context(session_key, sessions)
             client, is_new, _resumed = await sessions.open_task_session(
                 f"{SESSION_PREFIX}:{run.task_id}:runtime",
                 session_key,
@@ -337,6 +345,9 @@ async def execute_task(
                     agent=agent or None,
                     project=str(work_dir) if work_dir else None,
                     provider_type=KiroCrewConfig.load().agent.provider,
+                    memory_store=memory_store,
+                    context_provider=client,
+                    resumed=_resumed,
                 )
             else:
                 full_prompt = task_prompt
@@ -374,8 +385,12 @@ async def execute_task(
                             agent=agent,
                             tool_kind=event.tool_kind,
                             raw_params=event.raw_tool_params,
+                            diff_path=event.diff_path,
                             command=event.shell_command,
                             is_shell=event.is_shell,
+                            mcp_server_name=event.mcp_server_name,
+                            mcp_tool_name=event.tool_name,
+                            mcp_identity_trusted=event.mcp_identity_trusted,
                         )
                         if tool_result.action == TOOL_DENY:
                             await client.reject_tool(event.request_id)
@@ -391,8 +406,35 @@ async def execute_task(
                             )
                             continue
                         if tool_result.action == TOOL_AUTO_APPROVE:
-                            _auto_approved = True
-                            _auto_reason = "hook_auto_approve"
+                            # The hook granted this by NAME (its
+                            # `auto_approve_tools` globs, or the read-only
+                            # allowlist). Honour it only while each program name
+                            # in the command still resolves to the program it
+                            # appears to name; a shadowed, agent-tree or
+                            # unidentified resolution DOWNGRADES to this
+                            # surface's normal path below (interactive approval
+                            # when a handler is present, deny-by-default when
+                            # headless) — never a hard block.
+                            _ng_refusal = await name_grant.refusal_for_event(event)
+                            if _ng_refusal is None:
+                                _auto_approved = True
+                                _auto_reason = "hook_auto_approve"
+                            else:
+                                logger.warning(
+                                    "declining a hook auto-approve: %s; the request "
+                                    "falls through to the task runner's normal "
+                                    "approval path",
+                                    _ng_refusal.log_text,
+                                )
+                                name_grant.log_decline(
+                                    source="taskrunner",
+                                    session_key=session_key,
+                                    agent=agent or "kirocrew",
+                                    event=event,
+                                    refusal=_ng_refusal,
+                                    tier="hook_auto_approve",
+                                    sel_factory=sel,
+                                )
 
                     # Per-run trust toggle: the user explicitly opted THIS run into
                     # unattended execution via the dashboard. It is NOT the global
@@ -803,8 +845,8 @@ async def check_context(session_key: str, sessions: "SessionManager") -> None:
     path gateway compaction uses — so the task runner inherits concurrent-
     trigger dedup, the failure/ineffective cooldown, turn-semaphore exclusion,
     the still-critical post-compaction reset, and skills-index reinjection,
-    instead of bypassing them all with a direct ``provider.compact()``
-    (#4686). A ``"busy"`` decline (a turn holds the semaphore) is final for
+    instead of bypassing them all with a direct ``provider.compact()``.
+    A ``"busy"`` decline (a turn holds the semaphore) is final for
     this check: never fall back to a direct compact — the next check retries
     once the turn drains.
     """
@@ -822,9 +864,14 @@ async def self_review(
     sessions: "SessionManager",
     agent: str,
     session_key: str = "",
+    *,
+    ctx: "ContextBuilder | None" = None,
 ) -> bool:
     """Review task using a separate session that reads the actual git diff."""
     review_key = f"{SESSION_PREFIX}:{run.task_id}:review"
+    from kiro_crew.context import inherit_session_memory
+
+    await inherit_session_memory(ctx, f"{SESSION_PREFIX}:{run.task_id}:runtime", review_key)
     try:
         diff = ""
         if run.branch_name:
@@ -976,7 +1023,9 @@ async def run_tests(test_cmd: list[str], work_dir: Path) -> tuple[bool, str]:
     # The test command and its working directory are both agent-influenced, so
     # route the spawn through the sandbox chokepoint: OS-level isolation plus a
     # credential-scrubbed environment.
-    argv, env, cleanup = sandboxed_spawn_argv(list(test_cmd))
+    argv, env, cleanup = await sandboxed_spawn_argv_async(
+        list(test_cmd), _prepare=sandboxed_spawn_argv
+    )
     proc: asyncio.subprocess.Process | None = None
     try:
         proc = await create_subprocess_limited(

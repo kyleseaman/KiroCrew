@@ -269,6 +269,20 @@ class TestToLlmEventFieldPropagation:
         assert ev.usage.cache_creation_tokens == 33
         assert ev.usage.cache_read_tokens == 44
 
+    @pytest.mark.asyncio
+    async def test_stream_propagates_synthetic_completion_provenance(self):
+        provider = _build_provider(backend=ACP_BACKEND_CLAUDE)
+        src = AcpEvent(
+            kind="complete",
+            stop_reason="end_turn",
+            synthetic_completion=True,
+        )
+        provider._client.stream_events = MagicMock(return_value=_async_iter([src]))
+
+        events = await _drain(provider.stream("hi"))
+
+        assert events[0].synthetic_completion is True
+
 
 class TestToLlmEventFieldParity:
     """Structural guard: every field on AcpEvent must either be explicitly
@@ -285,29 +299,67 @@ class TestToLlmEventFieldParity:
         "todo",
     }
 
+    @staticmethod
+    def _distinguishable(field: "dataclasses.Field") -> object | None:
+        """A value for *field* that its default cannot be mistaken for.
+
+        ``None`` means the field cannot be driven from its declared default
+        (``default_factory`` or required), and the caller skips it.
+        """
+        default = field.default
+        if default is dataclasses.MISSING:
+            return None
+        if isinstance(default, bool):
+            return not default
+        if isinstance(default, str):
+            return "sentinel-" + field.name
+        if isinstance(default, int):
+            return default + 7
+        if isinstance(default, float):
+            return default + 1.5
+        if default is None:
+            return {"sentinel": field.name}
+        return None
+
     def test_all_acp_event_fields_forwarded_or_allowlisted(self):
         """_to_llm_event must forward every AcpEvent field not in the
-        intentionally-dropped allowlist."""
-        all_fields = {f.name for f in dataclasses.fields(AcpEvent)}
-        # Build a source event with kind (required positional)
-        src = AcpEvent(kind="test")
+        intentionally-dropped allowlist.
+
+        Every field is driven to a value its DEFAULT cannot be mistaken for.
+        That is the whole point: an omitted field arrives at the default, so a
+        guard that compares against the default cannot fail for an omission —
+        which is the only bug this exists to catch. The earlier default-valued
+        version passed while ``synthesized`` was being dropped, disarming a
+        dashboard guard on the primary interactive surface.
+        """
+        driven: dict[str, object] = {}
+        undrivable: set[str] = set()
+        for f in dataclasses.fields(AcpEvent):
+            if f.name == "kind":
+                continue
+            value = self._distinguishable(f)
+            if value is None:
+                # default_factory (options, usage) — covered by the dedicated
+                # propagation tests above rather than by this sweep.
+                undrivable.add(f.name)
+                continue
+            driven[f.name] = value
+
+        src = AcpEvent(kind="sentinel-kind", **driven)
         result = AcpProvider._to_llm_event(src)
 
-        forwarded: set[str] = set()
-        for f in dataclasses.fields(AcpEvent):
-            src_val = getattr(src, f.name)
-            out_val = getattr(result, f.name)
-            # If the output matches the source default, it was forwarded
-            # (since we only set kind, all others are at their defaults).
-            if out_val == src_val:
-                forwarded.add(f.name)
-
-        # Verify with non-default values to be certain (kind is always set).
-        missing = all_fields - forwarded - self._INTENTIONALLY_DROPPED
+        dropped = {name for name, value in driven.items() if getattr(result, name) != value}
+        missing = dropped - self._INTENTIONALLY_DROPPED
         assert not missing, (
             f"AcpEvent fields not forwarded by _to_llm_event and not in "
             f"allowlist: {sorted(missing)}. Either add them to _to_llm_event "
             f"or document why in _INTENTIONALLY_DROPPED."
+        )
+        # The allowlist must not outlive the omission it documents.
+        assert self._INTENTIONALLY_DROPPED - undrivable <= dropped, (
+            "allowlisted field(s) are actually forwarded now: "
+            f"{sorted(self._INTENTIONALLY_DROPPED - undrivable - dropped)}. "
+            "Remove them from _INTENTIONALLY_DROPPED."
         )
 
     def test_intentionally_dropped_fields_exist_on_acp_event(self):
@@ -585,7 +637,7 @@ class TestEffortControl:
             )
         )
         # Must not raise.
-        await provider._set_claude_effort("max")
+        await provider._set_effort_config_option("max")
 
     @pytest.mark.asyncio
     async def test_kiro_clear_effort_no_default_returns_false_for_reset(self):
@@ -621,7 +673,7 @@ class TestEffortControl:
         provider._client.set_config_option = AsyncMock(side_effect=RuntimeError("rejected"))
         with pytest.raises(RuntimeError):
             await provider.change_effort("xhigh")
-        # Override rolled back (was previously unset).
+        # Override rolled back to unset.
         assert "claude-opus-4.7" not in provider._effort_per_model
 
     @pytest.mark.asyncio
@@ -665,7 +717,6 @@ class TestStartKiroRuntimeResume:
         provider._client._sandbox_mode = "auto"
         provider._client._extra_env = {}
         provider._client._mcp_gateway_overlay = None
-        provider._client._mcp_gateway_settings_mcp_json = None
         provider._client._mcp_gateway_socket = None
         # _model is a real string (not a MagicMock) so the DEFAULT_MODEL guard
         # in _start_kiro_runtime compares correctly.
@@ -709,8 +760,12 @@ class TestStartKiroRuntimeResume:
         runtime.create_session.assert_not_awaited()
         args = runtime.load_session.await_args.args
         loaded_path, loaded_sid = args[0], args[1]
-        # First positional is the full transcript path, never the bare sid.
-        assert loaded_path.endswith("/.kiro/sessions/cli/abc-123.json")
+        # First positional is the full transcript path under kiro-cli's session
+        # store -- wherever the resolver says that is (the test floor pins it) --
+        # never the bare sid.
+        from kiro_crew.config.paths import kiro_sessions_dir
+
+        assert loaded_path == str(kiro_sessions_dir() / "abc-123.json")
         assert loaded_path != "abc-123"
         # Second positional is the original sid, adopted as the resumed sessionId.
         assert loaded_sid == "abc-123"
@@ -846,7 +901,6 @@ class TestKiroStartupMetric:
         provider._client._sandbox_mode = "auto"
         provider._client._extra_env = {}
         provider._client._mcp_gateway_overlay = None
-        provider._client._mcp_gateway_settings_mcp_json = None
         provider._client._mcp_gateway_socket = None
         provider._client._resume_session_id = ""
         provider._client._model = model
@@ -932,7 +986,6 @@ class TestFixBDeadRuntimeRespawn:
         provider._client._sandbox_mode = "auto"
         provider._client._extra_env = {}
         provider._client._mcp_gateway_overlay = None
-        provider._client._mcp_gateway_settings_mcp_json = None
         provider._client._mcp_gateway_socket = None
         provider._client._model = "auto"
         return provider
@@ -1059,6 +1112,62 @@ class TestLoadSessionWithRetry:
         assert rt.load_session.await_count == 1  # a genuine failure is not retried
         assert sleep_mock.await_count == 0
 
+    # The exact RPC error kiro-cli returns on the dashboard hard-stop path: the
+    # killed holder's exit handler unlinks the lock between the new holder's
+    # create and its confirming re-read.
+    _LOCK_FILE_RACE = (
+        "RPC error: {'code': -32603, 'message': 'Internal error', 'data': "
+        "'Failed to start session: failed to re-read lock file "
+        '"/home/u/.kiro/sessions/cli/ee21.lock": No such file or directory '
+        "(os error 2)'}"
+    )
+
+    @pytest.mark.asyncio
+    async def test_lock_file_race_is_retried_and_recovers(self):
+        """A missing-lock-file re-read failure is a transient race with the dying
+        holder, not a genuine load failure: retry, and resume losslessly once
+        the holder is gone instead of demoting the tab to conversation-log
+        replay for the rest of its life."""
+        provider = _build_provider(backend="")
+        handle = object()
+        rt = self._runtime(
+            AsyncMock(side_effect=[RuntimeError(self._LOCK_FILE_RACE), handle]),
+        )
+        with patch("kiro_crew.providers.acp.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            got = await provider._load_session_with_retry(rt, "/s.json", "sid", None, None)
+        assert got is handle
+        assert rt.load_session.await_count == 2
+        assert sleep_mock.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_lock_file_race_exhausts_and_falls_back(self):
+        from kiro_crew.providers.acp import _RESUME_MAX_ATTEMPTS
+
+        provider = _build_provider(backend="")
+        rt = self._runtime(AsyncMock(side_effect=RuntimeError(self._LOCK_FILE_RACE)))
+        with patch("kiro_crew.providers.acp.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            got = await provider._load_session_with_retry(rt, "/s.json", "sid", None, None)
+        assert got is None  # Phase 2 (fresh session + history replay) still applies
+        assert rt.load_session.await_count == _RESUME_MAX_ATTEMPTS
+        assert sleep_mock.await_count == _RESUME_MAX_ATTEMPTS - 1
+
+    def test_transient_classifier_is_narrow(self):
+        """Only the two known lock shapes are transient. An unrelated 'No such
+        file' (a missing session file) and a PERMANENT lock failure (permission
+        denied on the lock path) must both still fail fast: a wrong 'transient'
+        verdict there costs the whole 1s+2s+4s backoff before the identical
+        fresh-session fallback."""
+        from kiro_crew.providers.acp import _is_transient_resume_lock_error as transient
+
+        assert transient(RuntimeError("Session is ACTIVE in another process"))
+        assert transient(RuntimeError(self._LOCK_FILE_RACE))
+        assert transient(RuntimeError("Failed to Re-Read Lock File: gone"))
+        assert not transient(RuntimeError("failed to open lock file: Permission denied"))
+        assert not transient(RuntimeError("corrupt lock file"))
+        assert not transient(RuntimeError("session file not found: No such file or directory"))
+        assert not transient(RuntimeError("session/load parse error"))
+        assert not transient(RuntimeError(""))
+
     @pytest.mark.asyncio
     async def test_dead_runtime_stops_retry(self):
         provider = _build_provider(backend="")
@@ -1071,6 +1180,108 @@ class TestLoadSessionWithRetry:
         assert got is None
         assert rt.load_session.await_count == 1  # bail as soon as the runtime is dead
         assert sleep_mock.await_count == 0
+
+
+class TestToolSearchResumeCompatibility:
+    """Dashboard-native ``session/load`` loses deferred-tool activation state.
+
+    A dashboard Tool Search session therefore resumes through a fresh native
+    session plus Kiro Crew's conversation-log replay. Operators who disable Tool
+    Search, and every non-dashboard dispatcher, keep native resume.
+    """
+
+    @staticmethod
+    def _provider(tool_search: bool) -> AcpProvider:
+        provider = _build_provider(backend="")
+        provider._client._work_dir = "/tmp/ws"
+        provider._client._agent = "kirocrew"
+        provider._client._sandbox_mode = "auto"
+        provider._client._extra_env = {}
+        provider._client._mcp_gateway_overlay = None
+        provider._client._mcp_gateway_socket = None
+        provider._client._resume_session_id = "old-sess-id"
+        provider._client._session_key = "dashboard:chat-1"
+        provider._client._channel_id = None
+        provider._client._model = "auto"
+        provider._tool_search = tool_search
+        return provider
+
+    @staticmethod
+    async def _start(provider: AcpProvider, *, load_succeeds: bool = True) -> MagicMock:
+        handle = MagicMock()
+        handle.session_id = "live-sess-id"
+        handle.available_models = []
+        handle.set_model = AsyncMock()
+
+        runtime = MagicMock()
+        runtime.pid = 4321
+        runtime.spawn = AsyncMock()
+        runtime.is_alive = MagicMock(return_value=True)
+        runtime.saw_not_logged_in = MagicMock(return_value=False)
+        runtime.kill = AsyncMock()
+        runtime.load_session = AsyncMock(return_value=handle if load_succeeds else None)
+        runtime.create_session = AsyncMock(return_value=handle)
+
+        with (
+            patch("kiro_crew.providers.acp.AcpRuntime", return_value=runtime),
+            patch(
+                "kiro_crew.providers.acp.AcpSessionProvider",
+                side_effect=lambda h, r, **kw: MagicMock(_handle=h, _runtime=r, resumed=False),
+            ),
+            patch("pathlib.Path.exists", return_value=True),
+        ):
+            await provider._start_kiro_runtime()
+        return runtime
+
+    @pytest.mark.asyncio
+    async def test_enabled_uses_fresh_session_with_history_replay(self):
+        provider = self._provider(tool_search=True)
+
+        runtime = await self._start(provider)
+
+        runtime.load_session.assert_not_awaited()
+        runtime.create_session.assert_awaited_once()
+        assert provider._history_replay_needed is True
+        assert provider._defer_replay_sid_promotion is True
+        assert provider.defer_replay_sid_promotion is True
+
+    @pytest.mark.asyncio
+    async def test_disabled_preserves_native_session_load(self):
+        provider = self._provider(tool_search=False)
+
+        runtime = await self._start(provider)
+
+        runtime.load_session.assert_awaited_once()
+        runtime.create_session.assert_not_awaited()
+        assert provider._history_replay_needed is False
+        assert provider._defer_replay_sid_promotion is False
+        assert provider.defer_replay_sid_promotion is False
+
+    @pytest.mark.asyncio
+    async def test_enabled_linked_slack_session_preserves_native_load(self):
+        provider = self._provider(tool_search=True)
+        provider._client._session_key = "dashboard:chat-linked"
+        provider._client._channel_id = "C123"
+
+        runtime = await self._start(provider)
+
+        runtime.load_session.assert_awaited_once()
+        runtime.create_session.assert_not_awaited()
+        assert provider._history_replay_needed is False
+        assert provider._defer_replay_sid_promotion is False
+        assert provider.defer_replay_sid_promotion is False
+
+    @pytest.mark.asyncio
+    async def test_native_load_fallback_replays_without_deferring_sid(self):
+        provider = self._provider(tool_search=False)
+
+        runtime = await self._start(provider, load_succeeds=False)
+
+        runtime.load_session.assert_awaited_once()
+        runtime.create_session.assert_awaited_once()
+        assert provider._history_replay_needed is True
+        assert provider._defer_replay_sid_promotion is False
+        assert provider.defer_replay_sid_promotion is False
 
 
 class TestStartKiroRuntimeModelEntitlement:
@@ -1089,7 +1300,6 @@ class TestStartKiroRuntimeModelEntitlement:
         provider._client._sandbox_mode = "auto"
         provider._client._extra_env = {}
         provider._client._mcp_gateway_overlay = None
-        provider._client._mcp_gateway_settings_mcp_json = None
         provider._client._mcp_gateway_socket = None
         provider._client._model = model
         provider._client._resume_session_id = ""  # straight to create_session
@@ -1161,10 +1371,12 @@ def test_child_fidelity_aware_survives_client_replacement():
 
 
 def test_to_llm_event_preserves_provenance_flags():
-    """`AcpProvider._to_llm_event` reconstructs the event — dropping the two
-    provenance fields would zero them to False and flip child_low_fidelity to
-    True for EVERY child permission event on this surface, making the
-    full-fidelity half of the feature (mode-parity auto-approval) inert."""
+    """`AcpProvider._to_llm_event` reconstructs the event — dropping a
+    provenance field would zero it to False: for the params pair that flips
+    child_low_fidelity to True for EVERY child permission event on this
+    surface (making the full-fidelity half of the feature inert); for
+    mcp_identity_trusted it revokes the verified-identity half
+    (child_mcp_identity_trusted) the unconditional grant paths rely on."""
     from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, AcpEvent
     from kiro_crew.providers.acp import AcpProvider
 
@@ -1183,3 +1395,43 @@ def test_to_llm_event_preserves_provenance_flags():
     assert out.raw_params_trusted is True
     assert out.shell_classified is True
     assert out.child_low_fidelity is False
+
+
+def test_to_llm_event_preserves_mcp_identity_trusted():
+    """The identity-provenance flag crosses the provider copy: dropping it
+    from the copy list silently reads False and revokes
+    child_mcp_identity_trusted for every crossing event (the drop-to-False
+    trap the explicit flag was added to guard against — it must fail closed
+    only for genuinely untrusted population, never for a copy)."""
+    from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, AcpEvent
+    from kiro_crew.providers.acp import AcpProvider
+
+    src = AcpEvent(
+        kind=EVENT_PERMISSION_REQUEST,
+        request_id=11,
+        title="@example-server/get-item",
+        sub_session_id="child-a",
+        shell_classified=True,
+        is_shell=False,
+        mcp_server_name="example-server",
+        tool_name="get-item",
+        mcp_identity_trusted=True,
+    )
+    assert src.child_mcp_identity_trusted is True
+    out = AcpProvider._to_llm_event(src)
+    assert out.mcp_identity_trusted is True
+    assert out.child_mcp_identity_trusted is True
+    assert out.child_unconditional_grant_eligible is True
+    # And the flag is copied, not invented: an untrusted source stays False.
+    src_untrusted = AcpEvent(
+        kind=EVENT_PERMISSION_REQUEST,
+        request_id=12,
+        sub_session_id="child-a",
+        shell_classified=True,
+        is_shell=False,
+        mcp_server_name="example-server",
+        tool_name="get-item",
+    )
+    out_untrusted = AcpProvider._to_llm_event(src_untrusted)
+    assert out_untrusted.mcp_identity_trusted is False
+    assert out_untrusted.child_mcp_identity_trusted is False

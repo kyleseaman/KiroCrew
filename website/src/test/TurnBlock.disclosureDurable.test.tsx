@@ -13,7 +13,7 @@ import { render, screen, fireEvent } from '@testing-library/react'
 import { useCallback, useMemo, useState, type ReactNode } from 'react'
 import TurnBlock from '../pages/chat/TurnBlock'
 import { groupDisplayItems, applyRunningState } from '../pages/chat/groupDisplayItems'
-import { virtualKeyFor } from '../pages/ChatPage'
+import { virtualKeyFor } from '../pages/chat/ChatPageMessageContent'
 import type { DisplayItem, TurnItem } from '../pages/chat/types'
 import type { ChatMessage } from '../types'
 
@@ -44,7 +44,7 @@ function Transcript({ messages, running, mounted }: { messages: ChatMessage[]; r
                 turn={item}
                 renderItem={renderTurnItem}
                 disclosure={disclosure[k]}
-                onDisclosureChange={(next: boolean) => setFor(k, next)}
+                disclosureKey={k} onDisclosureChange={setFor}
               />
             </div>
           )

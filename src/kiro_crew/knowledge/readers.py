@@ -81,11 +81,17 @@ class FileReader:
     # Binary formats need optional runtime deps: .pdf -> pdfplumber and .docx ->
     # python-docx (both declared in setup.cfg). .pptx -> python-pptx is NOT declared,
     # so .pptx is intentionally kept out of SUPPORTED even though _read_pptx exists.
+    # Every source-code extension listed in ingestion.CODE_EXTS must appear here:
+    # SUPPORTED is the folder-scan gate (folder_watcher._walk), and a source's
+    # include_extensions can only narrow it, so an extension missing here is
+    # silently skipped before any reader or chunker runs. test_knowledge.py pins
+    # CODE_EXTS as a subset of this set.
     SUPPORTED = {
         '', '.md', '.txt', '.org', '.py', '.java', '.ts', '.js', '.rs', '.go',
         '.html', '.htm', '.docx', '.pdf',
         '.csv', '.log', '.json', '.jsonl', '.ndjson', '.yaml', '.yml',
         '.sh', '.rb', '.ps1', '.psm1', '.psd1', '.c', '.cpp', '.h',
+        '.cs', '.kt', '.kts', '.swift', '.scala',
     }
 
     _DISPATCH = {
@@ -132,7 +138,20 @@ class FileReader:
             return _missing_dep('PDF', 'pdfplumber')
         try:
             with pdfplumber.open(path) as pdf:
-                pages = [p.extract_text() or '' for p in pdf.pages]
+                pages: list[str] = []
+                for page in pdf.pages:
+                    try:
+                        pages.append(page.extract_text() or '')
+                    finally:
+                        # pdfplumber caches the parsed layout on each Page. Release
+                        # it before parsing the next page so large PDFs do not keep
+                        # every page's layout resident until the document closes.
+                        # Page.close() also clears the text-map cache when available;
+                        # pdfplumber 0.10 only exposes flush_cache().
+                        close_page = getattr(page, 'close', None)
+                        if close_page is None:
+                            close_page = page.flush_cache
+                        close_page()
                 return '\n'.join(pages), {'format': 'pdf', 'page_count': len(pages)}
         except Exception as e:
             return _read_error(e)

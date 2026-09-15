@@ -1,9 +1,10 @@
 import * as React from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Pencil, Circle, Pin, Zap, Locate, Link2, Tag as TagIcon, X, ExternalLink, Monitor, Undo2, RotateCw } from 'lucide-react'
+import { Pencil, Circle, Pin, Zap, Locate, Link2, Tag as TagIcon, X, ExternalLink, Monitor, Undo2, RotateCw, PanelTop } from 'lucide-react'
 import type { ChatFolder } from '../types'
 import FolderMoveSubmenu from './FolderMoveSubmenu'
 import SendToInstanceSubmenu from './SendToInstanceSubmenu'
+import ExportSessionItem from './ExportSessionItem'
 import SessionColorSwatches from './SessionColorSwatches'
 import LinkedSurfacesSection from './LinkedSurfacesSection'
 import { DropdownMenuItem, DropdownMenuSeparator } from './ui/dropdown-menu'
@@ -36,6 +37,12 @@ export interface SessionActionsMenuProps {
   onReveal?: () => void
   /** Rename entry point — differs per surface (sidebar inline row-edit vs header title editor). */
   onRename?: () => void
+  /**
+   * Open this session as a tab on the calling surface. Present only where a tab
+   * strip exists (the dashboard chat surface), which is why it is a bubble prop
+   * and not internalised: there is no store-wide "tabs" the menu could reach.
+   */
+  onOpenInNewTab?: () => void
   /** Extra items rendered in the top "informational" group (header-only today:
    *  the MCP-servers submenu). Generic so the shared menu stays surface-agnostic. */
   infoSlots?: React.ReactNode[]
@@ -75,12 +82,12 @@ export function collapseGroups<T>(groups: (T | false | null | undefined)[][]): T
  * with dividers auto-collapsing between them):
  *   [informational]  MCP servers ▸  (header only)
  *   [tab modifiers]  Rename · Mark read/unread · Pin · Switch to Autopilot/Chat · Move to folder ▸ · Tags…
- *   [nav / access]   Reveal in sidebar (header only) · Copy link · Connected surfaces
+ *   [nav / access]   Reveal in sidebar (header only) · Copy link · Send a copy ▸ · Export to a file · Connected surfaces
  *   [colour]         colour swatches
  *   [close]          Close session
  */
 export default function SessionActionsMenu({
-  variant, slotKey, mode, onReveal, onRename, infoSlots, onColorPicked,
+  variant, slotKey, mode, onReveal, onRename, onOpenInNewTab, infoSlots, onColorPicked,
 }: SessionActionsMenuProps) {
   const Item = variant === 'context' ? ContextMenuItem : DropdownMenuItem
   const Separator = variant === 'context' ? ContextMenuSeparator : DropdownMenuSeparator
@@ -163,6 +170,16 @@ export default function SessionActionsMenu({
           <Locate size={13} className="shrink-0 text-muted" /> {i18nT('components.sessionActionsMenu.reveal_in_sidebar')}
         </Item>
       ),
+      // Open as a session TAB on the surface this menu was opened from — the
+      // discoverable form of the middle-click/modifier-click gesture. Offered
+      // only where a caller passes the handler, because only the dashboard
+      // chat surface has a tab strip to open into; the popped-out window and
+      // the embed shell would have nowhere to put it.
+      onOpenInNewTab && (
+        <Item key="open-in-tab" onSelect={onOpenInNewTab}>
+          <PanelTop size={13} className="shrink-0 text-muted" /> {i18nT('components.sessionActionsMenu.open_in_new_tab')}
+        </Item>
+      ),
       // Pop out to a dedicated browser window — or, if already out, focus /
       // bring it back. Lets you keep typing to one session while looking at an
       // artifact or another view in the main window. Inside the popout window
@@ -193,6 +210,15 @@ export default function SessionActionsMenu({
       // about this tab — the peer gets its own copy under its own key.
       // Self-hiding when no instances are configured.
       <SendToInstanceSubmenu key="send-instance" slotKey={slotKey} variant={variant} />,
+      // The same act with the live hop removed: a tunnel needs both machines up
+      // and reachable at once, a file does not. Adjacent to the submenu above
+      // so the two read as one choice about where the copy goes.
+      <ExportSessionItem
+        key="export-file"
+        slotKey={slotKey}
+        Item={Item}
+        memoryMode={slot?.memory_mode}
+      />,
       // Channel-neutral link state and actions — connected origins are read-only,
       // explicit mirrors can be reminded/stopped, and an otherwise-unlinked
       // dashboard session retains the existing Slack channel picker.

@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -22,8 +23,10 @@ from kiro_crew.pod import provision as prov
 from kiro_crew.pod import runtime as rt
 from kiro_crew.pod.config import PodConfig
 from kiro_crew.sel import sel
+from kiro_crew.tips_text import truncate_summary
 
 logger = logging.getLogger(__name__)
+_SCENARIOS_TABLE_WIDTH = 100
 
 # A verb handler: (config, parsed args) -> None.
 PodHandler = Callable[[PodConfig, argparse.Namespace], None]
@@ -52,26 +55,112 @@ def _die(msg: str) -> NoReturn:
     sys.exit(1)
 
 
-def _wait_healthy(cfg: PodConfig, name: str, port: int, tries: int = 45) -> int:
-    """Poll until the pod serves (200/401/403), or bail fast if the unit died.
+# Default health-wait budget for `pod up`, in seconds. A first pod boot does
+# real extra work beyond serving /api/health -- config migration, staging CLI
+# files, minting a fresh .local_secret -- and on a loaded host a healthy
+# gateway was measured needing well past the old 45s wall, so the default is
+# twice that. Override per-run with `pod up --wait-secs` or the env var below.
+POD_HEALTH_WAIT_SECS_DEFAULT = 90
+POD_HEALTH_WAIT_SECS_ENV = "KIROCREW_POD_HEALTH_SECS"
+# Floor so a misconfigured tiny value cannot make every boot fail before the
+# gateway has any chance to answer; ceiling so an absurd value cannot wedge
+# `pod up` for hours or overflow float arithmetic on the deadline.
+_POD_HEALTH_WAIT_FLOOR_SECS = 5
+_POD_HEALTH_WAIT_CEIL_SECS = 3600
+
+
+def _health_wait_secs(args: argparse.Namespace) -> int:
+    """Resolve the `pod up` health-wait budget in seconds: flag > env > default.
+
+    The env var must parse as a positive integer; a malformed value warns on
+    stderr and falls back to the default rather than raising, so a typo in a
+    profile cannot make `pod up` unbootable. The result is clamped to a small
+    floor for the same reason in the other direction.
+    """
+    secs = getattr(args, "wait_secs", None)
+    if secs is not None:
+        if secs <= 0:
+            # The warning promises the default, so the default is what applies:
+            # an invalid explicit flag does not fall through to the env var.
+            print(
+                f"pod: ignoring --wait-secs {secs} (not a positive integer); "
+                f"using the default {POD_HEALTH_WAIT_SECS_DEFAULT}s",
+                file=sys.stderr,
+            )
+            secs = POD_HEALTH_WAIT_SECS_DEFAULT
+    else:
+        raw = os.environ.get(POD_HEALTH_WAIT_SECS_ENV, "").strip()
+        if raw:
+            try:
+                secs = int(raw)
+                if secs <= 0:
+                    raise ValueError(raw)
+            except ValueError:
+                print(
+                    f"pod: ignoring {POD_HEALTH_WAIT_SECS_ENV}={raw!r} (not a "
+                    f"positive integer); using the default "
+                    f"{POD_HEALTH_WAIT_SECS_DEFAULT}s",
+                    file=sys.stderr,
+                )
+                secs = POD_HEALTH_WAIT_SECS_DEFAULT
+    if secs is None:
+        secs = POD_HEALTH_WAIT_SECS_DEFAULT
+    return min(max(secs, _POD_HEALTH_WAIT_FLOOR_SECS), _POD_HEALTH_WAIT_CEIL_SECS)
+
+
+def _wait_healthy(
+    cfg: PodConfig, name: str, port: int, tries: int = POD_HEALTH_WAIT_SECS_DEFAULT
+) -> int:
+    """Poll until the pod itself serves (200/401/403), or bail fast on failure.
 
     Returns the HTTP code on success, or a negative sentinel on early failure:
       -1 = the unit's gateway crashed / is crash-looping (a broken worktree build
            — the thing under test won't boot, so there's nothing to wait for). The
            caller surfaces the gateway's own journal as the cause.
+      ``rt.HEALTH_FOREIGN`` = the port answers, but another process owns it, so
+           this pod's gateway cannot have bound it.
     A pod IS the worktree's gateway, so a dead gateway is a real, expected signal —
-    we just want it fast and clearly attributed, not a silent 45s timeout.
+    we just want it fast and clearly attributed, not a silent timeout. ``tries``
+    is the WALL-CLOCK budget in seconds, enforced by a monotonic deadline
+    (default ``POD_HEALTH_WAIT_SECS_DEFAULT``, overridable via `pod up
+    --wait-secs` or ``KIROCREW_POD_HEALTH_SECS``): polls run about once per
+    second when the port answers fast, and a slow probe (a bound-but-silent
+    socket eats the probe's own timeout) shortens the remaining sleeps rather
+    than stretching the budget, so the total overrun is at most one probe.
+    The exhausted-budget return is 0 only when NOTHING ever answered the
+    port: a real HTTP status (the last polled one, or the last one seen
+    before the port went silent) is returned whenever the gateway spoke.
+
+    A foreign responder does NOT end the wait on sight. The pod may still be
+    starting, and its own gateway may be moments from winning the port back after
+    a predecessor releases it, so the loop keeps its existing exit conditions.
+    What the flag changes is the ATTRIBUTION: a port already held by somebody else
+    is the reason this pod's gateway is crash-looping, so it is reported ahead of
+    the generic crash verdict, which would otherwise send the operator to read a
+    journal that only says "address already in use".
     """
-    for _ in range(tries):
-        code = rt.health(port)
+    saw_foreign = False
+    last_http = 0
+    deadline = time.monotonic() + max(tries, 1)
+    while True:
+        code = rt.health(cfg, name, port)
         if code in (200, 401, 403):
             return code
+        if code == rt.HEALTH_FOREIGN:
+            saw_foreign = True
+        elif code > 0:
+            # Any real HTTP answer is remembered: a gateway that served an
+            # error and then went silent DID answer, and reporting 0 for it
+            # would misattribute a broken health route as a slow boot.
+            last_http = code
         state, restarts = rt.unit_state(cfg, name)
         # failed = exited non-zero and not restarting; restarts>0 = crash-looping.
         if state == "failed" or restarts > 0:
-            return -1
-        time.sleep(1)
-    return rt.health(port)
+            return rt.HEALTH_FOREIGN if saw_foreign else -1
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return rt.HEALTH_FOREIGN if saw_foreign else (code or last_http)
+        time.sleep(min(1.0, remaining))
 
 
 def _resolve_or_die(cfg: PodConfig, name: str) -> Path:
@@ -84,9 +173,60 @@ def _resolve_or_die(cfg: PodConfig, name: str) -> Path:
 # --------------------------------------------------------------------------- #
 # verbs
 # --------------------------------------------------------------------------- #
+def _home_holds_state(cfg: PodConfig, name: str) -> bool:
+    """Return whether the pod home already contains state or is unusable."""
+    home = cfg.home_dir(name)
+    try:
+        return home.exists() and (not home.is_dir() or any(home.iterdir()))
+    except OSError:
+        return True
+
+
+def _verify_seed_landed(cfg: PodConfig, name: str, scenario: str, home_was_populated: bool) -> None:
+    """Refuse to report success when a requested scenario did not reach the home."""
+    landed = rt.seeded_scenario_in_home(cfg, name)
+    if home_was_populated:
+        held = f"scenario {landed!r}" if landed else "state from an earlier boot"
+        _audit(
+            "pod.up",
+            "failure",
+            f"name={name} seed={scenario}",
+            error="populated home seed request refused before start",
+        )
+        _die(
+            f"{name!r} already held {held}, so --seed {scenario} was NOT applied — "
+            "a populated home is never re-seeded. The pod was not started, because "
+            "cleanup after a failed start would otherwise be allowed to delete that "
+            "existing state. To restart it unchanged: "
+            f"kirocrew pod up {name}. To boot it fresh: "
+            f"kirocrew pod down {name} && kirocrew pod up {name} --seed {scenario}"
+        )
+    if landed == scenario:
+        return
+    _audit("pod.up", "failure", f"name={name} seed={scenario}", error="seed did not land")
+    found = f"it holds scenario {landed!r} instead" if landed else "its home holds no fixture"
+    _die(
+        f"{name}: the pod is up, but --seed {scenario} did NOT land — {found}.\n"
+        f"  The per-pod boot override should point systemd at this checkout: "
+        f"{rt.unit_mod.dropin_path(cfg, name)}.\n"
+        f"  Its boot log: kirocrew pod logs {name}\n"
+        f"  Then retry:   kirocrew pod down {name} && kirocrew pod up {name} "
+        f"--seed {scenario}"
+    )
+
+
 def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
     name = rt.validate_name(args.name)
     checkout = _resolve_or_die(cfg, name)
+
+    scenario = ""
+    if args.seed and rt.is_scenario_ref(args.seed):
+        try:
+            rt.resolve_seed_scenario(args.seed)
+        except rt.PodError as exc:
+            _audit("pod.up", "denied", f"name={name}", error="unknown seed scenario")
+            _die(str(exc))
+        scenario = args.seed
 
     # Graduated, teaching errors + auto-provisioning. The venv is cheap and
     # idempotent so we build it on demand; the dist is the slow SPA build, so we
@@ -136,40 +276,136 @@ def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
         if crons:
             env_updates["CRONS"] = "1"
             boot_flags.append("--crons")
-        if env_updates:
-            rt.write_env_file(cfg, name, env_updates)
+        no_embeddings = bool(getattr(args, "no_embeddings", False))
+        if no_embeddings:
+            env_updates["EMBEDDINGS"] = "0"
+            boot_flags.append("--no-embeddings")
 
+        # Read the unit's state BEFORE choosing a port, and inside the mutex: the
+        # two questions are one decision. An `up` against an already-active pod is
+        # a restart, and that pod's port is legitimately busy BECAUSE IT OWNS IT --
+        # probing would find it taken and move a running pod out from under every
+        # reader. Only a pod that is not running is choosing a port at all.
         was_active = rt.is_active(cfg, name)
+        home_was_populated = _home_holds_state(cfg, name)
+        # State that predates this command must be judged BEFORE `start_pod`:
+        # any failed health wait calls `stop_pod`, whose zero-residue cleanup is
+        # allowed to delete the pod home. Post-health verification remains for a
+        # fresh home, where the state belongs to this start transaction.
+        if scenario and home_was_populated:
+            _verify_seed_landed(cfg, name, scenario, home_was_populated=True)
         if not was_active:
-            cp = rt.start_pod(cfg, name)
-            if cp.returncode != 0:
-                _audit(
-                    "pod.up", "failure", f"name={name} port={port}", error="backend start failed"
+            # Asked BEFORE allocating, because allocation records a claim that would
+            # then look like ours. An operator's deliberate `PORT=` must not acquire
+            # the PORT_AUTO marker: that marker is what licenses a later relocation,
+            # so stamping it here would silently convert a pin the operator set into
+            # one this code may move -- defeating the guarantee that a pin you set is
+            # never moved automatically.
+            operator_pin = rt.operator_pinned(cfg, name)
+            # The plane lock, INSIDE the name lock, covers choose -> start. Two
+            # DIFFERENT colliding names hold disjoint NAME locks, so without this
+            # both could probe one port free and both boot onto it. See
+            # `pod_plane_mutex` for the window this shrinks and the one it leaves.
+            with rt.pod_plane_mutex(cfg):
+                try:
+                    port, displaced_from = rt.allocate_port(cfg, name)
+                except rt.PodError as exc:
+                    _audit("pod.up", "denied", f"name={name}", error="port unavailable")
+                    _die(f"refusing: {exc}")
+                # Record the claim on EVERY allocation, not only when the port
+                # moved. A unit is `Type=simple`, so `start_pod` returns before the
+                # gateway binds; until then a bind probe reports this port free and a
+                # concurrently-starting colliding name would be handed the same one.
+                # The recorded claim is visible immediately, which is what makes the
+                # concurrent case behave like the sequential one.
+                #
+                # This makes the cksum derivation a default HINT rather than a
+                # contract: after its first `up` a pod's port comes from its
+                # recorded claim, not from the formula. That is the intended
+                # trade -- an explicit ownership claim is what the pod plane needs,
+                # and it degrades gracefully, since the formula still chooses the
+                # first-preference port for every pod that has never come up.
+                env_updates["PORT"] = str(port)
+                if operator_pin:
+                    # CLEAR any marker left from an earlier automatic allocation.
+                    # Without this the stale value outlives the pin it described, and
+                    # the trap is a natural user action rather than a coincidence:
+                    # having seen the pod moved to :7850, an operator pins :7850 --
+                    # which now MATCHES the old marker, so their deliberate pin reads
+                    # as machine-made and may be relocated out from under them.
+                    # Emptied rather than deleted because `write_env_file` merges and
+                    # has no delete; an empty value does not parse as a port, so an
+                    # empty marker reads as no marker.
+                    env_updates[rt.AUTO_PORT_KEY] = ""
+                else:
+                    env_updates[rt.AUTO_PORT_KEY] = str(port)
+                if displaced_from is not None:
+                    print(
+                        f"pod: {name!r} moved to :{port} -- :{displaced_from} is "
+                        f"already in use. Pinned PORT={port} so every reader "
+                        f"agrees; `kirocrew pod url {name}` prints it.",
+                        file=sys.stderr,
+                    )
+                if env_updates:
+                    rt.write_env_file(cfg, name, env_updates)
+                cp = rt.start_pod(cfg, name)
+                if cp.returncode != 0:
+                    _audit(
+                        "pod.up",
+                        "failure",
+                        f"name={name} port={port}",
+                        error="backend start failed",
+                    )
+                    _die(f"starting pod {name} failed: {(cp.stderr or '').strip()}")
+        else:
+            # Re-resolve INSIDE the lock. `port` above was read before we held it,
+            # so a concurrent same-name `up` that pinned a fallback in the meantime
+            # would leave us holding the OLD port -- and the health wait below
+            # stops the unit when it cannot reach `port`, which would tear down the
+            # pod that other `up` just successfully started.
+            port = rt.derive_port(cfg, name)
+            if env_updates:
+                rt.write_env_file(cfg, name, env_updates)
+            if boot_flags:
+                joined = " ".join(boot_flags)
+                print(
+                    f"pod: note: {joined} recorded for {name!r}, but that pod is already "
+                    f"running, so it applies on the next boot "
+                    f"(kirocrew pod down {name} && kirocrew pod up {name} {joined}).",
+                    file=sys.stderr,
                 )
-                _die(f"starting pod {name} failed: {(cp.stderr or '').strip()}")
-        elif boot_flags:
-            joined = " ".join(boot_flags)
-            print(
-                f"pod: note: {joined} recorded for {name!r}, but that pod is already "
-                f"running, so it applies on the next boot "
-                f"(kirocrew pod down {name} && kirocrew pod up {name} {joined}).",
-                file=sys.stderr,
-            )
-        # Record boot-time settings: a pod in `yolo` auto-approves every tool and
-        # one with the scheduler on runs work unattended, so the audit trail must
-        # say so rather than recording only that a pod came up. Mark the
+        # Record boot-time settings: a pod in `yolo` auto-approves every tool, one
+        # with the scheduler on runs work unattended, and one without embeddings
+        # answers search from a different index than a normal pod -- so the audit
+        # trail must say so rather than recording only that a pod came up. Mark the
         # requested-but-not-yet-effective case: `boot` reads these once at start,
         # so a setting recorded against a live pod has not applied yet.
+        # `embeddings=off` is keyed on what the pod boots WITH, not on this command's
+        # flag. The merge-preserving env file keeps EMBEDDINGS=0 from an earlier `up`,
+        # so a re-up without the flag boots the same embedding-light pod; and a
+        # KIROCREW_SKIP_MODEL_DOWNLOAD=1 already in this environment is what
+        # pod_context hands every `pod exec` and what an inheriting boot carries,
+        # with no key ever written. Either pod answers search from a different
+        # index, and a row that said nothing would contradict the journal line
+        # `boot` prints for both (it keys on the effective env the same way).
+        embeddings_off = (
+            no_embeddings
+            or rt.embeddings_disabled(rt.read_env_file(cfg, name))
+            or os.environ.get(rt.SKIP_MODEL_DOWNLOAD_ENV) == "1"
+        )
         resources = f"name={name} port={port}"
         if approval:
             resources += f" approval={approval}"
         if crons:
             resources += " crons=on"
+        if embeddings_off:
+            resources += " embeddings=off"
         if boot_flags and was_active:
             resources += " applied=next_boot"
         _audit("pod.up", "allowed", resources)
 
-        code = _wait_healthy(cfg, name, port)
+        wait_secs = _health_wait_secs(args)
+        code = _wait_healthy(cfg, name, port, tries=wait_secs)
         if code not in (200, 401, 403):
             # A pod IS the worktree's own gateway. If it won't boot, that's a broken
             # worktree build (bad import / config / unbuilt dist) — NOT a pod-tooling
@@ -184,24 +420,110 @@ def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
             # started.
             tail = rt.recent_journal(cfg, name, 30)
             print(tail, file=sys.stderr)
+            # Attribution must be read BEFORE stop_pod tears the unit down:
+            # after the stop, unit_state cannot tell a slow boot from a dead
+            # gateway. Positive evidence only, on BOTH axes: code == 0 means
+            # nothing ever answered the port (a real HTTP error like 404/5xx
+            # means the gateway IS serving and its health route is broken --
+            # more wait can never fix that, so it keeps the legacy verdict),
+            # and an active/activating unit with zero restarts is the inverse
+            # of the crash signal _wait_healthy returns -1 on;
+            # "unknown"/"inactive" also keeps the legacy verdict.
+            still_starting = False
+            if code == 0:
+                state, restarts = rt.unit_state(cfg, name)
+                still_starting = state in ("active", "activating") and restarts == 0
             rt.stop_pod(cfg, name)
+            if code == rt.HEALTH_FOREIGN:
+                # Reported ahead of the crash verdict: the port being taken is
+                # WHY this gateway could not boot, and it is fixed by choosing a
+                # port rather than by debugging the worktree. Without this the
+                # operator reads a journal that only says "address already in
+                # use" — or, before the identity check existed, was told the pod
+                # was up and drove somebody else's instance.
+                _audit(
+                    "pod.up",
+                    "failure",
+                    f"name={name} port={port}",
+                    error="derived port held by another process",
+                )
+                _die(
+                    f"{name}: :{port} is already held by another process (another pod, "
+                    f"or the live gateway), so this pod's gateway could not bind it — "
+                    f"the responder on that port is not this pod.\n"
+                    f"  Which pods hold which ports: kirocrew pod ls\n"
+                    f"  Give this pod its own port:  add PORT=<free port> to "
+                    f"{cfg.env_file(name)}, then `kirocrew pod up {name}` again."
+                )
             if code == -1:
                 _die(
                     f"{name}: the worktree's gateway failed to start (see journal above). "
                     f"This is the worktree build, not pod — fix it, then `kirocrew pod up {name}` again."
+                )
+            if still_starting:
+                # Slow boot, not a dead gateway: the process is alive and simply
+                # has not answered /api/health inside the budget. Stopping the pod
+                # stays (the caller contract is 'up means healthy'); only the
+                # attribution and the remedy change.
+                _audit(
+                    "pod.up",
+                    "failure",
+                    f"name={name} port={port}",
+                    error="health wait exhausted while gateway alive",
+                )
+                _die(
+                    f"{name}: gateway still starting after {wait_secs}s on :{port} "
+                    f"(process alive, /api/health not yet answering). Raise the wait "
+                    f"with `kirocrew pod up {name} --wait-secs {wait_secs * 2}` or "
+                    f"{POD_HEALTH_WAIT_SECS_ENV}={wait_secs * 2}."
                 )
             _die(
                 f"{name}: gateway never became healthy on :{port} within timeout "
                 f"(see journal above; check the worktree's gateway start path)."
             )
 
+        if scenario and not home_was_populated:
+            _verify_seed_landed(cfg, name, scenario, home_was_populated=False)
+
+    # The pod is already booted and healthy by here, so the credential is the
+    # LAST step, not the point of the command. That asymmetry decides how the two
+    # refusals are handled:
+    #
+    # * FOREIGN is positive knowledge that the port is somebody else's, so there
+    #   is nothing truthful left to print — die.
+    # * UNPROVEN is not knowledge. On a POSIX host with no lsof there is no way to
+    #   prove ownership at all, and dying here would boot the pod and then fail
+    #   the command that booted it, turning a hardened credential path into a
+    #   `pod up` that never succeeds on that host class. So report what IS known
+    #   (the pod, its port, its base_url), withhold only the credential, and say
+    #   how to get it. The secret still never goes on the wire — the guard lives
+    #   in `mint_token`, which raised before dialling anything.
+    token = ""
+    unproven = ""
     try:
         token = rt.mint_token(cfg, name, args.ttl)
+    except rt.PodOwnershipUnproven as exc:
+        unproven = str(exc)
+        _audit(
+            "pod.token",
+            "denied",
+            f"name={name} port={port}",
+            error="ownership unprovable; credential withheld",
+        )
     except rt.PodError as exc:
         _audit("pod.token", "failure", f"name={name} port={port}", error="mint failed")
         _die(str(exc))
-    _audit("pod.token", "allowed", f"name={name} port={port} ttl={args.ttl}")
+    if token:
+        _audit("pod.token", "allowed", f"name={name} port={port} ttl={args.ttl}")
     base = f"http://127.0.0.1:{port}"
+    if unproven:
+        # The reason goes to stderr on BOTH paths rather than into the payload. The
+        # empty ``token`` is already the machine-readable signal -- it is what
+        # pod-e2e tests, and it is unambiguous because every other mint failure
+        # exits instead of returning -- so a payload field would add schema surface
+        # that is committed forever for no consumer. stderr reaches a subprocess
+        # caller and a human equally.
+        print(f"pod: {unproven}", file=sys.stderr)
     if args.json:
         print(
             json.dumps(
@@ -218,8 +540,11 @@ def _up(cfg: PodConfig, args: argparse.Namespace) -> None:
     else:
         print(f"pod '{name}' is up (full stack: API + frontend on one port)")
         print(f"  base_url : {base}")
-        print(f"  token    : {token}")
-        print(f"  open     : {base}/?token={token}")
+        if token:
+            print(f"  token    : {token}")
+            print(f"  open     : {base}/?token={token}")
+        else:
+            print("  token    : (withheld — ownership of the port could not be proven)")
         print(f"  stop     : kirocrew pod down {name}")
 
 
@@ -250,8 +575,10 @@ def _down(cfg: PodConfig, args: argparse.Namespace) -> None:
         # fatal: a reclaim that could not finish must not report success.
         # On macOS it is always fatal, because a loaded-but-dead agent has no pid
         # (was_up False) yet still needs its unload CONFIRMED before anything is
-        # torn down.
-        if cp.returncode != 0 and (was_up or had_home or rt.IS_MACOS):
+        # torn down. Windows is the same shape: a task whose gateway already died
+        # leaves no supervised pid, so `was_up` is False while the task itself is
+        # still registered and must be deleted before the HOME is reclaimed.
+        if cp.returncode != 0 and (was_up or had_home or rt.IS_MACOS or rt.IS_WINDOWS):
             _audit("pod.down", "failure", f"name={name}", error=f"stop rc={cp.returncode}")
             _die(f"stopping pod {name} failed: {(cp.stderr or '').strip()}")
         if rt.RECLAIMED_MARKER in (cp.stdout or ""):
@@ -277,6 +604,18 @@ def _down(cfg: PodConfig, args: argparse.Namespace) -> None:
         print(f"pod '{name}' was not running (nothing to stop)")
 
 
+def _health_label(code: int) -> str:
+    """Human rendering of a :func:`rt.health` verdict.
+
+    The JSON stays numeric (three callers parse ``pod ls --json``), but a bare
+    ``-2`` on a terminal tells the operator nothing, and "another instance owns
+    this port" is precisely the thing they need to read.
+    """
+    if code == rt.HEALTH_FOREIGN:
+        return "foreign (port held by another instance)"
+    return str(code)
+
+
 def _ls(cfg: PodConfig, args: argparse.Namespace) -> None:
     names = sorted(rt.active_names(cfg))
     # Teardown belongs to `pod down` on BOTH platforms, so a pod that went away
@@ -289,7 +628,7 @@ def _ls(cfg: PodConfig, args: argparse.Namespace) -> None:
         rows: list[dict[str, object]] = []
         for n in names:
             p = rt.derive_port(cfg, n)
-            rows.append({"name": n, "port": p, "health": rt.health(p)})
+            rows.append({"name": n, "port": p, "health": rt.health(cfg, n, p)})
         print(json.dumps(rows))
         return
     # Any fail-closed probe underneath surfaces as PodError, which the dispatch
@@ -299,10 +638,44 @@ def _ls(cfg: PodConfig, args: argparse.Namespace) -> None:
         print(f"{'POD':<28} {'PORT':<7} HEALTH")
         for n in names:
             p = rt.derive_port(cfg, n)
-            print(f"{n:<28} {p:<7} {rt.health(p)}")
+            print(f"{n:<28} {p:<7} {_health_label(rt.health(cfg, n, p))}")
     else:
         print("no pods running")
+    _print_refusals(cfg)
     _print_orphans(cfg, orphans)
+
+
+def _print_refusals(cfg: PodConfig) -> None:
+    """Report pods whose LAST boot refused terminally.
+
+    ``PodConfig.refusal_file``'s whole justification is that a terminal refusal is
+    visible in different amounts on the two service managers -- systemd leaves the
+    unit ``failed``, while launchd sees the exit-0 that stops its restart loop and
+    reads it as an ordinary clean exit -- and that ``pod ls`` should report the same
+    fact either way. It did not: a refused pod is not running, so it fell out of the
+    listing entirely and ``ls`` printed "no pods running". The note existed with no
+    reader, and a pod that silently vanishes from ``ls`` is exactly how a boot
+    failure hides.
+
+    Rendered as its own section rather than a row in the main table, mirroring
+    :func:`_print_orphans`: a refused pod has no port and no health, so a table row
+    would have to invent both.
+    """
+    try:
+        names = sorted(p.name[: -len(".refused")] for p in cfg.pods_dir.glob("*.refused"))
+    except OSError:
+        return
+    refused = [(n, rt.refusal_reason(cfg, n)) for n in names]
+    refused = [(n, why) for n, why in refused if why]
+    if not refused:
+        return
+    print(
+        f"\n{len(refused)} pod(s) REFUSED to boot — the last attempt stopped on a "
+        "safety check and did not start a gateway:"
+    )
+    for name, why in refused:
+        print(f"  {name:<26} {why}")
+        print(f"  {'':<26} clear: kirocrew pod down {name}")
 
 
 def _print_orphans(cfg: PodConfig, orphans: list[str]) -> None:
@@ -420,7 +793,9 @@ def _prune(cfg: PodConfig, args: argparse.Namespace) -> None:
             threshold = time.time() - _parse_older_than(args.older_than)
         orphans = rt.orphan_homes(cfg)
     except rt.PodError as exc:
-        _audit("pod.prune", "denied", f"older_than={args.older_than or 'all'}", error=str(exc)[:120])
+        _audit(
+            "pod.prune", "denied", f"older_than={args.older_than or 'all'}", error=str(exc)[:120]
+        )
         raise
     dry_run = bool(getattr(args, "dry_run", False))
     results: list[dict[str, str]] = []
@@ -556,8 +931,11 @@ def _prune_one_decide(cfg: PodConfig, name: str) -> tuple[str, str, str, str]:
                 )
             # macOS: a per-pod plist means "installed" (a name mid-`up`), not
             # orphaned — same predicate orphan_homes applies, re-checked at
-            # delete time for writers that bypass the mutex.
+            # delete time for writers that bypass the mutex. Windows: its
+            # per-pod `.cmd` wrapper carries exactly the same meaning.
             if rt.IS_MACOS and rt.launchd.plist_path(cfg, name).exists():
+                return "skipped", "pod is now installed", "denied", "pod is now installed"
+            if rt.IS_WINDOWS and rt.win_backend.task_script_path(cfg, name).exists():
                 return "skipped", "pod is now installed", "denied", "pod is now installed"
             cp = rt.stop_pod(cfg, name)
             if cp.returncode != 0:
@@ -584,7 +962,7 @@ def _status(cfg: PodConfig, args: argparse.Namespace) -> None:
     name = rt.validate_name(args.name)
     port = rt.derive_port(cfg, name)
     up = rt.is_active(cfg, name)
-    code = rt.health(port) if up else 0
+    code = rt.health(cfg, name, port) if up else 0
     if args.json:
         print(
             json.dumps(
@@ -592,7 +970,7 @@ def _status(cfg: PodConfig, args: argparse.Namespace) -> None:
             )
         )
     else:
-        print(f"{name}: {'up' if up else 'down'}  port={port}  health={code}")
+        print(f"{name}: {'up' if up else 'down'}  port={port}  health={_health_label(code)}")
 
 
 def _token(cfg: PodConfig, args: argparse.Namespace) -> None:
@@ -630,14 +1008,102 @@ def _exec(cfg: PodConfig, args: argparse.Namespace) -> None:
     sys.exit(rt.exec_in_pod(cfg, name, argv))
 
 
+def _api_body(raw: str) -> object:
+    """Decode a pod response body without ever raising.
+
+    The fixed-key envelope is this command's output contract, so a body that
+    cannot be parsed degrades to its (already scrubbed) text instead of
+    replacing the envelope with a traceback. Deciding that per exception TYPE is
+    what keeps failing: `json.loads` recurses once per nesting level, so a deep
+    response raises RecursionError — a RuntimeError, not the ValueError a
+    malformed body raises. Any decode failure is a body problem, never a reason
+    to abandon the envelope.
+    """
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return raw
+
+
+def _api_envelope(name: str, method: str, path: str, status: int, ok: bool, body: object) -> str:
+    """Render the envelope, degrading a body that cannot be serialized.
+
+    Serialization is the command's last exit, so it must not raise either:
+    encoding recurses per nesting level too, and a body deep enough to decode
+    but not re-encode would otherwise take the envelope down after the request
+    had already succeeded. The fallback document has a fixed shape and depth,
+    so it cannot fail in turn.
+    """
+    document: dict[str, object] = {
+        "name": name,
+        "method": method,
+        "path": path,
+        "status": status,
+        "ok": ok,
+        "body": body,
+    }
+    try:
+        return json.dumps(document, indent=2)
+    except Exception:
+        document["body"] = "<body omitted: not serializable>"
+        return json.dumps(document, indent=2)
+
+
+def _api(cfg: PodConfig, args: argparse.Namespace) -> None:
+    """Make one authenticated pod request and print a stable JSON document.
+
+    Every exit from this function is the envelope. The request, the decode and
+    the render all sit inside one guarded region whose handlers cover any
+    Exception, so a failure mode nobody enumerated degrades the body rather than
+    escaping as a traceback on stdout — which an agent parsing this output reads
+    as a protocol violation, not as an error it can act on.
+    """
+    name = str(args.name)
+    method = str(args.method).upper()
+    normalized = "/api/<invalid>"
+    status = 0
+    body: object = ""
+    ok = False
+    error = ""
+    try:
+        name = rt.validate_name(name)
+        normalized = rt.api_path(args.path)
+        status, raw = rt.pod_api(
+            cfg,
+            name,
+            method,
+            normalized,
+            data=getattr(args, "data", "") or "",
+            allow_write=bool(getattr(args, "allow_write", False)),
+        )
+        body = _api_body(raw)
+        ok = 200 <= status < 300
+        error = "" if ok else f"status={status}"
+    except rt.PodError as exc:
+        body = str(exc)
+        error = type(exc).__name__
+    except Exception as exc:
+        body = f"pod api failed ({type(exc).__name__})"
+        error = type(exc).__name__
+    resources = f"name={name} method={method} path={normalized} status={status}"
+    if method not in rt.API_READ_METHODS:
+        resources += " write=1"
+    _audit("pod.api", "allowed" if ok else "failure", resources, error=error)
+    print(_api_envelope(name, method, normalized, status, ok, body))
+    if not ok:
+        sys.exit(1)
+
+
 def _logs(cfg: PodConfig, args: argparse.Namespace) -> None:
     name = rt.validate_name(args.name)
     # Gate before exec'ing the log mechanism — on an unsupported host this would
     # otherwise raise a bare FileNotFoundError instead of the documented refusal.
     rt.require_backend()
-    if rt.IS_MACOS:
-        # launchd has no journal; the plist routes stdout/stderr to files and
-        # recent_journal tails them.
+    if rt.IS_MACOS or rt.IS_WINDOWS:
+        # Neither launchd nor Task Scheduler has a journal; the plist / the .cmd
+        # wrapper route stdout/stderr to files and recent_journal tails them.
         print(rt.recent_journal(cfg, name, args.lines))
         return
     subprocess.run(
@@ -687,8 +1153,27 @@ def _run_internal(cfg: PodConfig, args: argparse.Namespace) -> None:
     # Audit BEFORE boot — boot() exec()s the gateway and never returns on success.
     _audit("pod.boot", "allowed", f"name={args.name}")
     rc = rt.boot(cfg, args.name)
+    # Audit the HONEST code, before any service-manager translation below.
     _audit("pod.boot", "failure", f"name={args.name}", error=f"exit={rc}")
-    sys.exit(rc)
+    # launchd has no RestartPreventExitStatus: its only restart discriminator is
+    # the success/failure axis, and this backend's KeepAlive restarts on NON-ZERO.
+    # A terminal refusal must therefore exit 0 or launchd re-runs it every 5s.
+    # ``rt.terminal_exit_code`` is the record-CONDITIONAL gate -- it translates only
+    # when the refusal note actually landed, so a refusal that could not be recorded
+    # keeps its honest non-zero instead of looking like a clean exit. Do NOT call
+    # ``launchd.launchd_exit_code`` directly here; it states the platform semantics
+    # but knows nothing about whether the record exists. Windows needs no
+    # translation at all: Task Scheduler never restarts a non-zero exit, so the
+    # honest code is already the terminal one. The branch below says so, and
+    # `test_the_runtime_wrapper_does_not_translate_on_windows` pins it there --
+    # which is where a change that adds a restart policy would have to look.
+    exit_code = rt.terminal_exit_code(cfg, args.name, rc)
+    if exit_code != rc:
+        print(
+            f"kirocrew-pod: exiting 0 instead of {rc} so launchd does not restart "
+            f"into the same refusal every 5s; recorded at {cfg.refusal_file(args.name)}"
+        )
+    sys.exit(exit_code)
 
 
 def _cleanup_internal(cfg: PodConfig, args: argparse.Namespace) -> None:
@@ -707,6 +1192,44 @@ def _cleanup_internal(cfg: PodConfig, args: argparse.Namespace) -> None:
     sys.exit(rc)
 
 
+def _scenario_table_description(description: str, width: int) -> str:
+    """Shorten *description* to *width* for one table row, never cutting mid-word.
+
+    Sentence detection lives in ``truncate_summary`` alone. It prefers the last
+    complete sentence that fits, which on a description whose second sentence
+    does not fit IS the first sentence — so a separate first-sentence pass here
+    would be a second spelling of the same rule that discards a second sentence
+    the row had room for.
+    """
+    return truncate_summary(" ".join(description.split()), width)
+
+
+def _scenarios(cfg: PodConfig, args: argparse.Namespace) -> None:
+    """List the named fixtures accepted by ``pod up --seed``."""
+    from kiro_crew import seed as seed_mod
+
+    rows = [
+        {"name": name, "description": seed_mod.fixture_summary(name)}
+        for name in sorted(seed_mod.available_fixtures())
+    ]
+    if getattr(args, "json", False):
+        print(json.dumps(rows))
+        return
+    if not rows:
+        print("no seed scenarios found (the packaged fixtures tree is missing)")
+        return
+
+    width = max(len("SCENARIO"), *(len(str(row["name"])) for row in rows))
+    description_width = _SCENARIOS_TABLE_WIDTH - width - 2
+    print(f"{'SCENARIO':<{width}}  DESCRIPTION")
+    for row in rows:
+        name = str(row["name"])
+        description = str(row["description"] or "(no description)")
+        description = _scenario_table_description(description, description_width)
+        print(f"{name:<{width}}  {description}")
+    print(f"\nseed one with: kirocrew pod up <worktree> --seed {rows[0]['name']}")
+
+
 _VERBS: dict[str, PodHandler] = {
     "up": _up,
     "down": _down,
@@ -715,6 +1238,8 @@ _VERBS: dict[str, PodHandler] = {
     "status": _status,
     "token": _token,
     "url": _url,
+    "scenarios": _scenarios,
+    "api": _api,
     "logs": _logs,
     "install": _install,
     "provision": _provision,
@@ -729,7 +1254,7 @@ def dispatch(args: argparse.Namespace) -> None:
     if not action:
         print(
             "Usage: kirocrew pod "
-            "{up|down|ls|prune|status|token|url|logs|exec|install|provision} …"
+            "{up|down|ls|prune|status|token|url|scenarios|api|logs|exec|install|provision} …"
         )
         sys.exit(2)
     cfg = PodConfig.load()

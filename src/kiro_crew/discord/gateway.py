@@ -23,6 +23,7 @@ from kiro_crew.discord.commands import application_command_payload
 from kiro_crew.discord.transport import DiscordTransport
 from kiro_crew.discord.transport_dispatch import DiscordDispatcher
 from kiro_crew.messaging.driver import APPROVAL_AUTO, APPROVAL_INTERACTIVE
+from kiro_crew.messaging.transport import InboundMessage
 
 if TYPE_CHECKING:
     from kiro_crew.slack.gateway import GatewayOrchestrator
@@ -138,6 +139,10 @@ async def maybe_start_discord(orch: "GatewayOrchestrator") -> "DiscordClient | N
             on_interaction=dispatcher.on_interaction,
             enable_guild_threads=bool(allowed_threads or allowed_channels),
         )
+
+        async def _dispatch(message: InboundMessage) -> None:
+            await dispatcher.handle_message(message)
+
         transport = DiscordTransport(
             client,
             allowed_user_ids=allowed_ids,
@@ -145,13 +150,16 @@ async def maybe_start_discord(orch: "GatewayOrchestrator") -> "DiscordClient | N
             allowed_channel_ids=allowed_channels,
             auto_thread=auto_thread,
             on_thread_created=dispatcher.register_allowed_thread,
-            dispatch=dispatcher.handle_message,
+            dispatch=_dispatch,
         )
         # Inbound: Gateway WS -> transport.receive (authorize + normalize)
         # -> dispatcher.handle_message (drive the turn on the shared TurnDriver).
         # set_message_handler avoids the client<->transport construction cycle.
         client.set_message_handler(transport.receive)
         dispatcher.client = client
+        # Handed to the dispatcher so its config applier can push a reloaded
+        # allow-list at the live transport instead of waiting for a restart.
+        dispatcher.transport = transport
 
         await transport.connect()  # starts the Gateway WebSocket loop
         if orch.dashboard_state is not None:

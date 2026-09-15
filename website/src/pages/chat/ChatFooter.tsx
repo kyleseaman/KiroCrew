@@ -5,9 +5,12 @@ import { motion } from 'framer-motion'
 import { i18nT } from '../../i18n/t'
 import { GHOST_POSE_ICONS } from '../../components/GhostPoses'
 import { getThemeBranding } from '../../themeBranding'
+import { resolveThemeLoaderIcons } from '../../themeLoaderIcons'
+import { useOptionalTheme } from '../../hooks/useTheme'
 import ErrorBoundary from '../../components/ErrorBoundary'
 import { ExecutionLocationStartup } from '../../components/ExecutionLocationStartup'
 import type { ExecutionLocation } from '../../types'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 type StopState = 'idle' | 'soft_pending' | 'killing'
 
 /** One carousel beat — the cadence the .csb4 cross-fade was built around. */
@@ -90,22 +93,63 @@ function useThemeSlug(): string {
   return slug
 }
 
-/** Resolve what the footer should show while a turn runs. A theme may replace the
- *  whole loader, or just the artwork the default carousel cycles through:
- *    1. `loader`      — the theme's own component, rendered instead of everything
- *    2. `loaderIcons` — the stock carousel, cycling the theme's artwork
- *    3. the default pool (the mascot poses)
- *  An empty registered pool is ignored rather than rendering nothing. */
-export function resolveLoader(slug: string):
+/** The loader-relevant slice of an installed pack's assets. */
+type LoaderAssets = {
+  loaderIcons?: readonly string[]
+  loaderImages?: readonly string[]
+}
+
+/** A theme-supplied loader image (raster art the pack ships). Decorative: no alt
+ *  text, aria-hidden, same sizing class as the mascot poses so it drops into the
+ *  carousel unchanged. */
+function loaderImageIcon(url: string): ComponentType {
+  return function LoaderImage() {
+    return <img className="kp" src={url} alt="" aria-hidden="true" draggable={false} />
+  }
+}
+
+/** The installed-pack slug behind an active theme id, or undefined for a built-in. */
+function packSlugOf(slug: string): string | undefined {
+  return slug.startsWith('custom-') ? slug.slice('custom-'.length) : undefined
+}
+
+/** Resolve what the footer should show while a turn runs. Precedence:
+ *    1. `loader`               — trusted compiled component
+ *    2. pack `loaderImages`    — the pack's own images (L1): one renders on its
+ *                                own (self-animating WebP/APNG/GIF/SVG), 2..8
+ *                                feed the carousel
+ *    3. manifest `loaderIcons` — stock symbols selected by an installed pack
+ *    4. compiled `loaderIcons` — trusted compiled artwork
+ *    5. the default pool (the mascot poses)
+ *  Invalid or empty pools are ignored rather than rendering nothing. */
+export function resolveLoader(slug: string, assets?: LoaderAssets):
   | { kind: 'custom'; Component: ComponentType }
+  | { kind: 'image'; src: string }
   | { kind: 'icons'; icons: ComponentType[] } {
   const branding = getThemeBranding(slug)
   if (branding?.loader) return { kind: 'custom', Component: branding.loader }
-  return { kind: 'icons', icons: resolveLoaderIcons(slug) }
+  // A pack shipping exactly one loader image gets that image on its own — an
+  // animated WebP/APNG/GIF or animated SVG self-animates in the <img>. Two or
+  // more images are cycled by the carousel instead.
+  const packSlug = packSlugOf(slug)
+  const images = assets?.loaderImages
+  if (packSlug && images && images.length === 1) {
+    return { kind: 'image', src: `/api/theme/${encodeURIComponent(packSlug)}/assets/${images[0]}` }
+  }
+  return { kind: 'icons', icons: resolveLoaderIcons(slug, assets) }
 }
 
 /** The icon pool for the default carousel under a given theme. */
-export function resolveLoaderIcons(slug: string): ComponentType[] {
+export function resolveLoaderIcons(slug: string, assets?: LoaderAssets): ComponentType[] {
+  // A pack's own raster art (the author's images) — backend emits 4..8 relative
+  // asset paths, resolved against the theme's asset route.
+  const packSlug = packSlugOf(slug)
+  const images = assets?.loaderImages
+  if (packSlug && images && images.length > 0) {
+    return images.map(path => loaderImageIcon(`/api/theme/${encodeURIComponent(packSlug)}/assets/${path}`))
+  }
+  const installed = resolveThemeLoaderIcons(assets?.loaderIcons)
+  if (installed.length > 0) return installed
   const registered = getThemeBranding(slug)?.loaderIcons
   if (registered && registered.length > 0) return registered
   return DEFAULT_ICONS
@@ -244,7 +288,12 @@ const ChatFooter = memo(function ChatFooter({
   connected = true,
   statusKind,
 }: ChatFooterProps) {
-  const loader = resolveLoader(useThemeSlug())
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  const slug = useThemeSlug()
+  const themeState = useOptionalTheme()
+  const packSlug = packSlugOf(slug)
+  const installedTheme = packSlug ? themeState?.customThemeDataMap.get(packSlug) : undefined
+  const loader = resolveLoader(slug, installedTheme?.assets)
   // A managed runtime can reconnect to an already-provisioned environment after
   // its local process idles out. That transient state is not another workspace
   // boot: once this conversation has completed a turn, keep the large startup
@@ -332,7 +381,21 @@ const ChatFooter = memo(function ChatFooter({
             {loader.kind === 'custom'
               // The theme replaced the whole loader — it owns its size and motion.
               ? <loader.Component />
-              : <SwapCarousel icons={loader.icons} />}
+              : loader.kind === 'image'
+                // The pack shipped a single image — rendered on its own, self-
+                // animating if it's an animated WebP/APNG/GIF or SVG. Sized to a
+                // carousel slot (14px) with object-contain so an intrinsically
+                // large image cannot expand the footer band; decorative, so
+                // aria-hidden + no alt.
+                ? <img
+                    className="kp"
+                    src={loader.src}
+                    alt=""
+                    aria-hidden="true"
+                    draggable={false}
+                    style={{ width: 14, height: 14, objectFit: 'contain' }}
+                  />
+                : <SwapCarousel icons={loader.icons} />}
           </ErrorBoundary>
         )}
       </div>

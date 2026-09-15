@@ -141,14 +141,8 @@ def read_target() -> Path | None:
     return target
 
 
-def read_target_reason() -> tuple[Path | None, str | None]:
-    """``(target, reason)`` — at most one of the two is ever set.
-
-    An absent pointer is the ordinary case and yields ``(None, None)``: nothing
-    to explain. A pointer that exists but cannot be honoured yields
-    ``(None, <why>)`` so the boot log and the dashboard can say what was ignored
-    instead of silently running the wrong code.
-    """
+def _read_pointer_object() -> tuple[dict | None, str | None]:
+    """Parse the pointer once, preserving absent versus malformed semantics."""
     path = pointer_path()
     try:
         raw_text = path.read_text(encoding="utf-8")
@@ -166,28 +160,74 @@ def read_target_reason() -> tuple[Path | None, str | None]:
         return None, f"the live-target pointer is not valid JSON: {path}"
     if not isinstance(data, dict):
         return None, f"the live-target pointer is not a JSON object: {path}"
+    return data, None
+
+
+def read_target_reason() -> tuple[Path | None, str | None]:
+    """``(target, reason)`` — at most one of the two is ever set.
+
+    An absent pointer is the ordinary case and yields ``(None, None)``: nothing
+    to explain. A pointer that exists but cannot be honoured yields
+    ``(None, <why>)`` so the boot log and the dashboard can say what was ignored
+    instead of silently running the wrong code.
+    """
+    data, reason = _read_pointer_object()
+    if data is None:
+        return None, reason
     raw = data.get("checkout")
     if not isinstance(raw, str):
-        return None, f"the live-target pointer has no 'checkout' string: {path}"
+        return None, f"the live-target pointer has no 'checkout' string: {pointer_path()}"
     try:
         return validate(raw), None
     except InvalidTarget as exc:
         return None, str(exc)
 
 
-def write_target(checkout: Path | str) -> Path:
-    """Validate and store *checkout* as the live target. Returns the resolved path.
+def read_previous_target() -> Path | None:
+    """Return the validated one-level undo target, or ``None`` when unavailable.
 
-    Validation happens BEFORE the write, so an unusable target is refused up
-    front rather than persisted and then ignored on every subsequent boot.
+    Undo history is actionable code-execution state, so the previous checkout
+    must validate before it is offered. The current field only needs the pointer
+    schema's string shape: a running checkout can lose its venv after cutover
+    without making an otherwise safe previous checkout unusable.
+    """
+    data, _reason = _read_pointer_object()
+    if data is None:
+        return None
+    current = data.get("checkout")
+    previous = data.get("previous_checkout")
+    if not isinstance(current, str) or not isinstance(previous, str):
+        return None
+    try:
+        return validate(previous)
+    except InvalidTarget:
+        return None
+
+
+def write_target(
+    checkout: Path | str,
+    *,
+    previous_checkout: Path | str | None = None,
+) -> Path:
+    """Validate and store the live target plus optional one-level undo history.
+
+    Both paths validate BEFORE the write, so neither an unusable target nor an
+    unusable rollback destination can become persisted code-execution state.
+    The previous field is omitted when absent or equal to the new target; old
+    readers continue to consume the unchanged ``checkout`` field.
     """
     resolved = validate(str(checkout))
-    payload = json.dumps({"checkout": str(resolved)}, indent=2) + "\n"
+    previous = validate(str(previous_checkout)) if previous_checkout is not None else None
+    data = {"checkout": str(resolved)}
+    if previous is not None and previous != resolved:
+        data["previous_checkout"] = str(previous)
+    payload = json.dumps(data, indent=2) + "\n"
     path = pointer_path()
     # ``restrict_to_owner=True`` locks the temp file down BEFORE the payload
     # reaches it: the pointer is a code-execution input read at every startup,
-    # and the previous post-rename lockdown left it inheriting the directory's
-    # ACL on Windows for the whole write window (issue #5285). It implies the
+    # so it must never be readable by another account, not even for the width
+    # of the write window — locking down only after the rename would leave it
+    # inheriting the directory's ACL on Windows until then. It implies the
     # owner-only POSIX mode, so the pointer is owner-only on every platform,
     # and a lockdown failure refuses the write before the final path is
     # touched. ``atomic_write`` also creates the parent directory itself,
@@ -227,13 +267,13 @@ def restore(prior: str | None) -> bool:
             # the pointer is a code-execution input read at every startup, and
             # a rollback must not be the step that widens access to it.
             # ``restrict_to_owner=True`` locks the temp file down before the
-            # content reaches it (the previous post-rename lockdown left the
-            # restored pointer inheriting the directory's ACL on Windows for
-            # the write window, issue #5285), and a lockdown failure surfaces
-            # as the OSError this except already maps to ``False`` — before
-            # the final path is touched, so a failed rollback never publishes
-            # an unprotected pointer. The parent mkdir lives inside
-            # ``atomic_write``, after its planted-link check.
+            # content reaches it, so the restored pointer never inherits the
+            # directory's ACL on Windows even for the width of the write
+            # window, and a lockdown failure surfaces as the OSError this
+            # except already maps to ``False`` — before the final path is
+            # touched, so a failed rollback never publishes an unprotected
+            # pointer. The parent mkdir lives inside ``atomic_write``, after
+            # its planted-link check.
             atomic_write(path, prior, restrict_to_owner=True)
         return True
     except OSError:

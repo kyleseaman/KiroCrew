@@ -18,8 +18,9 @@ so the caller reads remediation instead of a raw regex. It is metadata only: it
 never participates in matching. Create-only, mirroring ``pattern`` — neither has
 an edit endpoint; you delete the rule and re-add it.
 
-Mutations run under the shared config lock, write atomically (0600), and emit a
-SEL audit entry (``ok`` on success, ``denied`` on reject). Governance
+Mutations run under the shared config lock, write atomically (owner-only
+before the payload is published), and emit a SEL audit entry (``ok`` on
+success, ``denied`` on reject). Governance
 ``commands``-scope pins force a built-in rule enabled even when the user disabled
 it or set disable-all (tightest-wins): a pinned rule cannot be turned off (409)
 and always counts as enabled in the snapshot.
@@ -46,19 +47,31 @@ from pathlib import Path
 
 from aiohttp import web
 
-from kiro_crew.apps.execution import APP_NAME_RE, builtin_app_names, trusted_app_names
+from kiro_crew.apps.execution import (
+    APP_NAME_RE,
+    _repository_grant_denied_for_binding,
+    builtin_app_names,
+    trusted_app_names,
+)
 from kiro_crew.apps.manager import disable_app, get_app, list_apps
 from kiro_crew.apps.official_catalog import CatalogUnavailable
-from kiro_crew.apps.registry import get_registry_app
+from kiro_crew.apps.registry import (
+    _entry_git_url,
+    _git_target_is_unsupported,
+    _normalize_git_target,
+    get_registry_app,
+    resolve_installed_trust_repository,
+)
 from kiro_crew.apps.routes import app_lifecycle_lock
 from kiro_crew.apps.teardown import teardown_app_runtime
 from kiro_crew.config.loader import (
+    ConfigReadError,
     KiroCrewConfig,
     _invalidate_config_cache,
     config_local_path,
     config_path,
     denied_commands_path,
-    write_config_atomically,
+    update_config_locked,
 )
 from kiro_crew.dashboard.handlers.agents import _get_config_lock
 from kiro_crew.executors import governance_executor
@@ -85,7 +98,7 @@ from kiro_crew.platform.governance_profiles import (
     resolve_active_scope,
     unknown_profile_scopes,
 )
-from kiro_crew.security import DENY_REASON_MATCH_PREFIX
+from kiro_crew.security import DENY_REASON_MATCH_PREFIX, edition_denied_rules
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +198,9 @@ def _denied_state(data: dict) -> dict:
         "disable_all": _coerce_bool(denied.get("disable_all", False), default=False),
         "disabled_ids": [i for i in disabled_ids if isinstance(i, str) and i],
         "user_added": list(user_added) if isinstance(user_added, list) else [],
+        # This function REBUILDS the object rather than passing it through, so an
+        # unlisted key is invisible to every consumer downstream. A new key must
+        # be added here or it silently does nothing.
     }
 
 
@@ -261,10 +277,28 @@ def build_denied_commands_snapshot() -> dict:
     floor_ids = floor_enforced_builtin_command_ids()
 
     builtins: list[dict] = []
-    for rule in builtin_denied_rules():
+    # Edition-contributed rules are listed in the SAME array so the panel's
+    # category grouping, counts and toggles work with no frontend change. They
+    # carry source="edition" so a consumer can tell them apart, and they are
+    # never pinned or floor-enforced: a governance pin resolves a pattern to a
+    # rule id against the static catalog only, so a pin cannot name one.
+    catalog: list[tuple[dict, bool]] = [(r, False) for r in builtin_denied_rules()]
+    catalog += [
+        (
+            {
+                "id": r.id,
+                "pattern": r.pattern,
+                "category": r.category,
+                "description": r.description,
+            },
+            True,
+        )
+        for r in edition_denied_rules()
+    ]
+    for rule, from_edition in catalog:
         rid = rule["id"]
-        is_pinned = rid in pinned
-        is_floor = rid in floor_ids
+        is_pinned = (not from_edition) and rid in pinned
+        is_floor = (not from_edition) and rid in floor_ids
         # Floor-enforced rules render forced-on even when the id somehow sits in
         # disabled_ids (state persisted before the toggle rejected it): the floor
         # consults no opt-out state, so honesty requires enabled=true.
@@ -287,6 +321,7 @@ def build_denied_commands_snapshot() -> dict:
                 "enabled": enabled,
                 "pinned": is_pinned,
                 "lock_reason": lock_reason,
+                "source": "edition" if from_edition else "builtin",
             }
         )
 
@@ -353,28 +388,30 @@ async def _write_denied_state(mutate) -> dict:
 
     ``mutate(denied: dict) -> None`` edits the opt-out object (the file root) in
     place. Runs under the shared config lock. Returns the updated object so the
-    caller can hot-reload the live HookManager. The file is written 0600 (owner-
-    only, like other keystone secrets).
+    caller can hot-reload the live HookManager.     The file is locked down to the
+    owner only on every write: 0600 on POSIX and an owner-only DACL on Windows.
+    The lockdown is applied to the temp file before any content reaches it, so
+    the keystone never exists in a world-readable file.
 
     The blocking read-modify-write (disk read, JSON (de)serialize, atomic
     replace) runs in a thread executor so it never stalls the gateway event
     loop; the async config lock still serializes concurrent mutations.
     """
-    from kiro_crew.agent import _atomic_json_write
+    from kiro_crew.atomic_write import atomic_write
+
     path: Path = denied_commands_path()
 
     def _read_modify_write() -> dict:
         denied = _read_denied_strict()
         mutate(denied)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_json_write(path, denied)
-        # Keystone file: restrict to owner (best-effort; matches other secrets).
-        try:
-            from kiro_crew.platform_compat import chmod_safe
-
-            chmod_safe(path, 0o600)
-        except Exception:
-            logger.debug("could not chmod denied_commands.json to 0600", exc_info=True)
+        # atomic_write(..., restrict_to_owner=True) refuses a linked parent
+        # before it mkdir's, then locks the temp. A mkdir here would walk
+        # through a planted link and create dirs under its target first.
+        atomic_write(
+            path,
+            json.dumps(denied, indent=2) + "\n",
+            restrict_to_owner=True,
+        )
         return denied
 
     async with _get_config_lock():
@@ -393,9 +430,7 @@ def _reload_live_hooks(request: web.Request, denied_state: dict) -> None:
     replaced from *denied_state* (the keystone file's new content). Best-effort:
     a missing context builder (e.g. in a unit test harness) is a no-op.
     """
-    import dataclasses
-
-    from kiro_crew.hooks import HooksConfig
+    from kiro_crew.hooks import HooksConfig, splice_denied_commands
 
     try:
         state = request.app["state"]
@@ -403,22 +438,13 @@ def _reload_live_hooks(request: web.Request, denied_state: dict) -> None:
         manager = getattr(builder, "hooks", None)
         if manager is None:
             return
-        # Reparse ONLY the opt-out fields from the keystone state and splice them
-        # onto the live config so the flat hook keys (auto_replies, transforms,
-        # auto_approve_tools, …) are not lost.
-        parsed = HooksConfig.from_dict({"denied_commands": denied_state})
+        # Splice ONLY the opt-out fields from the keystone state onto the live config
+        # so the flat hook keys (auto_replies, transforms, auto_approve_tools, …) are
+        # not lost. Same helper the config.json hooks reload uses from the other
+        # side, so neither write reverts the other's half.
         current = getattr(manager, "_config", None)
-        if isinstance(current, HooksConfig):
-            manager.reload(
-                dataclasses.replace(
-                    current,
-                    denied_commands_disabled_ids=parsed.denied_commands_disabled_ids,
-                    denied_commands_disable_all=parsed.denied_commands_disable_all,
-                    denied_commands_user_added=parsed.denied_commands_user_added,
-                )
-            )
-        else:
-            manager.reload(parsed)
+        base = current if isinstance(current, HooksConfig) else HooksConfig()
+        manager.reload(splice_denied_commands(base, denied_state))
     except Exception:
         logger.warning(
             "failed to hot-reload HookManager after denied-commands change", exc_info=True
@@ -459,7 +485,11 @@ async def api_denied_commands_list(request: web.Request) -> web.Response:
 
 async def api_denied_command_builtin_toggle(request: web.Request) -> web.Response:
     """PATCH /api/security/denied-commands/builtins/{id} — {enabled: bool}."""
-    from kiro_crew.security import builtin_denied_rules, floor_enforced_builtin_command_ids
+    from kiro_crew.security import (
+        builtin_denied_rules,
+        edition_denied_rules,
+        floor_enforced_builtin_command_ids,
+    )
 
     op = "security.denied_commands.builtin_toggle"
     rule_id = request.match_info["id"]
@@ -477,7 +507,10 @@ async def api_denied_command_builtin_toggle(request: web.Request) -> web.Respons
         _audit(request, operation=op, outcome="denied", resources=f"{rule_id}=bad_type")
         return web.json_response({"error": "enabled must be a boolean"}, status=400)
 
-    if rule_id not in {r["id"] for r in builtin_denied_rules()}:
+    # Union the edition-contributed ids: a rule listed in the panel must be
+    # toggleable there, or the UI offers a switch the API 404s.
+    known_ids = {r["id"] for r in builtin_denied_rules()} | {r.id for r in edition_denied_rules()}
+    if rule_id not in known_ids:
         _audit(request, operation=op, outcome="denied", resources=f"{rule_id}=unknown")
         return web.json_response({"error": "unknown builtin rule"}, status=404)
 
@@ -582,14 +615,45 @@ async def api_denied_command_user_add(request: web.Request) -> web.Response:
     # Reject catastrophic-backtracking (ReDoS) patterns before they can enter the
     # effective set: the gate runs user regexes synchronously on the event loop,
     # so an unsafe pattern like ``(a+)+$`` would freeze the gateway.
-    from kiro_crew.security import is_safe_user_regex
+    from kiro_crew.security import (
+        _DANGEROUS_AWS_FLAG_RUN,
+        _LINEARIZED_AWS_FLAG_RUN,
+        is_safe_user_regex,
+    )
 
     if not is_safe_user_regex(pattern):
-        _audit(request, operation=op, outcome="denied", resources="redos_unsafe")
-        return web.json_response(
-            {"error": "pattern rejected: unsafe (catastrophic-backtracking) regex"},
-            status=400,
+        error = "pattern rejected: unsafe (catastrophic-backtracking) regex"
+        # A user who copies a built-in pattern and tweaks it embeds the dangerous
+        # flag-run fragment verbatim and hits a dead end: the fragment is exempt
+        # from the backtracking check only as part of a COMPLETE built-in pattern
+        # (the scrub in ``is_safe_user_regex`` is builtin-gated), and a complete
+        # built-in never reaches this branch, so any pattern here is
+        # user-authored. Name the fragment so the trigger is self-explanatory --
+        # but only when it really is the trigger: the hint is emitted only if
+        # the pattern with both fragments scrubbed would pass, mirroring the
+        # builtin scrub (the linearized form is checked too for symmetry with
+        # it). ``is_safe_user_regex`` returns False on a non-compiling residue,
+        # so a misleading hint fails safe to the generic message.
+        embedded = next(
+            (
+                frag
+                for frag in (_DANGEROUS_AWS_FLAG_RUN, _LINEARIZED_AWS_FLAG_RUN)
+                if frag in pattern
+            ),
+            None,
         )
+        if embedded is not None:
+            scrubbed = pattern.replace(_DANGEROUS_AWS_FLAG_RUN, "").replace(
+                _LINEARIZED_AWS_FLAG_RUN, ""
+            )
+            if is_safe_user_regex(scrubbed):
+                error += (
+                    f"; the embedded built-in flag-run fragment '{embedded}' is"
+                    " the trigger. It is exempt only inside a complete built-in"
+                    " pattern, so remove or rewrite that fragment"
+                )
+        _audit(request, operation=op, outcome="denied", resources="redos_unsafe")
+        return web.json_response({"error": error}, status=400)
 
     # Optional operator note. Absent is the norm (and the pre-existing shape), so
     # a missing key is NOT an error — but a present-and-wrong-typed one is, to
@@ -765,6 +829,33 @@ def _trusted_list_raw(agent_raw: dict) -> list[str]:
     return [a for a in raw if isinstance(a, str) and a]
 
 
+def _trusted_local_list_raw(agent_raw: dict) -> list[str]:
+    """Explicit local grant markers from the raw base config, junk dropped."""
+    raw = agent_raw.get("apps_trusted_local", [])
+    if not isinstance(raw, list):
+        return []
+    return [a for a in raw if isinstance(a, str) and a]
+
+
+def _trusted_repositories_raw(agent_raw: dict) -> dict[str, str]:
+    """Credential-free repository bindings from the raw base config."""
+    raw = agent_raw.get("apps_trusted_repositories", {})
+    if not isinstance(raw, dict):
+        return {}
+    repositories: dict[str, str] = {}
+    for name, repository in raw.items():
+        if not isinstance(name, str) or not name or not isinstance(repository, str):
+            continue
+        # Never turn an unsupported legacy identity into a valid base-URL grant
+        # as a side effect of mutating an unrelated app's settings.
+        if _git_target_is_unsupported(repository):
+            continue
+        normalized = _normalize_git_target(repository)
+        if normalized:
+            repositories[name] = normalized
+    return repositories
+
+
 def build_trusted_apps_snapshot() -> dict:
     """Compute the snapshot returned by every trusted-apps endpoint.
 
@@ -787,7 +878,47 @@ def build_trusted_apps_snapshot() -> dict:
     """
     agent = KiroCrewConfig.load().agent
     stored = set(_trusted_list(agent))
-    effective = trusted_app_names()
+    syntactically_effective = trusted_app_names()
+    # A legacy name-only grant is no longer an execution grant for code known to
+    # come from a repository. Classify it with the same resolver used by runtime
+    # admission so the Security panel never displays a fail-closed grant as fully
+    # trusted. The name stays in ``ineffective`` and can still be revoked or
+    # replaced through the existing endpoints.
+    raw_repositories = getattr(agent, "apps_trusted_repositories", {})
+    if not isinstance(raw_repositories, dict):
+        raw_repositories = {}
+    raw_local = getattr(agent, "apps_trusted_local", [])
+    local_bindings = set(raw_local) if isinstance(raw_local, list) else set()
+    effective = set()
+    for name in syntactically_effective:
+        binding = raw_repositories.get(name, "")
+        binding = binding.strip() if isinstance(binding, str) else ""
+        repository: str | None = None
+        # A repository grant is intentionally usable before the app is installed.
+        # In that state there is no installed provenance to compare, so resolve the
+        # same authoritative row install will consume. A rebind or catalog failure
+        # moves the name to ``ineffective`` without reflecting either coordinate.
+        if binding and get_app(name) is None:
+            try:
+                entry = get_registry_app(name)
+                entry_url = _entry_git_url(entry) if entry else ""
+                repository = (
+                    ""
+                    if _git_target_is_unsupported(entry_url)
+                    else _normalize_git_target(entry_url)
+                )
+            except CatalogUnavailable:
+                repository = ""
+        if (
+            _repository_grant_denied_for_binding(
+                name,
+                binding=binding,
+                local_binding=name in local_bindings,
+                repository=repository,
+            )
+            is None
+        ):
+            effective.add(name)
     return {
         "apps": sorted(stored & effective),
         "ineffective": sorted(stored - effective),
@@ -833,7 +964,12 @@ class TrustSettingOverlayOwned(Exception):
         )
 
 
-_TRUST_SETTING_NAMES = ("apps_trusted", "apps_allow_third_party")
+_TRUST_SETTING_NAMES = (
+    "apps_trusted",
+    "apps_trusted_local",
+    "apps_trusted_repositories",
+    "apps_allow_third_party",
+)
 
 
 def _overlay_owned_trust_settings() -> list[str]:
@@ -918,26 +1054,32 @@ async def _mutate_agent_config(mutate) -> None:
     """
     def _read_modify_write() -> None:
         path = config_path()
-        raw: dict = {}
-        if path.is_file():
-            try:
-                loaded = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-                raise ConfigCorruptError(f"{path} is unreadable: {exc}") from exc
-            if not isinstance(loaded, dict):
-                raise ConfigCorruptError(f"{path} is not a JSON object")
-            raw = loaded
-        # Inside the lock, so a concurrent writer cannot add an overlay between the
-        # check and the write.
-        owned = _overlay_owned_trust_settings()
-        if owned:
-            raise TrustSettingOverlayOwned(owned)
-        agent_raw = raw.get("agent")
-        if not isinstance(agent_raw, dict):
-            agent_raw = {}
-            raw["agent"] = agent_raw
-        mutate(agent_raw)
-        write_config_atomically(path, raw)
+
+        def _apply(raw: dict) -> dict:
+            # Runs inside ``update_config_locked``'s hold on the
+            # ``<config>.json.lock`` sidecar, so neither the overlay check nor
+            # the grant edit can be separated from the write by ANY other
+            # writer -- including the CLI and other processes, which the
+            # surrounding asyncio lock cannot reach.
+            owned = _overlay_owned_trust_settings()
+            if owned:
+                raise TrustSettingOverlayOwned(owned)
+            agent_raw = raw.get("agent")
+            if not isinstance(agent_raw, dict):
+                agent_raw = {}
+                raw["agent"] = agent_raw
+            mutate(agent_raw)
+            return raw
+
+        try:
+            update_config_locked(path, mutate=_apply, stamp_meta=False)
+        except ConfigReadError as exc:
+            # Same refusal as before, reported through this module's own error
+            # type so callers keep turning it into a coded 409. The locked read
+            # fails closed by default (``on_corrupt="fail"``), so the existing
+            # file is never replaced with defaults -- an absent file is still a
+            # genuine empty starting point and proceeds.
+            raise ConfigCorruptError(f"{path} is unreadable: {exc}") from exc
         # save() would have done this; a raw write must do it explicitly or the
         # grant does not take effect until a restart — and a REVOKE that does not
         # take effect is the exact failure this feature exists to prevent.
@@ -984,6 +1126,49 @@ async def api_trusted_app_grant(request: web.Request) -> web.Response:
             status=400,
         )
 
+    # The repository is a consent proof, not authority: the server resolves the
+    # current target independently below. An empty body keeps local installed
+    # apps (which have no repository binding) compatible, while a malformed
+    # proof is refused before any config mutation.
+    body: object = {}
+    if request.can_read_body:
+        try:
+            body = await request.json()
+        except Exception:
+            _audit(request, operation=op, outcome="denied", resources=f"{name}=invalid_json")
+            return web.json_response(
+                {
+                    "error": "repository consent proof must be valid JSON",
+                    "code": "invalid_repository_consent",
+                },
+                status=400,
+            )
+    if not isinstance(body, dict):
+        body = {}
+    consent_raw = body.get("repository")
+    if consent_raw is not None and not isinstance(consent_raw, str):
+        _audit(request, operation=op, outcome="denied", resources=f"{name}=bad_repository")
+        return web.json_response(
+            {
+                "error": "repository consent proof must be a string",
+                "code": "invalid_repository_consent",
+            },
+            status=400,
+        )
+    if _git_target_is_unsupported(consent_raw or ""):
+        _audit(request, operation=op, outcome="denied", resources=f"{name}=bad_repository")
+        return web.json_response(
+            {
+                "error": (
+                    "repository consent proof contains an unsupported query or fragment "
+                    "or an ambiguous Git transport identity"
+                ),
+                "code": "invalid_repository_consent",
+            },
+            status=400,
+        )
+    consent_repository = _normalize_git_target(consent_raw or "")
+
     # Validation and the write must be ONE critical section, held against the
     # same per-app lock every other lifecycle transition takes. Uninstall's
     # grant-removal precondition and this handler's existence check are both
@@ -1002,16 +1187,28 @@ async def api_trusted_app_grant(request: web.Request) -> web.Response:
     async with app_lifecycle_lock(name):
         # Offloaded: both read from disk (installed.json + app.json; the registry
         # file and its cached external-index snapshots).
-        def _is_known_app() -> bool:
-            if get_app(name) is not None:
-                return True
+        def _known_app_repository() -> tuple[bool, str]:
+            installed = get_app(name)
+            if installed is not None:
+                try:
+                    return resolve_installed_trust_repository(installed)
+                except CatalogUnavailable:
+                    # A legacy registry install cannot safely degrade to a
+                    # name-only grant when its current source is unavailable.
+                    return False, ""
             try:
-                return get_registry_app(name) is not None
+                entry = get_registry_app(name)
             except CatalogUnavailable:
                 # Resolution was refused because the catalog could not be consulted.
                 # Treat as not-known: this gates an execution grant, so declining
                 # while the source cannot be confirmed is the safe direction.
-                return False
+                return False, ""
+            if entry is None:
+                return False, ""
+            entry_url = _entry_git_url(entry)
+            if _git_target_is_unsupported(entry_url):
+                return False, ""
+            return True, _normalize_git_target(entry_url)
 
         # Whether the app is INSTALLED right now, kept separate from "known". A
         # registry-only name is grantable on purpose (the install-consent flow grants
@@ -1020,7 +1217,8 @@ async def api_trusted_app_grant(request: web.Request) -> web.Response:
         # after the write is the race below.
         was_installed = await _run_off_loop(lambda: get_app(name) is not None)
 
-        if not await _run_off_loop(_is_known_app):
+        known, repository = await _run_off_loop(_known_app_repository)
+        if not known:
             _audit(request, operation=op, outcome="denied", resources=f"{name}=unknown")
             return web.json_response(
                 {
@@ -1028,6 +1226,28 @@ async def api_trusted_app_grant(request: web.Request) -> web.Response:
                     "code": "app_not_installed",
                 },
                 status=404,
+            )
+
+        # Bind the click to what the modal actually showed. The registry may
+        # legitimately publish both ``repo`` (display/legacy alias) and
+        # ``gitUrl`` (the effective clone URL); only the latter wins through
+        # ``_entry_git_url`` above. A stale or compromised client cannot replace
+        # that server-side result — it can only prove it displayed the same one.
+        # Compare even when one side is empty: an app changing between a local
+        # install and a repository-backed source is also a changed consent scope.
+        if consent_repository != repository:
+            reason = "missing_repository" if repository and not consent_repository else "repository_changed"
+            _audit(request, operation=op, outcome="denied", resources=f"{name}={reason}")
+            return web.json_response(
+                {
+                    "error": (
+                        "repository consent proof is required; refresh the app listing and review it"
+                        if reason == "missing_repository"
+                        else "app repository changed since the consent dialog was opened; refresh and review it"
+                    ),
+                    "code": "app_trust_repository_mismatch",
+                },
+                status=409,
             )
 
         # A builtin needs no grant (shipped package code is exempt at the gate), and
@@ -1055,6 +1275,19 @@ async def api_trusted_app_grant(request: web.Request) -> web.Response:
             if name not in current:
                 current.append(name)
             agent_raw["apps_trusted"] = current
+            repositories = _trusted_repositories_raw(agent_raw)
+            local_bindings = _trusted_local_list_raw(agent_raw)
+            if repository:
+                repositories[name] = repository
+                local_bindings = [a for a in local_bindings if a != name]
+            else:
+                # Re-granting a local app under a formerly registry-owned name
+                # must not retain a stale binding from that prior occupant.
+                repositories.pop(name, None)
+                if name not in local_bindings:
+                    local_bindings.append(name)
+            agent_raw["apps_trusted_local"] = local_bindings
+            agent_raw["apps_trusted_repositories"] = repositories
 
         try:
             await _mutate_agent_config(_mutate)
@@ -1102,6 +1335,12 @@ async def api_trusted_app_grant(request: web.Request) -> web.Response:
             agent_raw["apps_trusted"] = [
                 a for a in _trusted_list_raw(agent_raw) if a != name
             ]
+            repositories = _trusted_repositories_raw(agent_raw)
+            repositories.pop(name, None)
+            agent_raw["apps_trusted_local"] = [
+                a for a in _trusted_local_list_raw(agent_raw) if a != name
+            ]
+            agent_raw["apps_trusted_repositories"] = repositories
 
         try:
             await _mutate_agent_config(_undo)
@@ -1266,6 +1505,12 @@ async def api_trusted_app_revoke(request: web.Request) -> web.Response:
             agent_raw["apps_trusted"] = [
                 a for a in _trusted_list_raw(agent_raw) if a != name
             ]
+            repositories = _trusted_repositories_raw(agent_raw)
+            repositories.pop(name, None)
+            agent_raw["apps_trusted_local"] = [
+                a for a in _trusted_local_list_raw(agent_raw) if a != name
+            ]
+            agent_raw["apps_trusted_repositories"] = repositories
 
         try:
             await _mutate_agent_config(_mutate)
@@ -1525,15 +1770,14 @@ async def _stop_apps_running_on_blanket_trust(
         # the apps whose recorded state was least trustworthy from the sweep that
         # exists to stop them.
         #
-        # Builtin exemption comes from `builtin_app_names()` ALONE. The candidate
-        # query used to also skip `origin == "builtin"`, but `origin` is a field of
-        # the app's own `installed.json` record — writable by any app trusted to run
-        # code — so a trusted app could stamp itself first-party and walk out of the
-        # sweep that exists to stop it. `builtin_app_names()` cannot be forged: it
-        # requires a SHIPPED `app.json` to declare the name, and its own contract is
-        # that `installed.json` is consulted only to REMOVE trust, never to widen
-        # it. Reading `origin` here inverted exactly that rule.
-        granted = trusted_app_names()
+        # Builtin exemption comes from `builtin_app_names()` ALONE, never from
+        # `origin == "builtin"`: `origin` is a field of the app's own
+        # `installed.json` record — writable by any app trusted to run code — so a
+        # trusted app could stamp itself first-party and walk out of the sweep that
+        # exists to stop it. `builtin_app_names()` cannot be forged: it requires a
+        # SHIPPED `app.json` to declare the name, and its own contract is that
+        # `installed.json` is consulted only to REMOVE trust, never to widen it.
+        granted = set(build_trusted_apps_snapshot()["apps"])
         builtins = builtin_app_names()
         return [
             app["name"]
@@ -1623,8 +1867,8 @@ def _serialize_ruleset(value: object) -> dict:
         return {
             "mode": "intersect",
             "components": [
-                _serialize_ruleset(value.ceiling),
-                _serialize_ruleset(value.profile),
+                _serialize_ruleset(value.outer),
+                _serialize_ruleset(value.inner),
             ],
         }
     return {}
@@ -1719,6 +1963,40 @@ def _other_bound_surfaces() -> list[str]:
     except Exception:
         logger.warning("could not enumerate bound surfaces", exc_info=True)
         return []
+
+
+def _distribution_posture() -> dict:
+    """Central-policy-distribution posture for the viewer.  Never raises.
+
+    A thin, total wrapper over
+    :func:`kiro_crew.platform.policy_distribution.distribution_posture`, which is
+    already posture-only (a scheme, never the URL; enums, never prose).  It exists
+    for two reasons the caller cannot supply.
+
+    It must not raise, because it is called from BOTH literals in the snapshot
+    below — including the fail-safe one, whose whole job is to answer when
+    something else already went wrong.
+
+    And it must not FETCH.  This snapshot is browser-triggerable and the viewer
+    repolls it every 30 seconds, so a network round trip here would put the fleet's
+    policy endpoint behind an open dashboard tab.  ``distribution_posture`` reads
+    only the parsed pins, the on-disk cache metadata and the refresher's in-memory
+    record — the background refresher is what talks to the network.
+
+    The degraded return carries an ``error_code``, not a bare ``configured: False``.
+    The viewer renders the distribution block on ``configured || error_code``, so
+    without the code this branch would render NOTHING — and a centrally-governed
+    host whose posture could not be read would show the reassuring "no enterprise
+    policy in effect" card, the exact confusion this field was added to remove.
+    """
+    try:
+        from kiro_crew.platform.policy_distribution import distribution_posture
+
+        return distribution_posture()
+    except Exception:
+        logger.warning("policy distribution posture unavailable", exc_info=True)
+        # The import may be what failed, so the code cannot come from the module.
+        return {"configured": False, "error_code": "misconfigured"}
 
 
 def build_governance_policy_snapshot() -> dict:
@@ -1836,6 +2114,22 @@ def build_governance_policy_snapshot() -> dict:
             "unknown_profile_scopes": {
                 stem: sorted(scopes) for stem, scopes in unknown_profile_scopes().items()
             },
+            # Whether this host's ceiling is fetched from a central source, and how
+            # that fetch is going. The first field here that is not about the
+            # ceiling's CONTENT but about its PROVENANCE, and it earns the space
+            # because the alternative is worse: a host configured to follow a fleet
+            # policy whose first fetch has not landed has no policy and no profile,
+            # so without this the viewer renders a reassuring "no enterprise policy
+            # in effect" for a machine that is supposed to have one.
+            #
+            # POSTURE ONLY, same contract as the fields above and then some:
+            # ``distribution_posture`` reports the source's SCHEME and never its
+            # URL. A stem was judged not to be rule content; an endpoint is a
+            # stronger claim — it is the fleet's control plane, and this page is
+            # reachable by the agent's own browser tooling, so naming it would tell
+            # a prompt-injected agent where to aim. Every value is a number, a
+            # boolean, or a machine-readable enum, so no English ships in this body.
+            "distribution": _distribution_posture(),
             "unavailable": False,
             "scopes": scopes,
         }
@@ -1850,6 +2144,10 @@ def build_governance_policy_snapshot() -> dict:
             "other_bound_surfaces": [],
             "fallback_profiles": [],
             "unknown_profile_scopes": {},
+            # Present on the fail-safe literal too: the frontend reads this key
+            # unconditionally, and a host that could not resolve its governance is
+            # exactly when an operator needs to be told where its ceiling comes from.
+            "distribution": _distribution_posture(),
             "unavailable": True,
             "scopes": [],
         }

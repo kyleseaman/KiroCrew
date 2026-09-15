@@ -21,8 +21,15 @@ from kiro_crew.acp.types import TurnUsage
 from kiro_crew.config.paths import data_home, kiro_sessions_dir
 from kiro_crew.context_blocks import USER_LABEL
 from kiro_crew.hooks import validate_file_path
+from kiro_crew.jsonl_util import bounded_records
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.link import telemetry_channel_of
+from kiro_crew.metrics.turns import (
+    OUTCOME_UNCLASSIFIED,
+    emit_turn_duration,
+    emit_turn_usage,
+    turn_outcome,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -193,8 +200,8 @@ def slot_spend(days: int = SPEND_WINDOW_DAYS) -> dict[str, dict[str, float]]:
 
     for path in paths:
         try:
-            with path.open() as fh:
-                for line in fh:
+            with path.open("rb") as fh:
+                for line in bounded_records(fh, path, label="usage"):
                     try:
                         obj = json.loads(line)
                     except ValueError:
@@ -204,13 +211,8 @@ def slot_spend(days: int = SPEND_WINDOW_DAYS) -> dict[str, dict[str, float]]:
                     # Per-row timestamp cutoff: the shard file date is a coarse
                     # filter (a shard can span midnight), so rows older than the
                     # cutoff must still be excluded individually.
-                    ts_raw = str(obj.get("ts") or "")
-                    try:
-                        ts_str = ts_raw[:-1] + "+00:00" if ts_raw.endswith("Z") else ts_raw
-                        ts_epoch = datetime.fromisoformat(ts_str).timestamp()
-                    except (ValueError, TypeError, AttributeError):
-                        continue
-                    if ts_epoch < cutoff:
+                    ts_epoch = _parse_row_ts(str(obj.get("ts") or ""))
+                    if ts_epoch is None or ts_epoch < cutoff:
                         continue
                     slot = str(obj.get("slot") or "")
                     if not slot or not is_session_slot(slot):
@@ -298,6 +300,14 @@ _BACKGROUND_CHANNELS = frozenset(
         "heartbeat",
         "taskrunner",
         "workflow_pool",
+        # A workflow STAGE's own session, which gained the ``workflow`` label
+        # when the turn histogram needed one (it read ``other`` before, pooled
+        # with unrecognised key shapes). Listed deliberately rather than left to
+        # this set's fail-open behaviour: ``workflow_pool`` — the pool those
+        # stages run on — is already background, and a stage is the same kind of
+        # thing, so surfacing it as its own new panel category would split one
+        # concept across two rows.
+        "workflow",
         "background",
         "secretary",
     }
@@ -306,8 +316,8 @@ _BACKGROUND_CHANNELS = frozenset(
 #: The one category that can be opened from the dashboard. Kept separate from
 #: the category list because "is a session" and "has a route" are different
 #: questions — a Telegram thread is a first-class session with nowhere for a
-#: dashboard link to go, which is exactly the bug the old "titled -> link it"
-#: rule shipped.
+#: dashboard link to go, which is exactly what a "titled -> link it" rule gets
+#: wrong.
 NAVIGABLE_CATEGORY = "dashboard"
 
 
@@ -397,8 +407,8 @@ def context_occupancy(days: int = 14) -> dict[str, Any]:
 
     for shard_path in shard_paths:
         try:
-            with shard_path.open() as fh:
-                for line in fh:
+            with shard_path.open("rb") as fh:
+                for line in bounded_records(fh, shard_path, label="usage"):
                     try:
                         obj = json.loads(line)
                     except ValueError:
@@ -409,14 +419,9 @@ def context_occupancy(days: int = 14) -> dict[str, Any]:
                     window = _coerce_int(obj.get("context_window"))
                     if used <= 0 or window <= 0:
                         continue
-                    ts_epoch = 0.0
-                    ts_raw = obj.get("ts") or ""
-                    try:
-                        ts_str = ts_raw[:-1] + "+00:00" if ts_raw.endswith("Z") else ts_raw
-                        ts_epoch = datetime.fromisoformat(ts_str).timestamp()
-                    except (ValueError, TypeError, AttributeError):
-                        continue
-                    if ts_epoch < cutoff:
+                    ts_raw = str(obj.get("ts") or "")
+                    ts_epoch = _parse_row_ts(ts_raw)
+                    if ts_epoch is None or ts_epoch < cutoff:
                         continue
                     slot = str(obj.get("slot") or "unknown")
                     # Before the percentile sample, not after: the spread and the
@@ -520,19 +525,69 @@ TURN_USAGE_FIELDS: tuple[str, ...] = (
 )
 
 
+def _parse_row_dt(raw: Any) -> datetime | None:
+    """A row's timestamp as a ``datetime``, or ``None`` when unparseable.
+
+    THE one spelling for reading a stored row timestamp (``Z`` rewritten to
+    ``+00:00`` for py3.10's ``fromisoformat``; a naive stamp left naive so a
+    caller's ``.timestamp()`` reads it in local time): every reader of the same
+    rows derives from this helper, because two readers that disagree about
+    which rows a window contains produce numbers that cannot be reconciled.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        ts_str = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        return datetime.fromisoformat(ts_str)
+    except ValueError:
+        return None
+
+
 def _parse_row_ts(raw: str) -> float | None:
     """A shard row's ``ts`` as an epoch, or ``None`` when unparseable.
 
-    The SAME spelling as this module's other shard-ts readers (``Z`` rewritten
-    to ``+00:00`` for py3.10's ``fromisoformat``; a naive stamp interpreted in
-    local time via ``.timestamp()``): two readers of the same rows must not
-    disagree about which rows a window contains.
+    ``timestamp()`` is guarded too: a parseable-but-extreme stamp (year 1)
+    raises ``ValueError`` on local-time conversion, and a corrupt row must
+    never take a read path down.
     """
-    try:
-        ts_str = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
-        return datetime.fromisoformat(ts_str).timestamp()
-    except (ValueError, TypeError, AttributeError):
+    dt = _parse_row_dt(raw)
+    if dt is None:
         return None
+    try:
+        return dt.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _parse_row_day(raw: Any) -> str | None:
+    """A row timestamp's LOCAL calendar day (``YYYY-MM-DD``), or ``None``.
+
+    Same guard rationale as :func:`_parse_row_ts`: ``astimezone()`` performs
+    the same local-time conversion and raises on the same extreme stamps.
+    """
+    dt = _parse_row_dt(raw)
+    if dt is None:
+        return None
+    try:
+        return dt.astimezone().strftime("%Y-%m-%d")
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _usage_number(value: Any) -> int | float | None:
+    """A shard row's numeric field, or ``None`` when it is not a usable number.
+
+    ints are accepted directly: ``math.isfinite`` would convert to float first
+    and an oversized int raises ``OverflowError`` (a corrupt row must never 500
+    a read path). bool is an int subclass and is not a count.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return None
 
 
 def slot_turn_usage(
@@ -570,8 +625,8 @@ def slot_turn_usage(
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp()
     for shard_path in _shards_in_window(days):
         try:
-            with shard_path.open() as fh:
-                for line in fh:
+            with shard_path.open("rb") as fh:
+                for line in bounded_records(fh, shard_path, label="usage"):
                     try:
                         obj = json.loads(line)
                     except ValueError:
@@ -592,16 +647,8 @@ def slot_turn_usage(
                         "model": str(obj.get("model") or ""),
                     }
                     for field in TURN_USAGE_FIELDS:
-                        value = obj.get(field)
-                        # ints are accepted directly: math.isfinite would convert
-                        # to float first and an oversized int raises OverflowError
-                        # (a corrupt row must never 500 the endpoint). bool is an
-                        # int subclass and is not a count.
-                        if isinstance(value, bool):
-                            continue
-                        if isinstance(value, int) or (
-                            isinstance(value, float) and math.isfinite(value)
-                        ):
+                        value = _usage_number(obj.get(field))
+                        if value is not None:
                             row[field] = value
                     turns.append(row)
         except (OSError, UnicodeDecodeError):
@@ -614,6 +661,9 @@ def context_trace(slot: str, days: int = 14) -> dict[str, Any]:
 
     Reads the ``ctx_blocks`` / ``phase`` fields ``persist_token_record`` writes
     each turn and returns them in chronological order, plus per-block totals.
+    Each turn also carries the row's ``credits`` and ``duration_ms`` when the
+    shard recorded usable numbers: injection and billing live on the same row,
+    so the drill-down answers "what was injected and what it cost" in one read.
 
     Kept out of the OTEL pipeline for the same reason as
     :func:`context_occupancy`: this is per-session, per-turn detail, and slot
@@ -637,8 +687,8 @@ def context_trace(slot: str, days: int = 14) -> dict[str, Any]:
     totals: dict[str, int] = {}
     for shard_path in _shards_in_window(days):
         try:
-            with shard_path.open() as fh:
-                for line in fh:
+            with shard_path.open("rb") as fh:
+                for line in bounded_records(fh, shard_path, label="usage"):
                     try:
                         obj = json.loads(line)
                     except ValueError:
@@ -655,17 +705,24 @@ def context_trace(slot: str, days: int = 14) -> dict[str, Any]:
                         continue
                     for label, size in blocks.items():
                         totals[label] = totals.get(label, 0) + size
-                    turns.append(
-                        {
-                            "ts": str(obj.get("ts") or ""),
-                            "phase": str(obj.get("phase") or ""),
-                            "blocks": blocks,
-                            "total_chars": sum(blocks.values()),
-                            "context_used": _coerce_int(obj.get("context_used")),
-                            "context_window": _coerce_int(obj.get("context_window")),
-                            "model": str(obj.get("model") or ""),
-                        }
-                    )
+                    turn_row: dict[str, Any] = {
+                        "ts": str(obj.get("ts") or ""),
+                        "phase": str(obj.get("phase") or ""),
+                        "blocks": blocks,
+                        "total_chars": sum(blocks.values()),
+                        "context_used": _coerce_int(obj.get("context_used")),
+                        "context_window": _coerce_int(obj.get("context_window")),
+                        "model": str(obj.get("model") or ""),
+                    }
+                    # The same shard row also carries the turn's billing; the
+                    # trace returns it rather than making the panel walk the
+                    # shards a second time through the usage-turns reader and
+                    # re-join what was never apart.
+                    for field in ("credits", "duration_ms"):
+                        value = _usage_number(obj.get(field))
+                        if value is not None:
+                            turn_row[field] = value
+                    turns.append(turn_row)
         except (OSError, UnicodeDecodeError):
             continue
 
@@ -751,8 +808,8 @@ def cost_breakdown(days: int = SPEND_WINDOW_DAYS) -> dict[str, Any]:
 
     for shard_path in shard_paths:
         try:
-            with shard_path.open() as fh:
-                for line in fh:
+            with shard_path.open("rb") as fh:
+                for line in bounded_records(fh, shard_path, label="usage"):
                     try:
                         obj = json.loads(line)
                     except ValueError:
@@ -760,12 +817,8 @@ def cost_breakdown(days: int = SPEND_WINDOW_DAYS) -> dict[str, Any]:
                     if not isinstance(obj, dict) or obj.get("_type") != "tokens":
                         continue
                     ts_raw = str(obj.get("ts") or "")
-                    try:
-                        ts_str = ts_raw[:-1] + "+00:00" if ts_raw.endswith("Z") else ts_raw
-                        ts_epoch = datetime.fromisoformat(ts_str).timestamp()
-                    except (ValueError, TypeError, AttributeError):
-                        continue
-                    if ts_epoch < prior_cutoff:
+                    ts_epoch = _parse_row_ts(ts_raw)
+                    if ts_epoch is None or ts_epoch < prior_cutoff:
                         continue
 
                     credits = float(obj.get("credits") or 0.0)
@@ -1329,6 +1382,13 @@ def persist_token_record(
     """Append a token usage record to today's shard under
     ``<data home>/usage/tokens/YYYY-MM-DD.jsonl`` (synchronous).
 
+    Has NO caller today, and unlike :func:`persist_token_record_async` it does
+    not emit ``kirocrew.turn.duration``. A future direct caller of this variant
+    would therefore write a usage row for a turn that appears in no latency or
+    fault-rate reading — silently reopening the gap the async variant's emit
+    closed. If you reach for this for a real per-turn path, emit there too (or
+    call the async variant).
+
     The ``provider`` field tags the source LLM backend (acp,
     claude_code, bedrock) so the dashboard chart can filter by provider.
     ``surface`` / ``agent`` tag the dispatch origin and resolved agent, and
@@ -1387,6 +1447,7 @@ async def persist_token_record_async(
     phase: str = "",
     app: str = "",
     model_source: object = None,
+    emit_metric: bool = True,
 ) -> None:
     """Async variant: builds the record on-loop, offloads the file write.
 
@@ -1397,6 +1458,32 @@ async def persist_token_record_async(
     See :func:`persist_token_record` for the ``surface`` / ``agent`` /
     ``context_used`` / ``context_window`` / ``elapsed_ms`` / ``model_source``
     fields.
+
+    ALSO emits the per-turn OTEL family — ``kirocrew.turn.duration`` plus the
+    turn's usage (``kirocrew.turn.tokens`` and whichever of
+    ``kirocrew.turn.credits`` / ``kirocrew.turn.cost_usd`` the backend billed in)
+    — and this is the only place that does. Being the one call every dispatch
+    surface already makes once per turn is exactly why: an emit sited in
+    ``chat_runner`` beside the dashboard turn loop leaves cron, heartbeat, memory
+    consolidation, subagents, task-runner steps, workflow stages and every
+    messaging channel absent from turn latency and fault rate entirely — and
+    absent does not read as absent, it reads as healthy. See
+    :mod:`kiro_crew.metrics.turns`.
+
+    Every sample reuses the BUILT record's own fields — ``duration_ms``, the
+    token counts, ``credits``/``cost``, and the RESOLVED ``model``/``provider`` —
+    so the row store and the metrics cannot disagree about one turn, the property
+    the record builder's docstring already claims and now enforces by
+    construction rather than by two call sites being handed the same variables.
+
+    ``emit_metric=False`` says the CALLER owns this turn's samples. The
+    dashboard passes it because its persist call sits behind a
+    ``usage_has_billing`` gate: a turn that timed out having billed nothing
+    writes no row, and letting the row's absence swallow the samples would drop
+    exactly the faults ``fault_rate`` exists to count. It emits unconditionally
+    itself instead, which is also how its ``stall_exhausted`` refinement reaches
+    the histogram. Do NOT set this without emitting — the turn then goes
+    unrecorded, which reads as a healthy gap rather than a missing one.
     """
     try:
         model = _resolve_model(model, model_source)
@@ -1416,9 +1503,68 @@ async def persist_token_record_async(
             phase=phase,
             app=app,
         )
+        # Before the offloaded write: a file-write failure must not cost the
+        # latency sample, which needs nothing from disk.
+        if emit_metric:
+            _emit_turn_histogram(record, slot_key, event)
         await asyncio.to_thread(_write_token_record, record, now)
     except Exception:
         logger.debug("Failed to persist token record for slot %s", slot_key, exc_info=True)
+
+
+def _emit_turn_histogram(
+    record: dict,
+    slot_key: str,
+    event: object,
+) -> None:
+    """Emit this turn's OTEL samples from a built record.
+
+    ``kirocrew.turn.duration`` plus the turn's usage family
+    (``kirocrew.turn.tokens`` and whichever of ``kirocrew.turn.credits`` /
+    ``kirocrew.turn.cost_usd`` the backend billed in). Split out so the emit is
+    one statement in the persist path and can be asserted directly by a test
+    without writing a row.
+
+    Reads every value off the RECORD rather than recomputing from
+    ``event``/``elapsed_ms``: the builder already applies the
+    provider-reported-wins-else-wall-clock rule for the duration and already
+    coerces the usage fields, so duplicating either here is how the row store and
+    the metrics would come to disagree about one turn. ``model`` and ``provider``
+    come from the same place for the same reason — the record's ``model`` is the
+    RESOLVED one (``_resolve_model``), so the attribute names the model that ran
+    rather than the alias the caller asked for.
+
+    An ABSENT ``stop_reason`` attribute and a ``None``/empty one mean different
+    things and must not collapse. A bare ``TurnUsage`` has no such attribute and
+    cannot say how its turn ended (``unclassified``); an ``LLMEvent`` whose
+    ``stop_reason`` is ``None`` is reporting a CLEAN turn, which is what the acp
+    path leaves on a normal completion. The distinction lives here rather than in
+    ``turn_outcome`` because only this layer can see whether the attribute exists
+    at all — and it must not be resolved by a default: labelling the bare-usage
+    case ``ok`` claims successes nobody observed, while labelling it ``unknown``
+    puts it in ``telemetry._TERMINAL_FAULT_OUTCOMES`` and invents a fault for
+    every clean background turn.
+    """
+    _MISSING = object()
+    stop = getattr(event, "stop_reason", _MISSING)
+    outcome = OUTCOME_UNCLASSIFIED if stop is _MISSING else turn_outcome(stop)  # type: ignore[arg-type]  # noqa: E501
+    model = str(record.get("model") or "")
+    provider = str(record.get("provider") or "")
+    emit_turn_duration(
+        record.get("duration_ms"),
+        session_key=slot_key,
+        outcome=outcome,
+        model=model,
+        provider=provider,
+    )
+    emit_turn_usage(
+        input_tokens=record.get("input"),
+        output_tokens=record.get("output"),
+        credits=record.get("credits"),
+        cost_usd=record.get("cost"),
+        model=model,
+        provider=provider,
+    )
 
 
 def _parse_token_history() -> dict[str, Any]:
@@ -1486,27 +1632,19 @@ def _parse_token_history() -> dict[str, Any]:
 
     for shard_path in shard_paths:
         try:
-            with shard_path.open() as fh:
-                for line in fh:
+            with shard_path.open("rb") as fh:
+                for line in bounded_records(fh, shard_path, label="usage"):
                     try:
                         obj = json.loads(line)
                     except ValueError:
                         continue
                     if not isinstance(obj, dict) or obj.get("_type") != "tokens":
                         continue
-                    day = None
-                    if "ts" in obj:
-                        try:
-                            ts_str = obj["ts"]
-                            if ts_str.endswith("Z"):
-                                ts_str = ts_str[:-1] + "+00:00"
-                            ts_dt = datetime.fromisoformat(ts_str)
-                            if ts_dt.timestamp() < cutoff:
-                                continue
-                            day = ts_dt.astimezone().strftime("%Y-%m-%d")
-                        except (ValueError, TypeError, AttributeError):
-                            pass
-                    if not day:
+                    ts_epoch = _parse_row_ts(str(obj.get("ts") or ""))
+                    if ts_epoch is None or ts_epoch < cutoff:
+                        continue
+                    day = _parse_row_day(obj.get("ts"))
+                    if day is None:
                         continue
                     inp = obj.get("input", 0)
                     out = obj.get("output", 0)
@@ -1648,8 +1786,6 @@ def _parse_token_history() -> dict[str, Any]:
 def _parse_sessions() -> dict:
     """Parse local kiro session files for usage analytics."""
     sessions_dir = _sessions_dir()
-    if not sessions_dir.exists():
-        return {"error": "No sessions directory"}
 
     cutoff = time.time() - (30 * 86400)
     daily: Counter = Counter()
@@ -1659,13 +1795,34 @@ def _parse_sessions() -> dict:
     total_msgs = 0
     total_tools = 0
     all_time_sessions = 0
+    # Count of transcripts that did NOT load for any reason (validator refusal,
+    # stat failure, read failure) -- surfaced so the page can say the totals are
+    # incomplete instead of rendering a silent under-count. The name matches the
+    # payload/frontend contract; it is the did-not-load total.
+    refused_transcripts = 0
     now_dt = datetime.now()
     today_str = now_dt.strftime("%Y-%m-%d")
 
+    # Set when the directory could not be read at all. Carried ALONGSIDE the
+    # statistics rather than instead of them: every consumer of this payload
+    # reads the period keys unconditionally, so an error-only object is not a
+    # degraded answer, it is a differently-shaped one.
+    read_error: dict[str, str] = {}
     try:
         entries = list(sessions_dir.iterdir())
+    except FileNotFoundError:
+        # First-run homes have no transcript directory yet; use the same
+        # complete zero statistics as an existing, empty directory.
+        entries = []
     except OSError as exc:
-        return {"error": f"Cannot read sessions directory: {exc}"}
+        # The OSError carries a filesystem path; keep it server-side and report a
+        # generic message (the ``error`` field is rendered verbatim in the UI).
+        logger.warning("usage: cannot read sessions directory: %s", exc)
+        entries = []
+        read_error = {
+            "error": "cannot read sessions directory",
+            "code": "sessions_dir_unreadable",
+        }
 
     for f in entries:
         if f.suffix != ".jsonl":
@@ -1673,11 +1830,26 @@ def _parse_sessions() -> dict:
         # Validate path through hooks.py (resolves symlinks, checks sensitive)
         resolved_str = validate_file_path(str(f))
         if resolved_str is None:
+            # Counted, not swallowed: a refusal here is indistinguishable
+            # from an idle account in the rendered numbers, and on a
+            # roaming-profile (UNC) home EVERY transcript lands in this branch --
+            # so the page reports a confident zero with nothing anywhere to say
+            # why. Aggregated after the loop rather than logged per file, because
+            # that failure mode refuses all of them. Admitting the transcript dir
+            # to the UNC gate -- which is what would make the count correct
+            # rather than merely explained -- is deferred; it needs a resolution
+            # that refuses links atomically first.
+            refused_transcripts += 1
             continue
         resolved = Path(resolved_str)
         try:
             mtime = resolved.stat().st_mtime
         except OSError:
+            # A transcript that validated but cannot be stat'd did not load, so
+            # it is dropped from the counts exactly like a refusal. Count
+            # it in the same total: the warning's absence promises complete data,
+            # so every did-not-load branch must feed it, not just the UNC refusal.
+            refused_transcripts += 1
             continue
         all_time_sessions += 1
         if mtime < cutoff:
@@ -1687,28 +1859,26 @@ def _parse_sessions() -> dict:
         msgs = 0
         tools = 0
         try:
-            with resolved.open() as fh:
-                for line in fh:
+            with resolved.open("rb") as fh:
+                for line in bounded_records(fh, resolved, label="usage.sessions"):
                     try:
                         obj = json.loads(line)
                     except ValueError:
                         continue
                     if not isinstance(obj, dict):
                         continue
-                    if day is None and "timestamp" in obj:
-                        try:
-                            ts_str = obj["timestamp"]
-                            if ts_str.endswith("Z"):
-                                ts_str = ts_str[:-1] + "+00:00"
-                            day = datetime.fromisoformat(ts_str).astimezone().strftime("%Y-%m-%d")
-                        except (ValueError, TypeError, AttributeError):
-                            pass
+                    if day is None:
+                        day = _parse_row_day(obj.get("timestamp"))
                     kind = obj.get("kind", "")
                     if kind in ("Prompt", "AssistantMessage"):
                         msgs += 1
                     elif kind == "ToolResults":
                         tools += 1
         except (OSError, UnicodeDecodeError):
+            # Same as the stat branch above: a transcript that could not be read
+            # did not load, so it counts toward the incomplete-data warning
+            # rather than vanishing from the totals.
+            refused_transcripts += 1
             continue
 
         if day is None:
@@ -1720,6 +1890,18 @@ def _parse_sessions() -> dict:
         daily_tools[day] += tools
         total_msgs += msgs
         total_tools += tools
+
+    if refused_transcripts:
+        # Server-side only: %s of a Path is a filesystem path, which the
+        # returned payload deliberately never carries (see the iterdir handler
+        # above). Counts every did-not-load branch (validator refusal, stat
+        # failure, read failure), not just the UNC refusal.
+        logger.warning(
+            "usage: %d transcript(s) could not be loaded in %s; "
+            "the reported session counts exclude them",
+            refused_transcripts,
+            sessions_dir,
+        )
 
     # Build daily history sorted by date
     all_days = sorted(set(daily.keys()))
@@ -1765,6 +1947,18 @@ def _parse_sessions() -> dict:
         },
         "avg_msgs_per_session": round(total_msgs / max(total_sessions, 1), 1),
         "avg_tools_per_session": round(total_tools / max(total_sessions, 1), 1),
+        # How many transcripts the path validator refused. Carried in
+        # the payload -- not just the server log -- so the page can say the
+        # count is incomplete instead of rendering a confident zero. On a
+        # roaming-profile (UNC) home this is every transcript, so a zero
+        # session count with a positive refusal count is the exact silent
+        # failure this field makes visible.
+        "refused_transcripts": refused_transcripts,
+        # Present only when the directory read itself failed. ``api_kiro_usage``
+        # keys its no-cache decision on this, and the zeros above are then a
+        # SHAPE, not a measurement -- which is why the message has to travel with
+        # them rather than replace them.
+        **read_error,
     }
 
 

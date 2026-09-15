@@ -47,6 +47,7 @@ from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, AcpEve
 from kiro_crew.hooks import TOOL_DENY
 from kiro_crew.messaging.renderer import Renderer, TransportCapabilities
 from kiro_crew.safety_override import safety_override
+from kiro_crew.session_allocation import SessionClosingError
 
 # ── Channel-neutral doubles ───────────────────────────────────────────────────
 
@@ -136,6 +137,12 @@ class _Sessions:
         # is_new=False deliberately: it keeps the turn off the dashboard-surfacing
         # and set_channel paths, neither of which this suite is about.
         return self._p, False, False
+
+    def begin_turn(self, key: str) -> None:
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns = getattr(self, "begin_turns", 0) + 1
+        if getattr(self, "closing", False):
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key: str, channel_id: str) -> None:
         return None
@@ -277,7 +284,19 @@ def _cfg(channel: str) -> SimpleNamespace:
             queue_mode="steer",
         ),
     )
-    setattr(cfg, channel, SimpleNamespace(hard_threshold_pct=95.0, soft_threshold_pct=80.0))
+    setattr(
+        cfg,
+        channel,
+        SimpleNamespace(
+            hard_threshold_pct=95.0,
+            soft_threshold_pct=80.0,
+            # Webex threads its replies, so its dispatcher reads this on every send.
+            # Harmless for the channels that do not: an attribute nobody looks at.
+            reply_in_thread=True,
+            # Read by the Webex card-press path when authorizing a sender.
+            allowed_emails=["kyle@example.com"],
+        ),
+    )
     return cfg
 
 
@@ -402,7 +421,15 @@ _CHANNELS: dict[str, Any] = {
 #: Channels that pass a real ``decider``, so a prompt IS clickable there. Their
 #: no-grant case ends in a refusal too -- the decider denies by default -- but only
 #: once its deadline passes, so these tests shorten it rather than waiting.
-_WIDGET_CHANNELS = frozenset({"teams"})
+_WIDGET_CHANNELS = frozenset({"teams", "webex"})
+
+#: Where each widget channel's click deadline lives, so the deny-by-default path
+#: can resolve immediately instead of waiting one out. Read per call inside the
+#: decider, so patching the module attribute is enough.
+_APPROVAL_DEADLINE_SYMBOL = {
+    "teams": "kiro_crew.teams.approvals.APPROVAL_TIMEOUT_SECS",
+    "webex": "kiro_crew.messaging.approval.APPROVAL_TIMEOUT_S",
+}
 
 
 def _run_turn(
@@ -411,8 +438,7 @@ def _run_turn(
     """Drive one real turn for *channel*; return its provider and renderer."""
     if channel in _WIDGET_CHANNELS:
         # Collapse the click deadline so the deny-by-default path resolves now.
-        # Read per call inside the decider, so patching the module value is enough.
-        monkeypatch.setattr("kiro_crew.teams.approvals.APPROVAL_TIMEOUT_SECS", 0.01)
+        monkeypatch.setattr(_APPROVAL_DEADLINE_SYMBOL[channel], 0.01)
     provider = _Provider()
     mod, renderer_attr, dispatcher, inbound = _CHANNELS[channel](_Sessions(provider), _Ctx(hooks))
     rendered: list[_Renderer] = []

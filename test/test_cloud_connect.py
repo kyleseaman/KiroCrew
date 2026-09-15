@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from kiro_crew import platform_compat as pc
@@ -252,6 +254,10 @@ class TestConnect:
             connect.connect("i-0abc", "dev", "us-east-1")
 
 
+#: Stands in for what `trusted_system_bin` returns on Windows; never spawned.
+TASKKILL_BIN = r"C:\Windows\System32	askkill.exe"
+
+
 class TestKillProcessTree:
     def test_kills_whole_group_not_just_parent(self, tmp_path):
         # The SSM tunnel is spawned with start_new_session=True, so the parent
@@ -334,19 +340,25 @@ class TestKillProcessTree:
 
         monkeypatch.setattr(ssm_mod.os, "name", "nt")
         monkeypatch.setattr(ssm_mod.subprocess, "run", fake_run)
+        # `taskkill` is resolved through `platform_compat.trusted_system_bin`, so
+        # the real lookup answers None off Windows. Stubbed, or the tree kill is
+        # skipped and this test falls through to the POSIX branch -- which would
+        # `killpg` the REAL pid 4321 on a CI host, taking the worker with it.
+        monkeypatch.setattr(
+            ssm_mod.platform_compat, "trusted_system_bin", lambda name: TASKKILL_BIN
+        )
         ssm_mod.kill_port_forward(FakeProc())
 
         assert calls, "Windows must attempt a tree kill"
         argv = calls[0]
-        assert argv[0] == "taskkill"
+        assert argv[0] == TASKKILL_BIN
+        assert argv[0] != "taskkill", "the binary must not come from PATH"
         assert "/T" in argv, "/T is what reaps the plugin child"
         assert "/F" in argv
         assert str(FakeProc.pid) in argv
         assert not FakeProc.terminated, "parent-only terminate must not be the Windows path"
 
-    def test_windows_tree_kill_tolerates_a_process_object_without_a_pid(
-        self, monkeypatch
-    ) -> None:
+    def test_windows_tree_kill_tolerates_a_process_object_without_a_pid(self, monkeypatch) -> None:
         """A Popen-LIKE stand-in must not raise on the Windows branch.
 
         `kill_port_forward` accepts any object with poll/terminate/wait -- the
@@ -419,6 +431,7 @@ class TestRegistryIntegration:
         assert inst.aws_profile == "dev"
         assert inst.aws_region == "us-west-2"
         assert inst.ssh_host == ""
+        assert inst.provisioner_id == "aws_ec2"
 
     def test_register_instance_is_idempotent_on_relaunch(self, monkeypatch, tmp_path):
         from kiro_crew.instances.registry import InstancesRegistry
@@ -443,6 +456,7 @@ class TestRegistryIntegration:
         assert rec.ttl == "30m"
         assert rec.local_port == 5599
         assert rec.was_connected is True
+        assert rec.provisioner_id == "aws_ec2"
 
     def test_unregister_instance_empty_arg_is_noop(self, monkeypatch, tmp_path):
         from kiro_crew.instances.registry import InstancesRegistry
@@ -484,3 +498,97 @@ class TestRegistryIntegration:
 
         assert connect.unregister_instance("i-0abc") is True
         assert not any(i.ssh_host == "i-0abc" for i in reg.list())
+
+
+class TestIsLaunchedInstance:
+    """Unit coverage for is_launched_instance() — the correlation check
+    handlers_instances.py uses to lock PATCH's addressing fields."""
+
+    def _store(self, monkeypatch, tmp_path):
+        import kiro_crew.cloud.launch_job as ljmod
+
+        store = ljmod.LaunchJobStore(root=tmp_path / "launch-jobs")
+        monkeypatch.setattr(ljmod, "LaunchJobStore", lambda *a, **k: store)
+        return store
+
+    def test_empty_target_is_not_launched(self):
+        assert connect.is_launched_instance("") is False
+
+    def test_matching_job_is_launched(self, monkeypatch, tmp_path):
+        store = self._store(monkeypatch, tmp_path)
+        job = store.create(profile="dev", region="us-west-2", size_key="light")
+        job.instance_id = "i-0abc1234"
+        store.save(job)
+
+        assert connect.is_launched_instance("i-0abc1234") is True
+
+    def test_unrelated_target_is_not_launched(self, monkeypatch, tmp_path):
+        # A hand-added SSM record whose ssm_target happens to look like an EC2 id
+        # but was never provisioned by a Kiro Crew launch job.
+        store = self._store(monkeypatch, tmp_path)
+        job = store.create(profile="dev", region="us-west-2", size_key="light")
+        job.instance_id = "i-0abc1234"
+        store.save(job)
+
+        assert connect.is_launched_instance("i-neverlaunched") is False
+
+    def test_no_jobs_at_all_is_not_launched(self, monkeypatch, tmp_path):
+        self._store(monkeypatch, tmp_path)
+        assert connect.is_launched_instance("i-0abc1234") is False
+
+    def test_malformed_job_file_fails_closed(self, monkeypatch, tmp_path):
+        # Fails CLOSED on a job file that cannot be PARSED. This is the failure
+        # mode LaunchJobStore.list() hides: list() defers to get(), which logs
+        # and returns None for an unparseable file, so the job drops out of the
+        # result entirely — a corrupted record for the very instance being
+        # edited would read as "no such launch job" and unlock the addressing
+        # fields this check exists to freeze. Reading the files directly is
+        # what keeps the refusal reachable.
+        store = self._store(monkeypatch, tmp_path)
+        job = store.create(profile="dev", region="us-west-2", size_key="light")
+        job.instance_id = "i-0abc1234"
+        store.save(job)
+        (store.root / f"{job.id}.json").write_text("{not json", encoding="utf-8")
+
+        with pytest.raises(ValueError):
+            connect.is_launched_instance("i-0abc1234")
+
+    def test_unreadable_job_file_fails_closed(self, monkeypatch, tmp_path):
+        # Same guarantee for an I/O failure rather than a parse failure: the
+        # OSError propagates so api_instances_update answers 503 and persists
+        # nothing, instead of treating an unverifiable correlation as absent.
+        store = self._store(monkeypatch, tmp_path)
+        store.root.mkdir(parents=True, exist_ok=True)
+        # A directory where a job file is expected: read_text() raises OSError
+        # on every platform (IsADirectoryError on POSIX, PermissionError on
+        # Windows), without depending on chmod semantics or the test user.
+        (store.root / "00000000000000000000000000000000.json").mkdir()
+
+        with pytest.raises(OSError):
+            connect.is_launched_instance("i-0abc1234")
+
+    def test_vanished_job_file_is_skipped(self, monkeypatch, tmp_path):
+        # The one benign case: a concurrent `cloud destroy` removing a job
+        # between the glob and the read. An instance whose launch record is
+        # gone is not correlated to anything, so the scan continues to
+        # the remaining jobs rather than refusing the edit.
+        store = self._store(monkeypatch, tmp_path)
+        gone = store.create(profile="dev", region="us-west-2", size_key="light")
+        gone.instance_id = "i-vanishing"
+        store.save(gone)
+        keep = store.create(profile="dev", region="us-west-2", size_key="light")
+        keep.instance_id = "i-stillhere"
+        store.save(keep)
+
+        victim = store.root / f"{gone.id}.json"
+        real_read_text = Path.read_text
+
+        def _read_text(self, *a, **k):
+            if self == victim:
+                raise FileNotFoundError(str(victim))
+            return real_read_text(self, *a, **k)
+
+        monkeypatch.setattr(Path, "read_text", _read_text)
+
+        assert connect.is_launched_instance("i-stillhere") is True
+        assert connect.is_launched_instance("i-vanishing") is False

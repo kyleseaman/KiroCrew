@@ -60,6 +60,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from kiro_crew.platform.context import redact_via_context
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 from ..spine.git_safety import GIT_SAFE_CONFIG, require_pinned
@@ -229,7 +230,12 @@ def setup_isolated_clone(
         # --local hardlinks the object store: no network, near-instant, cheap on disk.
         proc = _git("clone", "--local", shared_clone, dest, timeout=300)
         if proc.returncode != 0:
-            return "", f"git clone --local failed: {(proc.stderr or '').strip()[:200]}"
+            # Redact BEFORE the bound: a slice can cut a credential in the URL git
+            # echoes mid-match, leaving a fragment no downstream pass recognises.
+            return "", (
+                f"git clone --local failed: "
+                f"{redact_via_context((proc.stderr or '').strip())[:200]}"
+            )
         if branch:
             checkout = _git("-C", dest, "checkout", branch, timeout=60)
             if checkout.returncode != 0:
@@ -244,7 +250,7 @@ def setup_isolated_clone(
                 shutil.rmtree(dest, ignore_errors=True)
                 return "", (
                     f"could not check out the pull request head {branch!r}: "
-                    f"{(checkout.stderr or '').strip()[:160]}"
+                    f"{redact_via_context((checkout.stderr or '').strip())[:160]}"
                 )
         _fetch_base_ref(dest, base_ref)
         neutralize_origin(dest)
@@ -1111,7 +1117,17 @@ class PRWatcherRegistry:
         itself stays best-effort (a lost patch must not fail the watcher), but "the patch
         was lost" and "the directory holding the commits may be deleted" are different
         decisions, and conflating them destroyed verified work.
+
+        No clone configured means no working tree to diff — there is nothing to export
+        and nothing to retain. Without this guard the fallback `git diff`/`git status`
+        calls below still ran with `-C ""`, which git treats as no `-C` at all: it walks
+        up from the process's real CWD and operates on whatever repository (or worktree)
+        happens to contain it, spawning a host-side git call — and `require_pinned`'s
+        attributes pin write — against the operator's real checkout instead of this run's
+        clone.
         """
+        if not clone:
+            return True
         try:
             self._export_fix(st, clone, attempt)
         except (OSError, subprocess.SubprocessError) as exc:
@@ -1331,7 +1347,7 @@ def publish_if_authorized(pr: str, status: dict[str, Any]) -> tuple[bool, str]:
     proc = _gh("pr", "ready", pr)
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:] or [""]
-        return False, f"gh pr ready failed: {tail[0][:160]}"
+        return False, f"gh pr ready failed: {redact_via_context(tail[0])[:160]}"
     logger.info("watchers: marked %s ready for review (%s)", pr, reason)
     return True, reason
 
@@ -1371,7 +1387,7 @@ def _delete_clone_if_unowned(reg: PRWatcherRegistry, child: Path) -> bool:
 
 
 def sweep_orphan_clones(*, clones_root: str | None = None) -> int:
-    """Delete per-PR watcher clones whose watcher is no longer live. Returns the count.
+    """Delete per-PR watcher clones whose watcher is not live. Returns the count.
 
     A watcher removes its own clone on a clean exit, but a crash, a SIGKILL, or a gateway
     restart mid-run leaves it behind — and each is a full repo checkout, so they
@@ -1455,12 +1471,11 @@ def _work_items(status: dict[str, Any]) -> list[str]:
 def _redact(text: str) -> str:
     """Credential/exfiltration redaction for a watcher log line. FAIL-CLOSED.
 
-    This used to fail OPEN so "redaction must never be the reason a watcher stops logging".
-    The concern was right but the remedy leaked: `GET /watchers/{fp}/log` serves these lines
-    straight to the browser with NO second redaction pass, so this is the only scan standing
-    between agent/CI output and the operator's screen — the same boundary
-    `routes._redact_for_display` fails closed on. Fixed alongside the identical gap in
-    `runner._redact_activity`, which the GPT review of this branch raised.
+    Failing OPEN would honour "redaction must never be the reason a watcher stops logging",
+    but it leaks: `GET /watchers/{fp}/log` serves these lines straight to the browser with NO
+    second redaction pass, so this is the only scan standing between agent/CI output and the
+    operator's screen — the same boundary `routes._redact_for_display` fails closed on.
+    `runner._redact_activity` guards the identical surface for the activity feed.
 
     Failing closed still does not stop the watcher logging: the LINE is replaced by a fixed
     placeholder, so the log keeps advancing and the operator sees activity, just not

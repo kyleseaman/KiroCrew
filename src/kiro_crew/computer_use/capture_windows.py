@@ -367,7 +367,7 @@ def ensure_shots_dir() -> str:
     every other owner-only directory in the tree uses.
 
     Tightening runs at most once per process (guarded by ``_dir_ready``) because
-    ``restrict_to_owner`` shells out to ``icacls`` on Windows, and a subprocess per
+    ``restrict_to_owner`` rewrites a DACL on Windows, and doing that per
     screenshot would block the pooled worker that also serves chat. A failure is
     logged and tolerated, the posture ``capture_macos`` takes: the files still land
     under a per-user ``%TEMP%``.
@@ -414,10 +414,51 @@ def persist_jpeg(raw: bytes) -> str:
         handle_fd, path = tempfile.mkstemp(
             prefix=prefix, suffix=SCREENSHOT_FILE_SUFFIX, dir=directory
         )
-        with os.fdopen(handle_fd, "wb") as handle:
+    except OSError:
+        # Allocation itself failed — ``mkstemp`` raised, so no file exists and
+        # there is nothing to remove.
+        logger.warning("could not persist computer-use screenshot", exc_info=True)
+        return ""
+    try:
+        handle = os.fdopen(handle_fd, "wb")
+    except OSError:
+        logger.warning(
+            "could not write computer-use screenshot; removing the partial frame",
+            exc_info=True,
+        )
+        # ``fdopen`` raised before adopting the descriptor (fd pressure), so
+        # nothing will ever close it — close it here, or the unlink below fails
+        # on Windows, which refuses to remove a file with an open handle. This
+        # is the ONLY branch that may close the raw fd: once ``fdopen`` returns,
+        # the file object owns it, and a second ``os.close`` on the number could
+        # hit an unrelated descriptor another executor thread was just handed.
+        try:
+            os.close(handle_fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return ""
+    try:
+        with handle:
             handle.write(raw)
     except OSError:
-        logger.warning("could not persist computer-use screenshot", exc_info=True)
+        logger.warning(
+            "could not write computer-use screenshot; removing the partial frame",
+            exc_info=True,
+        )
+        # The ``mkstemp`` above succeeded, so this invocation owns *path* and no
+        # caller will ever receive it — without the unlink the partially-written
+        # frame (which can hold sensitive screen pixels) sits in the spool as an
+        # orphan until the ring trim happens to reach it. Best-effort: cleanup
+        # must never mask the original failure. The ``with`` has already closed
+        # the descriptor; do NOT close the fd number again (see above).
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
         return ""
     try:
         platform_compat.restrict_to_owner(path)
@@ -494,7 +535,7 @@ def _has_content(pixels: bytes, *, width: int = 0, bits_per_pixel: int = _BITSPI
         return False
     # ~4096 evenly-spaced probes, enough to catch a body that differs from a uniform
     # caption without scanning megabytes each capture. Counted in PIXELS, so the step
-    # can no longer alias onto a byte lane.
+    # cannot alias onto a byte lane.
     step = max(1, total_pixels // 4096)
     seen = set()
     for n in range(0, total_pixels, step):
@@ -529,7 +570,7 @@ def _capture_window_bitmap(hwnd: int) -> "tuple[Any, int, int] | None":
     space, so a legacy Win32 window renders at its logical size no matter what the
     caller's awareness is: measured 620x392 drawn into both a 620x400 buffer and a
     775x500 one, leaving the aware-sized buffer with a black L-shaped margin and an
-    image that no longer maps linearly onto the window rect the element frames use.
+    image that does not map linearly onto the window rect the element frames use.
     A DPI-aware window fills whichever buffer it is given (1296 unaware, 1620
     aware). ``windows_ffi.window_render_scale`` supplies the ratio, so the buffer is
     exactly the region the window draws into and carries no margin.

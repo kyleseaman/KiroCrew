@@ -24,11 +24,11 @@ instead of degrading silently:
 - **Display-only inventory.** ``list_catalog_rows`` maps the published list's
   DISPLAY fields (identity, name, summary, version, tags, author, asset refs)
   into storefront rows. It emits no clone coordinates and no ``origin``, because
-  the catalog is trusted only as far as TLS: install coordinates stay with the
-  seed and external registries, and a non-builtin row never mints the verified
-  badge. ``list_catalog_apps`` intersects the rendered set with the seed's
-  installable entries, so a catalog-only ``git`` name renders nothing until it is
-  installable.
+  the catalog is trusted only as far as TLS, and a non-builtin row never mints
+  the verified badge. Install coordinates come from ``inventory``, materialised
+  ONLY from a fresh fetch (``fetch_inventory_entries``) and never from the cache,
+  so ``list_catalog_apps`` keeps a ``git`` row that either the seed, an external
+  registry, or the catalog's own pins can install.
 """
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew.apps.manifest import KEBAB_RE, app_name_error
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import config_dir
 
 logger = logging.getLogger(__name__)
@@ -110,8 +111,7 @@ def _read_cache() -> dict[str, Any] | None:
 def _write_cache(doc: dict[str, Any]) -> None:
     path = _cache_path()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(doc), encoding="utf-8")
+        atomic_write(path, json.dumps(doc))
     except OSError:
         logger.debug("could not cache the official catalog", exc_info=True)
 
@@ -119,6 +119,22 @@ def _write_cache(doc: dict[str, Any]) -> None:
 def _write_failure() -> None:
     """Remember that the fetch just failed, so the next caller does not wait again."""
     _write_cache({_FAILED_KEY: time.time()})
+
+
+def forget_cache() -> None:
+    """Drop the cached document AND any failure memory, so the next read re-fetches.
+
+    The server half of the store's manual refresh: deleting the file is the one
+    operation that clears both a stale document (``CACHE_TTL`` not yet expired)
+    and a ``_fetchFailedAt`` sentinel (``FAILURE_TTL`` back-off) in a single
+    step. It never fetches anything itself -- the caller's next read pays the
+    fetch, so a refresh that cannot reach the CDN degrades exactly like a cold
+    start rather than inventing a third failure mode.
+    """
+    try:
+        _cache_path().unlink(missing_ok=True)
+    except OSError:
+        logger.debug("could not drop the official catalog cache", exc_info=True)
 
 
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
@@ -148,10 +164,10 @@ def _open_catalog(req: urllib.request.Request) -> Any:
 
     A named function rather than an inline `urlopen`, because tests must be able
     to intercept the network at a place that cannot drift: patching
-    `urllib.request.urlopen` used to work here, and when this function started
-    using an opener instead, those tests silently stopped intercepting anything
-    and began making real requests to the live CDN. A seam that belongs to this
-    module cannot be bypassed by changing how this module calls out.
+    `urllib.request.urlopen` does not survive this module switching to an opener:
+    such tests silently stop intercepting anything and make real requests to the
+    live CDN. A seam that belongs to this module cannot be bypassed by changing
+    how this module calls out.
 
     The opener is built per call: an opener is mutable shared state, and one
     built at import time is something any other import can reach in and
@@ -287,13 +303,40 @@ def _resolve_ref(ref: Any) -> str:
     return OFFICIAL_CATALOG_BASE + ref
 
 
+def _resolve_ref_list(refs: Any) -> list[str]:
+    """Resolve a published LIST of asset refs, dropping every unusable one.
+
+    For ``screenshotRefs``. Each member goes through :func:`_resolve_ref`, so a
+    member that is the wrong type, carries a scheme, or tries to traverse is
+    dropped -- the same rule the scalar refs already enforce, applied per entry.
+
+    The absent case and the unreadable case are kept DISTINCT, which is the
+    whole reason this returns a list and the caller sets the field on a truthy
+    result. A non-``list`` input (absent, or a hostile non-list type) answers
+    ``[]``, and a list whose every member is unusable also answers ``[]`` -- so
+    the caller leaves the field UNSET in both, and "no screenshots" never
+    renders as a present-but-empty gallery. A dropped member is a swallowed
+    miss on purpose: the alternative is emitting a ref this client already knows
+    a browser cannot load, which is the guaranteed-404 ``<img>`` this module
+    exists to avoid. Order is preserved for the members that survive; a catalog
+    screenshot list is not index-paired with anything, so dropping one shifts
+    only its own position.
+
+    ``list`` specifically, not any iterable: a bare ``str`` is iterable and
+    would resolve one ref per character.
+    """
+    if not isinstance(refs, list):
+        return []
+    return [resolved for ref in refs if (resolved := _resolve_ref(ref))]
+
+
 def _curated_str(value: Any) -> str:
     """A curated display string, or ``""`` for anything that is not one.
 
     Every field below arrives from a document fetched over the network, so its
     TYPE is as untrusted as its content. A wrong type is not hypothetical
-    tidiness: ``{"tags": 5}`` used to reach ``list(5)`` and turn one malformed
-    entry into an HTTP 500 for the whole store, and a non-string
+    tidiness: unguarded, ``{"tags": 5}`` reaches ``list(5)`` and turns one
+    malformed entry into an HTTP 500 for the whole store, and a non-string
     ``displayName`` reaches the browser to be sorted and lowercased there.
     Returning ``""`` collapses both into the falsy case the callers already
     handle, so a bad field degrades that field and nothing else.
@@ -310,6 +353,33 @@ def _curated_tags(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [t for t in value if isinstance(t, str)]
+
+
+#: The largest integer JavaScript can represent exactly (2**53 - 1). A star
+#: count above this is not a plausible count, and forwarding one lets a
+#: hostile document render hundreds of digits into the store's layout.
+_STARS_MAX = 9_007_199_254_740_991
+
+
+def _curated_stars(entry: dict[str, Any]) -> int | None:
+    """The entry's baked ``stargazersCount``, or ``None`` when absent/invalid.
+
+    The publisher generates this field for git-source entries only, so a
+    non-git entry never yields one here regardless of what the document says.
+    ``bool`` is excluded explicitly (it subclasses ``int``), and the value is
+    bounded to the JS safe-integer range: the document arrived over the
+    network, so its types and magnitudes are as untrusted as its content.
+    Absence means "unknown", never zero.
+    """
+    source = entry.get("source")
+    if not isinstance(source, dict) or source.get("type") != "git":
+        return None
+    stars = entry.get("stargazersCount")
+    if isinstance(stars, bool) or not isinstance(stars, int):
+        return None
+    if stars < 0 or stars > _STARS_MAX:
+        return None
+    return stars
 
 
 #: A git object name as the published document must spell it: sha1 (40 hex) or
@@ -379,8 +449,8 @@ def inventory(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     This is what makes the catalog the SHELF rather than a decoration on one:
     :func:`annotate` can only change a row that already exists, so an app the
-    catalog lists but the bundled seed does not was previously unlistable and
-    therefore uninstallable -- adding one required shipping a release.
+    catalog lists but the bundled seed does not would otherwise be unlistable and
+    therefore uninstallable -- adding one would require shipping a release.
 
     ``builtin`` entries produce nothing here on purpose. Their code ships in the
     wheel and is discovered from disk; a row for code this client does not have
@@ -468,6 +538,12 @@ def inventory(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
             row["iconUrlDark"] = dark
         if hero := _resolve_ref(entry.get("heroRef")):
             row["heroImage"] = hero
+        if hero_detail := _resolve_ref(entry.get("heroDetailRef")):
+            row["heroImageDetail"] = hero_detail
+        if shots := _resolve_ref_list(entry.get("screenshotRefs")):
+            row["screenshots"] = shots
+        if (stars := _curated_stars(entry)) is not None:
+            row["stargazersCount"] = stars
         seen.add(name)
         rows.append(row)
     return rows
@@ -651,6 +727,18 @@ def annotate(rows: list[dict[str, Any]], entries: list[dict[str, Any]]) -> None:
             row["iconUrlDark"] = dark
         if hero := _resolve_ref(entry.get("heroRef")):
             row["heroImage"] = hero
+        if hero_detail := _resolve_ref(entry.get("heroDetailRef")):
+            row["heroImageDetail"] = hero_detail
+        if shots := _resolve_ref_list(entry.get("screenshotRefs")):
+            row["screenshots"] = shots
+        # ``stargazersCount`` is deliberately NOT overlaid here. This function
+        # matches rows by NAME, and a same-name SEED row can pin a DIFFERENT
+        # repository than the catalog entry (seed collisions keep the pin by
+        # design) — overlaying the catalog repository's star count onto a row
+        # that installs another repository would forge a trust cue. Mismatched
+        # display copy is survivable; a popularity number beside Install is
+        # not. The count therefore flows through ``inventory()`` alone, where
+        # a row's identity and its count come from the same catalog entry.
 
 
 def list_catalog_rows() -> list[dict[str, Any]]:
@@ -693,14 +781,24 @@ def list_catalog_rows() -> list[dict[str, Any]]:
             row["iconUrlDark"] = dark
         if hero := _resolve_ref(entry.get("heroRef")):
             row["heroImage"] = hero
+        if hero_detail := _resolve_ref(entry.get("heroDetailRef")):
+            row["heroImageDetail"] = hero_detail
+        if shots := _resolve_ref_list(entry.get("screenshotRefs")):
+            row["screenshots"] = shots
         source = entry.get("source")
         if isinstance(source, dict):
             # The source TYPE is a display marker (builtin vs git), not install
             # coordinates: url/ref stay out, so the catalog cannot name a clone
-            # target. ``registry.list_catalog_apps`` uses it to intersect git rows
-            # with the seed's installable set.
+            # target. ``registry.list_catalog_apps`` uses it to gate git rows on
+            # the installable set: the seed's names plus the catalog's own pins.
             stype = _curated_str(source.get("type"))
             if stype in ("builtin", "git"):
                 row["source"] = {"type": stype}
+        # ``stargazersCount`` is deliberately NOT projected here: this function
+        # reads ``load_official_catalog()``, which serves the agent-writable
+        # CACHE — display copy degrading from a poisoned cache is survivable,
+        # but a trust cue rendered beside Install is not, so the count flows
+        # only through the projections fed by a fresh TLS fetch
+        # (``inventory``/``annotate`` via ``fetch_inventory_entries``).
         rows.append(row)
     return rows

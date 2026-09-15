@@ -18,7 +18,13 @@ from kiro_crew.dashboard import (
     handlers_instances,
     handlers_project,
 )
-from kiro_crew.dashboard.handlers.auth_refresh import api_auth_logout, api_auth_me, api_auth_refresh
+from kiro_crew.dashboard.handlers.auth_mobile import api_auth_mobile_link
+from kiro_crew.dashboard.handlers.auth_refresh import (
+    api_auth_logout,
+    api_auth_me,
+    api_auth_refresh,
+)
+from kiro_crew.dashboard.handlers.mobile_connect import api_mobile_connect_methods
 from kiro_crew.platform import current_context, safe_context_call
 
 
@@ -85,9 +91,13 @@ def register(app: web.Application) -> None:
 
     # OAuth-style refresh tokens for dashboard auth. POST /api/auth/refresh and
     # POST /api/auth/logout self-authenticate via the refresh cookie (the
-    # token_auth middleware exempts them); GET /api/auth/me is gated by the
-    # standard access-cookie auth.
+    # token_auth middleware exempts them); GET /api/auth/me and POST
+    # /api/auth/mobile-link are gated by the standard access-cookie auth.
     app.router.add_get("/api/auth/me", api_auth_me)
+    app.router.add_post("/api/auth/mobile-link", api_auth_mobile_link)
+    # Phone-connection method listing (CPP mobile_connect seam + governance
+    # filter). Same auth floor as mobile-link's read half.
+    app.router.add_get("/api/mobile-connect/methods", api_mobile_connect_methods)
     app.router.add_post("/api/auth/refresh", api_auth_refresh)
     app.router.add_post("/api/auth/logout", api_auth_logout)
 
@@ -111,11 +121,35 @@ def register(app: web.Application) -> None:
     app.router.add_post(
         "/api/instances/{id}/send-session", handlers_instances.api_instances_send_session
     )
+    # Peer capability read — the per-instance counterpart to the local
+    # /api/agents, /api/models, /api/effort-levels and /api/workspaces, for a
+    # session whose turns run on that peer. Registered BEFORE the catch-all
+    # proxy route so `{path:.*}` cannot swallow it.
+    app.router.add_get(
+        "/api/instances/{id}/capabilities", handlers_instances.api_instances_capabilities
+    )
+    # Peer live-session read for the merged-sessions sidebar. A dedicated route
+    # rather than a bare proxy hop because the peer's reply needs a hub-side
+    # filter: the peer lists the slots THIS hub drives for its own
+    # remote-execution bindings, and without that filter one conversation renders
+    # twice (see api_instances_chat_slots). Also registered BEFORE the catch-all.
+    app.router.add_get(
+        "/api/instances/{id}/chat-slots", handlers_instances.api_instances_chat_slots
+    )
+    # Generic chat proxy — the carrier for the remote-crew chat view. Forwards
+    # a bounded slice of the peer's /api surface over the already-open tunnel;
+    # method/path policy lives in the handler (see api_instances_proxy).
+    app.router.add_route(
+        "*", "/api/instances/{id}/proxy/{path:.*}", handlers_instances.api_instances_proxy
+    )
 
     # Cloud provisioning (owner-only, user-initiated) — provision a Kiro Crew
     # instance in the user's own AWS account as a durable launch job.
     app.router.add_get("/api/cloud/preflight", handlers_cloud.api_cloud_preflight)
     app.router.add_get("/api/cloud/iam-policy", handlers_cloud.api_cloud_iam_policy)
+    # The lanes the Set-up tab may offer (CPP remote_provisioners seam); the
+    # built-in EC2 lane plus whatever the edition composes in.
+    app.router.add_get("/api/cloud/provisioners", handlers_cloud.api_cloud_provisioners)
     app.router.add_get("/api/cloud/launch", handlers_cloud.api_cloud_launch_list)
     app.router.add_post("/api/cloud/launch", handlers_cloud.api_cloud_launch_create)
     app.router.add_get("/api/cloud/launch/{id}", handlers_cloud.api_cloud_launch_get)

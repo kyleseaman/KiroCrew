@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 import yaml
 
-from conftest import requires_symlinks
+from conftest import make_dir_link, requires_symlinks
 from kiro_crew import beacon, diagnostics
 from kiro_crew.dashboard.handlers import diagnostics as dh
 from kiro_crew.diagnostics import BundleResult
@@ -112,8 +112,8 @@ def test_midline_authorization_header_is_redacted(tmp_path, monkeypatch):
     """A header embedded MID-LINE must be redacted, not just one at line start.
 
     Log lines and user notes routinely quote a header inside a sentence
-    ("request used Authorization: Basic <b64>"). The rule used to be anchored
-    with ``^``, so those credentials reached the bundle and the pre-filled
+    ("request used Authorization: Basic <b64>"). A rule anchored
+    with ``^`` would let those credentials reach the bundle and the pre-filled
     GitHub issue URL verbatim.
     """
     home = tmp_path / "home"
@@ -143,7 +143,7 @@ def test_archive_is_opened_in_binary_mode(tmp_path, monkeypatch):
     ``os.open`` defaults to TEXT mode on Windows and ``os.fdopen(fd, "wb")``
     cannot change the translation mode of an fd handed to it, so each 0x0A in
     the DEFLATE stream would be written as 0x0D 0x0A and the central-directory
-    offsets would no longer match. Asserted by capturing the real flags, so the
+    offsets would not match. Asserted by capturing the real flags, so the
     guard is verifiable on POSIX (where ``O_BINARY`` is absent and the expected
     contribution is 0) instead of only on a Windows runner.
     """
@@ -472,7 +472,7 @@ def test_prerelease_wheel_is_never_reported_as_stable(monkeypatch):
 def test_channel_never_returns_the_old_prerelease_name(monkeypatch):
     """``"prerelease"`` named a channel no feed, label, or doc uses.
 
-    An insider build used to report it, so its bug reports arrived tagged with
+    An insider build could report it, so its bug reports would arrive tagged with
     a lane nobody triages by. Every answer must be a key of the label map.
     """
     for version in ("0.1.4", "0.1.4-insider.1", "0.1.4-nightly.20260807t0615"):
@@ -612,6 +612,52 @@ def test_triage_workflow_maps_every_channel_dropdown_answer():
             f"issue-triage.yml never applies {label!r}, but the dashboard flow "
             "attaches it -- the two paths must agree on the vocabulary"
         )
+
+
+# ── collector link guard ──────────────────────────────────────────
+
+
+class TestUsableDirRejectsEveryDirLink:
+    """``_usable_dir`` is the collector's one guard against enumerating THROUGH a
+    linked log directory: ``Path.is_dir()`` follows the link, and the real files
+    found on the other side are not themselves links, so they sail past the
+    per-file check and get packaged into a bundle destined for a public issue.
+
+    ``Path.is_symlink()`` does not report a Windows junction, and a junction is
+    the only directory link an unprivileged Windows user can create — a symlink
+    needs ``SeCreateSymbolicLinkPrivilege`` — so a symlink-only guard is open on
+    exactly the platform where planting one is easiest.
+    """
+
+    def test_a_real_directory_link_is_not_usable(self, tmp_path: Path) -> None:
+        # A junction on Windows, a directory symlink on POSIX — the same
+        # traversal either way, and no privilege needed on either.
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "id_rsa").write_text("secret", encoding="utf-8")
+        link = tmp_path / "kiro-log"
+        make_dir_link(link, outside)
+
+        assert link.is_dir()  # the link resolves — this is what makes it dangerous
+        assert list(link.glob("*"))  # and enumerating it reaches the target's files
+        assert diagnostics._usable_dir(link) is False
+
+    def test_a_plain_directory_stays_usable(self, tmp_path: Path) -> None:
+        # The guard must not reject the ordinary case it exists to allow.
+        real = tmp_path / "kiro-log"
+        real.mkdir()
+        assert diagnostics._usable_dir(real) is True
+
+    def test_guard_routes_through_the_shared_link_predicate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Pinned at the seam as well as end to end: the junction-aware predicate
+        # is the shared one, so this guard cannot drift from the rest of the
+        # tree on which reparse types count as a link.
+        real = tmp_path / "kiro-log"
+        real.mkdir()
+        monkeypatch.setattr(diagnostics.platform_compat, "is_link_or_junction", lambda p: True)
+        assert diagnostics._usable_dir(real) is False
 
 
 # ── API handlers (mode-independent: stub request + asyncio.run) ──────────────

@@ -13,9 +13,12 @@ could not complete sets ``error`` and leaves ``checked`` False.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import json
 import subprocess
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
@@ -57,6 +60,15 @@ def _manifest(**overrides: object) -> bytes:
     return json.dumps(body).encode()
 
 
+def _request() -> MagicMock:
+    """A request stub for ``api_update_check``: only ``.app["state"]`` is read."""
+    req = MagicMock()
+    state = MagicMock()
+    state._background_tasks = set()
+    req.app = {"state": state}
+    return req
+
+
 def _stub_feed(monkeypatch, *, status: int = 200, body: bytes | None = None, exc=None):
     """Replace the single network seam. Records the URL that was requested."""
     seen: dict[str, str] = {}
@@ -76,7 +88,7 @@ def _wheel_install(monkeypatch, tmp_path):
     """Default every test in this module to a WHEEL install on the insider lane.
 
     A git checkout is opt-in per test (``_git_install``), because the interesting
-    new behaviour is the layout that used to be skipped entirely.
+    layout is the one skipped entirely without that checkout.
     """
     monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
     monkeypatch.delenv("KIROCREW_CDN_BASE", raising=False)
@@ -212,7 +224,7 @@ class TestWheelInstallCheck:
         `derive_capability` composes the installer command from the channel at
         DERIVATION time; the feed check reads the channel again to build the URL. A
         switch (the endpoint, or `cli.sh` writing the file directly) landing between
-        the two used to publish the new lane's name beside the OLD lane's command —
+        the two can publish the new lane's name beside the OLD lane's command —
         and the command is the half the user acts on, so copy-pasting it would move
         the install straight back.
         """
@@ -272,6 +284,291 @@ class TestWheelInstallCheck:
         info = updates.get_update_info()
         assert "latest_pub_date" not in info
         assert info["check_status"] == "succeeded"  # optional field, not a hard failure
+
+
+class TestChannelMovePending:
+    """The running build is ahead of everything the FOLLOWED lane publishes.
+
+    That is the state a channel switcher leaves behind on an install whose bytes
+    it cannot replace: the feed answers honestly ("nothing newer for you"), and
+    the panel must still say the install is not on the chosen lane yet. It is
+    derived from the feed comparison rather than from the version's prerelease
+    stamp because promotion never re-stamps -- see ``_channel_move_pending``.
+    """
+
+    def _run(self, monkeypatch, tmp_path, *, channel: str, local: str, remote: str) -> dict:
+        (tmp_path / "channel").write_text(f"{channel}\n")
+        _stub_feed(monkeypatch, body=_manifest(channel=channel, version=remote))
+        monkeypatch.setattr(updates, "_local_version", local)
+        asyncio.run(updates._do_update_check())
+        return updates.get_update_info()
+
+    def test_insider_bytes_following_stable_report_a_pending_move(self, monkeypatch, tmp_path):
+        info = self._run(
+            monkeypatch, tmp_path, channel="stable", local="0.5.0rc3", remote="0.4.1rc1"
+        )
+        assert info["channel_move_pending"] is True
+        # No update is available, and that is not a contradiction: the lane has
+        # nothing NEWER. Both facts ride the status frame so the panel can show
+        # "not on stable yet" instead of a green "up to date".
+        assert info["update_available"] is False
+        fields = updates.status_update_fields()
+        assert fields["update_channel_move_pending"] is True
+        assert fields["update_channel"] == "stable"
+        # The move's target, folded for display, so the note can name it.
+        assert fields["update_latest_version_display"] == "0.4.1"
+        # ...and the running build keeps its own stamp rather than being renamed
+        # to a stable release that was never published.
+        assert fields["version_display"] == "0.5.0rc3"
+
+    def test_a_promoted_stable_install_is_not_mid_switch(self, monkeypatch, tmp_path):
+        # The regression this predicate exists for: comparing the followed channel
+        # against the version-derived lane reported `insider != stable` here, so
+        # the whole promoted-stable population saw the switch note permanently.
+        info = self._run(
+            monkeypatch, tmp_path, channel="stable", local="0.4.1rc1", remote="0.4.1rc1"
+        )
+        assert info["channel_move_pending"] is False
+        assert updates.status_update_fields()["version_display"] == "0.4.1"
+
+    def test_running_behind_is_an_update_not_a_move(self, monkeypatch, tmp_path):
+        info = self._run(
+            monkeypatch, tmp_path, channel="stable", local="0.4.0rc14", remote="0.4.1rc1"
+        )
+        assert info["update_available"] is True
+        assert info["channel_move_pending"] is False
+
+    def test_nightly_bytes_following_stable_report_a_pending_move(self, monkeypatch, tmp_path):
+        info = self._run(
+            monkeypatch,
+            tmp_path,
+            channel="stable",
+            local="0.6.0.dev20260829060906",
+            remote="0.4.1rc1",
+        )
+        assert info["channel_move_pending"] is True
+
+    def test_a_failed_check_reports_no_move(self, monkeypatch, tmp_path):
+        (tmp_path / "channel").write_text("stable\n")
+        _stub_feed(monkeypatch, status=503)
+        monkeypatch.setattr(updates, "_local_version", "0.5.0rc3")
+        asyncio.run(updates._do_update_check())
+        info = updates.get_update_info()
+        assert info["check_status"] == "failed"
+        # A verdict the check never reached must not be inferred from the stamp.
+        assert info["channel_move_pending"] is False
+        assert updates.status_update_fields()["version_display"] == "0.5.0"
+
+
+class TestFeedMinVersion:
+    """The feed's optional ``min_version`` floor drives the mandatory-update verdict.
+
+    The floor coerces the UI, so unlike the rest of the manifest it is honored
+    only when the manifest signature verifies (``platform/feed_trust.py``,
+    stubbed here — its own crypto behaviour is pinned by ``test_feed_trust``).
+    Every failure — malformed, inconsistent, unverified — DROPS the floor
+    (never a failed check) and degrades to the ordinary dismissible prompt.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _verified_signature(self, monkeypatch):
+        """Default the signature to VERIFIED so each test exercises one axis;
+        the unverified case overrides this explicitly."""
+        from kiro_crew.platform import feed_trust
+
+        monkeypatch.setattr(feed_trust, "verify_manifest_signature", lambda _m: True)
+
+    def test_install_below_the_floor_is_required(self, monkeypatch):
+        _stub_feed(monkeypatch, body=_manifest(version="0.6.0", min_version="0.6.0"))
+        monkeypatch.setattr(updates, "_local_version", "0.5.2")
+        asyncio.run(updates._do_update_check())
+
+        info = updates.get_update_info()
+        assert info["feed_min_version"] == "0.6.0"
+        fields = updates.status_update_fields()
+        assert fields["update_required"] is True
+        assert fields["update_min_version"] == "0.6.0"
+
+    def test_prerelease_of_the_floor_is_still_below_it(self, monkeypatch):
+        _stub_feed(monkeypatch, body=_manifest(version="0.6.0", min_version="0.6.0"))
+        monkeypatch.setattr(updates, "_local_version", "0.6.0rc3")
+        asyncio.run(updates._do_update_check())
+        assert updates.status_update_fields()["update_required"] is True
+
+    def test_install_at_the_floor_is_not_required(self, monkeypatch):
+        _stub_feed(monkeypatch, body=_manifest(version="0.7.0", min_version="0.6.0"))
+        monkeypatch.setattr(updates, "_local_version", "0.6.0")
+        asyncio.run(updates._do_update_check())
+
+        info = updates.get_update_info()
+        assert info["feed_min_version"] == "0.6.0"  # kept: display may still want it
+        fields = updates.status_update_fields()
+        assert fields["update_required"] is False
+        assert fields["update_min_version"] == ""
+
+    def test_absent_floor_is_never_required(self, monkeypatch):
+        _stub_feed(monkeypatch, body=_manifest(version="0.7.0"))
+        monkeypatch.setattr(updates, "_local_version", "0.1.0")
+        asyncio.run(updates._do_update_check())
+
+        assert "feed_min_version" not in updates.get_update_info()
+        assert updates.status_update_fields()["update_required"] is False
+
+    @pytest.mark.parametrize("bad", ["0.6.0rc1", "v0.6.0", "abc", "", 7, None])
+    def test_malformed_floor_is_dropped_not_fatal(self, monkeypatch, bad):
+        _stub_feed(monkeypatch, body=_manifest(version="0.7.0", min_version=bad))
+        monkeypatch.setattr(updates, "_local_version", "0.1.0")
+        asyncio.run(updates._do_update_check())
+
+        info = updates.get_update_info()
+        assert "feed_min_version" not in info
+        assert info["check_status"] == "succeeded"  # optional field, not a hard failure
+        assert updates.status_update_fields()["update_required"] is False
+
+    def test_floor_above_the_offered_version_is_dropped(self, monkeypatch):
+        """A floor the feed itself cannot satisfy is inconsistent, so it must
+        not force an update loop that never terminates."""
+        _stub_feed(monkeypatch, body=_manifest(version="0.6.0", min_version="0.7.0"))
+        monkeypatch.setattr(updates, "_local_version", "0.1.0")
+        asyncio.run(updates._do_update_check())
+
+        assert "feed_min_version" not in updates.get_update_info()
+        assert updates.status_update_fields()["update_required"] is False
+
+    def test_unverified_signature_drops_the_floor_not_the_check(self, monkeypatch):
+        """The floor coerces the UI, so a manifest whose signature does not
+        verify contributes NO floor — while the ordinary (non-coercive) update
+        verdict still succeeds, exactly the pre-floor posture."""
+        from kiro_crew.platform import feed_trust
+
+        monkeypatch.setattr(feed_trust, "verify_manifest_signature", lambda _m: False)
+        _stub_feed(monkeypatch, body=_manifest(version="0.6.0", min_version="0.6.0"))
+        monkeypatch.setattr(updates, "_local_version", "0.1.0")
+        asyncio.run(updates._do_update_check())
+
+        info = updates.get_update_info()
+        assert "feed_min_version" not in info
+        assert info["update_available"] is True
+        assert info["check_status"] == "succeeded"
+        assert updates.status_update_fields()["update_required"] is False
+
+    def test_promoted_stable_stamp_satisfies_its_own_floor(self, monkeypatch, tmp_path):
+        """Promotion never re-stamps: the stable feed offers ``0.3.0rc13``
+        meaning the ``0.3.0`` release. A floor of ``0.3.0`` must neither be
+        dropped as above-the-offered-version nor force the very build it
+        names."""
+        (tmp_path / "channel").write_text("stable\n")
+        _stub_feed(
+            monkeypatch,
+            body=_manifest(
+                channel="stable",
+                version="0.3.0rc13",
+                min_version="0.3.0",
+            ),
+        )
+        # An install already running the promoted stable build.
+        monkeypatch.setattr(updates, "_local_version", "0.3.0rc13")
+        asyncio.run(updates._do_update_check())
+
+        info = updates.get_update_info()
+        assert info["feed_min_version"] == "0.3.0"  # floor kept, not dropped
+        assert updates.status_update_fields()["update_required"] is False
+
+        # An older stable install IS forced.
+        monkeypatch.setattr(updates, "_local_version", "0.2.0rc7")
+        asyncio.run(updates._do_update_check())
+        assert updates.status_update_fields()["update_required"] is True
+
+    def test_available_update_on_stable_stays_raw_for_arm_but_folds_for_display(
+        self, monkeypatch, tmp_path
+    ):
+        """The feed check's `_update_info["latest_version"]` MUST stay the raw
+        stamp (``0.4.0rc14``): `api_update_arm` arms against it verbatim, and
+        the shadow-venv apply step compares it byte-for-byte against the
+        installed build's own `__version__`, which is never folded either
+        (promotion never re-stamps the bytes). A folded value there would make
+        every stable in-app apply fail with a version mismatch.
+
+        The clean release version for the About panel comes from a SEPARATE
+        display-only field on the `/api/update/check` response,
+        `latest_version_display`, folded the same way `_display_local_version`
+        folds the running build."""
+        (tmp_path / "channel").write_text("stable\n")
+        _stub_feed(
+            monkeypatch,
+            body=_manifest(channel="stable", version="0.4.0rc14"),
+        )
+        monkeypatch.setattr(updates, "_local_version", "0.3.0")
+        asyncio.run(updates._do_update_check())
+
+        info = updates.get_update_info()
+        assert info["channel"] == "stable"
+        assert info["check_status"] == "succeeded"
+        assert info["latest_version"] == "0.4.0rc14"  # RAW -- what arm/apply use
+
+        resp = asyncio.run(updates.api_update_check(_request()))
+        payload = json.loads(resp.body.decode())
+        assert payload["latest_version"] == "0.4.0rc14"  # still raw on the wire
+        assert payload["latest_version_display"] == "0.4.0"  # folded for display
+
+        # Same fold applies on the unparseable-local-version failure branch,
+        # and `latest_version` there stays raw too.
+        monkeypatch.setattr(updates, "_local_version", "not-a-version")
+        asyncio.run(updates._do_update_check())
+        info = updates.get_update_info()
+        assert info["check_status"] == "failed"
+        assert info["latest_version"] == "0.4.0rc14"
+        resp = asyncio.run(updates.api_update_check(_request()))
+        payload = json.loads(resp.body.decode())
+        assert payload["latest_version_display"] == "0.4.0"
+
+        # An insider feed keeps its full stamp everywhere -- the fold is
+        # stable-only, both raw and display agree.
+        (tmp_path / "channel").write_text("insider\n")
+        _stub_feed(
+            monkeypatch,
+            body=_manifest(channel="insider", version="0.4.0-insider.14"),
+        )
+        monkeypatch.setattr(updates, "_local_version", "0.3.0")
+        asyncio.run(updates._do_update_check())
+        info = updates.get_update_info()
+        assert info["channel"] == "insider"
+        assert info["latest_version"] == "0.4.0-insider.14"
+        resp = asyncio.run(updates.api_update_check(_request()))
+        payload = json.loads(resp.body.decode())
+        assert payload["latest_version_display"] == "0.4.0-insider.14"
+
+    def test_governance_pin_alone_also_reads_required(self, monkeypatch):
+        """The two authorities are OR'd: the enterprise pin needs no feed floor."""
+        _stub_feed(monkeypatch, body=_manifest(version="0.7.0"))
+        monkeypatch.setattr(updates, "_local_version", "0.1.0")
+        monkeypatch.setattr(updates, "update_required", lambda _v: True)
+        monkeypatch.setattr(updates, "min_version", lambda: "0.5.0")
+        asyncio.run(updates._do_update_check())
+
+        fields = updates.status_update_fields()
+        assert fields["update_required"] is True
+        assert fields["update_min_version"] == "0.5.0"
+
+    @pytest.mark.parametrize(
+        ("governance", "feed", "shown"),
+        [
+            ("0.5.0", "0.6.0", "0.6.0"),  # feed floor is higher — it binds
+            ("0.6.0", "0.5.0", "0.6.0"),  # governance floor is higher
+        ],
+    )
+    def test_both_floors_show_the_higher_one(self, monkeypatch, governance, feed, shown):
+        """Naming the lower floor would send the user to a version that still
+        sits below the other authority's floor."""
+        _stub_feed(monkeypatch, body=_manifest(version="0.7.0", min_version=feed))
+        monkeypatch.setattr(updates, "_local_version", "0.1.0")
+        monkeypatch.setattr(updates, "update_required", lambda _v: True)
+        monkeypatch.setattr(updates, "min_version", lambda: governance)
+        asyncio.run(updates._do_update_check())
+
+        fields = updates.status_update_fields()
+        assert fields["update_required"] is True
+        assert fields["update_min_version"] == shown
 
 
 class TestWheelInstallFailuresAreHonest:
@@ -791,50 +1088,144 @@ class TestCheckIsRateLimitedEvenOnFailure:
         asyncio.run(updates._do_update_check())
         assert updates._last_update_check > 0.0
 
-    def test_overlapping_checks_are_single_flight(self, monkeypatch):
-        # /api/status fires this as a background task on every poll until the
-        # interval clock is stamped, and the clock is only stamped when a check
-        # FINISHES — so concurrent polls used to stack one CDN fetch each, every
-        # one holding a session for the full timeout.
+    def test_overlapping_checks_share_and_await_one_verdict(self, monkeypatch):
+        # Concurrent manual checks and the automatic coordinator must consume
+        # the same completed verdict. Returning early can silently skip apply.
         calls = {"n": 0}
+        started = asyncio.Event()
+        release = asyncio.Event()
 
-        async def _slow(url: str) -> tuple[int, bytes]:
+        async def _blocked(url: str) -> tuple[int, bytes]:
             calls["n"] += 1
-            await asyncio.sleep(0.05)
+            started.set()
+            await release.wait()
             return 200, _manifest(version="0.1.3rc2")
 
-        monkeypatch.setattr(updates, "_fetch_feed_bytes", _slow)
+        monkeypatch.setattr(updates, "_fetch_feed_bytes", _blocked)
         monkeypatch.setattr(updates, "_local_version", "0.1.2rc3")
 
         async def _drive() -> None:
-            await asyncio.gather(*(updates._do_update_check() for _ in range(5)))
+            leader = asyncio.create_task(updates._do_update_check())
+            await asyncio.wait_for(started.wait(), timeout=1)
+            follower = asyncio.create_task(updates._do_update_check())
+            await asyncio.sleep(0)
+            assert not follower.done(), "a follower returned before the shared verdict existed"
+            release.set()
+            await asyncio.gather(leader, follower)
 
         asyncio.run(_drive())
         assert calls["n"] == 1
-        # The winner's verdict still lands — the no-ops must not blank it.
         assert updates.get_update_info()["update_available"] is True
 
-    def test_the_flag_is_released_even_when_the_check_raises(self, monkeypatch):
-        # A stuck flag would wedge the check for the process's lifetime.
+    def test_cancelled_manual_creator_does_not_stop_coordinator_follower(self, monkeypatch):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _blocked() -> None:
+            started.set()
+            await release.wait()
+
+        monkeypatch.setattr(updates, "_run_update_check", _blocked)
+
+        async def _drive() -> None:
+            creator = asyncio.create_task(updates._do_update_check())
+            await asyncio.wait_for(started.wait(), timeout=1)
+            worker = updates._check_task
+            assert worker is not None
+
+            creator.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await creator
+            assert not worker.cancelled()
+            assert not worker.done()
+
+            coordinator = asyncio.create_task(updates._do_update_check())
+            release.set()
+            await coordinator
+            assert worker.done()
+            assert updates._check_task is None
+            assert updates._check_task_generation is None
+
+        asyncio.run(_drive())
+
+    def test_cancelled_only_caller_does_not_cache_completed_worker(self, monkeypatch):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def _blocked_once() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                started.set()
+                await release.wait()
+
+        monkeypatch.setattr(updates, "_run_update_check", _blocked_once)
+
+        async def _drive() -> None:
+            creator = asyncio.create_task(updates._do_update_check())
+            await asyncio.wait_for(started.wait(), timeout=1)
+            worker = updates._check_task
+            assert worker is not None
+
+            creator.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await creator
+            release.set()
+            await worker
+            await asyncio.sleep(0)
+            assert updates._check_task is None
+
+            await updates._do_update_check()
+            assert calls == 2
+
+        asyncio.run(_drive())
+
+    def test_gateway_shutdown_cancels_the_shared_check(self, monkeypatch):
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def _blocked() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        monkeypatch.setattr(updates, "_run_update_check", _blocked)
+
+        async def _drive() -> None:
+            coordinator = asyncio.create_task(updates._do_update_check())
+            await asyncio.wait_for(started.wait(), timeout=1)
+            await updates._cancel_update_check()
+            with pytest.raises(asyncio.CancelledError):
+                await coordinator
+            assert cancelled.is_set()
+            assert updates._check_task is None
+            assert updates._check_task_generation is None
+
+        asyncio.run(_drive())
+
+    def test_task_ownership_is_released_even_when_check_raises(self, monkeypatch):
+        # A finished task reference would wedge checks for the process's lifetime.
         async def _boom(url: str) -> tuple[int, bytes]:
             raise RuntimeError("unexpected")
 
         monkeypatch.setattr(updates, "_fetch_feed_bytes", _boom)
         asyncio.run(updates._do_update_check())
-        assert updates._check_in_flight is False
+        assert updates._check_task is None
         assert updates.get_update_info()["error_code"] == "unknown"
 
-    def test_the_flag_is_released_when_the_DERIVATION_raises(self, monkeypatch):
+    def test_task_ownership_is_released_when_derivation_raises(self, monkeypatch):
         # The derivation runs before any branch is chosen, so a raise there is the
-        # one that can escape the single-flight guard. A leaked flag makes every
-        # later check a silent no-op: the gateway stops noticing updates at all
-        # and nothing surfaces the fact.
+        # one that can escape ordinary result containment. A leaked task owner
+        # makes later callers join a dead worker instead of checking again.
         def _boom() -> object:
             raise RuntimeError("git exploded")
 
         monkeypatch.setattr(updates, "derive_capability", _boom)
         asyncio.run(updates._do_update_check())
-        assert updates._check_in_flight is False
+        assert updates._check_task is None
         assert updates.get_update_info()["error_code"] == "unknown"
         assert updates.get_update_info()["check_status"] == "failed"
 
@@ -859,14 +1250,31 @@ class TestAutoApplyGuard:
         # drag in credentials, the slot manager and the whole boot path.
         orch = object.__new__(GatewayOrchestrator)
         orch.dashboard_state = MagicMock()
+        orch._update_apply_deferred = False
+        orch._mandatory_update_deferred_at = None
+        orch._mandatory_update_deferred_key = None
+        orch._session_tasks = {}
+        orch.sessions = MagicMock()
+        orch.sessions.pause_turn_admission_for_update = AsyncMock(return_value=True)
+        orch.sessions.resume_turn_admission_after_update = AsyncMock()
+        orch.sessions.drain_active_turns = AsyncMock(return_value=0)
+        orch._schedule_inbound_replay = MagicMock()
         orch._auto_apply_update = AsyncMock()
         orch._auto_apply_wheel_update = AsyncMock()
         return orch
 
-    def _run(self, info: dict[str, object], *, auto_update: bool, dist: str = "wheel"):
+    def _run(
+        self,
+        info: dict[str, object],
+        *,
+        auto_update: bool,
+        managed_venv: bool = True,
+        busy: int = 0,
+    ):
         import kiro_crew.dashboard.handlers as handlers
 
         orch = self._orchestrator()
+        orch._in_flight_work_counts = MagicMock(return_value=(busy, 0))
         cfg = MagicMock()
         cfg.auto_update = auto_update
         from kiro_crew.platform.governance import UpdatePins
@@ -881,10 +1289,13 @@ class TestAutoApplyGuard:
                         "kiro_crew.platform.update_governance.update_required",
                         return_value=False,
                     ):
-                        # The installer may only be driven for the `wheel` stamp,
-                        # so the stamp is part of the case rather than whatever
-                        # this test host happens to be built as.
-                        with patch("kiro_crew.slack.gateway.distribution", return_value=dist):
+                        # Runtime ownership is authoritative. Old managed wheels
+                        # predate the build stamp and report "source", while a
+                        # foreign wheel must never be rewritten by Kiro Crew.
+                        with patch(
+                            "kiro_crew.platform.wheel_engine.running_from_managed_venv",
+                            return_value=managed_venv,
+                        ):
                             # No commands in the policy pins, so resolve_provider
                             # returns None and the code falls through to the legacy
                             # path under test.
@@ -898,7 +1309,29 @@ class TestAutoApplyGuard:
             handlers._update_info.update(original)
         return orch
 
-    def test_wheel_install_notifies_instead_of_applying(self):
+    def test_managed_install_auto_applies_without_consulting_the_build_stamp(self):
+        info = {
+            "update_available": True,
+            "can_apply": False,
+            "managed_by": "kirocrew",
+            "remediation": {
+                "kind": "command",
+                "message": "Re-run the installer to upgrade.",
+                "command": "curl -fsSL … | sh",
+            },
+        }
+        with patch(
+            "kiro_crew.slack.gateway.distribution",
+            side_effect=AssertionError("managed-venv ownership must replace the build stamp"),
+        ):
+            orch = self._run(info, auto_update=True, managed_venv=True)
+        orch._auto_apply_update.assert_not_awaited()
+        orch._auto_apply_wheel_update.assert_awaited_once()
+        orch.sessions.pause_turn_admission_for_update.assert_awaited_once()
+        orch.sessions.resume_turn_admission_after_update.assert_awaited_once()
+        orch._schedule_inbound_replay.assert_called_once()
+
+    def test_busy_managed_install_defers_and_keeps_update_pending(self):
         orch = self._run(
             {
                 "update_available": True,
@@ -911,11 +1344,95 @@ class TestAutoApplyGuard:
                 },
             },
             auto_update=True,
+            managed_venv=True,
+            busy=1,
         )
-        # The git apply must NOT run on a non-git tree.
+        orch._auto_apply_wheel_update.assert_not_awaited()
+        assert orch._update_apply_deferred is True
+        orch.sessions.pause_turn_admission_for_update.assert_awaited_once()
+        orch.sessions.resume_turn_admission_after_update.assert_awaited_once()
+        orch._schedule_inbound_replay.assert_called_once()
+        orch.dashboard_state.push_refresh.assert_called_with("update_available")
+
+    def test_mandatory_busy_update_keeps_deferring_after_the_grace_limit(self):
+        orch = self._orchestrator()
+        orch._mandatory_update_deferred_at = 0.0
+        orch._mandatory_update_deferred_key = "floor:9.9.9"
+        orch._in_flight_work_counts = MagicMock(return_value=(1, 0))
+
+        prepared = asyncio.run(
+            orch._prepare_auto_update_apply(
+                mandatory=True,
+                mandatory_key="floor:9.9.9",
+            )
+        )
+
+        assert prepared is False
+        orch.sessions.pause_turn_admission_for_update.assert_awaited_once()
+        orch.sessions.drain_active_turns.assert_not_awaited()
+        orch.sessions.resume_turn_admission_after_update.assert_awaited_once()
+        assert orch._update_apply_deferred is True
+        assert orch._mandatory_update_deferred_at == 0.0
+        assert orch._mandatory_update_deferred_key == "floor:9.9.9"
+
+    def test_mandatory_update_does_not_drain_through_background_work(self):
+        orch = self._orchestrator()
+        orch._mandatory_update_deferred_at = 0.0
+        orch._mandatory_update_deferred_key = "floor:9.9.9"
+        # The active provider turn may belong to the TaskRunner represented by
+        # the background count. Cancelling it would lose work while apply still
+        # remains deferred.
+        orch._in_flight_work_counts = MagicMock(return_value=(1, 1))
+
+        prepared = asyncio.run(
+            orch._prepare_auto_update_apply(
+                mandatory=True,
+                mandatory_key="floor:9.9.9",
+            )
+        )
+
+        assert prepared is False
+        orch.sessions.drain_active_turns.assert_not_awaited()
+        orch.sessions.resume_turn_admission_after_update.assert_awaited_once()
+        orch._schedule_inbound_replay.assert_called_once()
+        assert orch._update_apply_deferred is True
+
+    def test_new_mandatory_target_gets_a_fresh_deferral_window(self):
+        orch = self._orchestrator()
+        orch._mandatory_update_deferred_at = 0.0
+        orch._mandatory_update_deferred_key = "old-floor:1.0.0"
+        orch._in_flight_work_counts = MagicMock(return_value=(1, 0))
+
+        prepared = asyncio.run(
+            orch._prepare_auto_update_apply(
+                mandatory=True,
+                mandatory_key="new-floor:2.0.0",
+            )
+        )
+
+        assert prepared is False
+        orch.sessions.drain_active_turns.assert_not_awaited()
+        orch.sessions.resume_turn_admission_after_update.assert_awaited_once()
+        assert orch._mandatory_update_deferred_at is not None
+        assert orch._mandatory_update_deferred_key == "new-floor:2.0.0"
+
+    def test_foreign_environment_never_runs_the_managed_installer(self):
+        orch = self._run(
+            {
+                "update_available": True,
+                "can_apply": False,
+                "managed_by": "kirocrew",
+                "remediation": {
+                    "kind": "command",
+                    "message": "Re-run the installer to upgrade.",
+                    "command": "curl -fsSL … | sh",
+                },
+            },
+            auto_update=True,
+            managed_venv=False,
+        )
         orch._auto_apply_update.assert_not_awaited()
-        # The wheel auto-apply IS called (new behavior).
-        orch._auto_apply_wheel_update.assert_awaited_once()
+        orch._auto_apply_wheel_update.assert_not_awaited()
 
     def test_git_checkout_auto_applies_when_the_version_moved(self):
         """The git apply needs `version_newer`, not just `available`.
@@ -980,6 +1497,428 @@ class TestAutoApplyGuard:
         )
         assert "Already on latest version" not in capsys.readouterr().out
 
+    def test_failed_apply_replay_waits_for_the_existing_pass(self, tmp_path):
+        from kiro_crew.slack import gateway
+
+        orch = object.__new__(gateway.GatewayOrchestrator)
+        replay = AsyncMock()
+        orch._replay_spooled_inbound = replay
+        release = asyncio.Event()
+
+        async def _scenario() -> None:
+            async def _existing() -> None:
+                await release.wait()
+
+            previous = asyncio.create_task(_existing())
+            orch._inbound_replay_task = previous
+            with patch.object(gateway.inbound_spool, "spool_path", return_value=tmp_path):
+                orch._schedule_inbound_replay()
+            scheduled = orch._inbound_replay_task
+            await asyncio.sleep(0)
+            replay.assert_not_awaited()
+            release.set()
+            await scheduled
+
+        asyncio.run(_scenario())
+        replay.assert_awaited_once_with(spool=tmp_path)
+
+
+class TestRecurringAutoUpdateCoordinator:
+    def test_rechecks_after_the_interval(self):
+        from kiro_crew.slack import gateway
+
+        orch = object.__new__(gateway.GatewayOrchestrator)
+        orch._check_for_updates = AsyncMock(side_effect=[None, asyncio.CancelledError()])
+        sleep = AsyncMock(return_value=None)
+
+        async def _drive() -> None:
+            with patch.object(gateway.asyncio, "sleep", sleep):
+                with pytest.raises(asyncio.CancelledError):
+                    await orch._run_update_checks()
+
+        asyncio.run(_drive())
+        assert orch._check_for_updates.await_count == 2
+        sleep.assert_awaited_once_with(updates._UPDATE_CHECK_INTERVAL)
+
+    def test_busy_deferral_retries_soon(self):
+        from kiro_crew.slack import gateway
+
+        orch = object.__new__(gateway.GatewayOrchestrator)
+        calls = 0
+
+        async def _check() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                orch._update_apply_deferred = True
+                return
+            raise asyncio.CancelledError
+
+        orch._check_for_updates = AsyncMock(side_effect=_check)
+        sleep = AsyncMock(return_value=None)
+
+        async def _drive() -> None:
+            with patch.object(gateway.asyncio, "sleep", sleep):
+                with pytest.raises(asyncio.CancelledError):
+                    await orch._run_update_checks()
+
+        asyncio.run(_drive())
+        sleep.assert_awaited_once_with(gateway.GatewayOrchestrator._UPDATE_BUSY_RETRY_SECS)
+
+
+class TestUpdateBackgroundWorkContract:
+    """Make the distributed restart boundary fail CI when a launcher drifts."""
+
+    @staticmethod
+    def _registrations(kind: str, tree: ast.AST) -> list[ast.AST]:
+        found: list[ast.AST] = []
+        for node in ast.walk(tree):
+            if kind == "subagents":
+                queued = (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "append"
+                    and isinstance(node.func.value, ast.Attribute)
+                    and node.func.value.attr == "_queue"
+                )
+                running = (
+                    isinstance(node, ast.AugAssign)
+                    and isinstance(node.target, ast.Attribute)
+                    and node.target.attr == "_running_count"
+                    and isinstance(node.op, ast.Add)
+                )
+                if queued or running:
+                    found.append(node)
+            elif kind == "cron":
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "add"
+                    and isinstance(node.func.value, ast.Attribute)
+                    and node.func.value.attr == "_running_script_ids"
+                ):
+                    found.append(node)
+            elif kind == "taskrunner":
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "add"
+                    and isinstance(node.func.value, ast.Attribute)
+                    and node.func.value.attr == "_start_ids_in_flight"
+                ):
+                    found.append(node)
+            elif kind == "workflows":
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "run_background"
+                ):
+                    found.append(node)
+        return found
+
+    @staticmethod
+    def _is_admission_guard(statement: ast.stmt) -> bool:
+        if not isinstance(statement, ast.If):
+            return False
+        names_gate = any(
+            isinstance(node, ast.Attribute)
+            and node.attr in {"admission_closed", "_admission_closed"}
+            or isinstance(node, ast.Constant)
+            and node.value == "admission_closed"
+            for node in ast.walk(statement.test)
+        )
+        exits_on_closed = any(
+            isinstance(node, (ast.Raise, ast.Return)) for node in ast.walk(statement)
+        )
+        return names_gate and exits_on_closed
+
+    def _has_dominating_admission_guard(
+        self, node: ast.AST, parents: dict[ast.AST, ast.AST]
+    ) -> bool:
+        current = node
+        while current in parents:
+            parent = parents[current]
+            for field in ("body", "orelse", "finalbody"):
+                block = getattr(parent, field, None)
+                if not isinstance(block, list) or current not in block:
+                    continue
+                index = block.index(current)
+                if any(self._is_admission_guard(statement) for statement in block[:index]):
+                    return True
+                break
+            current = parent
+        return False
+
+    def test_one_cron_branch_cannot_cover_another(self):
+        tree = ast.parse("""
+async def callback(job):
+    if job.command:
+        if getattr(sessions, "admission_closed", False):
+            return
+        self._running_script_ids.add(job.id)
+    if job.script:
+        self._running_script_ids.add(job.id)
+""")
+        registrations = self._registrations("cron", tree)
+        parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        }
+        guarded = [
+            self._has_dominating_admission_guard(registration, parents)
+            for registration in registrations
+        ]
+
+        assert guarded == [True, False]
+
+    def test_every_background_registration_is_gated_and_counted(self):
+        root = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
+        from kiro_crew.slack import gateway
+
+        census = inspect.getsource(gateway.GatewayOrchestrator._in_flight_work_counts)
+        for token in (
+            "sessions.inbound_callback_count",
+            "inbound_spool.pending_refusal_write_count()",
+            'getattr(slot, "task", None)',
+            'getattr(slot, "_in_stage_execution", False)',
+            'getattr(owner, "_handler_tasks", None)',
+            'getattr(self, "_channel_handles", {})',
+        ):
+            assert token in census, f"channel callback census lost {token}"
+
+        from kiro_crew.subagent import SubagentManager
+
+        subagent_census = inspect.getsource(SubagentManager.pending_work_count.fget)
+        for token in (
+            "self._tasks.values()",
+            "self._report_tasks",
+            "self._followup_watchers.values()",
+            'getattr(self, "_reconcile_task", None)',
+            "self._abandoned_state_writers",
+            "len(self._queue)",
+            "self._running_count",
+        ):
+            assert token in subagent_census, f"subagent lifecycle census lost {token}"
+        contracts = {
+            "subagents": (
+                root / "subagent_manager" / "admission.py",
+                2,
+                ("subagents.pending_work_count",),
+            ),
+            "cron": (
+                root / "slack" / "gateway.py",
+                2,
+                ("len(self._running_script_ids)",),
+            ),
+            "taskrunner": (
+                root / "taskrunner.py",
+                3,
+                ("runner.running",),
+            ),
+            "workflows": (
+                root / "workflows" / "service.py",
+                3,
+                ("workflows.list_runs()", 'run.get("status") == "running"'),
+            ),
+        }
+
+        for kind, (path, expected_count, census_tokens) in contracts.items():
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            registrations = self._registrations(kind, tree)
+            assert (
+                len(registrations) == expected_count
+            ), f"{kind} registration sites changed; update the admission/census contract"
+            parents = {
+                child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+            }
+            for registration in registrations:
+                gated_before_registration = self._has_dominating_admission_guard(
+                    registration, parents
+                )
+                assert gated_before_registration, (
+                    f"{kind} registers at {path.name}:{registration.lineno} without a "
+                    "dominating terminating admission guard"
+                )
+            for token in census_tokens:
+                assert token in census, f"{kind} registers work but is absent from the census"
+
+    def test_every_pre_turn_channel_reserves_before_commands(self):
+        root = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
+        owners = {
+            path.parent.name
+            for path in root.glob("*/client.py")
+            if "_handler_tasks" in path.read_text(encoding="utf-8")
+        }
+        if "_handler_tasks" in (root / "imessage" / "rpc.py").read_text(encoding="utf-8"):
+            owners.add("imessage")
+        owners.add("slack")  # host-managed handler set lives on GatewayOrchestrator
+        # These transports dispatch through inline receive paths, so they need a
+        # dispatcher reservation even where WhatsApp/Weixin now also expose the
+        # upstream receive segment in a client handler registry.
+        inline_owners = {"feishu", "whatsapp", "weixin"}
+        owners.update(inline_owners)
+        assert owners == {
+            "discord",
+            "feishu",
+            "imessage",
+            "slack",
+            "teams",
+            "telegram",
+            "webex",
+            "wecom",
+            "whatsapp",
+            "weixin",
+        }
+
+        dispatcher_paths = {owner: root / owner / "transport_dispatch.py" for owner in owners}
+        dispatcher_paths["slack-native"] = root / "slack" / "handler.py"
+        for owner, path in dispatcher_paths.items():
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            handlers = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name in {"handle_message", "handle_message_transport"}
+            ]
+            assert handlers, f"{owner} has no inbound handler in {path.name}"
+            for handler in handlers:
+                admit_lines = [
+                    node.lineno
+                    for node in ast.walk(handler)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in {"admit_inbound_callback", "hold_inbound_callback"}
+                ]
+                assert admit_lines, f"{owner} handler does not reserve inbound callback work"
+                governance_lines = [
+                    node.lineno
+                    for node in ast.walk(handler)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "inbound_permitted"
+                ]
+                if owner in inline_owners:
+                    assert governance_lines and min(admit_lines) < min(
+                        governance_lines
+                    ), f"{owner} suspends for governance before callback reservation"
+                effect_lines = [
+                    node.lineno
+                    for node in ast.walk(handler)
+                    if isinstance(node, ast.Call)
+                    and (
+                        (isinstance(node.func, ast.Name) and node.func.id == "parse_command")
+                        or (
+                            isinstance(node.func, ast.Attribute)
+                            and node.func.attr == "_handle_admitted"
+                        )
+                    )
+                ]
+                if effect_lines:
+                    assert min(admit_lines) < min(
+                        effect_lines
+                    ), f"{owner} reserves only after command handling"
+
+        for owner in ("telegram", "discord", "teams"):
+            source = dispatcher_paths[owner].read_text(encoding="utf-8")
+            assert "refused_resume_is_restricted" in source
+            assert "_refused_turn_restricted" in source
+        teams_source = dispatcher_paths["teams"].read_text(encoding="utf-8")
+        assert "inbound_restricted=session_restricted" in teams_source
+
+    def test_upstream_inline_receivers_register_before_dispatch(self):
+        root = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
+        contracts = (
+            (root / "whatsapp" / "client.py", "_on_message", "on_message"),
+            (root / "weixin" / "transport.py", "_poll_forever", "receive"),
+        )
+        for path, function_name, dispatch_name in contracts:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            function = next(
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.AsyncFunctionDef) and node.name == function_name
+            )
+            registrations = [
+                node.lineno
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add"
+                and "_handler_tasks" in ast.unparse(node.func.value)
+            ]
+            dispatches = [
+                node.lineno
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == dispatch_name
+            ]
+            assert registrations and dispatches
+            assert min(registrations) < min(
+                dispatches
+            ), f"{path.parent.name} receives a callback before making it census-visible"
+
+        assert "_handler_tasks" in (root / "whatsapp" / "client.py").read_text(encoding="utf-8")
+        assert "_handler_tasks" in (root / "weixin" / "client.py").read_text(encoding="utf-8")
+
+    def test_slack_socket_reserves_before_ack(self):
+        path = Path(__file__).resolve().parents[1] / "src" / "kiro_crew" / "slack" / "events.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        listener = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_on_event"
+        )
+        admit = [
+            node.lineno
+            for node in ast.walk(listener)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "admit_inbound_callback"
+        ]
+        ack = [
+            node.lineno
+            for node in ast.walk(listener)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "send_socket_mode_response"
+        ]
+        assert admit and ack and min(admit) < min(ack)
+
+    def test_every_auto_apply_path_uses_the_final_restart_fence(self):
+        path = Path(__file__).resolve().parents[1] / "src" / "kiro_crew" / "slack" / "gateway.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        methods = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for name in ("_auto_apply_update", "_auto_apply_wheel_update"):
+            attrs = {
+                node.func.attr
+                for node in ast.walk(methods[name])
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            }
+            assert "_restart_after_update" in attrs
+            assert "reexec_python_module" not in attrs
+
+        prepare_attrs = {
+            node.func.attr
+            for node in ast.walk(methods["_prepare_auto_update_apply"])
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert "drain_active_turns" not in prepare_attrs
+
+        restart = methods["_restart_after_update"]
+        calls: dict[str, list[int]] = {}
+        for node in ast.walk(restart):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                calls.setdefault(node.func.attr, []).append(node.lineno)
+        drains = sorted(calls["_drain_update_callback_work"])
+        assert len(drains) == 2
+        assert drains[0] < calls["fence_update_restart"][0]
+        assert calls["fence_update_restart"][0] < calls["close_all"][0] < drains[1]
+        assert drains[1] < calls["reexec_python_module"][0]
+
 
 class TestCommandManagedCheck:
     """A policy-pinned command provider owns the check: no feed, no git, no channel.
@@ -996,13 +1935,15 @@ class TestCommandManagedCheck:
         saved_info = dict(updates._update_info)
         saved_clock = updates._last_update_check
         saved_generation = updates._check_generation
-        saved_flight = updates._check_in_flight
+        saved_task = updates._check_task
+        saved_task_generation = updates._check_task_generation
         yield
         updates._update_info.clear()
         updates._update_info.update(saved_info)
         updates._last_update_check = saved_clock
         updates._check_generation = saved_generation
-        updates._check_in_flight = saved_flight
+        updates._check_task = saved_task
+        updates._check_task_generation = saved_task_generation
 
     def _run(self, provider: CommandProvider, result: UpdateCheckResult) -> dict:
         # ``derive_capability`` and both built-in checkers are booby-trapped:

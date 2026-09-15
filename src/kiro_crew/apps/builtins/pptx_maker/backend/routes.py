@@ -77,6 +77,7 @@ from kiro_crew.apps.builtins.pptx_maker.backend import (
 )
 from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.credential_patterns import AWS_KEY_ID
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.hooks import FileTooLargeError
 from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
@@ -180,7 +181,7 @@ _INLINE_BITMAP_RE = re.compile(
 # and stays O(1) per blob: a genuine raster always carries its signature, and a
 # smuggled secret essentially never decodes into one. The shared sniffer also
 # checks WebP's form tag at offset 8, so a bare `RIFF` container (e.g. a WAVE
-# audio file) no longer counts as a bitmap here.
+# audio file) does not count as a bitmap here.
 
 # AVIF/HEIF put a 4-byte box length BEFORE the `ftyp` brand, so the signature is
 # at an offset rather than at byte 0.
@@ -192,7 +193,7 @@ _BITMAP_FTYP_MAGIC = b"ftyp"
 # An AWS key id is a fixed 4-char prefix plus exactly 16 upper/digit chars — all of it
 # base64 alphabet — so it can be smuggled as body text and reproduced by the re-encode.
 # Chance collision is negligible (~1.6e-7 per 20 KB raster) because the 16-char body is
-# required; matching a BARE 4-char prefix instead is what used to blank real pictures at
+# required; matching a BARE 4-char prefix instead blanks real pictures at
 # 0.88% per 20 KB and 4.7% per 100 KB.
 #
 # Every other provider marker (`xox…`, `sk-ant…`, `gh[pousr]_…`, `pypi-`, `glpat-`, a
@@ -202,9 +203,9 @@ _BITMAP_FTYP_MAGIC = b"ftyp"
 # body (see `_BITMAP_URI_TERMINATORS`), which covers every separator rather than an
 # enumerated few.
 #
-# Case-sensitive on purpose: `[A-Z0-9]{16}` over a lowercased body would match ordinary
-# mixed-case base64 constantly.
-_ENCODED_CREDENTIAL_RE = re.compile(r"(?:AKIA|ASIA)[A-Z0-9]{16}")
+# Case-sensitive on purpose: the shared spelling's uppercase-only body over a
+# lowercased body would match ordinary mixed-case base64 constantly.
+_ENCODED_CREDENTIAL_RE = re.compile(AWS_KEY_ID)
 
 
 # Characters that legitimately END a `data:` URI in the artifact formats the engine
@@ -478,10 +479,25 @@ async def _read_body(request: web.Request) -> bytes | None:
 
 
 async def _json_body(request: web.Request) -> tuple[dict | None, web.Response | None]:
-    """Parse a JSON object body, or return the 400 to send back."""
+    """Parse a JSON object body, or return the 400 to send back.
+
+    Same 400-for-non-object / (body, None)-tuple contract as
+    ``dashboard/handlers/_shared.read_bounded_json``; the deliberate divergence is
+    the app-specific ``code`` values (``body_not_json`` / ``body_not_object``)
+    that the dashboard switches on. Unlike ``read_bounded_json`` this helper does
+    not cap the body — the size-bounded reader ``_read_body`` guards the raw-body
+    ``styles/import`` endpoint instead, not this JSON path.
+
+    The catch spans the client-input failure set: ``LookupError`` (an unknown
+    ``charset=`` codec) answers 400 rather than escaping as a 500, and
+    ``RecursionError`` (a deeply nested body) is caught for the same reason.
+    ``UnicodeDecodeError`` is a ``ValueError`` subclass, so ``ValueError`` alone
+    already covers undecodable bytes; it is dropped from the tuple as redundant.
+    A mid-read transport error still propagates as itself.
+    """
     try:
         body = await request.json()
-    except (ValueError, UnicodeDecodeError):
+    except (LookupError, RecursionError, ValueError):
         return None, web.json_response(
             {"error": "request body must be JSON", "code": "body_not_json"}, status=400
         )
@@ -669,7 +685,7 @@ async def _handle_deps(request: web.Request) -> web.Response:
     which is a privileged host mutation driven by an unauthenticated-to-the-OS
     caller — the dashboard shows the command and the user runs it.
 
-    ``pdftoppm`` is no longer in that category: it is provided by an app-private
+    ``pdftoppm`` is not in that category: it is provided by an app-private
     launcher over the engine venv's own ``pypdfium2`` (see :mod:`.preview_tools`),
     installed as part of ``POST /engine/provision``. Nothing is elevated and
     nothing is written outside this app's data dir, so there is still no
@@ -959,7 +975,7 @@ async def _handle_put_config(request: web.Request) -> web.Response:
     """PUT /config {"deckRoot": "<path>"} — set the deck output directory.
 
     ``deckRoot`` is the ONLY writable key: the body is checked for exact key
-    equality rather than merged, so this endpoint cannot be used to set an
+    equality rather than merged, so this endpoint cannot set an
     arbitrary engine option.
     """
     body, error = await _json_body(request)

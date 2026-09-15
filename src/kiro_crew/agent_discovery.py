@@ -12,14 +12,21 @@ Each agent is identified by its ``modeId`` — the value passed to
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
+import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from kiro_crew.agent_files import AGENT_FILENAME, LITE_AGENT_FILENAME
+from kiro_crew import agent_state
+from kiro_crew.agent_files import (
+    AGENT_FILENAME,
+    LITE_AGENT_FILENAME,
+    OWNED_KIRO_AGENT_FILES,
+)
 from kiro_crew.config.paths import kiro_agents_dir, project_agents_dir, project_kiro_dir
 from kiro_crew.executors import discovery_executor
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes
@@ -62,7 +69,7 @@ SCOPE_PROJECT = "project"
 # sessions on different checkouts must not serve each other's agents from one
 # entry. The signature is the pair of per-directory signatures, so an edit in
 # either scope invalidates.
-_ListAgentsSig = tuple[int, int]
+_ListAgentsSig = tuple[tuple[str, int], ...]
 _LIST_AGENTS_KEY = tuple[str, str]
 _LIST_AGENTS_CACHE: dict[_LIST_AGENTS_KEY, tuple[tuple[_ListAgentsSig, ...], list[AgentInfo]]] = {}
 
@@ -71,6 +78,22 @@ _LIST_AGENTS_CACHE: dict[_LIST_AGENTS_KEY, tuple[tuple[_ListAgentsSig, ...], lis
 # resolver needs only the name set: building full AgentInfo rows (and scanning the
 # user-level dir alongside) on every turn is the cost this index exists to avoid.
 _PROJECT_NAMES_CACHE: dict[str, tuple[tuple[_ListAgentsSig, ...], frozenset[str]]] = {}
+
+# Parsed agent SPECS (raw dict + original path), keyed by directory and
+# revalidated by the same stat-only signature. This is the shared snapshot
+# behind :func:`agent_skill_globs` and the dashboard's ``loaded_by_agents``
+# annotation: both re-read every spec per call without it, and the parse is
+# their dominant cost. Guarded by a lock — callers run on executor threads.
+# Rows are shared, never copied: treat ``(data, path)`` tuples and the
+# ``data`` dicts as read-only.
+_PARSED_SPECS_LOCK = threading.Lock()
+_PARSED_SPECS_CACHE: dict[str, tuple[_ListAgentsSig, list[tuple[dict[str, Any], Path]]]] = {}
+# Bumped by clear_list_agents_cache() under the lock. A parse snapshot records
+# the generation it started under and is discarded instead of stored when a
+# clear landed meanwhile — otherwise an in-flight parse could re-publish rows
+# read BEFORE the write that the clear announced, inside one mtime tick where
+# the signature cannot tell the difference.
+_PARSED_SPECS_GEN = 0
 
 
 @dataclass
@@ -86,6 +109,16 @@ class AgentInfo:
     source: str = "builtin"  # "kirocrew" | "package" | "builtin"
     package: str = ""  # AIM package name (e.g. "Customer360GenAIContext")
     scope: str = SCOPE_GLOBAL  # "global" | "project"
+    # Display-only provenance, deliberately NOT folded into ``source``: that field
+    # also gates agent auto-creation and delete-blocking, so widening it to cover
+    # the helper specs would silently change both.
+    kirocrew_owned: bool = False
+    # Fork lineage from the agent_state sidecar: set when this template is one
+    # crew's private copy of another (blueprint semantics). ``private_to`` also
+    # gates the sync loop's agent auto-creation — a private copy is not a
+    # standalone template deserving its own agent.
+    forked_from: str = ""
+    private_to: str = ""
 
     def __post_init__(self) -> None:
         """Make the annotations above TRUE, at every construction site.
@@ -120,6 +153,8 @@ class AgentInfo:
             ("source", "builtin"),
             ("package", ""),
             ("scope", SCOPE_GLOBAL),
+            ("forked_from", ""),
+            ("private_to", ""),
         ):
             if not isinstance(getattr(self, name), str):
                 setattr(self, name, fallback)
@@ -128,6 +163,9 @@ class AgentInfo:
         # so a spec with one bad entry keeps the rest.
         self.skills = [s for s in self.skills if isinstance(s, str)]
         self.mcp_servers = [s for s in self.mcp_servers if isinstance(s, str)]
+        # The out-of-tree edition seam passes this through from a raw row, and a
+        # truthy non-bool would render as a provenance claim nothing verified.
+        self.kirocrew_owned = self.kirocrew_owned is True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -144,7 +182,57 @@ SKILL_URI_PREFIX = "skill://"
 AGENT_SPEC_SUFFIX = ".agent-spec.json"
 
 
-def _read_agent_spec(path: Path) -> dict[str, Any] | None:
+def _audit_denied(*, operation: str, source: str, resources: str, error: str) -> None:
+    """Emit a denial audit row for a refused path, never raising.
+
+    BOTH denial paths in this module promise not to raise -- ``_read_agent_spec``
+    by the contract :func:`_warn_on_systematic_scan_failure` documents and its
+    callers read bare, and :func:`project_agent_names` in its own docstring
+    ("Never raises; an unreadable checkout yields an empty set"). Auditing the
+    denial must not become the one way to break either promise: for some
+    surfaces this is the process's FIRST SEL use, and constructing the singleton
+    mkdirs its home (``sel.py``), so an unwritable or hostile SEL directory
+    would abort whichever surface asked -- on exactly the hostile path the
+    refusal exists to handle.
+
+    The REFUSAL always stands, so nothing unaudited is ever read or scanned;
+    what is lost is the audit ROW. That is best-effort by the SEL API's own
+    design: ``log_api_access`` reserves fail-closed behaviour for its explicit
+    ``critical=True`` callers (``apps/admission.py``, the auto-improvement
+    server) and neither of these sites has ever been one. WARNING, not debug, so
+    an operator sees that the trail has a hole rather than finding out later.
+
+    The fallback names only the ``operation`` -- a fixed internal label. The
+    REFUSED PATH is deliberately not logged here: on this branch its resolved
+    target is a sensitive location (that is why it was refused), so writing it at
+    a default-visible level would leak the very thing the deny list protects.
+    The path already appears in the neighbouring ``debug`` line for anyone
+    debugging a specific file, and the SEL row -- the record designed to carry
+    it, redacted and clipped -- is what is being lost.
+    """
+    try:
+        _sel().log_api_access(
+            caller="agent_discovery",
+            operation=operation,
+            outcome="denied",
+            source=source,
+            resources=resources,
+            error=error,
+        )
+    except Exception:
+        logger.warning(
+            "SEL denial audit failed for a %s denial -- refusal stands, audit row lost",
+            operation,
+            exc_info=True,
+        )
+
+
+def _read_agent_spec(
+    path: Path,
+    *,
+    operation: str = "list_agents",
+    source: str = "list_agents",
+) -> dict[str, Any] | None:
     """Parse an agent config file, or ``None`` when it is not usable.
 
     The one reader for both scopes, so every guard applies uniformly: AppleDouble
@@ -156,6 +244,20 @@ def _read_agent_spec(path: Path) -> dict[str, Any] | None:
     the size cap instead of being slurped into memory during a cache warm. The
     agents directories are user-writable and shared with other tools, so none of
     these are hypothetical.
+
+    *operation*/*source* label the SEL denial event emitted on a sensitive
+    resolved target. Precisely BECAUSE this is the one reader for every surface,
+    a fixed label would record a denial served for an unrelated request as an
+    agent-listing cache warm: the calling surface names itself here so
+    the security trail attributes the refusal to the request that triggered it.
+    ``source`` is the interface channel (``SecurityEvent.source`` vocabulary:
+    dashboard, cli, slack, cron, ...; ``"unknown"`` when the caller serves
+    multiple channels) — every call site passes it explicitly, enforced by the
+    call-site ratchet test. Both defaults exist ONLY so a bare call reproduces
+    the established event byte-for-byte (a forgotten future call site degrades
+    to exactly today's trail); they are not for new call sites.
+    ``caller`` stays fixed at ``"agent_discovery"``: the reader genuinely is the
+    caller into SEL, and a fixed value keeps the trail greppable by module.
     """
     if path.name.startswith("._"):
         return None
@@ -170,11 +272,9 @@ def _read_agent_spec(path: Path) -> dict[str, Any] | None:
         return None
     if is_sensitive_path(str(real)):
         logger.debug("Skipping sensitive agent config: %s", path)
-        _sel().log_api_access(
-            caller="agent_discovery",
-            operation="list_agents",
-            outcome="denied",
-            source="list_agents",
+        _audit_denied(
+            operation=operation,
+            source=source,
             resources=str(real),
             error="sensitive path rejected",
         )
@@ -196,6 +296,110 @@ def _read_agent_spec(path: Path) -> dict[str, Any] | None:
         logger.debug("Skipping non-object agent config: %s", path)
         return None
     return data
+
+
+class AmbiguousAgentSpecError(ValueError):
+    """More than one spec in one directory declares the same ``name``.
+
+    Which of them is live is undefined, so a resolver that picked one would
+    hand the caller an agent the operator did not name, with that agent's tools
+    and prompt. Every declared-name resolver refuses instead; the message names
+    each file so the operator can remove or rename one.
+    """
+
+
+def spec_by_declared_name(
+    agents_dir: Path,
+    agent_id: str,
+    *,
+    operation: str,
+    source: str,
+) -> dict[str, Any] | None:
+    """Return the parsed spec in *agents_dir* whose declared ``name`` is *agent_id*.
+
+    A spec's filename and its declared ``name`` are allowed to differ: a package
+    manager that installs several agents namespaces them on disk as
+    ``<package>-<name>.json`` while the declared ``name`` stays bare, and the
+    config, the CLI and :func:`kiro_crew.agent.agent_spec_path` all address such
+    an agent by the bare name. Two surfaces resolve through this scan when they
+    find no ``<agent_id>.json``: the KAS projection that starts a session
+    (:func:`kiro_crew.acp.kas_agents.load_agent_spec`) and the tool-policy read
+    that session's managed MCP servers then make, so those two agree on which
+    file an id means. Other surfaces still carry their own inline
+    ``data.get("name") == agent`` scans; routing them here is tracked, not done.
+
+    Reads go through :func:`_read_agent_spec`, the one hardened reader, so a
+    scan of a user-writable directory applies the same guards as the listing
+    path: size cap, AppleDouble sidecars, a symlink whose resolved target is
+    sensitive, non-UTF-8 bytes, JSON that is not an object. *operation* and
+    *source* label its SEL denial trail exactly as that reader documents, so a
+    denial is attributed to the surface that asked rather than to a listing.
+
+    The parsed spec is returned rather than its path, and the caller uses it
+    as it stands. Handing back a path to reopen would put a second read outside
+    the guards: between the reader resolving a symlink and the reopen, the link
+    can be repointed at a sensitive file, which would then be read with no
+    denial and no SEL audit entry.
+
+    Raises :class:`AmbiguousAgentSpecError` when two specs declare *agent_id*,
+    the refusal :func:`kiro_crew.agent.agent_spec_path` makes on the same
+    ambiguity. Propagates ``OSError`` from the directory walk itself; the
+    per-file reads never raise.
+
+    Only the first matching spec is held; a later match keeps its path and its
+    parse is dropped at once. The reader caps each file, so the parsed-spec
+    memory this scan holds at its peak is one capped parse, not one per
+    same-name file; the paths themselves, one per candidate, are what the
+    refusal message needs and are all the scan keeps of the rest.
+
+    This is a fresh walk rather than a filter over :func:`parsed_agent_specs`,
+    and the difference is the labels, not the loop. That cache serves catalog
+    readers of one directory, so its SEL labels are first-reader-wins for the
+    life of a snapshot; a denial met here would then be attributed to whichever
+    listing warmed the cache instead of to the projection or the policy read
+    that asked, which is the attribution the call-site ratchet exists to keep.
+    The cache also hands out its own rows to be treated as read-only, where
+    this returns a parse the caller owns.
+    """
+    match: dict[str, Any] | None = None
+    match_paths: list[Path] = []
+    for path in sorted(agents_dir.glob("*.json")):
+        spec = _read_agent_spec(path, operation=operation, source=source)
+        if isinstance(spec, dict) and spec.get("name") == agent_id:
+            if match is None:
+                match = spec
+            match_paths.append(path)
+    if len(match_paths) > 1:
+        # Paths are repr'd: a filename in this user-writable, tool-shared
+        # directory is untrusted input, and this message reaches a terminal.
+        raise AmbiguousAgentSpecError(
+            f"{len(match_paths)} specs declare the name {agent_id!r}: "
+            f"{', '.join(repr(str(path)) for path in match_paths)}. Which one is live is "
+            f"undefined -- remove or rename one."
+        )
+    return match
+
+
+def _warn_on_systematic_scan_failure(directory: Path, candidates: int, parsed: int) -> None:
+    """Emit ONE warning when a scan rejected every candidate spec it saw.
+
+    :func:`_read_agent_spec` deliberately degrades per file to ``None`` at debug
+    level — callers depend on that contract. The cost is that a SYSTEMATIC
+    failure (every spec in a scope unreadable for the same reason, e.g. the
+    trusted-root gate refusing an entire home layout) is indistinguishable at
+    default log levels from an empty agents directory: discovery lists nothing,
+    model resolution silently falls back, and nothing says why. This scan-level
+    check makes that case visible without touching the per-file contract: one
+    warning per scan invocation (the rate limit), none when the directory is
+    empty (N=0 is not failure) or when at least one spec parsed.
+    """
+    if candidates > 0 and parsed == 0:
+        logger.warning(
+            "agent discovery: read %d candidate spec file(s) under %s but parsed 0 — "
+            "all were unreadable or rejected; enable debug logging for per-file reasons",
+            candidates,
+            directory,
+        )
 
 
 def project_agent_files(
@@ -259,7 +463,7 @@ def _declared_project_agent_name(spec: Path) -> str | None:
     allowlist: offering the filename of a broken spec has the session accept the
     agent and then fail at ``session/set_mode``.
     """
-    data = _read_agent_spec(spec)
+    data = _read_agent_spec(spec, operation="resolve_project_agent_name", source="unknown")
     if data is None:
         return None
     return spec_str(data, "name", _project_agent_fallback_name(spec))
@@ -289,7 +493,12 @@ def _project_signature(project_dir: str | Path) -> tuple[_ListAgentsSig, ...]:
     )
 
 
-def project_agent_names(project_dir: str | Path | None) -> frozenset[str]:
+def project_agent_names(
+    project_dir: str | Path | None,
+    *,
+    operation: str = "project_agent_names",
+    source: str = "project_agent_names",
+) -> frozenset[str]:
     """Dispatchable agent names declared by a project, cached on a stat signature.
 
     Only ``<project>/.kiro/agents/*.json`` contributes, because only those names are
@@ -301,6 +510,17 @@ def project_agent_names(project_dir: str | Path | None) -> frozenset[str]:
     resolver calls this on EVERY turn of a project-agent-bound session: bounding the
     file count is not enough on its own, since the cost that stalls a caller is the
     reads, not the count.
+
+    *operation*/*source* label the SEL denial event emitted on a sensitive
+    project directory, exactly as on :func:`_read_agent_spec`: the calling
+    surface names itself so the security trail attributes the refusal to the
+    request that triggered it. ``source`` is the interface
+    channel (``SecurityEvent.source`` vocabulary: dashboard, cli, slack, cron,
+    ...; ``"unknown"`` when the caller serves multiple channels) — every call
+    site passes it explicitly, enforced by the call-site ratchet test. Both
+    defaults exist ONLY so a bare call reproduces the established event
+    byte-for-byte (a forgotten future call site degrades to exactly today's
+    trail); they are not for new call sites.
 
     Never raises; an unreadable checkout yields an empty set.
     """
@@ -314,11 +534,9 @@ def project_agent_names(project_dir: str | Path | None) -> frozenset[str]:
     # at a protected path, matching every other deny in this module.
     if is_sensitive_path(key):
         logger.debug("Skipping sensitive project dir for agent discovery: %s", project_dir)
-        _sel().log_api_access(
-            caller="agent_discovery",
-            operation="project_agent_names",
-            outcome="denied",
-            source="project_agent_names",
+        _audit_denied(
+            operation=operation,
+            source=source,
             resources=key,
             error="sensitive project dir rejected",
         )
@@ -327,14 +545,20 @@ def project_agent_names(project_dir: str | Path | None) -> frozenset[str]:
     cached = _PROJECT_NAMES_CACHE.get(key)
     if cached is not None and cached[0] == signature:
         return cached[1]
-    names = frozenset(
-        name
-        for f in project_agent_files(project_dir)
+    candidates = 0
+    declared: list[str] = []
+    for f in project_agent_files(project_dir):
+        # AppleDouble sidecars are rejected by design, not by failure — a
+        # directory holding only sidecars is empty of specs, not broken.
+        if not f.name.startswith("._"):
+            candidates += 1
         # Only a spec that parses contributes: a malformed or unreadable file can
         # never become a kiro-cli mode, and admitting its filename fallback here
         # would have dispatch accept a name whose session/set_mode then fails.
-        if (name := _declared_project_agent_name(f)) is not None
-    )
+        if (name := _declared_project_agent_name(f)) is not None:
+            declared.append(name)
+    _warn_on_systematic_scan_failure(project_agents_dir(project_dir), candidates, len(declared))
+    names = frozenset(declared)
     _PROJECT_NAMES_CACHE[key] = (signature, names)
     return names
 
@@ -369,7 +593,12 @@ def clear_project_agent_cache() -> None:
     _PROJECT_NAMES_CACHE.clear()
 
 
-async def warm_project_agent_names(project_dir: str | Path | None) -> None:
+async def warm_project_agent_names(
+    project_dir: str | Path | None,
+    *,
+    operation: str = "warm_project_agent_names",
+    source: str = "unknown",
+) -> None:
     """Populate the project name cache from the discovery pool, off the event loop.
 
     The counterpart to :func:`cached_project_agent_names`: an async caller runs this
@@ -381,6 +610,13 @@ async def warm_project_agent_names(project_dir: str | Path | None) -> None:
     ``StopIteration`` in particular cannot be delivered through a ``Future``, which
     hangs the awaiting caller instead of surfacing the error.
 
+    *operation*/*source* forward to :func:`project_agent_names` so a denial hit
+    during the warm names the surface that requested it rather than echoing the
+    helper's own name. The defaults name this hop truthfully: the warm
+    itself is the operation, and the helper serves several channels (dashboard
+    chat, spawn admission), so its channel is ``"unknown"`` unless the caller
+    says otherwise.
+
     A no-op without a *project_dir*. Best-effort and never raises: failing to warm
     costs one turn's fallback, and must not break turn handling.
     """
@@ -388,7 +624,8 @@ async def warm_project_agent_names(project_dir: str | Path | None) -> None:
         return
     try:
         await asyncio.get_running_loop().run_in_executor(
-            discovery_executor(), project_agent_names, project_dir
+            discovery_executor(),
+            functools.partial(project_agent_names, project_dir, operation=operation, source=source),
         )
     except Exception:  # noqa: BLE001 — a warm failure only costs a fallback
         logger.debug("Failed to warm project agent names for %s", project_dir, exc_info=True)
@@ -436,6 +673,57 @@ def spec_model(data: dict[str, Any]) -> str:
     It also leaked into ``subagent.py``'s spawn kwargs as a ``--model`` argument.
     """
     return spec_str(data, "model", _DEFER_MODEL)
+
+
+def agent_model_map(
+    agents_dir: Path | None = None,
+    *,
+    operation: str,
+    source: str,
+) -> dict[str, str]:
+    """Build the full agent name/stem-to-model map for legacy history restore.
+
+    Restore needs every entry, so this intentionally scans the complete scope.
+    It keeps that surface on the hardened reader while preserving
+    security-event attribution through the required *operation* and *source*
+    arguments. A missing or non-string model stays ``""`` here so a restored
+    legacy session continues to inherit its crew/global model; this deliberately
+    differs from session's targeted runtime resolver, where no pin means
+    ``"auto"``.
+
+    A refused spec is skipped like an absent one.  If every candidate in a
+    non-empty directory is refused, the scan-level warning used by discovery is
+    emitted so a systematic gate failure is not mistaken for an empty install.
+    """
+    directory = agents_dir or _kiro_agents_dir()
+    if not directory.is_dir():
+        return {}
+    try:
+        files = sorted(directory.glob("*.json"))
+    except OSError:
+        return {}
+
+    candidates = 0
+    parsed = 0
+    result: dict[str, str] = {}
+    for spec_file in files:
+        if not spec_file.name.startswith("._"):
+            candidates += 1
+        data = _read_agent_spec(
+            spec_file,
+            operation=operation,
+            source=source,
+        )
+        if data is None:
+            continue
+        model = spec_str(data, "model", "")
+        declared_name = spec_str(data, "name")
+        if declared_name:
+            result[declared_name] = model
+        result[spec_file.stem] = model
+        parsed += 1
+    _warn_on_systematic_scan_failure(directory, candidates, parsed)
+    return result
 
 
 def _builder_mcp_skills(data: dict[str, Any]) -> list[str]:
@@ -536,76 +824,135 @@ def expand_skill_uri(uri: str, agent_path: Path) -> str | None:
     return str(agent_path.parent.parent.parent / raw)
 
 
+def parsed_agent_specs(
+    agents_dir: Path | None = None,
+    *,
+    operation: str,
+    source: str,
+) -> list[tuple[dict[str, Any], Path]]:
+    """Return every parsed agent spec in *agents_dir* as ``(data, path)`` pairs.
+
+    ``path`` is the ORIGINAL file path (not the resolved target), in sorted
+    filename order, so ``path.stem`` matching and relative ``skill://`` glob
+    anchoring behave exactly as a direct scan would. Reads go through
+    :func:`_read_agent_spec`, so sidecars, symlink loops, sensitive targets,
+    oversized files, and invalid JSON are skipped best-effort.
+
+    Cached per directory and revalidated by :func:`_dir_signature`, so a warm
+    call costs one ``scandir`` instead of parsing every spec. The cache is
+    also dropped by :func:`clear_list_agents_cache` — the agent write paths
+    already call it, which covers a write landing inside one mtime tick. The
+    returned list is a fresh copy but its rows are the cached objects: treat
+    them as read-only.
+
+    *operation*/*source* label the SEL denial trail exactly as
+    :func:`_read_agent_spec` documents; the cache makes the labels
+    first-reader-wins for the lifetime of one snapshot, which is acceptable
+    because every current caller reads the same user-level directory for the
+    same catalog purpose.
+    """
+    d = agents_dir or _kiro_agents_dir()
+    key = str(d)
+    signature = _dir_signature(d)
+    with _PARSED_SPECS_LOCK:
+        cached = _PARSED_SPECS_CACHE.get(key)
+        gen = _PARSED_SPECS_GEN
+    if cached is not None and cached[0] == signature:
+        return list(cached[1])
+    # Parse OUTSIDE the lock: the lock guards only dict reads/writes, so an
+    # event-loop caller of clear_list_agents_cache() can never block behind a
+    # worker thread's disk scan. Two threads missing at once parse redundantly
+    # and last-write-wins — the same rows, from the same signature-checked
+    # directory state, so the duplicate work is bounded and harmless.
+    try:
+        candidates = sorted(d.glob("*.json"))
+    except OSError:
+        candidates = []
+    rows: list[tuple[dict[str, Any], Path]] = []
+    for f in candidates:
+        data = _read_agent_spec(f, operation=operation, source=source)
+        if data is None:
+            continue
+        rows.append((data, f))
+    with _PARSED_SPECS_LOCK:
+        # A clear() that landed during the parse announced a write this scan
+        # may predate; serve these rows to this caller but do not publish them.
+        if _PARSED_SPECS_GEN == gen:
+            _PARSED_SPECS_CACHE[key] = (signature, rows)
+    return list(rows)
+
+
 def agent_skill_globs(agent: str, agents_dir: Path | None = None) -> list[str]:
     """Return fnmatch globs for the skills mapped to *agent*, or ``[]``.
 
     An empty list means "this agent has no explicit skill mapping" — callers
     treat that as the legacy all-or-nothing default rather than as "no skills".
     Best-effort and never raises: an unreadable, invalid, or sensitive-path
-    agent file yields ``[]``.
+    agent file yields ``[]``. Resolved from the :func:`parsed_agent_specs`
+    snapshot, so a warm call parses nothing.
     """
-    d = agents_dir or _kiro_agents_dir()
-    if not agent or not d.is_dir():
+    if not agent:
         return []
-    try:
-        candidates = sorted(d.glob("*.json"))
-    except OSError:
-        return []
-    for f in candidates:
-        if f.name.startswith("._"):
-            continue
-        try:
-            real = f.resolve(strict=True)
-        except OSError:
-            continue
-        if is_sensitive_path(str(real)):
-            continue
-        try:
-            data = json.loads(real.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(data, dict):
-            continue
+    # ``f`` is the ORIGINAL path: ``f.stem`` and ``expand_skill_uri`` below
+    # must see it so a symlinked spec's relative globs stay anchored where
+    # the symlink lives.
+    for data, f in parsed_agent_specs(agents_dir, operation="agent_skill_globs", source="unknown"):
         if data.get("name") != agent and f.stem != agent:
             continue
-        globs = [g for uri in skill_resource_uris(data) if (g := expand_skill_uri(uri, f))]
-        return globs
+        return [g for uri in skill_resource_uris(data) if (g := expand_skill_uri(uri, f))]
     return []
 
 
 def _dir_signature(d: Path) -> _ListAgentsSig:
     """Cheap stat-only signature of the agents dir.
 
-    Captures the JSON file count and newest mtime — enough to detect adds,
-    removals, and in-place edits without reading or parsing any file. Used to
-    invalidate the :func:`list_agents` result cache.
+    Captures each JSON entry's name and mtime — enough to detect adds,
+    removals, renames, and any edit that changes a file's mtime, without
+    reading or parsing any file. An edit landing inside the same mtime tick
+    is invisible here; :func:`clear_list_agents_cache` is the escape hatch
+    the write paths use for exactly that case. Naming the files matters: a
+    rename changes neither the file count nor any file's mtime, but does
+    change the stem-derived agent name and the anchoring of relative
+    ``skill://`` globs. Invalidates the :func:`list_agents`, project-names,
+    and parsed-specs caches.
     """
-    count = 0
-    max_mtime = 0
+    entries: list[tuple[str, int]] = []
     try:
         with os.scandir(d) as it:
             for entry in it:
-                if not entry.name.endswith(".json"):
+                # Case-insensitive: a case-insensitive filesystem serves
+                # ``Foo.JSON`` to ``glob("*.json")`` consumers, so a
+                # case-sensitive suffix here would omit from the signature a
+                # file the scans include — its edits would never invalidate.
+                if not entry.name.lower().endswith(".json"):
                     continue
-                count += 1
                 try:
                     m = entry.stat().st_mtime_ns
                 except OSError:
                     m = 0
-                if m > max_mtime:
-                    max_mtime = m
+                entries.append((entry.name, m))
     except OSError:
         pass
-    return (count, max_mtime)
+    return tuple(sorted(entries))
 
 
 def clear_list_agents_cache() -> None:
-    """Drop all cached :func:`list_agents` results (forces a fresh scan next call).
+    """Drop the :func:`list_agents` result cache and the :func:`parsed_agent_specs`
+    snapshot (forces a fresh scan next call).
 
+    One invalidation point for those two caches, so the agent write paths that
+    already call this also cover a write landing inside one mtime tick. The
+    project-names cache is untouched: it revalidates purely by directory
+    signature and holds only name sets, never parsed spec content.
     Invalidation is normally automatic via the directory signature; call this
-    only to force an immediate refresh (e.g. right after writing an agent file).
+    only to force an immediate refresh (e.g. right after writing an agent
+    file).
     """
     _LIST_AGENTS_CACHE.clear()
+    global _PARSED_SPECS_GEN
+    with _PARSED_SPECS_LOCK:
+        _PARSED_SPECS_CACHE.clear()
+        _PARSED_SPECS_GEN += 1
 
 
 def _with_edition_agents(disk_agents: list[AgentInfo]) -> list[AgentInfo]:
@@ -654,6 +1001,7 @@ def _with_edition_agents(disk_agents: list[AgentInfo]) -> list[AgentInfo]:
                 mcp_servers=list(row.get("mcp_servers") or []),
                 source=row.get("source", "builtin"),
                 package=row.get("package", ""),
+                kirocrew_owned=row.get("kirocrew_owned", False),
             )
         except Exception:
             logger.debug("Skipping malformed edition agent row: %r", row)
@@ -698,6 +1046,7 @@ def _global_agent_info(f: Path, data: dict[str, Any]) -> AgentInfo:
         source=source,
         package=package,
         scope=SCOPE_GLOBAL,
+        kirocrew_owned=f.name in OWNED_KIRO_AGENT_FILES,
     )
 
 
@@ -718,6 +1067,7 @@ def _project_agent_info(f: Path, data: dict[str, Any]) -> AgentInfo:
         source="builtin",
         package="",
         scope=SCOPE_PROJECT,
+        kirocrew_owned=False,
     )
 
 
@@ -758,8 +1108,8 @@ def list_agents(
     cache_key = (str(d), str(project_dir or ""))
     signature: tuple[_ListAgentsSig, ...] = (
         _dir_signature(d),
-        _dir_signature(project_kiro_dir(project_dir)) if project_dir else (0, 0),
-        _dir_signature(project_agents_dir(project_dir)) if project_dir else (0, 0),
+        _dir_signature(project_kiro_dir(project_dir)) if project_dir else (),
+        _dir_signature(project_agents_dir(project_dir)) if project_dir else (),
     )
     cached = _LIST_AGENTS_CACHE.get(cache_key)
     if cached is not None and cached[0] == signature:
@@ -768,15 +1118,43 @@ def list_agents(
     agents: list[AgentInfo] = []
 
     if d.is_dir():
+        user_candidates = 0
+        user_parsed = 0
         for f in sorted(d.glob("*.json")):
+            # AppleDouble sidecars are rejected by design, not by failure — a
+            # directory holding only sidecars is empty of specs, not broken.
+            if not f.name.startswith("._"):
+                user_candidates += 1
             try:
-                data = _read_agent_spec(f)
+                data = _read_agent_spec(f, operation="list_agents", source="unknown")
                 if data is None:
                     continue
                 agents.append(_global_agent_info(f, data))
+                # Counted AFTER the append: a spec that parses but whose row
+                # construction raises into the handler below still ends in
+                # "discovery listed nothing", which is exactly what the
+                # systematic-failure warning exists to surface.
+                user_parsed += 1
             except Exception:
                 logger.debug("Skipping invalid agent config: %s", f)
                 continue
+        _warn_on_systematic_scan_failure(d, user_candidates, user_parsed)
+        # One sidecar read for the whole scan, not one per row. Global scope
+        # only: forks are made from (and recorded against) user-level templates.
+        # Lenient on purpose: a corrupt sidecar degrades the roster to "no fork
+        # info" rather than failing the whole listing — the strict readers are
+        # the mutators and the governance paths, where {} would be a hazard.
+        try:
+            forks = agent_state.all_fork_info()
+        except (OSError, ValueError):
+            logger.warning("fork sidecar unreadable; roster shows no fork info", exc_info=True)
+            forks = {}
+        if forks:
+            for a in agents:
+                fork_info = forks.get(a.name)
+                if fork_info:
+                    a.forked_from = fork_info["forked_from"]
+                    a.private_to = fork_info["private_to"]
 
     # Deduplicate by name — prefer package-installed (has package) over fallback
     seen: dict[str, AgentInfo] = {}
@@ -818,9 +1196,13 @@ def list_agents(
     # dir as cwd, so the project entry is what would actually run. The warning
     # mirrors kiro-cli's own conflict notice — shadowing is correct here, silent
     # shadowing is not, because the two configs can differ in tools and permissions.
+    project_candidates = 0
+    project_parsed = 0
     for pf in project_files:
+        if not pf.name.startswith("._"):
+            project_candidates += 1
         try:
-            data = _read_agent_spec(pf)
+            data = _read_agent_spec(pf, operation="list_agents", source="unknown")
             if data is None:
                 continue
             info = _project_agent_info(pf, data)
@@ -833,9 +1215,14 @@ def list_agents(
                     shadowed.filename,
                 )
             seen[info.name] = info
+            project_parsed += 1
         except Exception:
             logger.debug("Skipping invalid project agent config: %s", pf)
             continue
+    if project_dir:  # type narrowing only; without it candidates is 0 anyway
+        _warn_on_systematic_scan_failure(
+            project_agents_dir(project_dir), project_candidates, project_parsed
+        )
 
     result = list(seen.values())
     _LIST_AGENTS_CACHE[cache_key] = (signature, result)

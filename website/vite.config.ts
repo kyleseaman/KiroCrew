@@ -20,10 +20,12 @@ import {
   TAILWIND_RUNTIME_SRC,
 } from './src/lib/vendorPaths'
 import { precompressPlugin } from './scripts/precompress.mjs'
+import { CONTEXT_SINGLETON_DEDUPE } from './vite.shared'
 import {
   parseBrandingConfig,
   applyBrandingToHtml,
   SHELL_OVERLAY_ALLOWLIST,
+  verifyOverlayBytes,
 } from './scripts/lib/editionShell.mjs'
 
 /** Shape produced by parseBrandingConfig (editionShell.mjs is untyped .mjs). */
@@ -133,6 +135,15 @@ function vendorRuntimePlugin(): Plugin {
         const hit = RUNTIMES.find((r) => r.servePath === url)
         if (!hit) return next()
         res.setHeader('Content-Type', 'text/javascript; charset=utf-8')
+        // The consumers of these two files are sandboxed srcdoc iframes — null
+        // origin — whose <script> tags load with crossorigin="anonymous", which
+        // makes this header MANDATORY (without it the load hard-fails at the
+        // CORS layer and dev-mode widgets/sketches render unstyled). Vite's own
+        // cors default cannot supply it: since Vite 6.2 the default is a
+        // localhost-origin allowlist that `Origin: null` does not match. Scoped
+        // to exactly these two public runtime files, mirroring the gateway's
+        // /vendor/-only grant in production.
+        res.setHeader('Access-Control-Allow-Origin', '*')
         res.end(readFileSync(hit.src))
       })
     },
@@ -155,6 +166,94 @@ function vendorRuntimePlugin(): Plugin {
  * `vite build` only (not dev server). The public/ directory is copied
  * verbatim by Vite so `define` replacements don't apply to it.
  */
+/**
+ * Self-host Excalidraw's canvas fonts. Without `window.EXCALIDRAW_ASSET_PATH`
+ * the library resolves its lazily-loaded text-tool fonts (Excalifont, Xiaolai,
+ * …) against a third-party CDN (esm.sh) — verified by a network probe against
+ * a live pod — which breaks air-gapped dashboards and violates the same
+ * no-network rule that `lib/excalidrawScene.ts` documents for the read-only
+ * renderer. SketchDialog sets the asset path to `/vendor/excalidraw/`; this
+ * plugin makes that path real: build emits every font file from the npm
+ * package into `dist/vendor/excalidraw/fonts/**`, and the dev server serves
+ * the same files straight from node_modules.
+ *
+ * Deployment-time size choice (issue #8091): the Xiaolai CJK handwriting family
+ * is 12.67 MB of the 13.11 MB emitted here (96.6%); everything else combined is
+ * 0.44 MB. A size-sensitive deployment can opt OUT of shipping it by setting
+ * `KIROCREW_PRUNE_SKETCH_CJK_FONT=1` at build time. The DEFAULT is unset, which
+ * ships every family exactly as before, so no existing build changes and no user
+ * is affected unless a deployer deliberately opts in. When engaged, a pruned build
+ * emits a loud build-time warning rather than silently changing what a user sees:
+ * zh/ja/ko sketch text falls back to a system font (Excalidraw substitutes one when
+ * the family is absent), losing only the hand-drawn style, not legibility. What a
+ * pruned build should surface to those users at RUNTIME is a product decision left
+ * open on the issue and deliberately not made here.
+ */
+// Families excluded from the emitted set when the prune flag is on. Kept as a set
+// so the predicate is a filename lookup over what listFonts() already enumerates,
+// not a new configuration layer. Only Xiaolai carries meaningful weight.
+const PRUNABLE_CJK_FONT_FAMILIES = new Set(['Xiaolai'])
+
+function excalidrawFontsPlugin(): Plugin {
+  const FONTS_ROOT = path.resolve(__dirname, 'node_modules/@excalidraw/excalidraw/dist/prod/fonts')
+  const SERVE_PREFIX = '/vendor/excalidraw/fonts/'
+  // Default OFF: unset ships everything (today's behaviour). Only an explicit
+  // opt-in prunes. Evaluated once so the warning fires once per build/serve.
+  const pruneCjk = process.env.KIROCREW_PRUNE_SKETCH_CJK_FONT === '1'
+  // familyOf('Xiaolai/Xiaolai-Regular-....woff2') === 'Xiaolai'
+  const familyOf = (rel: string): string => rel.split('/')[0]
+  const isPruned = (rel: string): boolean => pruneCjk && PRUNABLE_CJK_FONT_FAMILIES.has(familyOf(rel))
+  if (pruneCjk) {
+    // A line of build output, not a runtime UI surface. It must be loud because
+    // an inherited env var would otherwise SILENTLY ship a build with degraded
+    // CJK sketching, which is the one thing #8091's direction forbids.
+    console.warn(
+      `\n[kirocrew-excalidraw-fonts] KIROCREW_PRUNE_SKETCH_CJK_FONT=1: pruning ` +
+        `${[...PRUNABLE_CJK_FONT_FAMILIES].join(', ')} (~12.67 MB) from the sketch-pad fonts. ` +
+        `zh/ja/ko sketch text will fall back to a system font (no hand-drawn style). ` +
+        `Unset the variable to ship every family.\n`,
+    )
+  }
+  const listFonts = (): string[] => {
+    const out: string[] = []
+    for (const family of readdirSync(FONTS_ROOT)) {
+      for (const file of readdirSync(path.join(FONTS_ROOT, family))) {
+        const rel = `${family}/${file}`
+        if (isPruned(rel)) continue
+        out.push(rel)
+      }
+    }
+    return out
+  }
+  return {
+    name: 'kirocrew-excalidraw-fonts',
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        const url = (req.url || '').split('?')[0]
+        if (!url.startsWith(SERVE_PREFIX)) return next()
+        const rel = decodeURIComponent(url.slice(SERVE_PREFIX.length))
+        // Path-traversal guard: the joined path must stay under FONTS_ROOT.
+        const abs = path.resolve(FONTS_ROOT, rel)
+        if (!abs.startsWith(FONTS_ROOT + path.sep) || !existsSync(abs)) return next()
+        // Dev-server parity with a pruned build: 404 the pruned family so a dev
+        // preview shows the same fallback a pruned deployment would.
+        if (isPruned(rel)) return next()
+        res.setHeader('Content-Type', 'font/woff2')
+        res.end(readFileSync(abs))
+      })
+    },
+    generateBundle() {
+      for (const rel of listFonts()) {
+        this.emitFile({
+          type: 'asset',
+          fileName: `vendor/excalidraw/fonts/${rel}`,
+          source: readFileSync(path.join(FONTS_ROOT, rel)),
+        })
+      }
+    },
+  }
+}
+
 function swVersionPlugin(): Plugin {
   return {
     name: 'kirocrew-sw-version',
@@ -180,7 +279,18 @@ function swVersionPlugin(): Plugin {
         // Falls back to version alone if git is unavailable (CI edge case).
         let sha = ''
         try { sha = execSync('git rev-parse --short HEAD', { encoding: 'utf-8' }).trim() } catch {}
-        const buildHash = sha ? `${pkg.version}-${sha}` : pkg.version
+        // A dirty tree means HEAD does not describe these bytes: two builds
+        // from different uncommitted states would stamp the SAME version, so
+        // the service worker never byte-changes and clients keep the previous
+        // deploy's shell cache alive. Suffix a timestamp so every dirty build
+        // is its own cache generation; clean builds stay reproducible.
+        let dirty = ''
+        try {
+          if (execSync('git status --porcelain', { encoding: 'utf-8' }).trim()) {
+            dirty = `-dev${Date.now().toString(36)}`
+          }
+        } catch {}
+        const buildHash = (sha ? `${pkg.version}-${sha}` : pkg.version) + dirty
         content = content.replace('%%SW_BUILD_HASH%%', buildHash)
         writeFileSync(swPath, content)
       } catch (e: unknown) {
@@ -338,6 +448,26 @@ function editionExtensionPlugin(): Plugin {
         })
       }
     },
+    // Enforce the emitFile-over-publicDir precedence generateBundle relies on.
+    // The overlay above assumes an emitted asset with a pinned fileName wins
+    // over the same-named publicDir copy; that is empirical (Vite 8 / Rolldown),
+    // not a documented bundler contract. writeBundle runs AFTER the bundle is
+    // written to disk, so it sees what actually landed: byte-compare each
+    // overlaid dist file against its edition source and fail loud on a mismatch
+    // or a missing file. A future bundler upgrade that flips the precedence
+    // would silently ship stock icons/manifest on a green build — and edition
+    // builds run downstream, outside this repo's CI, so this check is the only
+    // thing that would catch it. No-op for stock builds (overlayFiles is empty).
+    writeBundle(options) {
+      if (overlayFiles.length === 0) return
+      verifyOverlayBytes({
+        distDir: options.dir ?? path.resolve('dist'),
+        editionPublicDir: path.join(path.dirname(editionEntry as string), 'public'),
+        overlayFiles,
+        readFile: readFileSync,
+        join: path.join,
+      })
+    },
     config() {
       if (editionDir) {
         // Let vite's dev server serve/resolve files from outside the project
@@ -476,28 +606,12 @@ function appWindowUrls(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), swVersionPlugin(), editionExtensionPlugin(), bundleReportPlugin(), appWindowUrls(), precompressPlugin()],
+  plugins: [react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), excalidrawFontsPlugin(), swVersionPlugin(), editionExtensionPlugin(), bundleReportPlugin(), appWindowUrls(), precompressPlugin()],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
     },
-    // Force a SINGLE instance of every CONTEXT-CARRYING singleton across the
-    // bundle. A KIROCREW_EDITION_DIR in a separate repo may resolve these from
-    // ITS OWN node_modules; a second copy binds an edition component's hooks to
-    // a DIFFERENT context instance than the core's providers — "Invalid hook
-    // call" (react), "No QueryClient set" / null router context / silently empty
-    // data (the rest) — only at runtime, only in the out-of-repo edition build.
-    // Dedupe the libraries the core's provider tree owns; harmless in the stock
-    // single-node_modules build. (See website/AGENTS.md — edition peer-dep rule.)
-    dedupe: [
-      'react',
-      'react-dom',
-      'react-redux',
-      'react-router',
-      'react-router-dom',
-      '@tanstack/react-query',
-      'framer-motion',
-    ],
+    dedupe: CONTEXT_SINGLETON_DEDUPE,
   },
   define: {
     __APP_VERSION__: JSON.stringify(pkg.version),
@@ -587,7 +701,14 @@ export default defineConfig({
     // 3 is both the fastest and cheaper in memory than 4; peak single-fork RSS
     // was ~1.0-1.4 GB against the 3072 MB per-fork heap ceiling below.
     maxWorkers: 3,
-    execArgv: ['--max-old-space-size=3072'],
+    // Node 25 enables its process-global experimental Web Storage in forks but
+    // gives those workers no persistence path, emitting one
+    // "--localstorage-file ... without a valid path" warning per test file.
+    // happy-dom supplies the window-scoped Storage this suite actually tests,
+    // and setup.ts replaces it with a deterministic in-memory implementation,
+    // so disable the unrelated Node global instead of sharing a disk file
+    // across concurrent workers.
+    execArgv: ['--max-old-space-size=3072', '--no-experimental-webstorage'],
     // Default 5s is too tight for tests that ``await import(...)`` inside the
     // body: under a full concurrent forks run the collect phase can starve the
     // dynamic import past 5s and it times out. 15s gives headroom for
@@ -625,8 +746,38 @@ export default defineConfig({
       exclude: [
         'src/test/**',
         'src/**/*.test.{ts,tsx}',
+        // Storybook fixtures: development-only, never in the served bundle.
+        'src/**/*.stories.{ts,tsx}',
         'src/**/*.d.ts',
         'src/vite-env.d.ts',
+        // Everything in website/ that is NOT src/, spelled out. Vitest matches
+        // `include` against the ABSOLUTE file path with picomatch
+        // `{ contains: true }`, so `src/**` is satisfied by any `src/` segment
+        // anywhere in the path -- and the CodeBuild-hosted CI runner checks out
+        // under `/codebuild/output/src<random>/src/actions-runner/...`. There,
+        // every loaded file under website/ (integration mocks, scripts/) matched
+        // `src/**` and landed in the merged report with its own coverage number,
+        // which the per-file gate then failed. GitHub-hosted runners have no
+        // such segment, which is why this never showed before. Anchoring on
+        // `website/` keeps these correct on every checkout path; they are
+        // no-ops where the include already did not match.
+        //
+        // Why a blocklist and not an anchored include (`**/website/src/**`):
+        // vitest reuses `include` as a filesystem glob RELATIVE to root to add
+        // never-imported source files at 0% (getUntestedFilesByRoot), and from
+        // website/ that anchored form matches nothing, so untested files would
+        // silently drop out of the report and the per-file gate. A new
+        // top-level website/ directory whose files tests import needs an entry
+        // here -- the symptom is a non-src path in the merged report on the
+        // CodeBuild runner only.
+        '**/website/integration/**',
+        '**/website/scripts/**',
+        '**/website/capture/**',
+        '**/website/playwright/**',
+        '**/website/electron/**',
+        '**/website/eslint-rules/**',
+        '**/website/docs/**',
+        '**/website/*.ts',
       ],
     },
   },
@@ -705,43 +856,136 @@ export default defineConfig({
         // eager vendor chunk and regress load time. Monaco (editor.main +
         // *.worker) and mermaid diagrams already emit their own lazy chunks;
         // leave them alone.
-        manualChunks(id) {
-          if (!id.includes('node_modules')) return
-          // React + all context-carrying singletons in ONE chunk so a single
-          // module instance is guaranteed and provider/init ordering is
-          // preserved (mirrors resolve.dedupe above). Splitting these apart
-          // risks "Invalid hook call" / "No QueryClient set".
-          if (/[\\/]node_modules[\\/](react|react-dom|scheduler|react-redux|@reduxjs|redux|redux-thunk|react-router|react-router-dom|@tanstack[\\/]react-query|@tanstack[\\/]query-core|framer-motion)[\\/]/.test(id)) {
-            return 'vendor-react'
-          }
-          // d3 in its OWN chunk: MemoryGraphTab + KnowledgeGraph both defer it
-          // with `import('d3')` (only their type imports are eager), so d3 is a
-          // deliberate lazy boundary. Grouping it with the eager sigma/graphology
-          // stack below would pull d3 into that eager chunk and defeat the lazy
-          // load. Keep it separate so `import('d3')` stays its own async chunk.
-          if (/[\\/]node_modules[\\/](d3|d3-[^\\/]+|internmap|delaunator|robust-predicates)[\\/]/.test(id)) {
-            return 'vendor-d3'
-          }
-          // ForceAtlas2 + Louvain are physics-only: KnowledgeGraph defers both
-          // with `import('graphology-layout-forceatlas2')` / `.../worker` and
-          // `import('graphology-communities-louvain')`, reached only when physics
-          // is toggled on or the one-shot mount layout runs. Route them to their
-          // OWN lazy chunk ahead of the broad graphology rule below, so the eager
-          // vendor-graph chunk (sigma + core graphology, loaded for every graph
-          // view) does not carry code the default physics-off view never touches.
-          if (/[\\/]node_modules[\\/](graphology-layout-forceatlas2|graphology-communities-louvain)[\\/]/.test(id)) {
-            return 'vendor-graph-physics'
-          }
-          // Graph/network visualization stack (vis-network, vis-data, sigma,
-          // graphology, cytoscape) — large and only used by graph views.
-          if (/[\\/]node_modules[\\/](vis-network|vis-data|vis-util|sigma|graphology|graphology-[^\\/]+|cytoscape)[\\/]/.test(id)) {
-            return 'vendor-graph'
-          }
-          // Markdown/math/syntax rendering (katex, highlight.js, and the
-          // remark/rehype/unified pipeline).
-          if (/[\\/]node_modules[\\/](katex|highlight\.js|lowlight|refractor|react-markdown|remark-[^\\/]+|rehype-[^\\/]+|mdast-[^\\/]+|hast-[^\\/]+|micromark[^\\/]*|unified|unist-[^\\/]+)[\\/]/.test(id)) {
-            return 'vendor-markdown'
-          }
+        // Named groups, replacing the former `manualChunks` callback. The whole
+        // callback had to move in ONE step, not rule by rule: rolldown IGNORES
+        // `manualChunks` whenever `codeSplitting` is set -- it logs "`manualChunks`
+        // option is ignored because the `codeSplitting` option is specified" and
+        // drops it (rolldown 1.2.3, create-bundler-option:3046) -- so a rule left
+        // behind would have quietly un-split its chunk with only a warning to say
+        // so. `vite.build.rollupOptions` is an alias of `rolldownOptions`
+        // (`buildConfig.rolldownOptions ??= buildConfig.rollupOptions`), so these
+        // reach rolldown from here; setting BOTH keys to different objects is an
+        // error, which is why this stays under the existing one.
+        //
+        // `priority` replaces the callback's first-match-wins order: the highest
+        // number is matched first and a captured module is removed from every
+        // lower group. Two orderings are load-bearing, and both are now encoded as
+        // numbers instead of array position -- react above everything, because the
+        // icon group depends on it, and graph-physics above the broad graph rule.
+        // `includeDependenciesRecursively` is deliberately LEFT AT ITS DEFAULT
+        // (true). Do not set it to false here. An earlier revision did, to stop
+        // the icon group below from swallowing the whole lucide package and
+        // dragging the App chunk into main -- and it produced two import CYCLES
+        // that this base branch does not have: a 71-chunk one spanning App,
+        // client, vendor-react and vendor-icons, and a 3-chunk one across
+        // vendor-graph, vendor-graph-physics and graphology-communities-louvain,
+        // which also breaks the deliberate lazy-physics boundary below. A cycle
+        // there means a chunk body runs before a chunk it references has
+        // initialized, which blanks the page before React mounts. rolldown's own
+        // jsdoc warns about exactly this and asks for `preserveEntrySignatures`
+        // plus `strictExecutionOrder` alongside it; the smaller answer is to not
+        // disable it, because `minShareCount` on the icon group fixes the real
+        // cause. Measured: 0 cycles here, 2 with it off.
+        codeSplitting: {
+          groups: [
+            {
+              // React + all context-carrying singletons in ONE chunk so a single
+              // module instance is guaranteed and provider/init ordering is
+              // preserved (mirrors resolve.dedupe above). Splitting these apart
+              // risks "Invalid hook call" / "No QueryClient set".
+              name: 'vendor-react',
+              priority: 50,
+              test: /[\\/]node_modules[\\/](react|react-dom|scheduler|react-redux|@reduxjs|redux|redux-thunk|react-router|react-router-dom|@tanstack[\\/]react-query|@tanstack[\\/]query-core|framer-motion)[\\/]/,
+            },
+            {
+              // ForceAtlas2 + Louvain are physics-only: KnowledgeGraph defers both
+              // with `import('graphology-layout-forceatlas2')` / `.../worker` and
+              // `import('graphology-communities-louvain')`, reached only when physics
+              // is toggled on or the one-shot mount layout runs. Route them to their
+              // OWN lazy chunk ahead of the broad graphology rule below, so the eager
+              // vendor-graph chunk (sigma + core graphology, loaded for every graph
+              // view) does not carry code the default physics-off view never touches.
+              name: 'vendor-graph-physics',
+              priority: 40,
+              test: /[\\/]node_modules[\\/](graphology-layout-forceatlas2|graphology-communities-louvain)[\\/]/,
+            },
+            {
+              // Every lucide icon in ONE chunk, for REQUEST COUNT rather than byte
+              // size -- the reason this group exists at all. Left to automatic
+              // chunking each icon module became its own file: the served shell
+              // referenced 252 assets, 153 of them a single icon averaging 381 B
+              // (`check-*.js` is 124 B) for 57 KB all told. The bytes do not matter;
+              // the 153 round trips do. A browser reaching the gateway through a
+              // proxied HTTP/2 connection asks for the whole graph at once, and
+              // `tailscale serve` advertises 250 concurrent streams while answering
+              // 502 past roughly 140 -- measured on Windows at 200 streams -> 60x502
+              // and 247 -> 104x502, which is what PR #9518 and #9540 had to retry
+              // around. Nothing lazy is lost: the shell already preloads all 153, so
+              // they were eager regardless.
+              name: 'vendor-icons',
+              priority: 40,
+              // Load-bearing, and the reason `includeDependenciesRecursively`
+              // above can stay on. src/app-sdk/shared-modules.ts registers the
+              // WHOLE lucide-react namespace so an installed app can import it as
+              // a bare specifier, so the entire package is legitimately in the
+              // graph -- not dead code. Unfiltered, this group therefore captured
+              // all of it: 598.9 KiB eager for the 55.5 KB of icons actually
+              // shared, which also distorted the graph enough to pull App into
+              // main. `minShareCount` captures only modules referenced by more
+              // than one entry chunk, which every genuinely shared icon is (its
+              // named consumer plus the namespace). Result: 90.8 KiB. A module the
+              // filter skips is not dropped -- it falls back to automatic
+              // chunking, so no icon can go missing.
+              minShareCount: 2,
+              test: /[\\/]node_modules[\\/]lucide-react[\\/]/,
+            },
+            {
+              // d3 in its OWN chunk: MemoryGraphTab + KnowledgeGraph both defer it
+              // with `import('d3')` (only their type imports are eager), so d3 is a
+              // deliberate lazy boundary. Grouping it with the eager sigma/graphology
+              // stack below would pull d3 into that eager chunk and defeat the lazy
+              // load. Keep it separate so `import('d3')` stays its own async chunk.
+              name: 'vendor-d3',
+              priority: 30,
+              test: /[\\/]node_modules[\\/](d3|d3-[^\\/]+|internmap|delaunator|robust-predicates)[\\/]/,
+            },
+            {
+              // Markdown/math/syntax rendering (katex, highlight.js, and the
+              // remark/rehype/unified pipeline).
+              name: 'vendor-markdown',
+              priority: 30,
+              test: /[\\/]node_modules[\\/](katex|highlight\.js|lowlight|refractor|react-markdown|remark-[^\\/]+|rehype-[^\\/]+|mdast-[^\\/]+|hast-[^\\/]+|micromark[^\\/]*|unified|unist-[^\\/]+)[\\/]/,
+            },
+            {
+              // The YAML document parser, reached only by the skill editor's
+              // frontmatter round-trip (`SkillForm.tsx`). Bucketed like every other
+              // vendor library here because the App chunk is meant to hold FIRST-PARTY
+              // code -- its budget comment in scripts/check-bundle-size.mjs says as
+              // much -- and it is the ceiling that ordinary feature PRs trip. Measured
+              // 93.7 KB raw / 29 KB gzip, far under the gate's 500 KB default, so it
+              // needs no CHUNK_BUDGETS entry of its own. The leading separator keeps
+              // this off `js-yaml`, which is mermaid's and belongs in mermaid's chunk.
+              name: 'vendor-yaml',
+              priority: 30,
+              test: /[\\/]node_modules[\\/]yaml[\\/]/,
+            },
+            {
+              // Routed out because a sidebar change pushed the App chunk past the
+              // ceiling the `yaml` note above names; eager at every use site, no lazy
+              // boundary to defeat.
+              name: 'vendor-dompurify',
+              priority: 30,
+              test: /[\\/]node_modules[\\/]dompurify[\\/]/,
+            },
+            {
+              // Graph/network visualization stack (vis-network, vis-data, sigma,
+              // graphology, cytoscape) — large and only used by graph views. Lowest
+              // priority so graph-physics above claims its two packages first.
+              name: 'vendor-graph',
+              priority: 20,
+              test: /[\\/]node_modules[\\/](vis-network|vis-data|vis-util|sigma|graphology|graphology-[^\\/]+|cytoscape)[\\/]/,
+            },
+          ],
         },
       },
     },

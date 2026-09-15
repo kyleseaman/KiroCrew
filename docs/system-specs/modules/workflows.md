@@ -9,7 +9,18 @@ statically, executes it in a restricted namespace under hard ceilings, and strea
 a typed event journal that drives the UI, the chat `workflow_*` MCP tools, and
 resume.
 
-The subsystem lives in `src/kiro_crew/workflows/` (12 modules). This file is the
+This module also provides Kiro Crew's shared orchestration substrate: run
+identity, lifecycle state, event history, exact source, provenance, cancellation
+binding, and the reusable definition library. `RunRegistry.has_pending_work_for`
+provides a session-scoped, in-memory execution/terminal-handoff query for
+conversation-completion notifications. A terminal run whose driver has not
+exited still owns its handoff; no event or result snapshot is built for this
+query. Python dynamic workflows are one
+driver of that substrate. TaskRunner is another, stricter product layer: it uses
+the common substrate but keeps its planning, approval, retry, test,
+git/worktree, replan, persistence, and cleanup semantics.
+
+The subsystem lives in `src/kiro_crew/workflows/` (13 modules). This file is the
 **frozen contract** those modules cite: `workflows/__init__.py` declares the `ctx`
 Protocol and the event vocabulary and points here, `events.py` says the per-type
 `data` field table lives here, and `validate.py` says never to relax a check here
@@ -48,12 +59,13 @@ intra-package imports per module, so the direction cannot drift:
 ```
 __init__, validate, dsl, schema, events, registry, store,
 agent_exec, agent_pool          (leaves: no sibling imports, or __init__ only)
+library                         (definition persistence; may import store)
     ↑
 context      (may import: __init__, validate)
     ↑
 runner       (may import: __init__, validate, dsl, events, context, schema, registry)
     ↑
-service      (may import: validate, registry, runner, agent_exec, agent_pool, store)
+service      (may import: validate, registry, runner, agent_exec, agent_pool, store, library)
 ```
 
 The same test forbids the engine from importing `kiro_crew.dashboard.state` or
@@ -86,9 +98,13 @@ param-by-param (name, kind, default) and for async-ness by
 
 `now` is fixed for the whole run on purpose. `time`, `random`, `uuid` and
 `datetime` are unreachable inside a script (see Sandbox), so `ctx.now` is the only
-clock, which is what makes the event journal and the resume prefix stable. The
-runner does use `time.monotonic()` in **host** code for the wall-clock guard and
-the run duration; that is never exposed to the script.
+clock in script scope, which is what keeps the deterministic call order (and thus
+the resume prefix) stable. The event journal's `ts` is separate: the runner stamps
+each event from a HOST wall clock (`host_now_iso`, real UTC) so the journal records
+when each event actually happened, while `ctx.now` stays fixed for the script. The
+runner also uses `time.monotonic()` in **host** code for the wall-clock guard and
+the run duration; none of these host clocks are exposed to the script, so a
+workflow gains no new time capability.
 
 `_RunContext` also exposes `agent_results` (`call_index -> result` for calls
 already settled in this run). It is in `validate.CORE_CTX_SURFACE`, so a script may
@@ -215,6 +231,16 @@ next `ctx.phase()` call.
 
 ### Budget
 
+`ctx.budget` is a host-owned, read-only binding to the run's `Budget` object,
+not a token count or a timeout. The caller supplies `budget_total` when starting
+a run; a script keeps its own limits in local variables and inspects the budget
+through `total`, `spent()` and `remaining()`. A budget-only authoring lint rejects
+obvious replacement/deletion through the entrypoint parameter and its closures.
+A read-only property on `_RunContext` enforces immutability at runtime, including
+aliases, globals and helpers outside the lint's scope. The lint is an early
+authoring aid, not the enforcement boundary or the host's port-availability check.
+This protects the binding only; the `Budget` accounting API is unchanged.
+
 ```python
 class Budget(Protocol):
     total: Optional[int]      # None => no ceiling
@@ -304,7 +330,7 @@ Envelope (exactly these five keys, pinned by
 |-------|------|---------|
 | `run_id` | `str` | the run this event belongs to |
 | `seq` | `int` | monotonic from 0 within the run, contiguous |
-| `ts` | `str` | timestamp, supplied by the caller (the runner passes `ctx.now`) |
+| `ts` | `str` | wall-clock stamp; the runner stamps each event from a HOST clock (real UTC), distinct from the fixed script-visible `ctx.now`. `EventStream` takes an optional injected `clock` (the runner injects `runner.host_now_iso`; tests monkeypatch that host function) and falls back to the caller-supplied stamp when it is unset. Event journals already on disk keep whatever stamp their writer supplied; a load does not and cannot reconstruct a real wall-clock time for events recorded before the host clock existed |
 | `type` | `str` | one of `EVENT_TYPES` |
 | `data` | `dict` | per-type fields, below |
 
@@ -397,6 +423,19 @@ Static rejections:
     `(await ctx.agent(...)).get(...)` or `[...]` or `.attr`, for `agent`,
     `parallel`, `pipeline`, `workflow` and `approve`. Binding to a variable first
     and guarding is the correct pattern and is intentionally not flagged.
+  - assignment to or deletion of the workflow context's `budget` binding,
+    including annotated/augmented assignments, unpacking and loop targets. The
+    budget-only authoring aid is independent of the host-surface check and
+    supports positional-only workflow entrypoints. Nested helpers' own parameters
+    and locals (including assignment, exception and loop targets) are unrelated
+    state; closures and `nonlocal ctx` still refer to the nearest enclosing
+    binding. Global/module references are ambiguous and rely on the runtime
+    read-only property, like other aliases. No runtime binding, control-flow or
+    alias inference is attempted; legitimate module-owned `ctx.budget` writes
+    remain legal. Budget reads and mutations of script
+    data such as `ctx.args["stage"]` remain allowed. The diagnostic directs the
+    author to the caller's `budget_total` or a script-local variable; the existing
+    bounded authoring loop can then request a corrected script before execution.
 
 The runtime half of the sandbox is `context.build_safe_globals(ctx)`: the script is
 `exec`'d with a `__builtins__` built from exactly `validate.SAFE_BUILTINS` plus
@@ -410,7 +449,7 @@ safe to expose. Those two frozensets are the single source of truth shared by th
 validator and the exec namespace, so there is deliberately no second copy of the
 allowlist to drift.
 
-`tests/workflows/malicious/*.py` is an adversarial escape corpus; every file in it
+`test/workflows/malicious/*.py` is an adversarial escape corpus; every file in it
 must be statically rejected
 (`test_workflows_malicious.py::test_every_malicious_script_is_rejected`). New
 escape ideas are added by dropping a file in that directory. If a case in that
@@ -427,11 +466,18 @@ set: `agent`, `parallel`, `pipeline`, `phase`, `log`, `budget`, `args`, `now`,
 `where="validate"` and an error listing the available surface, instead of crashing
 mid-run with `RuntimeError("... no ... port wired")`.
 
-The check is **scope-aware**: only attribute accesses bound to the entrypoint's
-context parameter are checked, so a helper whose own parameter happens to be named
-`ctx` (say `def read(ctx): return ctx.get("k")`, called with a dict) is out of
-scope. Helpers that receive the real context are under-enforced by design; their
-misuse still fails at run time with the explicit unwired-port error.
+The host check conservatively walks the entrypoint body and nested functions,
+skipping a helper whose own parameter shares the context name (for example,
+`def read(ctx): return ctx.get("k")`, called with a dict). It does not infer
+ownership from module assignments, `global` declarations or helper-local stores:
+these cannot suppress an unwired-port diagnostic, even when a binding is in an
+unexecuted branch. An available attribute such as `budget` remains allowed here;
+write protection belongs to the separate budget lint and runtime property.
+This preserves the host check's existing limits: helper-local methods outside
+the available surface can be conservatively rejected; helpers receiving the real
+context through their own parameters are under-enforced. The host walk uses the
+first ordinary positional parameter, so positional-only entrypoints do not gain
+host-surface coverage from the budget lint's positional-only support.
 
 ## Structured output (`schema=`)
 
@@ -503,6 +549,24 @@ as it settles rather than only after the run ends
 (`test_workflows_resilience.py`). Without that, a run killed at the ceiling would
 write `agent_results: {}` and discard every payload it had already paid for.
 
+On a **caller cancellation** the runner cancels the in-flight script and drains
+it before emitting `run_cancelled`, as on the timeout path. Cooperative cleanup
+and checkpoints settle before the terminal event, and cancellation exceptions are
+consumed. After the initial cancellation, the runner shields and repeatedly drains
+ordinary script cleanup, the pre-terminal hook, and background completion cleanup;
+further cancel requests cannot cancel their awaited work. Cleanup exceptions are
+retrieved without replacing an already-selected timeout, failure or cancellation.
+A successful script return alone does not commit success: the pre-terminal hook
+reports any caller cancellation it observes after draining, and the runner emits
+one `run_cancelled` instead of `run_finished`, without rerunning the hook. Publishing
+a terminal event commits the outcome. During subsequent background completion
+cleanup, registry cancellation returns false even while the final registry status
+is pending; direct shutdown cancellation still drains cleanup without rewriting
+that event. Both paths depend on adapters cooperating with cancellation; they do
+not forcibly terminate Python code that ignores cancellation. A terminal status
+must not be published merely because a cleanup deadline elapsed while owned work
+is still executing.
+
 ## Run registry, persistence, and resume
 
 ### `registry.py`
@@ -514,37 +578,153 @@ objects (in particular never the `asyncio.Task`).
 
 `RunHandle` holds `run_id`, `name`, `status`, the growing `events` list, `result`,
 `error`, `author`, `session_key`, `source`, `args`, `agent_results`,
-`agent_errors`, and the driving `task`. Statuses: `running`, `finished`, `failed`,
+`agent_errors`, exact saved-definition provenance, optional `derived_from`
+ancestry, and the driving `task`. Statuses: `running`, `finished`, `failed`,
 `cancelled`.
 
 Two distinct serializations:
 
-- `snapshot(include_events=)` is the **UI view**. The compact form adds derived
-  live progress (`phase` from the last `phase_started`, `last_log` from the last
-  `log`) plus `partial_result_count` / `agent_error_count`; the full form adds
-  `events`, `source`, `partial_results` and `agent_errors`. Partials are keyed on
+- `snapshot(include_events=, include_result=)` is the **UI view**. The compact
+  form (`include_events=False, include_result=False`, what `list()` builds) adds
+  derived live progress (`phase` from the last `phase_started`, `last_log` from
+  the last `log`) plus `partial_result_count` / `agent_error_count`, and omits
+  the `result` payload — a finished run's result can be hundreds of KB, so it
+  rides only on the detail view, exactly like `events` and `source`. The full
+  form adds `result`, `events`, `source`, `partial_results`, `agent_results` and
+  `agent_errors`.
+  The `on_done` completion snapshot keeps `include_result=True`, so
+  result-to-chat injection is unaffected. Partials are keyed on
   **status**, not on `result is None`: a run can finish and legitimately return
   `None`, and a running run has no result yet, so neither lost anything and
   reporting partials for them would mislead the reader and resend every payload on
-  every poll.
+  every poll. A **finished** run additionally exposes its settled per-call outputs
+  — `agent_result_count` in the compact form and `agent_results` (the payloads) in
+  the full form. This is additive and status-keyed: `partial_results` stays the
+  failed/cancelled channel so a run never reports both, an active run omits both
+  (it is still accumulating), and the exposure is a factual record of the calls
+  that settled, not a claim the run produced a validated business artifact. The
+  `workflow_result` MCP projection includes these outputs through the same
+  recursive redaction as the aggregate result and errors. The completion message
+  names the recorded-call count and this field, and explicitly separates a
+  returned workflow function from verified required artifacts.
 - `to_store_json()` / `from_store_json()` is the **durable** round-trip of the
   complete run. `from_store_json` demotes a stored `running` run to `failed` with
   `"interrupted: gateway restarted while running"`, because it can never resume in
   a new process and would otherwise wedge the registry as a zombie that eviction
   refuses to reclaim.
 
-`mark_terminal` is idempotent: only the first terminal transition counts. It
-flushes to the store and fires `on_done` (result-to-chat injection).
-`record_event` fans out to `on_event` (live WS push) and durably checkpoints every
-5th event. `record_agent_result` lands each settled call in memory but deliberately
-does **not** force its own store write: `store.save` re-serializes and re-redacts
-the entire record synchronously on the gateway event loop, so writing per agent
-call would add an O(N) stall per call over a record that grows with every payload.
-Durability rides the existing cadence (every 5 events, and each agent call emits
-two) plus the guaranteed flush at `mark_terminal`. The trade is explicit: a hard
-gateway kill can lose the newest payloads no flush has covered yet, exactly as it
-can already lose the newest events. A raising `on_event` / `on_done` subscriber is
-swallowed, because a bad subscriber must not break a run.
+Before each model turn, authoring, pooled workers, named sessions and non-pooled
+workers use `messaging.identity.publish_turn_identity` for their own acquired
+session key and provider PID. Identity publication precedes context construction
+and model dispatch, including author revisions and warm worker turns. It uses the
+shared protected publisher, not an ambient parent key or a fabricated MCP header;
+private store binding and request-side identity verification remain required.
+The MCP `workflow_status`, `workflow_result` and `workflow_list` reads use the
+same strict caller gate as workflow mutations. An unidentified caller is refused
+before any GET, even if the lenient resolver could inherit a parent identity.
+Reads pass the verified key unchanged to HTTP and their result audit; HTTP still
+verifies the private store and run ownership. The explicitly global saved-definition
+library is not a private run listing and retains its existing scope.
+Start, author-start and rerun check the gateway's admission gate both before
+allocating an ID and after awaiting scope binding, before launching the run. A
+gate closed during that await rejects the launch without registering a run.
+
+Scope admission also freezes the originating sessions' strictest memory mode in
+the protected binding. Worker preparation carries that mode, not the current
+state of a replacement parent tab. Temporary workers suppress memory-context
+reads; incognito and temporary modes refuse durable-memory writes. A legacy
+binding without a mode remains inspectable but cannot establish a worker's memory
+permission. The gateway supplies policy resolution; standalone engine embedders
+without a session-policy resolver use persistent mode. Re-running a bound run
+combines its frozen mode with the current caller's mode, even for Global V1;
+changing or closing the original parent cannot loosen the rerun. This does not
+change the run's store binding or grant a caller access to another member.
+
+`mark_terminal` is idempotent: only the first terminal transition counts. Its async
+counterpart is used by live workflows and host drivers; it drains queued checkpoints,
+flushes the selected outcome, then fires `on_done` (result-to-chat injection). The
+in-memory terminal status is visible before that durable flush and callback complete,
+so tests asserting delivery wait for a callback-owned signal with a bounded timeout
+rather than sleeping after observing terminal status.
+`record_event` fans out to `on_event` (live WS push). Dynamic workflows keep that
+callback synchronous and queue an owned async checkpoint every fifth event; authored
+source publication uses the same queue. The synchronous `ctx.log`/`ctx.phase` contract
+and immediate in-memory agent-result settlement are unchanged. `record_agent_result`
+does not force a separate write: durability rides the five-event cadence plus the
+terminal flush. A hard gateway kill can lose payloads no flush has covered yet.
+A raising `on_event` / `on_done` subscriber is swallowed.
+
+Dynamic registration and host registration both await off-loop eviction and initial
+persistence before returning the identity. Cancellation drains admission before
+removing its partial run; no driver is launched for an unreturned identity. Source,
+intent and subtree-rerun entrypoints recheck gateway admission after this new await;
+a closed gate deletes the unlaunched run and returns the existing admission error.
+All live writes, including private directory ACL preparation, use the existing per-run
+snapshot/generation/lock path. Tests simulating an orderly restart await the
+background driver's terminal flush before constructing the replacement service;
+a terminal status in RAM alone is not a durable-completion barrier. A delayed-write
+regression pins this distinction without weakening the restored-source checks.
+Repeated cancellation drains owned writes and deletes
+before propagating. Terminal persistence cannot reinterpret the outcome already
+selected by the runner, and completion injection waits for that flush attempt.
+A failed save is not silent: directory preparation, serialization and temporary
+write/replace failures propagate from the store (after cleanup is attempted) to
+the registry. Their diagnostics contain only exception types, not private paths
+or payloads. A fixed, sanitized storage message is included in
+the run snapshot's `error` alongside any execution error, in completion messages
+(including a finished run), and in the run detail's `ErrorNotice`. It tells the
+operator to copy needed results before restart and check storage access/space.
+For non-failed runs with the backend's `error_code=workflow_checkpoint_failed`,
+the shared run tree renders a localized checkpoint summary and a closed-by-default
+diagnostic disclosure, not a clipped English backend sentence. The code is emitted
+only for a pure checkpoint error, never inferred from status or English prose;
+execution/cancellation errors and unknown legacy codes retain their original text.
+The full sanitized, credential-redacted diagnostic remains readable on
+expansion and accompanies the notice's agent hand-off as a system report, not
+an invented HTTP failure. Execution failures retain their separate presentation.
+Execution status/result remain distinct from this live durability health. The
+next successful checkpoint clears only the storage message; no separate retry
+timer or durable-ack guarantee is introduced. Synchronous registry APIs remain
+for standalone compatibility, not live workflow callbacks.
+Startup inventory is not best effort: both service construction paths propagate
+store-open/load/directory-enumeration failures rather than publish an empty
+registry and reset the legacy ID floor to zero. Missing directories on first
+boot are empty only when their nearest existing ancestor is a directory. This
+also checks Windows path-not-found errors beneath a plain file, rather than
+mistaking that broken inventory for a first boot. An unreadable or non-directory
+inventory is an error. Failure
+to resolve the private inventory root is also fatal, before returning any public
+rows: a public-only subset is not a complete recovery. Errors identify inventory
+unavailability and direct storage repair/restart without disclosing private paths.
+This preserves legacy binding-less run files. Explicit `persist=False` remains the
+in-memory choice. Malformed payload records are still rejected independently.
+However, a missing, unreadable or malformed protected binding for a bound record
+(or any record discovered in the private payload root) makes inventory recovery
+fail with a sanitized `WorkflowInventoryError`. The gateway then exposes its
+existing workflows-unavailable response rather than an apparently complete list
+that silently omits that run. Original files are retained for operator repair;
+editable payloads never reconstruct protected authority. This intentionally
+blocks the shared workflow service, not just the unreadable record, until repair
+and restart; it does not claim that corrupt records can be recovered.
+
+The trusted host lifecycle follows the same off-loop persistence rule. Its
+service methods mutate loop-affine handles and event streams on the event loop, then
+await async registry checkpoints for registration, binding/rebinding, source updates,
+status transitions, throttled events, terminal flushes, and deletion. Each checkpoint
+snapshots the handle on the event loop, then moves only the durable write through
+`asyncio.to_thread`. TaskRunner plans can reach the 256 KiB request ceiling, so no
+host lifecycle checkpoint may stall the gateway event loop or move live registry
+state across threads. Cancellation drains an in-flight registration write before
+asynchronously deleting the partial run, so a late atomic replace cannot resurrect an
+identity that was never returned to its host driver.
+
+The read handlers extend the same rule to the response path: the run list, run
+detail, and definition list/get endpoints serialize the payload once
+synchronously on the event loop (an atomic snapshot — no await, so no
+loop-driven mutation can interleave), then a worker thread rebuilds its own
+structure from that immutable string and performs redaction + the final JSON
+serialization. The thread only ever touches objects it created itself, so it
+can never observe or race live registry state.
 
 ### `store.py`
 
@@ -570,14 +750,174 @@ Properties that matter:
   when it changes the id a 12-hex-char sha256 prefix of the original is appended,
   so `wf/1` and `wf1` cannot collapse onto one file. Well-formed ids
   (`wf_NNNNNN`) are unchanged.
-- **Best-effort throughout:** every method swallows failures and logs at debug.
-  The in-memory registry is authoritative; a storage failure must never break a
-  run. `load_all` skips corrupt files and returns records oldest-file-first by
-  mtime.
+- **Bound target first:** `save` validates the protected binding and resolves the
+  actual payload path before preparing a directory. A private save prepares only
+  the hidden target parent, so a broken public workflows directory cannot suppress
+  it. Both private and public directory preparation failures propagate. Neither
+  branch falls back to the other root.
+- **Explicit checkpoint failures:** serialization/write/replace failures are logged
+  by exception type and propagate as fixed, sanitized errors. The registry reports
+  its storage warning separately while preserving the in-memory execution result.
+  Binding and private parent preparation refusals also propagate rather than
+  selecting a public fallback.
+  `load_all` skips corrupt files and returns records oldest-file-first by
+  mtime. Recovery resolves each discovery root once, allowing legitimate data-home
+  ancestor aliases. Each leaf is opened through the cross-platform no-reparse
+  helper; regular-file, single-link, POSIX ownership, exact resolved-root path
+  and JSON reads all use that same descriptor. Protected binding and private
+  payload placement checks still apply before registry hydration. Discovery errors
+  are isolated per root, including private-root resolution, so an unavailable
+  root cannot suppress valid records from the other root. Startup discovery logs
+  retain only the exception type and an opaque record digest, never paths,
+  exception bodies or tracebacks, even outside a private task context. Record
+  digest encoding tolerates surrogate filename characters so logging an unreadable
+  file cannot abort recovery of other records.
 
 `RunRegistry.load_persisted()` rehydrates on startup, fills only ids not already
 in memory, and re-runs eviction so a store with more records than `max_runs`
-cannot leave the registry over its bound.
+cannot leave the registry over its bound. A record stored as `running` was
+demoted to `failed` by `from_store_json` (it can never resume in a new process);
+`load_persisted` then persists that corrected state back to the store,
+idempotently — only the `running`→`failed` case writes, an already-terminal
+record is left untouched — so the durable record matches memory and a later
+restart does not re-demote the same zombie every time. The writeback goes through
+`to_store_json`, so agent payloads, source, provenance and args are retained.
+
+After the socket binds and instance credentials are published, both server entrypoints
+schedule one owned initialization task for `WorkflowService.create()`; neither
+awaits user-data-scaled rehydration on the boot-to-ready path. Until initialization
+settles, `workflow_service` remains unpublished and workflow routes return their
+existing 503 unavailable response. Before its first startup await, the dashboard
+calls `TaskRunner.defer_workflow_attachment()` on the shared gateway instance.
+Plan, direct run, background start, execute-plan and retry admission then refuse
+with an initializing/retry message before creating run state. This covers channel
+callers retaining `orch.task_runner` as well as dashboard admission paths.
+`attach_workflow_service(service)` releases admission atomically with attachment;
+`attach_workflow_service(None)` explicitly releases standalone fallback. Gateway
+failure cleanup detaches and immediately defers again without yielding, preserving
+fail-closed private admission with `workflow_initialization_failed` and a restart
+message. Pending recovery alone asks callers to retry. If storage blocks
+indefinitely, mutation requests deliberately keep returning 503 with
+`code: workflow_initializing`; reads and cancellation remain available. Treating
+slowness as standalone mode would admit permanently unlinked fresh runs and permit
+linked task records to diverge while the original restore worker still exists.
+An explicitly selected standalone host is different from a failed gateway;
+only standalone hosts use the established best-effort publication fallback. Ordinary standalone
+and headless constructors do not defer admission. The dashboard retains its runner
+pointer throughout initialization, so existing-task status and cancellation remain
+available. Deletion and plan/step edits require the same readiness boundary before
+any mutation: otherwise their workflow propagation would be skipped during restore.
+All task admission and linked-mutation handlers translate `WorkflowInitializing`
+from the shared check to an initializing 503, not a generic runtime error.
+Chat-to-plan checks before creating its placeholder; status and cancel do not
+require workflow readiness.
+The task attaches both directions and releases admission without an intervening
+await. Initialization failure is logged, keeps workflows unavailable, and keeps
+TaskRunner mutations closed until a gateway restart. A non-blocking aiohttp `on_shutdown`
+hook fences publication before cleanup begins, including while tunnel teardown is
+stalled. Tunnel teardown remains the first `on_cleanup` hook; only after it finishes
+(or reaches its existing bound) does workflow cleanup cancel and drain initialization,
+even under repeated cancellation. A factory returning during tunnel teardown or
+after cancellation cannot publish.
+
+`WorkflowService.create()` constructs the unpublished service off-loop, including
+run-store config lookup and definition-library path resolution. The constructor
+creates no asyncio tasks or locks; `live.bind` registers its weak setter under the
+watcher's thread lock without invoking it. Cancellation drains the owned constructor
+before propagating, even if construction subsequently fails. Registry hydration
+then runs on the owning loop. `WorkflowRunStore.load_all()` reads every run JSON
+before registry eviction: `DEFAULT_MAX_RUNS=200` bounds retained memory, not disk
+scan count or payload size, and is not an upper bound on startup I/O.
+
+The `load_persisted_async()` path reads records, writes
+restart corrections, and deletes evicted records off-loop; handle hydration and
+mutation remain on the owning loop. This is startup-only on an unpublished
+registry, never concurrent with live runs or host reopen. Cancellation (including
+repeated cancellation) drains the owned load before propagating, leaving no late
+writer to race a subsequent initialization. The synchronous constructor and
+`load_persisted()` remain available for standalone callers. Both paths retain the
+store's best-effort failure semantics: awaiting I/O does not certify a successful
+write when the store itself reports failure only through debug logging.
+
+### Reusable definition library
+
+Every invocation still persists its authored script as part of the run snapshot
+above. Promotion into the reusable library is a separate, explicit user action.
+`WorkflowDefinitionLibrary` stores one JSON record per saved workflow at
+`<KIROCREW_HOME>/workflow_library/<workflow_id>.json`, which is global to the
+Kiro Crew data home and therefore shared by Kiro and adapted harnesses such as
+KAS. Unlike run snapshots, definitions do not follow the configurable
+`workflows.dir`: `workflow_library` is a dedicated `_CREW_SECRET_LEAVES`
+directory, so the shared sensitive-path gate blocks agent file tools and shell
+commands from planting or rewriting executable definitions. Dashboard and
+workflow-service operations open the directory directly after the human action.
+The create and revision endpoints require a positively authenticated dashboard
+user, not an app token or internal agent call. An app token is also refused before
+a saved run accepts its caller-supplied session header, so it cannot spoof result
+delivery into another live session. Every allow or deny decision at these
+authorization gates is SEL-audited.
+
+A definition has a stable `wfd_*` id, unique slash-command `slug`, current source,
+SHA-256 content hash, timestamps, an integer `revision`, immutable source entries
+in `revisions`, an immutable `format` (`python` or `task-plan`), and optional
+`derived_from: {workflow_id, revision}` lineage. Schema-v1 records omit `format`
+and load as `python`; newly written records use schema v2. Python and TaskRunner
+YAML sources are validated by their owning parser before persistence.
+Every explicit save creates a separate definition identity, including when its
+source is byte-identical to a parent it adapted. Updates require `expected_revision`
+and append a revision; a stale writer receives a conflict instead of overwriting
+newer content. The dashboard snapshots the submitted editor state: a successful
+save advances its revision but preserves any further edits made while the request
+was pending. An omitted or blank slug on update preserves the existing slash
+command. Writes are atomic. Metadata is redacted before slug normalization
+and disk persistence, so normalization cannot hide a credential from the scanner;
+if credential or exfiltration redaction would change executable source, the save is rejected so
+the library never persists a corrupted script. Async gateway, authoring, and saved-run
+paths offload library disk I/O to worker threads, while the service serializes library
+operations so slug allocation and revision checks remain atomic in-process.
+
+Only explicitly saved definitions participate in local authoring matches.
+`search(intent)` uses deterministic local lexical ranking. `author(intent)` adds
+the bounded top matches to the authoring prompt as examples, never edits them,
+and accepts lineage only when the authored `META["adapted_from"]` exactly names
+the current revision of one of the candidates included in that prompt. Historical
+revisions embedded in a candidate record are not offered authoring references.
+The authored result remains an unsaved draft until `save_definition` is called.
+An explicit id or slug reference takes the opposite path: `start_definition`
+executes the exact current saved source. Python definitions place free-form
+slash-command input in `ctx.args["input"]`. `task-plan` definitions delegate
+their exact YAML to TaskRunner without LLM decomposition and retain the saved
+definition id, slug, and revision on both the project and shared run.
+
+The chat run card offers explicit promotion after an ad-hoc Python run reaches
+`finished`. Agent Capabilities > Workflows has **Workflow library** and **Runs**
+views; the Runs view lists both dynamic Python and TaskRunner-backed runs. It
+also offers promotion for a paused or finished TaskRunner plan whose run
+declares the `save` capability. It loads the response-redacted run snapshot for
+its compact read-only, format-highlighted preview, but submits only the run id
+plus user-entered name, slash-command slug, and description to the promotion
+route. The service reads the original source from the server-side run handle and
+passes those exact bytes to `save_definition`; display redaction can therefore
+never become executable source.
+The durable store records whether source bytes survived redaction unchanged. Exact
+restored source remains promotable; redaction-changed and legacy source lacks exact
+provenance and cannot use this route. An unedited rerun preserves that provenance;
+a genuinely edited rerun is exact to the submitted edit.
+Running, failed, and cancelled runs are not promotion candidates. The definition
+id on an exact saved invocation also makes it ineligible: it is already reusable
+and must not mint an accidental duplicate definition. The definition
+editor uses the same line-numbered, horizontally scrolling source surface in
+editable mode. Python is highlighted as Python and TaskRunner plans as YAML. Both
+source views are presentation-only:
+neither normalizes nor reformats source bytes. On success, the card shows
+`/workflow <slug>` and links to Agent Capabilities > Workflows.
+
+Session promotion derives lineage from the validated original source's
+`META["adapted_from"]` and accepts it only when the exact id and revision exist in
+the library; historical revisions remain valid after the parent advances. The
+general definition-create route does not infer lineage from source: a management
+surface must submit an explicit `derived_from` object, which receives the same
+existence check.
 
 ### Resume and restart-subtree
 
@@ -595,7 +935,18 @@ stored handle. If `source` is supplied and differs from the stored script, the
 rerun is treated as **edited**: the edited source is validated first (rejected with
 errors if invalid) and the replay cache is **not** reused (`replay_before=0`,
 `replay_results={}`), because editing the script can shift call indices and a
-mismatched index would replay the wrong result into the wrong step.
+mismatched index would replay the wrong result into the wrong step. An unedited
+rerun of a saved definition retains its definition id, slug, and revision so it
+remains an exact saved invocation and cannot be promoted into a duplicate. An
+edited rerun clears that saved-definition identity because its submitted source
+is no longer the exact saved revision.
+
+TaskRunner applies the same rule to saved task plans. A user edit or automatic
+replan clears the run's exact definition id, slug, and revision before publishing
+the changed YAML. The run retains the former id and revision only as
+`derived_from` ancestry, so promoting the adapted plan creates a distinct saved
+definition with correct lineage instead of falsely attributing changed source to
+the original revision.
 
 ## Gateway wiring
 
@@ -606,7 +957,43 @@ state, like `state.subagents` / `state.sessions`. It owns one `RunRegistry` (wit
 run.
 
 Entry points: `author`, `start`, `start_from_intent`, `status`, `result`,
-`list_runs`, `cancel`, `rerun_subtree`, plus the `timeout_secs` property.
+`list_runs`, `cancel`, `rerun_subtree`, `list_definitions`, `get_definition`,
+`save_definition`, `update_definition`, and `start_definition`, plus the trusted
+host lifecycle (`begin_host_run`, `bind_task`, `phase`, `log`, `step`, `pause`,
+`rebind`, `finish`, `fail`, `cancel_host_run`, `delete_run`) and the
+`timeout_secs` property. Every trusted host lifecycle mutation is async when it can
+produce a durable checkpoint, so host drivers await the off-loop persistence path.
+
+Dynamic workflows freeze a gateway-owned execution binding before scheduling.
+The immutable record lives below `member-memory-bindings/workflows`; a private
+run's source, results and replay cache live below the hidden
+`memory_stores/.workflow-runs` root. Ordinary run JSON, source, templates and
+session labels grant no private authority. New records carry an explicit binding
+version; missing or corrupt authority refuses rather than becoming legacy V1.
+
+Author attempts and pooled, overflow and named workers inherit the run's protected
+anchor before SessionManager allocation. Private prompts pass through
+`ContextBuilder.build_message` after store preparation. Named sessions are labels
+inside a run, not arbitrary existing session keys. Every send, warm reset and
+replay boundary revalidates the scope; invalidation fails without a V1 fallback.
+The author retains REJECT_ALL, and the existing tool and governance ceilings stay
+in force. Private access to run list/detail/cancel/rerun requires matching scope;
+owner-browser management retains owner authority. Reruns inherit protected run
+identity, not a current template or mutable caller field. Completion delivery
+checks the original binding before publishing private content.
+
+Host-driven runs carry `driver`, `source_format`, `task_id`, `capabilities`, and
+saved-definition provenance in every compact and full snapshot. `paused` is an
+active, durable workflow status. A restored paused host run, or a host run
+demoted to failed after interruption, rebuilds its event stream at the next
+sequence number and reopens the same identity when TaskRunner resumes it. Reopening a
+terminal host run first removes its trailing terminal event, so the retried attempt
+still has one terminal event at the end of a contiguous journal. Host drivers keep
+their own completion/reporting path by setting `completion_injection=false`.
+Off-loop checkpoints are serialized per run. When parallel host steps queue
+multiple snapshots behind an active write, superseded intermediate snapshots are
+discarded and the newest snapshot is written last; deletion uses the same queue
+so an in-flight checkpoint cannot resurrect a removed run.
 
 Run ids are `wf_NNNNNN` from a per-process monotonic counter, deliberately with no
 time or random component so they stay resume-stable. On startup, after rehydrating
@@ -616,24 +1003,40 @@ ids cannot collide with restored ones.
 ### Authoring
 
 `author(intent)` turns a natural-language intent into a validated script using the
-same in-session model plumbing as the rest of Kiro Crew, looping up to
-`_AUTHOR_RETRIES + 1` = 3 attempts and feeding the validation errors back on each
-retry. `_strip_fence` peels only the opening fence line and a trailing fence, never
-splitting on every ``` , because a literal triple backtick inside the script body
-would otherwise truncate it mid-statement.
+same in-session model plumbing as the rest of Kiro Crew. Session creation has its
+own narrow startup retry: up to three total attempts, each with a fresh isolated
+key and deterministic bounded backoff, only for `AcpRequestTimeout`,
+`AcpRuntimeDead`, or an `AcpError` accepted by the shared transient classifier.
+Each failed attempt is destroyed before the next. Authentication, configuration,
+permission, arbitrary, model-prompt, and validation failures are not startup
+retries. Once a session is ready, script validation still loops up to
+`_AUTHOR_RETRIES + 1` = 3 attempts and feeds the validation errors back on each
+retry. `_strip_fence` peels only the opening fence line and a trailing fence,
+never splitting on every ``` , because a literal triple backtick inside the
+script body would otherwise truncate it mid-statement.
 
-Authoring runs in a **fresh, isolated, ephemeral** session (`wf-author:<id>`), torn
-down with `cleanup=True` the instant it finishes, so a workflow's authoring context
-never pollutes (or is polluted by) chat, consolidation, or another run. It uses the
-tool-less `kirocrew-lite` agent with `ToolApprovalPolicy.REJECT_ALL`: the dominant
-cold-start cost is loading the full MCP toolset and system prompt, and authoring is
-pure text generation, so lite is what makes a fresh session cheap. `REJECT_ALL` is
-belt-and-suspenders against an alternate ACP backend injecting tools without
-`set_mode`.
+Before generation, authoring searches the saved global definition library and
+supplies up to three relevant local examples. The model may adapt one and declare
+its exact `id@revision` in `META["adapted_from"]`; otherwise it authors from
+scratch. A named saved workflow is never re-authored or reinterpreted.
+
+Authoring runs in a **fresh, isolated, ephemeral** session (`wf-author:<id>`).
+`wf-author:` is a stateless SessionManager prefix, so acquisition never consults
+or writes a resume mapping. Every failed startup attempt is explicitly destroyed
+before retry backoff, and the successfully acquired session is explicitly destroyed
+when authoring finishes; destruction shuts down the provider, removes the registry
+entry, and deletes any stale SessionMap entry. A workflow's authoring context
+therefore never pollutes (or is polluted by) chat, consolidation, or another run. It
+uses the tool-less `kirocrew-lite` agent with `ToolApprovalPolicy.REJECT_ALL`: the
+dominant cold-start cost is loading the full MCP toolset and system prompt, and
+authoring is pure text generation, so lite is what makes a fresh session cheap.
+`REJECT_ALL` is belt-and-suspenders against an alternate ACP backend injecting tools
+without `set_mode`.
 
 The authoring system prompt (`service._AUTHOR_SYSTEM`) is the model-facing
 statement of this contract: the required module shape, the sandbox rules, the
-async-vs-sync split, the "results can be `None`, bind and guard" rule, the exact
+async-vs-sync split, the "results can be `None`, bind and guard" rule, the
+host-owned `Budget` binding and caller-supplied `budget_total`, the exact
 builtin allowlist, and guidance to keep agent count lean (a generator plus critic
 pair per facet, not one verifier per claim). It must stay consistent with
 `validate.py` and with the wired port set.
@@ -687,6 +1090,12 @@ never spawns `kiro-cli` in tests. Two production adapters:
   `_MAX_TURNS_PER_STEP` is imported from `agent_exec` rather than duplicated, so
   one edit retunes both paths; `test_workflows_agent_pool.py` pins them equal.
 
+Named workflow sessions retain their provider and conversation, not their turn
+lease. Both adapters release every successfully acquired named lease in a
+`finally` block with `cleanup=False`, on success, exception and cancellation.
+A failed or cancelled acquisition must not release a lease held by another
+caller. A later call on that same name reuses the retained history.
+
 Pool init failure is caught and falls back to `build_agent_fn`, so pooling can
 never break a run start. The runner's `on_complete` hook fires on every exit path
 (success, failure, cancellation) to shut the pool down, so warm sessions are always
@@ -706,6 +1115,15 @@ Registered in `dashboard/server.py`, handled in
 (which call them with `X-Internal-Secret`) and the Workflows dashboard tab; the
 caller's `X-Session-Key` header becomes the run's `author` and `session_key`.
 
+Before author, source run, intent run, saved-definition run or subtree rerun
+calls the service, `internal_memory_scope` verifies the request's protected
+caller against its claimed session. Verification refusals pass through unchanged;
+a verified private caller may execute within that scope. Omitting or replacing
+the session header cannot turn a private process into an unbound caller. Run
+list/detail/cancel/rerun separately compare the caller with protected run identity.
+A run id never grants access to another store. Owner-browser and verified V1
+dispatch retain their authentication paths.
+
 | Route | Body / params | Response |
 |-------|---------------|----------|
 | `POST /api/workflows/author` | `{intent}` | `{ok, source, meta}` or `{ok:false, errors}` |
@@ -713,8 +1131,18 @@ caller's `X-Session-Key` header becomes the run's `author` and `session_key`.
 | `POST /api/workflows/run_intent` | `{intent, args?, name?, budget_total?, timeout_secs?}` | `{run_id}` immediately |
 | `GET /api/workflows/runs` | | `{runs: [...]}` compact, newest first |
 | `GET /api/workflows/runs/{run_id}` | | full snapshot incl. `events` (404 if absent) |
+| `POST /api/workflows/runs/{run_id}/promote` | `{name?, description?, slug?}` | save exact source from a finished run or paused TaskRunner plan; 404 when unknown, 409 when not promotable or only a restored redacted source remains |
 | `POST /api/workflows/runs/{run_id}/cancel` | | `{run_id, cancelled}` |
 | `POST /api/workflows/runs/{run_id}/rerun` | `{from_index?, source?}` | `{run_id, from, replayed_before, edited}`; 400 on an invalid edited script, 404 on an unknown run |
+| `GET /api/workflows/definitions?q=` | optional local match query | `{definitions: [...]}` |
+| `POST /api/workflows/definitions` | `{source, format?, name?, description?, slug?, derived_from?}` | explicitly save a validated definition; format defaults to `python` |
+| `GET /api/workflows/definitions/{id-or-slug}` | | one definition including revisions and lineage |
+| `PATCH /api/workflows/definitions/{id-or-slug}` | `{source, expected_revision, name?, description?, slug?}` | append a revision; 404 when unknown, 409 on stale revision |
+| `POST /api/workflows/definitions/{id-or-slug}/run` | `{input?, args?, budget_total?, timeout_secs?}` | run the exact saved revision; 404 when unknown, 409 on execution admission rejection, 503 when its executor is unavailable |
+
+Every mutation route that accepts JSON requires a top-level object. A syntactically
+valid scalar or array is rejected with 400 and `code: invalid_json` instead of
+reaching field access and surfacing as an internal-server error.
 
 With no `workflow_service` on state, every route answers 503.
 
@@ -737,11 +1165,30 @@ user gets a synthesized answer rather than a raw blob.
 
 ### MCP tools
 
-`mcp_core.py` exposes seven tools that forward to the routes above:
-`workflow_author`, `workflow_run` (takes `source` **or** `intent`, plus `name`,
-`args`, `budget_total`), `workflow_status`, `workflow_result`, `workflow_list`,
-`workflow_cancel`, `workflow_rerun_subtree`. All share one exit path that redacts
-LLM-derived strings.
+`mcp_core.py` exposes eight tools that forward to the routes above:
+`workflow_author`, `workflow_run` (takes `source`, `intent`, or an exact saved
+`workflow` reference, plus `input`, `name`, `args`, `budget_total`),
+`workflow_library_list`, `workflow_status`, `workflow_result`, `workflow_list`,
+`workflow_cancel`, and `workflow_rerun_subtree`. All share one exit path that
+redacts LLM-derived strings. Every workflow write resolves the caller with
+`_resolve_session_key_strict()` and passes that verified identity to the HTTP
+write, so a subagent cannot inherit an ancestor session and inject completion
+into the parent's chat. Saved-definition, ad-hoc `source` and `intent` runs all
+refuse before HTTP when strict identity is unavailable, even if the lenient
+resolver finds an ancestor session. Authoring, cancellation and subtree reruns
+use the same strict identity rule. Durable create and update operations
+are deliberately absent from the model-facing MCP surface: only the dashboard's
+explicit human management and completed-session confirmation flows may call the
+mutation routes.
+
+The dashboard handles `/workflow <slug> [input]` locally before harness session
+acquisition; `/workflow` alone lists saved definitions. This keeps the command
+identical across Kiro and adapted harnesses, and prevents an explicit reference
+from being reinterpreted by a harness. The definition format selects its owning
+driver; there is no user-facing engine choice. The Agent Capabilities →
+Workflows tab is the human management surface. Its Workflow library view owns
+listing, authoring unsaved drafts, lineage, source edits as new revisions, and
+exact saved runs; its Runs view owns common history and explicit promotion.
 
 The `workflows` builtin app (`apps/builtins/workflows/`) is `defaultEnabled:
 false` and `hidden: true`; it exposes `/validate`, `/run` and `/examples` over its
@@ -807,15 +1254,14 @@ contract edit. Do not "fix" the expectation.
 
 The neighbouring suites carry the same rule for their own invariants: never relax a
 `validate.py` check without updating `test_workflows_invariants.py` and the
-`tests/workflows/malicious/` corpus, and never relax the layering without
+`test/workflows/malicious/` corpus, and never relax the layering without
 `test_workflows_architecture.py`.
 
 The gate labels cited by the engine's docstrings and by the `test_workflows_*`
-docstrings (A4, B5, C1, D1, F1, F2, G1, …) are defined in
-[workflow-gates.md](workflow-gates.md), which names the test pinning each. A gate
-is closed by that test, not by either document: where a row and its test disagree,
-the test is right. This spec states the invariants directly rather than by label,
-so the catalog is a lookup table for the ids, not a second contract.
+docstrings (A4, B5, C1, D1, F1, F2, G1, …) are catalogued under
+[Conformance gates](#conformance-gates) below, which names the test pinning each.
+The sections above state those invariants directly rather than by label, so the
+catalog is a lookup table for the ids, not a second contract.
 
 > Open question: `M<n>` milestone markers (`M5`, `M6`, `M6.7`, …) still appear on
 > comments and docstrings across every workflow surface — the engine's tests, the
@@ -824,6 +1270,136 @@ so the catalog is a lookup table for the ids, not a second contract.
 > `grep -rnE '\bM(5|6)(\.[0-9]+)?\b'` is the live list rather than an inventory
 > kept here, which would go stale on the next edit. Clearing them belongs to each
 > file's own pass.
+
+## Conformance gates
+
+A *gate* is one named invariant of this engine that a test enforces as a failing
+build rather than as prose. The engine's docstrings cite gates by bare id
+(`GATE F2`, `GATES A3, A5`, `C3 schema-violating object rejected`), so the ids need
+a definition a reader can look up; the tables below are that lookup, and every row
+is derived from the test that pins it. A gate is closed by its test, not by this
+table: where a row and its test disagree, the test is right.
+
+### How to read a row
+
+- **Guarantees** is the property that goes RED when broken, not the
+  implementation.
+- **Pinned by** names the test module and the test function(s). Test modules live
+  at `test/` in the repo root; engine sources live at
+  `src/kiro_crew/workflows/`.
+- A gate is *closed* by its test, not by this document. If a row disagrees with
+  the named test, the test is right.
+
+The letter series are **not contiguous**: only the ids listed here appear in the
+code. Do not infer an `A1`, `A2`, `A6`, or `B8` from the gaps. Ids of the form
+`M<n>` (for example `M4`, `M6.2`) also appear in workflow docstrings; those are
+delivery milestone markers, not gates, and have no entry here.
+
+### Group A: execution semantics
+
+| Gate | Guarantees | Pinned by | Constrains |
+|---|---|---|---|
+| A3 | `pipeline()` has NO barrier between stages (an item may reach a later stage while another item is still in an earlier one), while `parallel()` IS a barrier (it awaits every thunk before returning). | `test_workflows_dsl.py::test_pipeline_no_inter_stage_barrier_deadlock_proof`, `::test_parallel_is_a_barrier` | `dsl.py` |
+| A4 | `Budget` is a HARD ceiling: `charge()` that reaches or passes `total` raises `BudgetExceeded`; `total=None` means unbounded and `remaining()` is `inf`. | `test_workflows_context.py::test_budget_hard_ceiling_raises_at_total`, `::test_budget_hard_ceiling_raises_over_total`, `::test_budget_unbounded_when_total_none` | `context.py` (`Budget`) |
+| A5 | A failing thunk or pipeline stage resolves to `None`; the combinator itself never raises, so callers filter `None` instead of handling exceptions. | `test_workflows_dsl.py::test_parallel_failed_thunk_becomes_none_and_does_not_raise`, `::test_pipeline_failed_stage_drops_item_to_none` | `dsl.py` |
+| A7 | A run emits exactly the documented event vocabulary, in order, with contiguous `seq` from zero: `run_started` first, one of `run_finished` / `run_failed` / `run_cancelled` last. `REQUIRED_DATA_KEYS` covers exactly `EVENT_TYPES`, and the validator rejects an unknown type or a missing required key. | `test_workflows_events.py::test_required_keys_cover_exactly_event_types`, `::test_every_event_type_has_a_builder_and_validates`, `::test_seq_is_monotonic_from_zero`, `::test_validate_rejects_unknown_type`, `::test_validate_rejects_missing_required_keys`; `test_workflows_runner.py::test_happy_path_emits_full_stream_in_order`, `::test_run_started_first_and_finished_last` | `events.py`, `runner.py`, `__init__.py` (`EVENT_TYPES`) |
+
+### Group B: sandbox, ceilings, and audit
+
+Group B splits into a **static half** (`validate.py` refuses the construct before
+the script is ever compiled) and a **runtime half** (`context.build_safe_globals`
+makes the capability absent from the exec namespace, so a construct that somehow
+slipped past static validation still cannot reach anything). B3 has both halves
+by name; the two together are why a single missed AST pattern is not an escape.
+
+| Gate | Guarantees | Pinned by | Constrains |
+|---|---|---|---|
+| B1 | A workflow script may not `import` anything, and may not reference `eval` / `exec` / `compile` / `open` / `__import__` / `globals` / `locals` / `getattr` / `setattr` / `vars` / `input` / `__builtins__`. The rejection message names the offending symbol. | `test_workflows_invariants.py::test_b1_imports_rejected`, `::test_b1_forbidden_builtins_rejected` | `validate.py` |
+| B2 | No dunder attribute or name access (`().__class__`, `__builtins__`, and the rest), no private (`_`-prefixed) attribute access, and no `.format` / `.format_map` call — their template is interpreted at run time, so a traversal can be assembled from parts no static fold can resolve (f-strings are the replacement: their fields are real AST and are already checked). An inline adversarial-escape corpus is rejected wholesale. | `test_workflows_invariants.py::test_b2_dunder_attribute_rejected`, `::test_b2_adversarial_escapes_rejected` | `validate.py` |
+| B3 | The nondeterminism modules (`time`, `random`, `uuid`) are unreachable, statically (they cannot be imported) and at run time (no `__import__` in the sandbox namespace, and `SAFE_BUILTINS` excludes nondeterministic and I/O builtins). Determinism is what makes a run stream resume-stable. | static: `test_workflows_invariants.py::test_b3_determinism_modules_rejected`, `::test_b3_safe_builtins_exclude_nondeterminism_and_io`; runtime: `test_workflows_context.py::test_import_statement_fails_in_safe_globals`, `::test_hostile_snippet_fails_at_runtime_in_safe_globals` | `validate.py`, `context.py` (`build_safe_globals`) |
+| B4 | Event persistence is JSON only: `serialize_events` / `deserialize_events` round-trip through `json`, reject non-JSON and non-array input, and the module imports no `pickle` / `marshal` / `shelve`. | `test_workflows_events.py::test_round_trip_through_json`, `::test_serialize_output_is_pure_json`, `::test_deserialize_rejects_non_json`, `::test_events_module_has_no_pickle_import` | `events.py` |
+| B5 | A wall-clock timeout terminates a runaway run and reports it as a clean `run_failed` with `where == "ceiling"` and `error == "timeout"`. The guard must never let an `asyncio.CancelledError` escape `run()` to the caller. | `test_workflows_runner.py::test_wall_clock_timeout_kills_runaway`, `::test_timeout_never_leaks_cancellederror` | `runner.py` |
+| B6 | `AgentCounter` caps lifetime `ctx.agent()` calls per run (default `DEFAULT_MAX_AGENTS_PER_RUN = 1000`) and the cap is enforced through the runner: an unbounded agent loop stops at the limit and ends as `run_failed` at the ceiling. | `test_workflows_context.py::test_agent_counter_raises_past_limit`, `::test_agent_counter_default_limit`; `test_workflows_runner.py::test_agent_count_cap_enforced` | `context.py` (`AgentCounter`), `runner.py` |
+| B7 | The exec namespace exposes only `SAFE_BUILTINS` plus `ctx`, so a script has no filesystem or egress reach: `open`, `eval`, `exec`, `compile`, `__import__`, `input` and `getattr` are absent, and benign safe builtins still work. | `test_workflows_context.py::test_safe_globals_only_exposes_ctx_and_safe_builtins`, `::test_hostile_snippet_fails_at_runtime_in_safe_globals`, `::test_safe_builtins_actually_usable` | `context.py` (`build_safe_globals`) |
+| B9 | Every hostile script in the on-disk escape corpus (`test/workflows/malicious/*.py`) is statically rejected, with a non-empty error. The corpus directory must exist and be non-empty, and a new escape idea is added by dropping a file in it: the test parametrizes over the directory. | `test_workflows_malicious.py::test_every_malicious_script_is_rejected`, `::test_corpus_dir_exists_and_is_populated` | `validate.py`, `test/workflows/malicious/` |
+| B10 | Every run writes an audit trail (author, runner, arg KEYS only, one record per agent call with its outcome, and a result *hash*, never the raw result). The sink is injectable and a sink that raises can never fail the run. | `test_workflows_audit.py::test_run_emits_started_and_finished_audit_with_author`, `::test_each_agent_call_is_audited`, `::test_result_hash_never_leaks_raw_result`, `::test_failed_agent_audited_as_failed`, `::test_audit_failure_never_breaks_run` | `runner.py` (`_default_audit`, `_result_hash`), [sel.md](sel.md) |
+
+### Group C: structured output for `ctx.agent(schema=)`
+
+The runtime ships no `jsonschema`, so `schema.py` is a dependency-free validator
+for the JSON-Schema subset the DSL uses. C1 to C3 are the three outcomes that
+subset has to get right.
+
+| Gate | Guarantees | Pinned by | Constrains |
+|---|---|---|---|
+| C1 | A conforming object validates clean (empty error list) and is returned to the script. | `test_workflows_schema.py::test_c1_valid_object_passes` | `schema.py` (`validate_against_schema`) |
+| C2 | Malformed or invalid model output triggers a *bounded* retry (`DEFAULT_SCHEMA_RETRIES = 2`, so at most initial plus 2 attempts), then returns `None` rather than raising or looping. | `test_workflows_schema.py::test_c2_retry_then_success`, `::test_c2_all_malformed_returns_none`, `::test_c2_schema_violation_retried_then_none` | `schema.py` (`run_with_schema`) |
+| C3 | An object that parses as JSON but violates the schema is rejected, not returned: missing `required` key, wrong type, `enum` violation, and `bool` not counting as `integer`. | `test_workflows_schema.py::test_c3_missing_required_rejected`, `::test_c3_wrong_type_rejected`, `::test_c3_enum_violation_rejected`, `::test_c3_bool_is_not_integer` | `schema.py` |
+
+### Group D: Kiro Crew's own `ctx` primitives
+
+Each native primitive delegates to a port injected per run. The gate is the
+*calling convention* (the ctx surface reaches the port with the right arguments),
+not the real service wiring, which is the gateway's job. A primitive whose port
+is not wired fails the run with a message naming the primitive instead of
+crashing.
+
+| Gate | Guarantees | Pinned by | Constrains |
+|---|---|---|---|
+| D1 | `ctx.cron` reaches the cron port with the job name, cron expression and workflow name. | `test_workflows_native.py::test_d1_cron_port_invoked` | `runner.py`, `__init__.py` (`CronPort`) |
+| D2 | `ctx.nudge` reaches the nudge port with the run's originating `session_key` threaded through, plus a notify emitter so nudge outcomes surface in the run event stream. | `test_workflows_native.py::test_d2_nudge_port_invoked` | `runner.py` |
+| D3 | `ctx.memory.get/set` persist across a run through the memory port, and `ctx.learn.add` reaches the learn port with its default `scope="workspace"`. | `test_workflows_native.py::test_d3_memory_get_set_and_learn` | `runner.py`, `__init__.py` (`MemoryPort`, `LearnPort`) |
+| D4 | `ctx.approve` awaits the approval port and returns its boolean decision to the script. | `test_workflows_native.py::test_d4_approve_resolves_decision` | `runner.py` |
+| D5 | `ctx.send_slack` and `ctx.send_message` reach their ports in call order with the resolved target (`ctx.owner_dm` resolves to the run's owner) and text. | `test_workflows_native.py::test_d5_send_slack_and_message` | `runner.py` |
+| (all D) | An unwired port produces `run_failed` with the primitive's name in the error, not a `NotImplementedError` traceback. | `test_workflows_native.py::test_unwired_primitive_fails_cleanly` | `runner.py` |
+
+### Group E: dashboard tab (unpinned)
+
+| Gate | Guarantees | Pinned by | Constrains |
+|---|---|---|---|
+| E1 | Undocumented. The only statement of intent is an inline comment in `website/src/apps/workflows/WorkflowsPage.tsx` ("invalid script blocks the run") on the run handler, which validates before it runs. No test asserts it by id. | Nearest coverage: `website/src/test/WorkflowsPage.test.ts` (pure event-stream folding), `website/playwright/builtin-apps.spec.ts` (`/workflows` renders). | `website/src/apps/workflows/WorkflowsPage.tsx` |
+| E2, E3, E4 | Undocumented. These ids appear only inside the range `E1-E4`, described as Playwright gates against a dev instance; no individual id is defined or asserted anywhere in the tree. | See `website/src/test/WorkflowsPage.test.ts` (which names the range) and `website/playwright/builtin-apps.spec.ts`. | `website/src/apps/workflows/` |
+
+The backend half of the tab is covered without gate ids, in
+`test_workflows_app.py` (manifest shape, `handle_validate` / `handle_run` /
+`handle_examples`, and redaction of credentials and exfiltration URLs before a
+run payload leaves the handler) and `test_workflow_handler_json_contract.py`
+(every legacy mutation handler rejects a non-object JSON body with a coded 400
+before service dispatch, while object bodies still reach that service).
+
+### Group F: fitness gates on the engine itself
+
+Group F gates are enforced as pure-stdlib AST scans with no `import-linter` or
+`git` dependency, so they hold in any checkout: git state is environment-fragile
+and a git-dependent gate can redden a clean trunk.
+
+| Gate | Guarantees | Pinned by | Constrains |
+|---|---|---|---|
+| F1 | The layering holds: `validate` / `dsl` / `schema` / `events` / `registry` / `__init__` and the optional adapters (`agent_exec`, `agent_pool`, `store`, `library`) are leaves with no intra-package siblings; `context` may import `validate`; `runner` may import `validate`, `dsl`, `events`, `context`, `schema`, `registry`; `service` sits above the runner. No module may import backwards, no module escapes the declared contract, and the engine must not reach into `kiro_crew.dashboard.state` or `kiro_crew.dashboard.ws` (progress goes through the event bus or a port). | `test_workflows_architecture.py::test_layering_no_backward_or_unexpected_sibling_imports`, `::test_engine_does_not_import_dashboard_internals`, `::test_every_module_is_covered_by_the_contract` | all of `src/kiro_crew/workflows/` |
+| F2 | The frozen contract in `workflows/__init__.py` cannot drift silently: `__all__`, the `WorkflowContext` data attributes, its exact method set, each method's signature and async-ness, each port's methods and `runtime_checkable`-ness, `EVENT_TYPES` (exact and ordered), and the event envelope keys plus JSON round-trip. Changing any of them is an explicit re-freeze that must update `__init__.py`, the spec above, and this test together. | `test_workflows_conformance.py::test_all_exports_exact`, `::test_ctx_method_set_exact`, `::test_ctx_method_signature`, `::test_port_method_signature`, `::test_event_types_exact_and_ordered`, `::test_event_envelope_keys_exact` | `__init__.py` |
+| F3 | Every implementation module under `workflows/` is imported by at least one `test/test_workflows_*.py`, so a module cannot be added without a test that reaches it. The gate carries its own negative control, so it cannot silently stop catching orphans. | `test_workflows_presence.py::test_every_workflows_module_has_a_referencing_test`, `::test_presence_gate_flags_an_orphan_module` | all of `src/kiro_crew/workflows/` |
+
+### Group G: authoring reliability
+
+The DSL is only useful if an agent can author it on the first try, so authoring
+reliability is a measured gate rather than an assumption. The candidate set mixes
+the shipped examples (known-good output) with intentionally plausible-but-flawed
+scripts, so the rate is a measurement and not a tautology.
+
+| Gate | Guarantees | Pinned by | Constrains |
+|---|---|---|---|
+| G1 | The first-try valid-script rate over the candidate set is at or above `G1_TARGET = 0.80`, every shipped example validates, and each deliberately flawed candidate is actually rejected. | `test_workflows_authoring_eval.py::test_g1_shipped_examples_all_validate`, `::test_g1_first_try_valid_rate_meets_target`, `::test_g1_flawed_candidates_are_caught` | `validate.py`, the shipped example scripts the test resolves |
+| G2 | Every script that validates terminates cleanly against a stub provider: `run_started` first, `run_finished` or `run_failed` last, `seq` contiguous. It never hangs, and no exception escapes the runner (a run that ends `run_failed` still satisfies G2, which is about termination and stream shape). | `test_workflows_authoring_eval.py::test_g2_valid_scripts_run_to_completion`, `::test_g2_simple_authored_script_fully_succeeds` | `runner.py`, `validate.py` |
+| G3 | Author-session startup retries only transient ACP startup failures, uses a fresh isolated key for each attempt, destroys a partial session before retrying, and preserves the final startup error when the bounded attempt budget is exhausted. Successfully acquired author sessions are stateless and destroyed after authoring, so their provider, registry entry, and SessionMap entry do not survive. Arbitrary failures are not retried. | `test_workflows_service.py::test_author_retries_transient_startup_with_fresh_session`, `::test_author_destroys_partial_session_before_startup_retry`, `::test_author_does_not_retry_arbitrary_startup_failure`, `::test_author_startup_retry_exhaustion_preserves_last_error`, `::test_author_uses_isolated_destroyed_lite_session` | `service.py`, `session.py` |
+
+### Adding or changing a gate
+
+1. Write the test first: a gate is the test, and this table is its index.
+2. Cite the gate by id in the source docstring it constrains, and add the row
+   here in the same change.
+3. Never relax a check to make a red gate green. A group-B case that flips from
+   RED to GREEN because a validator check was loosened is a sandbox regression,
+   not a fix; a red F3 means the new module needs a test, not an exemption.
 
 ## Related
 
@@ -836,3 +1412,96 @@ so the catalog is a lookup table for the ids, not a second contract.
 | Cron scheduling behind `CronPort` | [learn-cron-dashboard](learn-cron-dashboard.md) |
 | App manifest model for the Workflows app | [app-kit-platform](app-kit-platform.md) |
 | Example scripts | [examples/workflows](examples/workflows/README.md) |
+
+### Provider receipts and unavailable-store cancellation
+
+Private workflow prompt construction passes the acquired provider and actual
+resume state to `ContextBuilder.build_message(context_provider=...)`, after
+`prepare_store_vectors`. The provider's `EssentialDelivery` owns acknowledgment
+of a productive, successful raw terminal. Author and pool `is_new` flags describe
+lifecycle only; they never acknowledge essential delivery. Failed or cancelled
+attempts retain the full candidate, and a new conversation has its own receipt.
+
+Completion delivery checks protected run identity even when a supplied snapshot
+omits its binding-version field. A surviving hidden private payload cannot be
+classified as a legacy global run. Owner cancellation may use a valid protected
+run record without opening an unavailable member store; ordinary content reads
+and non-owner operations still require an active, matching memory scope.
+
+The private HTTP scope regression initializes and closes a real Global
+`VectorMemoryStore` off-loop, matching the database normally created by gateway
+startup. Its macOS-only companion compares the native Seatbelt query and
+protected PID lookup before and after that initialization; neither verifier is
+stubbed. Failure diagnostics observe the original request's checks, including
+native result/errno and database existence, and preserve any coverage tracer.
+They report only safe state fields, never private paths, proofs or payloads.
+Passing this fixture on Linux does not establish the macOS native result or the
+separate real-gateway private workflow E2E.
+
+### Atomic run identity allocation
+
+Before returning a new `wf_NNNNNN` identity, the service burns its number in
+`config_dir()/member-memory-bindings/workflows/.run-id.json`. The version-1
+record has exactly `version` and `high_water`: both are strict integers, and
+`high_water` is a nonnegative uint64. Booleans, floats, unknown versions and
+out-of-range values refuse allocation. Six digits are a minimum display width;
+`wf_999999` is followed by `wf_1000000`. The uint64 ceiling refuses, never wraps.
+
+One permanent `.run-id.lock` inode serializes the complete read/check/write/sync
+transaction with the platform's required exclusive cross-process lock. The
+counter is atomically replaced; the lock is never replaced, truncated or deleted.
+The service offloads the entire transaction in one `asyncio.to_thread` call.
+Cancellation cannot release a still-running worker's lock. After a durable burn,
+failed or cancelled admission, registry eviction and author-only calls never
+make the ID available again. The recovered registry sequence is only a lower
+bound, not a way to recreate lost allocator state.
+
+First-use protocol, entirely under that lock:
+
+1. An empty lock means initialization has not published its witness. Merely
+   creating the lock does not enable the allocator. A second process may take
+   the lock before its creator and finish initialization normally.
+2. With no witness and no counter, persist the recovered lower bound. With an
+   existing valid counter, retain and re-sync it instead. Use same-directory
+   atomic replacement, owner-only access, file fsync and parent-directory fsync.
+3. Only after the initial counter is durable, write byte `1` to the permanent
+   lock and fsync it and the directory chain. Only then may an ID be allocated.
+4. Select `max(high_water, recovered_floor) + 1`, skip occupied legacy candidates,
+   atomically persist the selected number and sync its parent before returning.
+
+A crash before witness publication leaves either no counter or a valid initial
+counter; the next lock holder can finish initialization because no ID was issued.
+A published witness with a missing counter fails closed. Empty, malformed or
+unknown-version counters always fail closed, even during initialization. Invalid
+witness bytes also refuse. Every allocation syncs the witness again so a failed
+prior witness sync cannot be mistaken for completed initialization. I/O or lock
+failure returns no ID and never rolls back a visible high water. A failure before
+counter publication has not issued that candidate; a failure after publication
+may burn it without returning it. Directory fsync retains `atomic_write`'s
+existing platform limits, including Windows and filesystems without directory
+sync support. This protocol does not detect restoring a syntactically valid old
+backup or destroying both allocator records.
+
+Existing hashed `.reserved/` entries and binding directories are checked for each
+candidate, including binding directories without `memory.json`. They are never
+deleted or replaced by allocation. New allocation creates no per-run reservation.
+New allocator bookkeeping is O(1) space; skipping K consecutive legacy collisions
+is O(K) work. Immutable bindings, including global bindings, still grow with runs,
+so the whole identity store is not O(1). No GC or reclamation is introduced.
+Allocation grants no store or caller authority. Proof, ownership, namespace and
+immutable no-replacement binding publication remain separate and unchanged.
+Exact path checks ignore only Windows' extended-length prefix, including UNC;
+redirects, non-regular or multiply-linked allocator files refuse allocation.
+
+This replaces the unmerged reservation protocol in
+[PR #10586](https://github.com/kirodotdev/KiroCrew/pull/10586), verified open before
+implementation. It does not promise mixed-version writers: stop all old
+allocators before using this protocol on the same data home. Old writers do not
+read the new lock or counter. This is a stop-and-upgrade constraint, not a new
+rolling-upgrade coordination mechanism. Do not delete allocator or legacy
+identity records as stale caches.
+
+Saved task-plan execution passes the effective protected caller session to
+TaskRunner, including calls that supply only `author`. TaskRunner's existing
+runtime, worker and reviewer binding path then retains that private store;
+`author` cannot be silently discarded into a Global V1 execution.

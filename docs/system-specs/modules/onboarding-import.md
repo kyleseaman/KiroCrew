@@ -1,9 +1,5 @@
 # Foreign-Agent Import Module
 
-Previously: 2026-07-28 (initial spec: industry-consensus scope, session-import
-removal, memory-hierarchy destination mapping, dry-run contract, and
-user-selectable conflict strategies)
-
 ## Overview
 
 `onboarding_import.py` migrates a user's setup from another AI agent into
@@ -86,7 +82,7 @@ Durable tiers only:
 | `lessons.jsonl` (`LessonStore`) | 22.6% — highest of any tier | Append-only; pruned oldest-first at `_MAX_LESSONS_TOTAL` (200) |
 | Semantic memory (`VectorMemoryStore`) | 7.7% | Durable; key-addressed, confidence-gated |
 | Episodic memory (`VectorMemoryStore`) | 7.7% | Durable; append-only |
-| `.kiro/steering/*.md` | 10% | Durable, but **workspace-scoped** |
+| `.kiro/steering/*.md` | 10% | Durable, but **workspace-scoped** — a tier the system has, never an import destination (rule 4) |
 
 ### Mapping rules
 
@@ -155,13 +151,16 @@ Durable tiers only:
    `json.loads` result is a real newline and does. See security invariant 3a for
    the two layers that enforce this. It applies to the plain semantic path too,
    not just directives — a `lesson.*` key reaches the same always-injected tier.
-4. **Workspace-scoped rules → `.kiro/steering/`, opt-in only.** A per-project
-   instruction file (a workspace's own `CLAUDE.md`/`AGENTS.md`) may be written
-   to `<workspace>/.kiro/steering/imported-<source>.md` **only** when the user
-   supplies an explicit workspace target. Import MUST NOT default the target to
-   the current directory, the data home, or the user's home. Absent an explicit
-   target the item is reported `skipped` with reason
-   `workspace_target_required` — a missing target is never implicit consent.
+4. **Instruction files land in the lesson tier, not in a steering file.**
+   `_add_instruction_files` turns a `CLAUDE.md`/`AGENTS.md` (and a persona
+   document's DIRECTIVE body) into `instructions` items of `kind: lesson`, and
+   `_write_instruction` writes them through `LessonStore` / `VectorMemoryStore`.
+   Import writes no `.kiro/steering/` file anywhere and takes no workspace-target
+   argument. `preferences.md` / `projects.md` are not valid destinations either:
+   the memory consolidator replaces both wholesale, so an import there is
+   destroyed on the next consolidation run. Where a workspace itself gets
+   registered is the separate `workspaces` category, which is not a
+   steering-write destination.
 
 Every imported memory item passes the existing content gates before it is
 written: `_sanitize_text` (truncate + credential redaction; a *redacted* file is
@@ -206,9 +205,11 @@ reports `embedding_backfill_pending: 0`.
 Why deferral and not batching: embedding cost grows steeply with text length
 (~0.4s per 2000-char chunk on CPU), and import writes hundreds of chunks, so an
 inline embed held the apply request for minutes. **`embed_batch()` is not the
-fix** — measured on real import text it is ~25% *slower* than looping `embed()`,
-because one 2000-char chunk already fills the model's micro-batch (`n_ubatch ==
-n_ctx == 2048`), so grouping adds padding with no parallelism to reclaim.
+fix** — measured on real import text it is ~25% *slower* than looping `embed()`.
+That measured workload result, rather than the physical micro-batch size, is the
+reason imports defer the work: llama.cpp now decodes each input in bounded
+512-token physical batches while retaining the full 2,048-token logical batch
+and context.
 
 `backfill_missing_embeddings()` requires numpy but **not faiss**. Faiss is an
 optional accelerator and not a declared dependency, so gating the sweep on it
@@ -229,13 +230,7 @@ The plan is per-item, not per-category: each entry carries `source_id`,
 and the **predicted** status (see status vocabulary). A category-level count
 alone is not a valid plan.
 
-**The plan is advisory, not authoritative.** `apply_import()` re-scans the
-source from disk and never trusts payloads echoed back by the client; only
-`(source_id, category_id)` pairs are read out of the submitted plan, filtered
-against `SOURCE_IDS`/`CATEGORY_IDS`. Consequently a preview status may differ
-from the applied status when the source changed in between. `apply_import()`
-returns per-item outcomes so the caller can report exactly which items diverged
-from their prediction; it MUST NOT silently present the preview as the result.
+**The plan is advisory, not authoritative.** `apply_import()` re-scans the source from disk and never writes item payloads echoed by the client. `_parse_selection()` validates the request shape and category ids, `_select_fresh_plan()` admits only `(source_id, category_id)` pairs offered by a fresh engine plan, and `_selected_pairs()` retains only source ids in that plan plus `CATEGORY_IDS`. The plan remains the identity authority when a provider fails closed between preview and apply, so a client cannot select an unplanned source. Consequently a preview status may differ from the applied status when the source changed in between. `apply_import()` returns per-item outcomes so the caller can report exactly which items diverged from their prediction; it MUST NOT silently present the preview as the result.
 
 ## Conflict strategy (user-selectable)
 
@@ -254,7 +249,7 @@ Applicability and rename derivation per category:
 |----------|-----------|-------------|
 | `skills` | skip · rename · overwrite | `<name>-imported-<source>`, then `<name>-<fingerprint[:8]>` |
 | `mcp_servers` | skip · rename · overwrite | `<name>-<source>`, then `<name>-<fingerprint[:8]>` |
-| `workspaces` | skip · rename | `base-<source>`, then `base-<fp[:8]>`. **Behavior change:** the pre-existing three-step ladder silently suffixed on a name collision; that is a rename, so it now requires `rename`. Plain `skip` reports the collision. |
+| `workspaces` | skip · rename | `base-<source>`, then `base-<fp[:8]>`. `skip` reports a collision; suffix derivation occurs only under `rename`. |
 | `instructions`, `memories` | n/a — merge-only, never collide destructively | — |
 | `denied_commands`, `settings` | n/a — merge-missing only | — |
 | `schedules` | skip only — a duplicate schedule is matched by `_same_schedule` | — |
@@ -295,11 +290,7 @@ Rules:
 - A strategy is chosen **per apply request**, applying to every item in it. A
   finer-grained per-item choice is a UI concern layered on top: the UI may issue
   several apply requests with different strategies.
-- `rename` exists specifically to give the user a way out of an otherwise
-  terminal conflict. Before it existed, an upstream edit to an
-  already-imported skill or MCP server produced a permanent `conflict` with no
-  resolution path, because the item fingerprint covers the content digest and
-  therefore did not match the ledger.
+- `rename` lets the user resolve a collision caused by a source edit: a changed skill or MCP server has a different content-derived fingerprint, so it does not match the ledger record for the installed item.
 
 ## Idempotency and deduplication
 
@@ -386,9 +377,8 @@ This vocabulary is the frontend contract — the UI MUST NOT invent a fifth stat
 | `conflict` | `rejected` | Destination holds a different item; resolvable via strategy |
 | `rejected` | `rejected` | Refused by a safety or validity gate; not resolvable via strategy |
 
-Apply also returns `skipped` entries (source unavailable, scan diagnostics,
-`workspace_target_required`) which are **not** item outcomes — they describe
-things never attempted.
+Apply also returns `skipped` entries (source unavailable, scan diagnostics)
+which are **not** item outcomes — they describe things never attempted.
 
 ## Per-source assumptions
 
@@ -412,11 +402,7 @@ installed. An edition that supersedes a predecessor of its own registers it
 instead of the core naming it, which is what keeps an edition-specific product
 name out of this tree.
 
-`ImportSourceProvider.import_sources()` (CPP seam, public default `[]`) returns
-`ImportSource` descriptors. A descriptor says WHERE an install is: `id` (what the
-API validates), `display_name` (what the dashboard shows), `env_vars` +
-`home_dir` (where it lives), `managed_mcp_names` (that agent's own MCP servers,
-never imported), and `superseded` + `stale_mcp_binaries` (see below).
+`ImportSourceProvider.import_sources()` (CPP seam, public default `[]`) returns `ImportSource` descriptors. A descriptor says WHERE an install is: `id` (normalized by the engine registry), `display_name` (carried by the engine plan to the dashboard), `env_vars` + `home_dir` (where it lives), `managed_mcp_names` (that agent's own MCP servers, never imported), and `superseded` + `stale_mcp_binaries` (see below).
 
 **A descriptor does not supply reader code, and does not choose a reader.** The
 engine does all reading with its own helpers, which is what keeps credential
@@ -431,9 +417,7 @@ genuinely novel foreign format needs a reader added to the core, because only th
 core can read it through the gates; when a second layout exists, naming one
 becomes an additive default-valued field on this same seam.
 
-`_sources()` unions contributions over the builtins for every scan, apply, and
-id-validation path, read fail-closed through `safe_context_call` — a broken
-adapter costs the edition's sources, not the page.
+`_sources()` unions contributions over the builtins for every scan and apply registry snapshot, read fail-closed through `safe_context_call` — a broken adapter costs the edition's sources, not the page. `_source_summary()` carries the resolved id and display name in that snapshot into the plan, so consumers do not perform a second registry lookup.
 
 **Everything questionable about a descriptor is settled at one boundary.**
 `_normalize_source` is the only place that validates and canonicalizes, and BOTH
@@ -545,27 +529,23 @@ Two layers, both required:
    diagnostic — so the user sees a reason in "Not imported" instead of a silent
    skip.
 
-### Adding a source touches THREE allowlists, not one
+### Source identity has one authority
 
-The source id is enumerated independently in three places, and missing any one
-of them fails in a different way:
-
-| Layer | Symbol | Failure mode if omitted |
-|-------|--------|-------------------------|
-| Backend registry | `onboarding_import.SOURCE_IDS` (+ `_SOURCE_NAMES`, `_SOURCE_ROOTS`, `scanners`) | The source is never scanned |
-| Handler projection | `dashboard/handlers/onboarding_import._SOURCE_IDS` + `_SOURCE_NAMES` | **`_scan_response` raises and the endpoint 500s — breaking the wizard for EVERY source**, on any machine where the new source's home merely exists. `_SOURCE_NAMES` is indexed with `[source_id]`, so it `KeyError`s even once `_SOURCE_IDS` is fixed |
-| Frontend filter | `AgentImportFlow.tsx` `SUPPORTED_SOURCE_IDS` | `eligibleSources()` silently drops the source — it never renders, even with a working backend |
-
-The handler duplication is load-bearing (it is the content-free projection
-boundary), so it is pinned by `test_handler_source_tables_match_the_backend` in
-`test/test_api_onboarding_import.py`: the omission fails loudly in CI instead of
-as a production 500.
+The engine owns source identity. `_sources()` resolves and normalizes the registry once per preview or apply operation, and `_source_summary()` carries its id and display name into the plan. The handler's `_parse_selection()` accepts bounded request shapes and known categories without maintaining a second source-id table; `_select_fresh_plan()` intersects client choices with the freshly generated plan before calling `apply_import()`. `AgentImportFlow.tsx` keeps a denylist only for the reserved `quick` setup mode, so registered sources remain visible. This prevents a registered source from being hidden or a transient registry read from turning an accepted plan into an HTTP error; `test_handler_category_tables_match_the_backend` and `test_selection_survives_a_registry_that_no_longer_lists_the_source` pin the seams.
 
 | Endpoint | Phase | Body |
 |----------|-------|------|
 | `GET /api/onboarding/import/scan` | detect + dry run | — |
 | `POST /api/onboarding/import/apply` | apply | `{sources: [{id, categories: [...]}], conflict_strategy?}` — `conflict_strategy` is one of `skip`/`rename`/`overwrite`; absent = `skip`, unrecognized = 400 |
 | `POST /api/onboarding/import/state` | onboarding bookkeeping | `{completed: bool}` |
+
+Each endpoint is owner-only: the handlers call `require_owner_dashboard_request`
+after authentication. With no `owner_id` configured the gate accepts the signed
+local bootstrap subjects (`local-app`, `local-startup`), which is the identity
+the onboarding flow runs as; once an owner exists, a stale pre-owner session
+gets the 401 re-auth answer and every other non-owner subject gets a 403
+`owner_only` denial. `test_agent_config_owner_gate_invariant.py` walks the two
+mutating routes as part of its gated-route invariant.
 
 Concurrency: apply holds a module-level import lock. Config-writing categories
 run under the config lock; `mcp_servers` runs in a separate phase **outside**
@@ -581,32 +561,22 @@ reported independently. `embedding_backfill_pending` is **backend-only** — it
 tells the handler to schedule the embedding sweep and MUST NOT cross into the
 browser (the HTTP `summary` does not carry it).
 
-## Session-import removal
+## No session import
 
-Session/transcript import is removed. The removal deletes the categories'
-scanners, writers, and their supporting machinery:
+**Session and transcript import does not exist, and must not be added back.**
+`sessions` is not a member of `CATEGORY_IDS`; there is no session scanner, no
+session writer, no session provenance classifier, no per-session read inside
+`_scan_hermes_db` or `_scan_lineage_memory_db`, no transcript-hash branch in
+`_deduplicate_items`, and no `conversation_log` plumbing through `apply_import`
+or the handler. A reader looking for the deleted symbol names will find them in
+git history, not here.
 
-- `sessions` from `CATEGORY_IDS`; `_write_session`, `_session_destination_key`
-- `_jsonl_session_items`, `_message_from_record`, `_extract_visible_content`,
-  `_claude_record_is_excluded`, `_without_runtime_sessions`,
-  `_add_sessions_and_workspaces`, `_record_workspaces`
-- the OpenClaw session-provenance set: `_OPENCLAW_RUNTIME_NAMESPACES`,
-  `_OPENCLAW_SESSION_OWNERSHIP_FIELDS`, `_OPENCLAW_CHECKPOINT_RE`,
-  `_OPENCLAW_CREATED_VIA`, `_openclaw_session_provenance_is_user_owned`,
-  `_openclaw_session_paths`, `_openclaw_session_artifact`,
-  `_openclaw_entry_matches_file`, `_openclaw_registry_map`
-- session reads in `_scan_hermes_db` / `_scan_lineage_memory_db`, and
-  `_HERMES_RUNTIME_SESSION_SOURCES`
-- the `sessions` branch of `_deduplicate_items` (transcript-hash canonicalization)
-- session-only limits: `_MAX_JSONL_LINES`, `_MAX_MESSAGES_PER_SESSION`,
-  `_MAX_LINE_BYTES`, `_VISIBLE_ROLES`, `_VISIBLE_TEXT_TYPES`, `_NON_TEXT_TYPES`
-- `conversation_log` plumbing through `apply_import` and the handler
-
-**Consequence for workspace discovery.** Workspaces were partly discovered by
-reading workspace paths out of session records. After removal, workspace
-discovery comes only from explicit configuration (`_collect_project_paths` and
-each source's config-declared workspace values). This narrows coverage; it does
-not break it. Do not reintroduce a session read to widen it.
+**Consequence for workspace discovery.** Workspace discovery comes only from
+explicit configuration — `_collect_project_paths` plus each source's
+config-declared workspace values. Reading workspace paths out of session records
+would widen coverage, which is exactly why it is not done: importing another
+agent's transcripts is not something a user consented to by importing its
+config. The narrower coverage is the deliberate trade.
 
 **Ledger compatibility.** Existing ledgers may contain `category_id:
 "sessions"` records. They are inert: no scanner produces a `sessions` item, so
@@ -619,9 +589,7 @@ wrote under a previous version.
 
 These are load-bearing. Changing any of them requires a security review.
 
-1. **Apply re-scans from disk.** No payload from the HTTP client is ever
-   written. Only `(source_id, category_id)` pairs, allowlist-filtered, are read
-   from the submitted plan.
+1. **Apply re-scans from disk against a fresh engine plan.** No item payload from the HTTP client is written. `_parse_selection()` validates bounded request shape and category ids; `_select_fresh_plan()` admits only `(source_id, category_id)` pairs offered by fresh `preview_import()`, and `_selected_pairs()` keeps only source ids in that plan plus `CATEGORY_IDS`. The plan remains the identity authority even if a provider fails closed between preview and apply; a client cannot select an unplanned source.
 2. **Credentials are never read.** Known credential files are not opened;
    secret-shaped MCP `env`/`headers` keys and URL-embedded secrets are stripped
    and counted, never stored.

@@ -54,33 +54,31 @@ def test_browser_skills_name_the_settings_toggle_not_only_a_cli() -> None:
     The failure this locks: a skill that offers only a raw `npm install -g ...`
     line (or nothing at all) leaves a user believing the feature is broken. The
     Settings Browser panel carries a one-click Install button, and it must be
-    named wherever a skill reports the browser missing. The toggle it used to
-    name is gone; the install card that replaced it is not.
+    named wherever a skill reports the browser missing. The current surface is
+    the install card, not a toggle.
     """
     for skill in (WEB_VERIFY, WEB_BROWSE):
-        assert "Settings → Browser" in _flat(skill), (
-            f"{skill.name} must name the Settings path"
-        )
+        assert "Settings → Browser" in _flat(skill), f"{skill.name} must name the Settings path"
 
 
 def test_browser_skills_do_not_point_at_a_toggle_that_no_longer_exists() -> None:
-    """Installing the CLI IS the grant now, so no skill may promise a switch.
+    """Installing the CLI provides the capability, so no skill may promise a switch.
 
     This assertion is the inverse of the one it replaces, and deliberately so.
     Under the MCP stack the enabler was a Settings toggle and the risk was a
     skill claiming the CLI could flip it. The toggle is gone: presence of
-    `playwright-cli` on PATH is the capability grant. The live risk is therefore
+    `playwright-cli` on PATH is capability availability. The live risk is therefore
     a skill telling the user to go turn on a setting that does not exist, which
     is a dead end no amount of retrying resolves.
     """
     for skill in (WEB_VERIFY, WEB_BROWSE):
         flat = _flat(skill)
-        assert "Browser Mode" not in flat or "no Browser Mode" in flat or (
-            "not the same as" in flat
+        assert (
+            "Browser Mode" not in flat or "no Browser Mode" in flat or ("not the same as" in flat)
         ), f"{skill.name} still presents Browser Mode as something to switch on"
-        assert "kirocrew browse setup" not in flat, (
-            f"{skill.name} names a CLI verb this migration removed"
-        )
+        assert (
+            "kirocrew browse setup" not in flat
+        ), f"{skill.name} names a CLI verb this migration removed"
 
 
 def test_browser_skills_do_not_assert_mode_off_as_fact() -> None:
@@ -93,9 +91,9 @@ def test_browser_skills_do_not_assert_mode_off_as_fact() -> None:
     for skill in (WEB_VERIFY, WEB_BROWSE):
         flat = _flat(skill)
         if "Browser Mode is off" in flat:
-            assert "usually means" in flat or "cannot see the setting" in flat, (
-                f"{skill.name} asserts Browser Mode is off without hedging"
-            )
+            assert (
+                "usually means" in flat or "cannot see the setting" in flat
+            ), f"{skill.name} asserts Browser Mode is off without hedging"
 
 
 def test_web_verify_names_all_three_capture_backends() -> None:

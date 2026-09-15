@@ -8,6 +8,7 @@ import pytest
 
 from kiro_crew.imessage.client import IMessageInbound
 from kiro_crew.imessage.transport_dispatch import IMessageDispatcher
+from kiro_crew.session_allocation import SessionClosingError
 
 HANDLE = "+15551234567"
 
@@ -52,12 +53,17 @@ class FakeProvider:
 class FakeSessions:
     def __init__(self) -> None:
         self.busy: set[str] = set()
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
         self.providers: dict[str, Any] = {}
         self.sessions: set[str] = set()
         self.acquired: list[str] = []
         self.released: list[str] = []
         self.acquire_ok = True
         self.usage_pct = 0.0
+        self.reserved_generations: list[str] = []
 
     def is_busy(self, key: str) -> bool:
         return key in self.busy
@@ -74,6 +80,12 @@ class FakeSessions:
         self.acquired.append(key)
         return True
 
+    def begin_turn(self, key: str) -> None:
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
+
     def release(self, key: str) -> None:
         self.released.append(key)
 
@@ -82,6 +94,12 @@ class FakeSessions:
 
     def list_sessions(self) -> list[str]:
         return sorted(self.sessions)
+
+    def reserve_generation(self, session_key: str) -> None:
+        self.reserved_generations.append(session_key)
+
+    async def aflush(self) -> None:
+        return None
 
     def max_generation(self, *_args: object, **_kwargs: object) -> int:
         """No prior generation to seed from — a fresh install starts at 0."""
@@ -150,10 +168,12 @@ class TestCommandIntercept:
 
     @pytest.mark.asyncio
     async def test_new_bumps_the_generation_so_the_session_key_changes(self) -> None:
-        dispatcher, client, _ = _dispatcher()
+        dispatcher, client, sessions = _dispatcher()
         before = dispatcher._session_key(HANDLE)
         await dispatcher.handle_message(_inbound("/new"))
-        assert dispatcher._session_key(HANDLE) != before
+        after = dispatcher._session_key(HANDLE)
+        assert after != before
+        assert sessions.reserved_generations == [after]
         assert "fresh conversation" in client.sent[0]
 
     @pytest.mark.asyncio
@@ -194,6 +214,34 @@ class TestCompact:
         assert provider.compacted == 1
         assert sessions.released == [key]
         assert "compacted" in client.sent[0]
+
+    @pytest.mark.asyncio
+    async def test_compact_declined_on_auto_managed_backend(self) -> None:
+        # A backend that cannot serve /compact gets the informational reply and
+        # compact() is NEVER dispatched.
+        dispatcher, client, sessions = _dispatcher()
+        key = dispatcher._session_key(HANDLE)
+        provider = FakeProvider()
+        provider.manual_compact_unsupported_backend = "kas"
+        sessions.providers[key] = provider
+        sessions.sessions.add(key)
+        await dispatcher.handle_message(_inbound("/compact"))
+        assert provider.compacted == 0
+        assert sessions.released == [key]
+        assert "manages compaction automatically" in client.sent[0]
+        assert "`" not in client.sent[0]  # iMessage speech carries no markdown
+
+    @pytest.mark.asyncio
+    async def test_compact_none_capability_preserves_dispatch(self) -> None:
+        # The ABC's None (supported) default keeps the existing dispatch.
+        dispatcher, client, sessions = _dispatcher()
+        key = dispatcher._session_key(HANDLE)
+        provider = FakeProvider()
+        provider.manual_compact_unsupported_backend = None
+        sessions.providers[key] = provider
+        sessions.sessions.add(key)
+        await dispatcher.handle_message(_inbound("/compact"))
+        assert provider.compacted == 1
 
     @pytest.mark.asyncio
     async def test_compact_on_a_busy_session_asks_the_user_to_retry(self) -> None:
@@ -297,6 +345,20 @@ class TestThresholdNotices:
         await dispatcher._maybe_notice(_inbound("x"), "k", provider)
         assert provider.compacted == 1
         assert "compacted automatically" in client.sent[0]
+
+    @pytest.mark.asyncio
+    async def test_thresholds_decline_silently_on_auto_managed_backend(self) -> None:
+        # Hard: no forced compaction; soft: no /compact nudge — the backend
+        # compacts on its own as context fills.
+        dispatcher, client, sessions = _dispatcher()
+        provider = FakeProvider()
+        provider.manual_compact_unsupported_backend = "kas"
+        sessions.usage_pct = 99.0
+        await dispatcher._maybe_notice(_inbound("x"), "k", provider)
+        assert provider.compacted == 0
+        sessions.usage_pct = 85.0
+        await dispatcher._maybe_notice(_inbound("x"), "k", provider)
+        assert client.sent == []
 
     @pytest.mark.asyncio
     async def test_a_failed_auto_compaction_is_not_announced_as_success(self) -> None:

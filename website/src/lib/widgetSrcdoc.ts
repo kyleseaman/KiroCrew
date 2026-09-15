@@ -37,6 +37,7 @@
 // - WidgetFrame.tsx (inline <mcwidget> rendering in chat)
 // - ArtifactDetailPage.tsx (full-screen artifact view at /artifacts/<slug>)
 
+import { parseCssColor, relativeLuminance } from './iconContrast'
 import { TAILWIND_RUNTIME_PATH } from './vendorPaths'
 
 /** CSS custom properties the parent app exposes to widgets. Resolved against
@@ -99,6 +100,21 @@ const HEIGHT_REPORT_SHRINK_MS = 200
  * reproduces the blank-widget symptom the indicator exists to prevent. */
 const OVERLAY_HANG_BACKSTOP_MS = 15000
 
+/** Event fired inside the iframe when the Tailwind runtime <script> fails to
+ * load (network refusal, PNA/CORS block, packaging gap). The loading overlay's
+ * reveal script listens for it and uncovers the widget immediately — a
+ * degraded-but-visible widget beats a blank box sitting on the hang backstop,
+ * regardless of why the runtime failed. */
+const TW_ERROR_EVENT = 'mc-tw-error'
+
+/** Inline onerror body for the runtime <script> tag. Sets a flag (for a reveal
+ * script that starts AFTER the failure already fired) and dispatches
+ * TW_ERROR_EVENT (for one already listening). Static trusted string — never
+ * carries LLM/user content; single-quoted so it embeds in a double-quoted
+ * HTML attribute. */
+const TW_ERROR_INLINE_HANDLER =
+  `window.__mcTwError=1;window.dispatchEvent(new Event('${TW_ERROR_EVENT}'))`
+
 /** Body of the height-reporter script. Defined as a string literal — the only
  * interpolation is the two numeric tuning constants above (never LLM/user
  * content; the LLM `html` never reaches here). Set as a script element via
@@ -110,7 +126,10 @@ const OVERLAY_HANG_BACKSTOP_MS = 15000
  * growth eagerly, and defers/cancels shrinks. The net effect is that a
  * continuously animating widget (lava lamp, starry night) reports its height
  * once and then stops posting, instead of feeding a per-frame resize loop back
- * to the parent. */
+ * to the parent. The one deliberate exception is the window `load` re-report
+ * below: quietness must never extend across a load event the parent can
+ * observe, because parent surfaces treat post-load silence as the frame no
+ * longer showing this document. */
 const HEIGHT_REPORTER_BODY = `(function(){
   var EPS = ${HEIGHT_REPORT_EPSILON_PX};
   var SHRINK_MS = ${HEIGHT_REPORT_SHRINK_MS};
@@ -175,7 +194,21 @@ const HEIGHT_REPORTER_BODY = `(function(){
     rafId = raf(evaluate);
   }
   new ResizeObserver(schedule).observe(document.body);
-  window.addEventListener('load', function(){ setTimeout(schedule, 100); });
+  window.addEventListener('load', function(){
+    // Re-report UNCONDITIONALLY after load, bypassing the deadband. The parent
+    // surface re-arms its silence window on EVERY iframe load event (an engine
+    // renavigation onto a spent single-use url fires load with no reporter
+    // behind it, and silence within the grace window is its only signal -- see
+    // DOC_REPORT_GRACE_MS in ArtifactBody). A first measurement that raced
+    // ahead of the load event -- layout settles before images and fonts finish
+    // -- would otherwise be the LAST post this document ever makes: the parent
+    // discards it at load, the deadband swallows this re-check because the
+    // height is unchanged, and three seconds later a healthy, rendering
+    // document is flagged as no longer showing. Resetting lastSent routes the
+    // scheduled measurement through the first-measurement path, so every load
+    // the parent can observe is followed by a report.
+    setTimeout(function(){ lastSent = -1; schedule(); }, 100);
+  });
   schedule();
   document.addEventListener('click', function(e){
  // NOTE: this isTrusted check runs INSIDE the sandboxed iframe
@@ -271,6 +304,101 @@ const SAFE_CENTER_GUARD_BODY = `(function(){
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', apply);
   else apply();
   window.addEventListener('resize', apply);
+})();`
+
+/** Clipboard write-fallback shim, injected into every document buildSrcdoc()
+ * builds. Widget and artifact bodies routinely carry a copy button, and
+ * without this every one of them is dead.
+ *
+ * These frames deliberately do NOT receive a delegated `clipboard-write`
+ * permission. Delegation would let agent-authored script write during load,
+ * without a Copy action. The null-origin frame's native writeText therefore
+ * rejects, while a user-initiated copy can still use the execCommand fallback
+ * below. On plain-HTTP deployments navigator.clipboard is absent entirely, so
+ * the same fallback supplies the only writeText implementation there too.
+ * Gesture-less load-time calls remain rejected when execCommand lacks user
+ * activation; the shim does not turn them into successful clipboard writes.
+ *
+ * Shadows ONLY `writeText` on the existing `navigator.clipboard` (an own
+ * property beats the prototype method for every caller), leaving
+ * `readText`/`write`/`read` and its EventTarget nature untouched — this is
+ * not a wholesale replacement, since `writeText` is the one method on the
+ * sensitive path. When `navigator.clipboard` is absent entirely a minimal
+ * object carrying just `writeText` is defined on `navigator` itself. Each
+ * `defineProperty` is wrapped in try/catch so an unusual engine cannot break
+ * widget rendering.
+ *
+ * The wrapped `writeText` tries the native implementation first (when one
+ * exists and is allowed); only on rejection — or when there is no native
+ * implementation at all — does it fall back to a textarea +
+ * `execCommand('copy')`, which works inside the sandbox during user activation.
+ * The fallback restores focus and the document selection exactly as
+ * `utils/clipboard.ts` does, for the same reason: widget bodies contain
+ * focusable controls, so a copy must not silently move focus or clobber a
+ * selection the caller means to keep. Static trusted JS string — never
+ * carries LLM/user content — assigned via script.textContent, never
+ * interpolated into the template literal. Lives in a template literal, so it
+ * must contain no backtick and no dollar-brace opener. */
+const CLIPBOARD_FALLBACK_SHIM_BODY = `(function(){
+  function execCommandCopy(text){
+    if (typeof document.execCommand !== 'function') return false;
+    var previouslyFocused = document.activeElement;
+    var selection = document.getSelection();
+    var savedRanges = [];
+    if (selection) { for (var i = 0; i < selection.rangeCount; i++) savedRanges.push(selection.getRangeAt(i)); }
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.readOnly = true;
+    ta.setAttribute('aria-hidden', 'true');
+    ta.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;padding:0;border:0;opacity:0';
+    document.body.appendChild(ta);
+    try {
+      ta.select();
+      return document.execCommand('copy');
+    } catch (e) {
+      return false;
+    } finally {
+      document.body.removeChild(ta);
+      if (selection) {
+        selection.removeAllRanges();
+        for (var j = 0; j < savedRanges.length; j++) selection.addRange(savedRanges[j]);
+      }
+      if (previouslyFocused && previouslyFocused.focus) {
+        try { previouslyFocused.focus({ preventScroll: true }); } catch (e) {}
+      }
+    }
+  }
+  function wrappedWriteText(nativeWriteText, text){
+    if (nativeWriteText) {
+      return nativeWriteText(text).then(function(){ return undefined; }, function(err){
+        if (execCommandCopy(text)) return undefined;
+        throw err;
+      });
+    }
+    return execCommandCopy(text)
+      ? Promise.resolve(undefined)
+      : Promise.reject(new Error('copy failed'));
+  }
+  try {
+    if (navigator.clipboard) {
+      var native = navigator.clipboard.writeText
+        ? navigator.clipboard.writeText.bind(navigator.clipboard)
+        : null;
+      try {
+        Object.defineProperty(navigator.clipboard, 'writeText', {
+          configurable: true,
+          value: function(text){ return wrappedWriteText(native, text); },
+        });
+      } catch (e) {}
+    } else {
+      try {
+        Object.defineProperty(navigator, 'clipboard', {
+          configurable: true,
+          value: { writeText: function(text){ return wrappedWriteText(null, text); } },
+        });
+      } catch (e) {}
+    }
+  } catch (e) {}
 })();`
 
 const COMMENT_BRIDGE_BODY = `(function(){
@@ -470,6 +598,163 @@ const COMMENT_BRIDGE_BODY = `(function(){
   parent.postMessage({type:'mc-comment-ready'}, '*');
 })();`
 
+/** Neutral light palette substituted for the dashboard theme when a widget was
+ * authored against a light canvas (see `isLightCanvasAuthored`) but the
+ * dashboard is dark. Every name in THEME_VAR_NAMES is covered so a widget that
+ * mixes one `var(--…)` in later still resolves. Tailwind's gray/indigo/green/
+ * amber/red 50-700 stops -- the same family the LLM reached for, so the island
+ * reads as one coherent light card rather than a patch. `--bg` is off-white,
+ * not pure white: the island sits inside a dark chat column, and gray-100
+ * reads as a light card there where #fff reads as glare. */
+const LIGHT_CANVAS_FALLBACK_VARS: Readonly<Record<(typeof THEME_VAR_NAMES)[number], string>> = {
+  '--bg': '#f3f4f6',
+  '--bg-elevated': '#ffffff',
+  '--bg-hover': '#e5e7eb',
+  '--card': '#ffffff',
+  '--card-fg': '#111827',
+  '--text': '#111827',
+  '--text-strong': '#030712',
+  '--muted': '#6b7280',
+  '--muted-strong': '#4b5563',
+  '--border': '#e5e7eb',
+  '--border-strong': '#d1d5db',
+  '--accent': '#4f46e5',
+  '--accent-hover': '#4338ca',
+  '--accent-subtle': '#eef2ff',
+  '--ok': '#15803d',
+  '--ok-subtle': '#ecfdf5',
+  '--warn': '#b45309',
+  '--warn-subtle': '#fffbeb',
+  '--danger': '#b91c1c',
+  '--danger-subtle': '#fef2f2',
+  '--info': '#1d4ed8',
+}
+
+// Tailwind utility classes that paint a light background: `bg-white` and the
+// 50/100/200 stops of every default hue. Optional variant prefixes are
+// allowed in Tailwind's full token syntax -- `hover:`, `md:`, `@md:`, `*:`, and
+// bracketed arbitrary variants such as `min-[300px]:` or `[&:hover]:` (name
+// capped at 64 chars, bracket body at 256, so a long attribute value cannot
+// make the scan quadratic); `dark:` is handled separately below.
+const LIGHT_TAILWIND_BG_RE =
+  /(?:^|[\s"'`])(?:(?=[a-zA-Z0-9@*\[-])[a-zA-Z0-9@*-]{0,64}(?:\[[^\]\s"'`]{1,256}\])?:)*bg-(?:white|(?:slate|gray|zinc|neutral|stone|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose)-(?:50|100|200))(?=$|[\s"'`\/])/
+// The mirror of LIGHT_TAILWIND_BG_RE: `bg-black` and the 700-950 stops. A
+// widget carrying one of these next to a light card is a mixed palette, and
+// flipping it wholesale to light would only trade which half is unreadable.
+const DARK_TAILWIND_BG_RE =
+  /(?:^|[\s"'`])(?:(?=[a-zA-Z0-9@*\[-])[a-zA-Z0-9@*-]{0,64}(?:\[[^\]\s"'`]{1,256}\])?:)*bg-(?:black|(?:slate|gray|zinc|neutral|stone|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose)-(?:700|800|900|950))(?=$|[\s"'`\/])/
+// Inline `background` / `background-color` declarations carrying a literal
+// color. Captures the value for a luminance check.
+const INLINE_BG_DECL_RE = /background(?:-color)?\s*:\s*(#[0-9a-f]{3,8}\b|rgba?\([^)]*\)|white\b)/gi
+// Tailwind arbitrary-value backgrounds (`bg-[#f0fdf4]`, `bg-[rgb(250,250,250)]`,
+// `bg-[white]`), which neither regex above sees. Captures the literal for the
+// same luminance check; `_` inside the brackets is Tailwind's space escape.
+const ARBITRARY_BG_CLASS_RE = /(?:^|[\s"'`])(?:(?=[a-zA-Z0-9@*\[-])[a-zA-Z0-9@*-]{0,64}(?:\[[^\]\s"'`]{1,256}\])?:)*bg-\[(#[0-9a-f]{3,8}|rgba?\([^\]]*\)|white)\]/gi
+
+/** Relative luminance (0..1) of a CSS `#hex` / `rgb()` / `white` literal, or
+ * null when it cannot be parsed. `parseCssColor` (the favicon-contrast parser)
+ * already reads every form the regexes above capture except the `white`
+ * keyword. Alpha is ignored: a translucent light tint over the dark canvas is
+ * still lighter than the themed text it inherits. */
+function literalLuminance(value: string): number | null {
+  const v = value.trim().toLowerCase()
+  if (v === 'white') return 1
+  const c = parseCssColor(v)
+  return c ? relativeLuminance(c.r, c.g, c.b) : null
+}
+
+// `class` / `style` attribute values, double- or single-quoted. Each value is
+// bounded by its own quote, so the scan is linear in the length of the HTML.
+const STYLED_ATTR_RE = /\b(?:class|style)\s*=\s*(?:"([^"]*)"|'([^']*)')/gi
+// Opening and closing `<style>` tags, paired by a forward walk below rather
+// than a lazy `[\s\S]*?` body match: that would rescan to the end for every
+// unclosed `<style>`, which is quadratic on hostile input.
+const STYLE_TAG_RE = /<(\/?)style\b/gi
+
+/** The parts of widget HTML where styling can actually take effect: every
+ * `class` / `style` attribute value (double- or single-quoted) and the body of
+ * every `<style>` block (case-insensitive), joined with single spaces.
+ * Rendered text is dropped, so a widget that merely TALKS about `bg-white` or
+ * `background:#fff` cannot look like it paints one. String-only, no DOM. */
+function styledSurfaces(html: string): string {
+  const parts: string[] = []
+  for (const m of html.matchAll(STYLED_ATTR_RE)) parts.push(m[1] ?? m[2] ?? '')
+  let bodyStart = -1
+  for (const m of html.matchAll(STYLE_TAG_RE)) {
+    if (m[1]) {
+      if (bodyStart >= 0) parts.push(html.slice(bodyStart, m.index))
+      bodyStart = -1
+    } else if (bodyStart < 0) {
+      const tagEnd = html.indexOf('>', m.index + 6)
+      if (tagEnd < 0) break
+      bodyStart = tagEnd + 1
+    }
+  }
+  return parts.join(' ')
+}
+
+/** Whether widget HTML was written for a LIGHT canvas without knowing the
+ * frame is themed. That is the shape of the dark-mode unreadable widget: the
+ * model hardcodes `bg-green-50` (or `background:#f0fdf4`) on a card, sets no
+ * text color, and inherits the theme's light `--text` from `body` -- white on
+ * off-white. The heuristic fires only when the author shows no theme
+ * awareness at all:
+ *
+ * - no `var(--…)` reference anywhere (an author using theme vars owns the
+ *   contract, half-set or not -- forcing a palette on them would be worse), and
+ * - no `dark:` Tailwind variant, bare or behind chained prefixes such as
+ *   `md:dark:` (an author who wrote a dark branch handled it), and
+ * - at least one light hardcoded background: a `bg-white` / `bg-<hue>-50|100|200`
+ *   class, or an inline `background` literal or `bg-[<literal>]` arbitrary-value
+ *   class with relative luminance above 0.6, and
+ * - no hardcoded DARK background beside it (`bg-black`, `bg-<hue>-700..950`, or
+ *   a literal with luminance below 0.2): a mixed palette is left alone, since
+ *   a light canvas would make the dark half unreadable instead.
+ *
+ * Every check -- the `var(--…)` and `dark:` gates included -- reads only the
+ * class/style attribute values and `<style>` blocks (`styledSurfaces`), so
+ * rendered text can neither trigger the heuristic nor suppress it: a widget
+ * explaining Tailwind in prose is not painting a light card, and a prose
+ * mention of `var(--bg)` is not theme awareness.
+ *
+ * Pure, string-only, and cheap enough to run on every srcdoc build. Reached
+ * only through `resolveWidgetTheme`, which is the seam the tests exercise. */
+function isLightCanvasAuthored(html: string): boolean {
+  if (!html) return false
+  const styled = styledSurfaces(html)
+  if (/var\(\s*--/.test(styled)) return false
+  if (/(?:^|[\s"'`])(?:(?=[a-zA-Z0-9@*\[-])[a-zA-Z0-9@*-]{0,64}(?:\[[^\]\s"'`]{1,256}\])?:)*dark:/.test(styled)) return false
+  if (DARK_TAILWIND_BG_RE.test(styled)) return false
+  let sawLight = LIGHT_TAILWIND_BG_RE.test(styled)
+  for (const re of [INLINE_BG_DECL_RE, ARBITRARY_BG_CLASS_RE]) {
+    for (const m of styled.matchAll(re)) {
+      const lum = literalLuminance(m[1].replace(/_/g, ' '))
+      if (lum === null) continue
+      if (lum < 0.2) return false
+      if (lum > 0.6) sawLight = true
+    }
+  }
+  return sawLight
+}
+
+/** Resolve the vars and mode a widget actually renders with. A light-canvas
+ * widget on a dark dashboard gets the neutral light palette and `light`
+ * mode, so its hardcoded light surfaces sit on a light canvas with dark text
+ * -- a readable light island instead of white-on-white. Everything else (any
+ * widget on a light dashboard, any theme-aware widget) passes through
+ * untouched, so the fallback can never override a user's chosen theme where
+ * the author respected it. */
+export function resolveWidgetTheme(
+  html: string,
+  themeVars: Record<string, string>,
+  mode: 'dark' | 'light',
+): { themeVars: Record<string, string>; mode: 'dark' | 'light' } {
+  if (mode === 'dark' && isLightCanvasAuthored(html)) {
+    return { themeVars: { ...themeVars, ...LIGHT_CANVAS_FALLBACK_VARS }, mode: 'light' }
+  }
+  return { themeVars, mode }
+}
+
 function buildThemeCss(vars: Record<string, string>, mode: 'dark' | 'light'): string {
   const rootBody = Object.entries(vars).map(([k, v]) => `${k}:${v}`).join(';')
   // No readable vars means no theme to apply, and inventing one is worse than
@@ -542,13 +827,18 @@ interface BuildSrcdocOptions {
  * header for the full security model. */
 export function buildSrcdoc({
   html,
-  themeVars,
-  mode,
+  themeVars: requestedThemeVars,
+  mode: requestedMode,
   includeHeightReporter = false,
   enableComments = false,
   showLoadingOverlay = false,
   loadingLabel = '',
 }: BuildSrcdocOptions): string {
+  // A widget hardcoded for a light canvas renders on a light canvas even when
+  // the dashboard is dark -- see resolveWidgetTheme. Resolved once here so the
+  // DOM and SSR paths, the :root vars, color-scheme and the body class agree.
+  const { themeVars, mode } = resolveWidgetTheme(html, requestedThemeVars, requestedMode)
+
   // SSR / unit-test fallback: when there's no DOM (Node.js, vitest before
   // jsdom is set up), fall back to a minimal string-builder that does NOT
   // interpolate `html` — we wrap it in a textarea-escaped <template> so it
@@ -654,6 +944,14 @@ export function buildSrcdoc({
   // <body class="dark|light">
   body.className = mode
 
+  // Clipboard write-fallback shim. Installed BEFORE the LLM html below so an
+  // on-load attempt sees the wrapper too; without user activation its fallback
+  // still fails rather than gaining an ambient clipboard-write path.
+  // textContent assignment only — no LLM/user content interpolated.
+  const clipboardShim = doc.createElement('script')
+  clipboardShim.textContent = CLIPBOARD_FALLBACK_SHIM_BODY
+  body.appendChild(clipboardShim)
+
   // Parse LLM html into a document fragment via the typed DOM API. The
   // `html` argument flows through createContextualFragment() — NOT through
   // string concatenation — so it never enters a template-literal HTML build.
@@ -688,6 +986,12 @@ export function buildSrcdoc({
       function hide(){el.classList.add('mc-hidden');setTimeout(function(){if(el.parentNode)el.parentNode.removeChild(el)},400);}
       var done=false;
       function finish(){if(done)return;done=true;hide();}
+      // Runtime load failure: uncover immediately (degraded-but-visible beats
+      // a blank box). The flag covers a failure that fired before this script
+      // ran — the runtime is a HEAD script, so its error task can precede any
+      // body script — and the listener covers one that fires after.
+      if(window.__mcTwError){finish();return;}
+      window.addEventListener('${TW_ERROR_EVENT}',finish);
       setTimeout(finish,${OVERLAY_HANG_BACKSTOP_MS});
       var obs=new MutationObserver(function(muts){
         for(var i=0;i<muts.length;i++){
@@ -739,10 +1043,25 @@ export function buildSrcdoc({
   // (2) attribute serialization HTML-escapes quotes, so a model byte sequence
   // cannot produce the exact `name="x-script-placeholder"` attribute pair.
   // The non-global replace is a defense-in-depth backstop for that invariant.
+  //
+  // The emitted tag carries two attributes tied to Chrome's Private Network
+  // Access policy (the sandboxed iframe is a null-origin, NON-secure context,
+  // and on the default deployment this src is a loopback address — a
+  // more-private address space):
+  //   - crossorigin="anonymous" routes the load through CORS, the only mode
+  //     that can carry the gateway's Access-Control-Allow-Origin /
+  //     PNA-preflight approval (see _apply_security_headers + the /vendor
+  //     OPTIONS handler in dashboard/server.py).
+  //   - onerror sets the failure flag + fires TW_ERROR_EVENT so the loading
+  //     overlay uncovers the widget IMMEDIATELY instead of sitting on the
+  //     15s hang backstop. An inline handler (not a listener added by a later
+  //     script) is deliberate: a head script's error task can run before any
+  //     body script executes, so only the element's own handler is free of
+  //     that ordering hazard. Static trusted string — no LLM content.
   const serialized = `<!DOCTYPE html>\n${doc.documentElement.outerHTML}`
   return serialized.replace(
     /<meta name="x-script-placeholder" data-src="([^"]*)">/,
-    (_match, src) => `<script src="${src}"></script>`,
+    (_match, src) => `<script src="${src}" crossorigin="anonymous" onerror="${TW_ERROR_INLINE_HANDLER}"></script>`,
   )
 }
 
@@ -773,9 +1092,15 @@ function buildSrcdocSSR({ html, themeVars, mode, includeHeightReporter }: BuildS
     // DOM path: a head script blocks parsing, so a style behind it leaves the
     // document unthemed — and painted white — until the script lands.
     `<style>${styleCss}</style>` +
-    `<script src="${TAILWIND_RUNTIME_PATH}"><\/script>` +
+    `<script src="${TAILWIND_RUNTIME_PATH}" crossorigin="anonymous" onerror="${TW_ERROR_INLINE_HANDLER}"><\/script>` +
     `</head><body class="${mode}">` +
     `<!-- SSR fallback: LLM body omitted -->` +
+    // NO clipboard shim here. This SSR builder is unreachable in production
+    // (buildSrcdoc only enters it when there is no DOM — i.e. pre-jsdom unit
+    // tests) AND it does not embed the LLM body at all, so a copy button never
+    // renders in its output. Injecting the write-fallback shim into it would be
+    // scope with no reachable effect; the real fix lives in the DOM path above
+    // (buildSrcdoc), which is what every production surface renders.
     reporter +
     `</body></html>`
   )

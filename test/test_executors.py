@@ -76,8 +76,31 @@ def test_pools_execute_work() -> None:
     assert ex.cron_executor().submit(lambda: 2 + 3).result(timeout=5) == 5
 
 
+def test_path_resolve_pool_is_isolated_bounded_named_and_reset() -> None:
+    # The sensitive-path gates' realpath run inline on the event loop can
+    # block in the kernel on a stalled automount for as long as the mount
+    # did.  The caller now bounds its wait, but a timed-out future does NOT free
+    # its thread -- so a wedged lstat must only ever be able to starve OTHER
+    # path resolution, never the sweeps, teardown, or the default executor.
+    pool = ex.path_resolve_executor()
+    assert pool is ex.path_resolve_executor()
+    for other in (
+        ex.maintenance_executor(),
+        ex.subprocess_executor(),
+        ex.cron_executor(),
+        ex.discovery_executor(),
+        ex.governance_executor(),
+    ):
+        assert pool is not other
+    assert pool._max_workers == ex._MAX_PATH_RESOLVE_WORKERS
+    assert pool._thread_name_prefix == "mc-pathres"
+    assert pool.submit(lambda: 6 * 7).result(timeout=5) == 42
+    ex.shutdown_maintenance_executor()
+    assert ex.path_resolve_executor() is not pool
+
+
 def test_governance_pool_is_isolated_bounded_and_reset() -> None:
-    # GPT round-7 pass 3: the governance pool (externally-paced inbound channels
+    # The governance pool (externally-paced inbound channels
     # gate + dashboard governance GETs) must be a DISTINCT, bounded, shutdown-
     # resettable pool so a remote message burst can't occupy the maintenance
     # workers the orphan sweeps need.
@@ -434,7 +457,7 @@ def test_the_gate_budget_is_capped_below_the_wake_budget() -> None:
     and the inversion is deliberate: for the execution pool, waiting past the
     budget and then running is correct, but a gate verdict arriving after the
     wake deadline is worthless -- the deadline kills the run either way, and the
-    caller can then no longer tell starvation from an overrun. That ambiguity is
+    caller then cannot tell starvation from an overrun. That ambiguity is
     precisely the state in which a one-shot is consumed by a run that never
     dispatched, so the cap is what keeps the retention marker reachable.
 
@@ -619,3 +642,82 @@ async def test_the_gate_keeps_most_of_its_budget_for_a_claimed_call() -> None:
     finally:
         release.set()
         ex.shutdown_maintenance_executor()
+
+
+# --- configure_default_executor: naming ----------------------------------------
+#
+# The default executor is the pool asyncio.to_thread and run_in_executor(None, ...)
+# route onto.  The loop itself uses it for getaddrinfo (DNS).  These tests cover
+# the thread naming (`mc-default-*`) -- sizing is left to Python's default.
+
+
+@pytest.mark.asyncio
+async def test_configure_default_executor_installs_named_pool() -> None:
+    """configure_default_executor installs a pool with mc-default-* threads."""
+    ex.configure_default_executor()
+
+    loop = asyncio.get_running_loop()
+    thread_name = await loop.run_in_executor(None, lambda: threading.current_thread().name)
+
+    assert thread_name.startswith(
+        "mc-default"
+    ), f"Expected thread name starting with 'mc-default', got {thread_name!r}"
+
+
+@pytest.mark.asyncio
+async def test_configure_default_executor_creates_fresh_pool_per_call() -> None:
+    """Each call to configure_default_executor creates a fresh pool for the loop.
+
+    The per-loop design means the loop owns the pool and shuts it down on close,
+    removing the need for process-global tracking and private-attribute probes.
+    """
+    ex.configure_default_executor()
+    loop = asyncio.get_running_loop()
+    first_executor = loop._default_executor
+
+    ex.configure_default_executor()
+    second_executor = loop._default_executor
+
+    # Each call creates a fresh pool
+    assert first_executor is not second_executor
+
+
+def test_second_loop_gets_configured_executor() -> None:
+    """A second event loop gets a configured mc-default executor, not anonymous.
+
+    Uses explicit loop management (new_event_loop + run_until_complete + close)
+    rather than asyncio.run to avoid a false positive from test_spawn_audit's
+    subprocess-spawn detector, which matches asyncio.run as base=asyncio attr=run.
+
+    This test pins the per-loop design: configure_default_executor creates a
+    fresh pool for each loop, and each loop gets mc-default threads.
+    """
+    results: list[str] = []
+
+    async def capture_thread_name() -> None:
+        ex.configure_default_executor()
+        loop = asyncio.get_running_loop()
+        thread_name = await loop.run_in_executor(None, lambda: threading.current_thread().name)
+        results.append(thread_name)
+
+    # First event loop
+    loop1 = asyncio.new_event_loop()
+    try:
+        loop1.run_until_complete(capture_thread_name())
+    finally:
+        loop1.close()
+
+    # Second event loop -- the per-loop design gives it its own fresh pool
+    loop2 = asyncio.new_event_loop()
+    try:
+        loop2.run_until_complete(capture_thread_name())
+    finally:
+        loop2.close()
+
+    assert len(results) == 2
+    assert results[0].startswith(
+        "mc-default"
+    ), f"First loop: expected 'mc-default*', got {results[0]!r}"
+    assert results[1].startswith(
+        "mc-default"
+    ), f"Second loop: expected 'mc-default*', got {results[1]!r}"

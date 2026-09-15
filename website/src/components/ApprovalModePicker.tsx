@@ -1,11 +1,14 @@
-import { useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import { motion } from 'framer-motion'
 import { useNavigate } from 'react-router-dom'
 import { ShieldCheck, BookOpen, Handshake, Rocket, Check, Clock } from 'lucide-react'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from './ui/dropdown-menu'
+import { Popover, PopoverAnchor, PopoverContent } from './ui/popover'
 import { useAppDispatch, useAppSelector } from '../store'
 import { changeApprovalMode } from '../store/dashboardSlice'
 import { safeSetItem } from '../utils/safeStorage'
+import { settingsPath } from './settingsPath'
+import ErrorNotice, { ErrorNoticeMenuItem } from './ErrorNotice'
 
 import { i18nT } from '../i18n/t'
 /** Single source of truth for approval-mode presentation.
@@ -82,46 +85,169 @@ function segmentText(key: ApprovalModeKey): { label: string; tooltip: string; de
  *  `mc-yolo-ack` is committed ONLY when the user confirms via Enable with
  *  the checkbox ticked — never on checkbox change, so check-then-Cancel
  *  cannot silently disable the confirm. */
-export default function ApprovalModePicker({ mode, slotKey, compact }: { mode: string; slotKey: string; compact?: boolean }) {
+/** Set once the user has ever OPENED the approval-mode picker (any route:
+ *  trigger click, the approval bar's hint link, or the nudge). The approval
+ *  bar's discoverability hint keys off this: discoverability is achieved the
+ *  moment the picker opens, so a user who saw the options and deliberately
+ *  stayed on Normal is not nagged on every later approval. */
+export const APPROVAL_MODE_ADJUSTED_LS_KEY = 'mc-approval-mode-adjusted'
+
+/** How long the spotlight ring stays on the trigger after an external
+ *  open request, so the user's eye lands on where the control lives. */
+const SPOTLIGHT_MS = 2000
+
+export default function ApprovalModePicker({ mode, slotKey, compact, openSignal, nudge, onNudgeDismiss, onNudgeHide }: {
+  mode: string; slotKey: string; compact?: boolean
+  /** A2: increment to open the menu from outside (the approval bar's
+   *  "adjust approval mode" hint) and flash a spotlight ring on the trigger,
+   *  teaching where the control lives. 0 / undefined = inert. */
+  openSignal?: number
+  /** B2: render a one-time anchored callout above the trigger nudging the
+   *  user toward the mode picker after repeated manual approvals. */
+  nudge?: boolean
+  /** Called when the nudge is dismissed for good — by its buttons or ANY
+   *  menu open (the user has answered the callout's question either way). */
+  onNudgeDismiss?: () => void
+  /** Called on Escape instead of onNudgeDismiss: a reflexive Escape aimed at
+   *  the composer should hide the one-time callout for this sitting, not
+   *  spend it forever unseen. Falls back to onNudgeDismiss when unset. */
+  onNudgeHide?: () => void
+}) {
+  const policyRefusedId = useId()
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
   const yoloDuration = useAppSelector(s => s.dashboard.status?.yolo_duration)
+  // Auto-approve modes the `approval_modes` policy scope forbids (a subset of
+  // trust_reads/trust/yolo). Absent/empty => every mode selectable, so the
+  // solo-operator default is unchanged. `normal` is the interactive floor and
+  // is never in this list. Denied modes are HIDDEN from the menu below rather
+  // than shown disabled — server-side enforcement remains the source of truth.
+  const disabledModes = useAppSelector(s => s.dashboard.status?.disabled_approval_modes) ?? []
+  const isModeBlocked = (k: string) => disabledModes.includes(k)
+  // A mode ALREADY selected when the policy lands is the one exception to
+  // hiding. The trigger renders `mode` unfiltered, so hiding its row too would
+  // put "Trust" on the button with no Trust row and no checkmark anywhere in the
+  // menu — the control would contradict itself with no explanation. The row
+  // stays, disabled and labelled, until the user picks something else.
+  const isModeVisible = (k: string) => !isModeBlocked(k) || k === mode
+  // Set when the gateway refuses a pick with 403 `mode_disabled_by_policy`.
+  // Reachable in the load race before the first status frame arrives, when
+  // `disabled_approval_modes` is still undefined and every mode renders: without
+  // this the click does nothing at all, silently.
+  const [policyRefused, setPolicyRefused] = useState('')
   const [open, setOpen] = useState(false)
   const [yoloConfirm, setYoloConfirm] = useState(0)
   const [yoloDontAsk, setYoloDontAsk] = useState(false)
+  const [spotlight, setSpotlight] = useState(false)
+  const spotlightTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Focus home for the nudge callout's dismissal, and the read the popover's
+  // close-focus handler needs (state would be stale inside Radix's callback).
+  const triggerBtnRef = useRef<HTMLButtonElement>(null)
+  const openRef = useRef(false)
+  openRef.current = open
+
+  // Any open counts as discovery (and answers an active nudge) — route
+  // through onOpenChange so every open path shares one semantics.
+  const openMenu = () => onOpenChange(true)
+  const spotlightNow = () => {
+    setSpotlight(true)
+    if (spotlightTimer.current) clearTimeout(spotlightTimer.current)
+    spotlightTimer.current = setTimeout(() => setSpotlight(false), SPOTLIGHT_MS)
+  }
+
+  // External open request (approval-bar hint): open the real menu and flash
+  // a ring on the trigger. Skip the initial mount value so a remount (slot
+  // switch) does not replay a stale signal.
+  const lastSignal = useRef(openSignal ?? 0)
+  useEffect(() => {
+    if (openSignal === undefined || openSignal === lastSignal.current) return
+    lastSignal.current = openSignal
+    if (openSignal > 0) {
+      openMenu()
+      spotlightNow()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openSignal])
+  useEffect(() => () => { if (spotlightTimer.current) clearTimeout(spotlightTimer.current) }, [])
 
   const display = APPROVAL_SEGMENTS.find(s => s.key === mode) || APPROVAL_SEGMENTS[0]
   const displayText = segmentText(display.key)
 
   const onOpenChange = (o: boolean) => {
     setOpen(o)
+    if (o) {
+      // Opening by any route (trigger click included) is discovery — see
+      // APPROVAL_MODE_ADJUSTED_LS_KEY. Writing here also covers keyboard opens.
+      safeSetItem(APPROVAL_MODE_ADJUSTED_LS_KEY, '1')
+      // And it answers an active callout: without this, a trigger-click open
+      // only HID the callout (open gates its render), so closing the menu
+      // without picking resurrected the "one interruption total" nudge.
+      if (nudge) onNudgeDismiss?.()
+    }
     if (!o) { setYoloConfirm(0); setYoloDontAsk(false) }
   }
 
   const pick = (m: ApprovalModeKey) => {
-    dispatch(changeApprovalMode({ mode: m, slot: slotKey }))
+    setPolicyRefused('')
+    void dispatch(changeApprovalMode({ mode: m, slot: slotKey })).then(r => {
+      // Only a POLICY refusal is held open and reported here. Any other failure
+      // keeps the existing close-and-move-on behaviour: it is transient and
+      // retrying the same click is the natural response, whereas a policy denial
+      // will never succeed and the user needs to be told why.
+      if (r.meta.requestStatus === 'rejected'
+          && (r.payload as { code?: string } | undefined)?.code === 'mode_disabled_by_policy') {
+        // Re-open so the note below is actually on screen: the menu was closed
+        // optimistically, and the refusal renders inside it.
+        setPolicyRefused(m)
+        onOpenChange(true)
+      }
+    })
+    // Close optimistically for the overwhelmingly common success case — a menu
+    // that lingered on every pick while a round-trip completed would feel broken
+    // — and re-open only on the policy refusal above.
     onOpenChange(false)
   }
 
   return (
+    // B2 callout: a Radix Popover anchored to the picker, portalled and
+    // collision-clamped by Radix itself (the composer's scrollable control
+    // row clips absolute children, and hand-rolled fixed positioning had to
+    // re-derive the clamping Radix already owns — this component already
+    // trusts the same machinery for its own menu).
+    <Popover open={!!nudge && !open}>
+      <PopoverAnchor asChild>
+        <div className="inline-flex shrink-0">
     <DropdownMenu open={open} onOpenChange={onOpenChange}>
       <DropdownMenuTrigger asChild>
         {/* Chrome type ("Normal" / "Reads" / "Trust" / "YOLO" are labels), so no
             `font-mono` — that pinned `var(--mono)`, which the Font Family
             setting never writes. */}
-        <button className="h-7 px-2 rounded-lg text-[12px] text-muted hover:text-text hover:bg-bg-hover flex items-center gap-1 cursor-pointer transition-all bg-transparent border-none shrink-0 whitespace-nowrap outline-none focus-visible:outline-2 focus-visible:outline-accent/50 focus-visible:-outline-offset-2" title={i18nT('components.approvalModePicker.approval_mode')} aria-label={i18nT('components.approvalModePicker.approval_mode_aria', { mode: displayText.label })}>
+        <button ref={triggerBtnRef} className={`h-7 px-2 rounded-lg text-[12px] text-muted hover:text-text hover:bg-bg-hover flex items-center gap-1 cursor-pointer transition-all bg-transparent border-none shrink-0 whitespace-nowrap outline-none focus-visible:outline-2 focus-visible:outline-accent/50 focus-visible:-outline-offset-2 ${spotlight || (nudge && !open) ? 'ring-2 ring-accent/60 bg-bg-hover text-text' : ''}`} title={i18nT('components.approvalModePicker.approval_mode')} aria-label={i18nT('components.approvalModePicker.approval_mode_aria', { mode: displayText.label })}>
           <span className={`shrink-0 ${display.color}`}>{display.icon}</span>
           {!compact && displayText.label}
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent side="top" align="start" collisionPadding={8} className="w-[280px]">
-        {APPROVAL_SEGMENTS.map(s => {
+        {/* Modes the `approval_modes` policy denies are hidden outright — a
+            hidden control can't be probed or asked about, and `normal` (the
+            interactive floor) is never deniable, so the list is never empty.
+            The ONE exception is a denied mode that is still the active one:
+            the trigger renders it regardless, so its row stays (disabled, with
+            the reason) rather than leaving the button label unexplained.
+            Server-side enforcement (api_chat_mode 403, the slot-approve gate,
+            safety_override arming) stays the source of truth. */}
+        {APPROVAL_SEGMENTS.filter(s => isModeVisible(s.key)).map(s => {
           const t = segmentText(s.key)
+          const blocked = isModeBlocked(s.key)
           return (
           <DropdownMenuItem
             key={s.key}
+            disabled={blocked}
             title={t.tooltip}
             onSelect={e => {
+              // Belt-and-braces with `disabled`: a denied mode must never reach
+              // `pick()`, whose PUT the gateway answers with 403.
+              if (blocked) { e.preventDefault(); return }
               if (s.key === 'yolo') {
                 if (mode === 'yolo') { e.preventDefault(); return }
                 if (localStorage.getItem('mc-yolo-ack')) { pick('yolo'); return }
@@ -136,12 +262,34 @@ export default function ApprovalModePicker({ mode, slotKey, compact }: { mode: s
             <span className="shrink-0">{s.icon}</span>
             <span className="flex flex-col min-w-0 flex-1">
               <span className="font-medium">{t.label}</span>
-              <span className="text-[11px] font-normal text-muted leading-snug">{t.desc}</span>
+              <span className="text-[11px] font-normal text-muted leading-snug">
+                {blocked ? i18nT('components.approvalModePicker.mode_disabled_by_policy') : t.desc}
+              </span>
             </span>
             {s.key === mode && <Check size={12} className="shrink-0 text-accent" />}
           </DropdownMenuItem>
           )
         })}
+        {/* The shared error surface, not a hand-written line. A 403 from the
+            policy gate is a rejected request like any other, and rolling our own
+            <div> here dropped the agent hand-off the rest of the dashboard
+            offers. `inline` because this sits inside the menu's own flow rather
+            than as a boxed banner. */}
+        {policyRefused && (
+          <>
+            <ErrorNotice
+              id={policyRefusedId}
+              variant="inline"
+              className="px-2 py-1.5"
+              message={i18nT('components.approvalModePicker.mode_disabled_by_policy')}
+            />
+            <ErrorNoticeMenuItem
+              Item={DropdownMenuItem}
+              message={i18nT('components.approvalModePicker.mode_disabled_by_policy')}
+              describedBy={policyRefusedId}
+            />
+          </>
+        )}
         {yoloConfirm > 0 && (
           <>
             <DropdownMenuSeparator />
@@ -175,13 +323,16 @@ export default function ApprovalModePicker({ mode, slotKey, compact }: { mode: s
                   {i18nT('components.approvalModePicker.cancel')}
                 </button>
                 <label className="flex items-center gap-1 text-[11px] text-muted cursor-pointer ml-auto">
-                  <input type="checkbox" className="rounded" checked={yoloDontAsk} onChange={e => setYoloDontAsk(e.target.checked)} />
+                  {/* Named from the SAME key as the visible text beside it, the
+                      way the JobForm checkboxes are: the wrapping label already
+                      makes the text a click target, this names the control. */}
+                  <input type="checkbox" className="rounded" aria-label={i18nT('components.approvalModePicker.don_t_show_again')} checked={yoloDontAsk} onChange={e => setYoloDontAsk(e.target.checked)} />
                   {i18nT('components.approvalModePicker.don_t_show_again')}
                 </label>
               </div>
               <button
                 className="mt-1.5 text-[11px] text-muted hover:text-text underline bg-transparent border-none cursor-pointer p-0"
-                onClick={() => { onOpenChange(false); navigate('/settings?tab=security&section=approval') }}
+                onClick={() => { onOpenChange(false); navigate(settingsPath({ tab: 'security', sub: 'approval' })) }}
               >
                 {i18nT('components.approvalModePicker.configure_duration')}
               </button>
@@ -190,5 +341,57 @@ export default function ApprovalModePicker({ mode, slotKey, compact }: { mode: s
         )}
       </DropdownMenuContent>
     </DropdownMenu>
+        </div>
+      </PopoverAnchor>
+      <PopoverContent
+        side="top"
+        align="start"
+        sideOffset={10}
+        collisionPadding={8}
+        role="dialog"
+        aria-label={i18nT('components.approvalModePicker.nudge_title')}
+        className="w-[300px] max-w-[80vw] p-3 rounded-lg bg-card border-border-strong shadow-lg"
+        // Focus steal guard: the callout mounts from an async approval
+        // completion, so the user may already be typing in the composer —
+        // leave their caret alone and let the callout sit passively.
+        onOpenAutoFocus={e => {
+          const a = document.activeElement as HTMLElement | null
+          if (a && (a.tagName === 'TEXTAREA' || a.tagName === 'INPUT' || a.isContentEditable)) e.preventDefault()
+        }}
+        // Return focus to the picker trigger on dismissal instead of dropping
+        // it on <body> — unless the dismissal opened the menu, which manages
+        // its own focus (openRef: state would be stale in Radix's callback).
+        onCloseAutoFocus={e => {
+          e.preventDefault()
+          if (!openRef.current) triggerBtnRef.current?.focus()
+        }}
+        onEscapeKeyDown={() => (onNudgeHide ?? onNudgeDismiss)?.()}
+        // Dismissal semantics, complete: buttons and ANY menu open dismiss
+        // FOREVER (the callout answered); Escape and outside interaction hide
+        // for the SITTING (reflexive gestures must not spend the one-time
+        // teaching moment unseen). Without this, the callout kept covering
+        // transcript content until an explicit interaction.
+        onInteractOutside={() => (onNudgeHide ?? onNudgeDismiss)?.()}
+      >
+        <p className="text-[12.5px] font-medium text-text-strong">{i18nT('components.approvalModePicker.nudge_title')}</p>
+        <p className="text-[11.5px] text-muted leading-snug mt-0.5">{i18nT('components.approvalModePicker.nudge_body')}</p>
+        <div className="flex items-center gap-1.5 mt-2">
+          <button
+            className="px-2.5 py-1 rounded-md bg-accent text-accent-fg text-[12px] font-medium cursor-pointer border-none hover:bg-accent-hover"
+            onClick={() => {
+              // openMenu -> onOpenChange(true) both retires the nudge and
+              // writes the discovery flag; no separate dismiss call needed.
+              openMenu()
+              spotlightNow()
+            }}
+          >
+            {i18nT('components.approvalModePicker.nudge_view_options')}
+          </button>
+          <button className="px-2.5 py-1 rounded-md text-[12px] text-muted hover:text-text hover:bg-bg-hover cursor-pointer bg-transparent border border-border" onClick={() => onNudgeDismiss?.()}>
+            {i18nT('components.approvalModePicker.nudge_dismiss')}
+          </button>
+        </div>
+      </PopoverContent>
+    </Popover>
   )
 }

@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from pathlib import Path
@@ -32,15 +33,17 @@ from typing import Any, Dict, Optional
 
 from aiohttp import web
 
+from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import CRED_WEIXIN_TOKEN, KiroCrewConfig, config_path, env_path
 from kiro_crew.dashboard.channel_folders import (
-    LIVE_RELOAD_FIELDS,
+    channel_restart_required,
     clean_session_folder,
     ensure_channel_folder,
     stored_folder_name,
 )
 from kiro_crew.dashboard.handlers.agents import _get_config_lock
+from kiro_crew.dashboard.handlers.core import _hot_apply_after_write
 from kiro_crew.dashboard.handlers.messaging import is_direct_local_request
 from kiro_crew.weixin.client import ILINK_BASE_URL, WeixinClient
 
@@ -174,26 +177,54 @@ def _commit_credential_and_config(cp: Path, serialized: str, token: str) -> None
     paired with stale account metadata — the channel would authenticate against
     the wrong account — and the previously working credential would be gone, with
     no way to recover it from the dashboard.
+
+    Acquires the shared ``.env.lock`` cross-process advisory lock (same sidecar
+    file used by ``secrets import --apply``) before any read or write of ``.env``,
+    so the importer and this handler cannot interleave their read-modify-write
+    cycles.  If the lock is already held by another process the function raises
+    ``OSError`` with a descriptive message; the caller (``_persist``) propagates
+    it as a 500 response, which is the same outcome as any other I/O failure here.
+    The existing in-process ``_get_config_lock()`` (held by the caller one level
+    up) continues to serialise same-process concurrent callers; the file lock adds
+    the cross-process exclusion layer on top.
     """
-    prior = _read_env_value(CRED_WEIXIN_TOKEN)
-    _write_env_secret(CRED_WEIXIN_TOKEN, token)
+    ep = env_path()
+    # Lazy import: the migration importer is an optional CLI subsystem, so keep it
+    # off the gateway boot-import path (weixin_qr is imported at server startup).
+    # Only load it when a credential write actually happens.
+    from kiro_crew.secrets.migrate import _env_lock_path
+
+    lock_path = _env_lock_path(ep)
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        _atomic_write(cp, serialized)
-    except BaseException:
-        try:
-            if prior is None:
-                _delete_env_key(CRED_WEIXIN_TOKEN)
-            else:
-                _write_env_secret(CRED_WEIXIN_TOKEN, prior)
-        except Exception:
-            # Surfacing the rollback failure would mask the original cause, so
-            # log it and let the real error propagate.
-            logger.error(
-                "weixin: config commit failed AND credential rollback failed; "
-                "the stored credential may not match config.json",
-                exc_info=True,
+        if not platform_compat.try_acquire_lock(lock_fd, exclusive=True):
+            raise OSError(
+                f"{ep} is locked by another process (secrets import in progress); "
+                "the WeChat credential was not written.  Retry the QR sign-in "
+                "once the other operation finishes."
             )
-        raise
+        prior = _read_env_value(CRED_WEIXIN_TOKEN)
+        _write_env_secret(CRED_WEIXIN_TOKEN, token)
+        try:
+            _atomic_write(cp, serialized)
+        except BaseException:
+            try:
+                if prior is None:
+                    _delete_env_key(CRED_WEIXIN_TOKEN)
+                else:
+                    _write_env_secret(CRED_WEIXIN_TOKEN, prior)
+            except Exception:
+                # Surfacing the rollback failure would mask the original cause, so
+                # log it and let the real error propagate.
+                logger.error(
+                    "weixin: config commit failed AND credential rollback failed; "
+                    "the stored credential may not match config.json",
+                    exc_info=True,
+                )
+            raise
+    finally:
+        platform_compat.release_lock(lock_fd)
+        os.close(lock_fd)
 
 
 def _stage_weixin_config(*, account_id: str, base_url: str) -> tuple[Path, str]:
@@ -322,9 +353,8 @@ async def weixin_qr_status(request: web.Request) -> web.Response:
         # BOTH — otherwise a concurrent channel save can interleave and silently
         # drop one side's write.
         #
-        # The whole block runs OFF the loop: besides the file I/O,
-        # restrict_to_owner() shells out to whoami/icacls on Windows, which would
-        # freeze the gateway for seconds on the first confirmation.
+        # The whole block runs OFF the loop: the file I/O plus, on Windows,
+        # the owner-only DACL restrict_to_owner() applies.
         async with _get_config_lock():
             await asyncio.to_thread(_persist)
     except Exception as exc:
@@ -453,12 +483,16 @@ async def weixin_config_save(request: web.Request) -> web.Response:
                     relabel="session_folder" in body,
                 )
 
-    # Every weixin field is read once in the orchestrator's constructor —
-    # except session_folder, which the channel-slot reconciler re-reads live, so
-    # a save that only changes it does not ask the user to restart.
+    # Answer only after the watcher applied the write: this save carries the
+    # allow-list, so a removed sender must be unauthorized on the running
+    # transport before the caller sees "saved", not one poll interval later.
+    await _hot_apply_after_write()
+    # Per field: session_folder is re-read live by the channel-slot reconciler,
+    # and the connection fields (token, account_id, base_url, enabled) are what a
+    # restart is actually for.
     return web.json_response(
         {
             "ok": True,
-            "restart_required": bool(set(body) - LIVE_RELOAD_FIELDS),
+            "restart_required": channel_restart_required("weixin", body.keys()),
         }
     )

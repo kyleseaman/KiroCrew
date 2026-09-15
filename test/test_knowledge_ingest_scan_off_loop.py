@@ -1,9 +1,9 @@
 """``_ingest_file`` must neither query per file nor await after the commit.
 
-Two defects meet in this one function, and the fix for the first used to create
+Two defects meet in this one function, and the naive fix for the first creates
 the second -- so both are ratcheted here together.
 
-**The query.** The scan used to learn which items a file produced by reading the
+**The query.** A naive scan learns which items a file produced by reading the
 source's entire item-id set BEFORE and AFTER every single file and diffing the two.
 ``idx_items_source_id`` keeps each read an index scan rather than a table scan, but
 it still materializes one row per item in the SOURCE -- about 20k rows on a large
@@ -134,27 +134,38 @@ def test_ingest_file_issues_no_sqlite_call_on_the_event_loop():
 
 
 def test_ingest_file_never_awaits_after_the_pipeline_commits():
-    """Ratchet: exactly one await, the pipeline call itself.
+    """Ratchet: the only awaits are the pipeline call and drained state writes.
 
     This is the invariant that makes the orphan window unreachable rather than
     merely unlikely. The caller writes the ``folder_file_state`` row naming the new
-    items only after this function RETURNS, so a second await -- however cheap, and
-    including an ``asyncio.to_thread`` hop added in good faith to get a query off
-    the loop -- lets a shutdown cancel the coroutine after the pipeline has already
-    committed. The items survive, nothing names them, and the next scan re-ingests
-    the file alongside them.
+    items only after this function RETURNS, so an await that a cancellation can
+    SKIP PAST -- a bare ``asyncio.to_thread`` hop added in good faith to get a
+    query off the loop -- lets a shutdown cancel the coroutine after the pipeline
+    has already committed. The items survive, nothing names them, and the next
+    scan re-ingests the file alongside them.
+
+    ``_persist_state`` is admitted because it is the opposite shape: it is
+    ``run_to_completion``-backed, so the state write it carries runs to completion
+    even when the coroutine is cancelled mid-await -- the same guarantee the
+    pipeline's own finalize hop relies on. It is how the failure branches record
+    their terminal ``failed`` row without a synchronous sqlite call on the loop
+    (the sqlite ratchet above), and every such branch is one where the pipeline
+    never committed, so there is no committed group for the await to orphan.
     """
     tree = ast.parse(_WATCHER_SRC.read_text(errors="replace"))
     fn = _async_def(tree, "_ingest_file")
     awaits = _awaits(fn)
     rendered = ", ".join(f"line {ln}: await {name}(...)" for ln, name in awaits)
-    assert [name for _, name in awaits] == ["ingest_file"], (
+    names = [name for _, name in awaits]
+    assert names.count("ingest_file") == 1 and set(names) <= {"ingest_file", "_persist_state"}, (
         f"_ingest_file has awaits other than the pipeline call ({rendered}).\n"
-        "Every await after the pipeline's commit is an orphan window: a shutdown "
-        "cancelling there leaves committed items that no folder_file_state row "
-        "names, so the next scan duplicates them and the first group is "
-        "undeletable. If you need data the pipeline holds, take it through a "
-        "callback that runs inside its finalize hop -- do not read it back."
+        "Every await after the pipeline's commit that a cancellation can skip is an "
+        "orphan window: a shutdown cancelling there leaves committed items that no "
+        "folder_file_state row names, so the next scan duplicates them and the "
+        "first group is undeletable. If you need data the pipeline holds, take it "
+        "through a callback that runs inside its finalize hop -- do not read it "
+        "back. A state WRITE belongs in `_persist_state`, which drains under "
+        "cancellation."
     )
 
 
@@ -211,6 +222,8 @@ async def test_ingest_file_reports_the_committed_ids_without_touching_sqlite(tmp
                 old_item_ids,
                 on_committed=None,
                 on_duplicate=None,
+                embed_priority=None,
+                count_toward_import_budget=True,
             ):
                 def _insert_and_report() -> None:
                     # Mirrors the real finalize hop: insert, then hand the ids to
@@ -284,6 +297,8 @@ async def test_ingest_file_reports_failure_when_the_pipeline_never_commits(tmp_p
                 old_item_ids,
                 on_committed=None,
                 on_duplicate=None,
+                embed_priority=None,
+                count_toward_import_budget=True,
             ):
                 # Rolls back internally and does NOT raise -- exactly the shape
                 # the old sync_status read existed to catch.
@@ -318,11 +333,17 @@ async def test_ingest_file_still_reports_a_refused_duplicate_as_deduped(tmp_path
 
     The pre-ingest gate refuses the write and never commits a group, so
     ``on_committed`` does not fire there either -- the same condition as a
-    rollback. The duplicate check must therefore keep winning, or a legitimately
-    refused file would be recorded ``failed`` and retried on every scan.
-    """
-    from kiro_crew.knowledge.ingestion import DUPLICATE_JOB_STATUS
+    rollback. The refusal is reported the same way the commit is: through
+    ``on_duplicate``, invoked inside the gate's own transaction (the only place
+    ``DUPLICATE_JOB_STATUS`` is ever written). The duplicate check must therefore
+    keep winning, or a legitimately refused file would be recorded ``failed`` and
+    retried on every scan.
 
+    The fake follows the real gate's contract and fires the callback. It also
+    exposes ``get_job_status`` and asserts it is never consulted: reading the
+    status back after the pipeline returned was a synchronous sqlite round-trip
+    on the event loop for every ingested file.
+    """
     store = KnowledgeStore(str(tmp_path / "knowledge.db"))
     try:
         doc = tmp_path / "doc.md"
@@ -330,6 +351,8 @@ async def test_ingest_file_still_reports_a_refused_duplicate_as_deduped(tmp_path
         source_id = store.add_source("folder", "local_folder", str(tmp_path))
 
         class _RefusingPipeline:
+            status_reads = 0
+
             async def ingest_file(
                 self,
                 path,
@@ -340,13 +363,19 @@ async def test_ingest_file_still_reports_a_refused_duplicate_as_deduped(tmp_path
                 old_item_ids,
                 on_committed=None,
                 on_duplicate=None,
+                embed_priority=None,
+                count_toward_import_budget=True,
             ):
+                assert on_duplicate is not None, "the watcher no longer listens for a refusal"
+                on_duplicate("text-hash-of-body")
                 return "job-dupe"
 
             def get_job_status(self, job_id):
-                return {"status": DUPLICATE_JOB_STATUS}
+                self.status_reads += 1
+                return {"status": "skipped_duplicate"}
 
-        watcher = FolderWatcher(store, _RefusingPipeline())
+        pipeline = _RefusingPipeline()
+        watcher = FolderWatcher(store, pipeline)
         item_ids, outcome = await watcher._ingest_file(str(doc), source_id, "default", {}, [])
 
         assert outcome == "deduped", (
@@ -354,6 +383,43 @@ async def test_ingest_file_still_reports_a_refused_duplicate_as_deduped(tmp_path
             "make every scan retry a write the gate will refuse again"
         )
         assert item_ids == [], f"a deduped file claimed ownership of {item_ids!r}"
+        assert pipeline.status_reads == 0, (
+            "the watcher read the job status back after the pipeline returned -- a "
+            "synchronous sqlite query on the event loop; the refusal arrives through "
+            "on_duplicate"
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_ingest_file_forwards_the_refusal_to_the_callers_on_duplicate(tmp_path):
+    """Latching the refusal must not swallow the caller's own ``on_duplicate``.
+
+    ``_do_scan`` passes one that writes the 'deduped' state row inside the gate's
+    transaction; a wrapper that only set its flag would leave that row unwritten.
+    """
+    store = KnowledgeStore(str(tmp_path / "knowledge.db"))
+    try:
+        doc = tmp_path / "doc.md"
+        doc.write_text("body", encoding="utf-8")
+        source_id = store.add_source("folder", "local_folder", str(tmp_path))
+
+        class _RefusingPipeline:
+            async def ingest_file(self, path, *, on_duplicate=None, **kw):
+                on_duplicate("text-hash-of-body")
+                return "job-dupe"
+
+        seen: list[str] = []
+        watcher = FolderWatcher(store, _RefusingPipeline())
+        _, outcome = await watcher._ingest_file(
+            str(doc), source_id, "default", {}, [], on_duplicate=seen.append
+        )
+        assert outcome == "deduped"
+        assert seen == ["text-hash-of-body"], (
+            f"the caller's on_duplicate saw {seen!r}; the text hash the gate matched "
+            "must reach it unchanged"
+        )
     finally:
         store.close()
 
@@ -435,6 +501,8 @@ async def test_commit_callback_persists_the_state_row_before_returning(tmp_path)
                 old_item_ids,
                 on_committed=None,
                 on_duplicate=None,
+                embed_priority=None,
+                count_toward_import_budget=True,
             ):
                 def _insert_report_and_observe() -> None:
                     item_id = store.add_item("T", "body", "document", source_id=source_id)
@@ -537,6 +605,8 @@ async def test_a_failed_callback_persistence_does_not_poison_the_ingest(tmp_path
                 old_item_ids,
                 on_committed=None,
                 on_duplicate=None,
+                embed_priority=None,
+                count_toward_import_budget=True,
             ):
                 def _insert_and_report() -> None:
                     created.append(store.add_item("T", "body", "document", source_id=source_id))

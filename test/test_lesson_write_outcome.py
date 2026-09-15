@@ -1,11 +1,12 @@
 """What a lesson write reports, and the four surfaces that read it.
 
-``write_lesson`` used to return a bare ``bool``, and its ``False`` meant several
-unrelated things at once: validation refused the value, a dedup rule claimed the write,
-the submit was a no-op, or a bare re-submit deliberately kept a stored NOT-clause. The
-first group means "your lesson did not land"; the second means "your lesson is fine,
-there was nothing to do". These tests pin the outcome each path now reports, that the
-result's TRUTH VALUE still answers the old bool's predicate (so the callers that only
+A bare ``bool`` return cannot carry this: one ``False`` would mean several
+unrelated things at once -- validation refused the value, a dedup rule claimed the
+write, the submit was a no-op, or a bare re-submit deliberately kept a stored
+NOT-clause. The first group means "your lesson did not land"; the second means
+"your lesson is fine, there was nothing to do". These tests pin the outcome each
+path reports, that the result's TRUTH VALUE answers the plain bool predicate (so
+the callers that only
 branch on success are unaffected -- see ``TestWriteLessonTruthValueIsTheOldBool``), and
 that the three surfaces a human or a model reads -- the CLI, the ``/api/lessons``
 response and the ``learn_add`` tool result -- stop saying "Saved" for a write that
@@ -14,10 +15,14 @@ stored nothing.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from body_stream_helpers import attach_body
 
+from kiro_crew.history import ConversationLog
+from kiro_crew.model_registry import MODEL_ID_LITERAL_PATTERN
 from kiro_crew.vector_memory import (
     LessonWriteOutcome,
     LessonWriteResult,
@@ -31,6 +36,766 @@ def _store(tmp_path) -> VectorMemoryStore:
     store = VectorMemoryStore(db_path=tmp_path / "m.db", embedding_dim=4)
     store.init()
     return store
+
+
+def _rule_of(row) -> str:
+    """The rule text of a lesson row, in either storage shape."""
+    import json as _json
+
+    value = _json.loads(row["value_json"])
+    return value["rule"] if isinstance(value, dict) else value
+
+
+class TestVolatileLessonWriteBoundary:
+    """Every vector lesson producer shares one volatile-fact boundary."""
+
+    VOLATILE_IDENTITY = "The current model identity is gpt-5.6-sol."
+
+    def test_consolidation_source_refuses_volatile_identity(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        try:
+            result = store.write_lesson(
+                self.VOLATILE_IDENTITY,
+                "knowledge",
+                source="consolidation",
+            )
+
+            assert result.outcome is LessonWriteOutcome.REFUSED
+            assert result.reason == "volatile_session_fact"
+            assert store.get_lessons() == []
+        finally:
+            store.close()
+
+    def test_concrete_model_preference_is_refused_as_a_stale_pin(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        try:
+            result = store.write_lesson(
+                "always use gpt-5.6-sol for cron summaries",
+                "preference",
+            )
+
+            assert result.outcome is LessonWriteOutcome.REFUSED
+            assert result.reason == "volatile_session_fact"
+        finally:
+            store.close()
+
+    def test_concrete_model_knowledge_fact_still_writes(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        try:
+            result = store.write_lesson(
+                "the vision endpoint only accepts gpt-5.6-sol",
+                "knowledge",
+            )
+
+            assert result.outcome is LessonWriteOutcome.INSERTED
+            assert "gpt-5.6-sol" in store.get_lessons_context()
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            "the selected model is gpt-5.6-sol",
+            "the session model is gpt-5.6-sol",
+        ],
+    )
+    def test_selected_or_session_identity_is_refused_in_knowledge(
+        self, tmp_path, rule: str
+    ) -> None:
+        store = _store(tmp_path)
+        try:
+            result = store.write_lesson(rule, "knowledge")
+
+            assert result.outcome is LessonWriteOutcome.REFUSED
+            assert result.reason == "volatile_session_fact"
+        finally:
+            store.close()
+
+    def test_direct_running_as_identity_is_refused_in_knowledge(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        try:
+            result = store.write_lesson(
+                "This session is running as gpt-5.6-sol",
+                "knowledge",
+            )
+
+            assert result.outcome is LessonWriteOutcome.REFUSED
+            assert result.reason == "volatile_session_fact"
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            "the Session model is persisted per tab",
+            "the selected model is the source of truth for login state",
+            "Use of gpt-5.6-sol requires the vision flag",
+        ],
+    )
+    def test_data_model_or_compatibility_fact_still_writes(self, tmp_path, rule: str) -> None:
+        store = _store(tmp_path)
+        try:
+            result = store.write_lesson(rule, "knowledge")
+
+            assert result.outcome is LessonWriteOutcome.INSERTED
+        finally:
+            store.close()
+
+    def test_behavioral_pin_cannot_bypass_through_knowledge(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        try:
+            result = store.write_lesson(
+                "always use gpt-5.6-sol for cron summaries",
+                "knowledge",
+            )
+
+            assert result.outcome is LessonWriteOutcome.REFUSED
+            assert result.reason == "volatile_session_fact"
+        finally:
+            store.close()
+
+    def test_noninitial_behavioral_pin_cannot_bypass_through_knowledge(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        try:
+            result = store.write_lesson(
+                "in cron jobs, always use gpt-5.6-sol",
+                "knowledge",
+            )
+
+            assert result.outcome is LessonWriteOutcome.REFUSED
+            assert result.reason == "volatile_session_fact"
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            "Compatibility varies. Select gpt-5.6-sol for reviews",
+            "Compatibility varies! Select gpt-5.6-sol for reviews",
+            "Compatibility varies? Select gpt-5.6-sol for reviews",
+            "Compatibility varies\nSelect gpt-5.6-sol for reviews",
+        ],
+    )
+    def test_sentence_boundary_behavioral_pin_cannot_bypass_through_knowledge(
+        self, tmp_path, rule: str
+    ) -> None:
+        store = _store(tmp_path)
+        try:
+            result = store.write_lesson(rule, "knowledge")
+
+            assert result.outcome is LessonWriteOutcome.REFUSED
+            assert result.reason == "volatile_session_fact"
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            "Please use gpt-5.6-sol for reviews",
+            "Kindly select gpt-5.6-sol for reviews",
+            "Do choose gpt-5.6-sol for reviews",
+            "Please do prefer gpt-5.6-sol for reviews",
+        ],
+    )
+    def test_prefixed_direct_imperative_cannot_bypass_through_knowledge(
+        self, tmp_path, rule: str
+    ) -> None:
+        store = _store(tmp_path)
+        try:
+            result = store.write_lesson(rule, "knowledge")
+
+            assert result.outcome is LessonWriteOutcome.REFUSED
+            assert result.reason == "volatile_session_fact"
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            "always use gpt-5.6-sol",
+            "always use gpt-5.6-sol.",
+            "Select gpt-5.6-sol for reviews",
+            "use the gpt-5.6-sol model",
+            "prefer opus-4.8 over gpt-5.6-sol",
+            "switch to gpt-5.6-sol",
+            "Please use our fallback backend gpt-5.6-sol for reviews",
+            "Stick with the same opus-4.8 model",
+            "always use gpt-5.6-sol, never opus-4.8",
+        ],
+    )
+    def test_selected_model_object_is_refused(self, tmp_path, rule: str) -> None:
+        store = _store(tmp_path)
+        try:
+            result = store.write_lesson(rule, "preference")
+
+            assert result.outcome is LessonWriteOutcome.REFUSED
+            assert result.reason == "volatile_session_fact"
+        finally:
+            store.close()
+
+    def test_descriptive_second_sentence_with_concrete_model_still_writes(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        try:
+            result = store.write_lesson(
+                "Pricing changed. gpt-5.6-sol costs less than opus",
+                "knowledge",
+            )
+
+            assert result.outcome is LessonWriteOutcome.INSERTED
+        finally:
+            store.close()
+
+    def test_vector_context_hides_legacy_sentence_boundary_pin(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        try:
+            assert (
+                store.set_semantic(
+                    "lesson.legacysentencepin",
+                    {
+                        "rule": "Compatibility varies. Select gpt-5.6-sol for reviews",
+                        "category": "knowledge",
+                        "negative": None,
+                    },
+                    1.0,
+                    "user_explicit",
+                )
+                is None
+            )
+            assert store.get_lessons(), "the legacy row must remain visible for deletion"
+
+            assert "gpt-5.6-sol" not in store.get_lessons_context()
+        finally:
+            store.close()
+
+    def test_jsonl_context_hides_legacy_sentence_boundary_pin(self, tmp_path) -> None:
+        import json as _json
+
+        from kiro_crew.learn import LessonStore
+
+        (tmp_path / "lessons.jsonl").write_text(
+            _json.dumps(
+                {
+                    "ts": "2026-09-11T00:00:00+00:00",
+                    "rule": "Compatibility varies. Select gpt-5.6-sol for reviews",
+                    "category": "knowledge",
+                    "negative": None,
+                    "repo_scope": None,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        store = LessonStore(base_dir=tmp_path)
+        assert store.load_all(), "the legacy row must remain visible for deletion"
+
+        assert "gpt-5.6-sol" not in store.get_context()
+
+    def test_onboarding_reports_sentence_boundary_jsonl_directive_rejected(self, tmp_path) -> None:
+        from kiro_crew import onboarding_import
+        from kiro_crew.learn import LessonStore
+
+        item = onboarding_import._Item(
+            "codex",
+            "instructions",
+            "sentence-pin",
+            {"rule": "Compatibility varies. Select gpt-5.6-sol for reviews"},
+        )
+
+        outcome = onboarding_import._write_instruction(
+            item,
+            LessonStore(base_dir=tmp_path),
+        )
+
+        assert outcome.status == "rejected"
+
+    def test_active_model_operational_rule_still_writes(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        try:
+            result = store.write_lesson(
+                "always confirm the active model supports the required context window",
+                "preference",
+            )
+
+            assert result.outcome is LessonWriteOutcome.INSERTED
+        finally:
+            store.close()
+
+    def test_volatile_negative_clause_is_refused(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        try:
+            result = store.write_lesson(
+                "use automatic model selection",
+                "preference",
+                negative="use gpt-5.6-sol",
+            )
+
+            assert result.outcome is LessonWriteOutcome.REFUSED
+            assert result.reason == "volatile_session_fact"
+            assert store.get_lessons() == []
+        finally:
+            store.close()
+
+    def test_knowledge_negative_clause_cannot_carry_an_imperative_model_pin(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        try:
+            result = store.write_lesson(
+                "automatic selection is safest",
+                "knowledge",
+                negative="Select gpt-5.6-sol for reviews",
+            )
+
+            assert result.outcome is LessonWriteOutcome.REFUSED
+            assert result.reason == "volatile_session_fact"
+            assert store.get_lessons() == []
+        finally:
+            store.close()
+
+    def test_automatic_jsonl_save_reports_refusal(self, tmp_path) -> None:
+        from kiro_crew.learn import Lesson, LessonStore
+
+        store = LessonStore(base_dir=tmp_path)
+        outcome = store.save(
+            Lesson(
+                ts="2026-09-11T00:00:00+00:00",
+                rule=self.VOLATILE_IDENTITY,
+                category="knowledge",
+            )
+        )
+
+        assert outcome == "refused"
+        assert store.load_all() == []
+
+    def test_vector_context_hides_preexisting_volatile_lesson(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        try:
+            assert (
+                store.set_semantic(
+                    "lesson.legacyvolatile",
+                    {
+                        "rule": self.VOLATILE_IDENTITY,
+                        "category": "preference",
+                        "negative": None,
+                    },
+                    1.0,
+                    "user_explicit",
+                )
+                is None
+            )
+            assert store.get_lessons(), "the legacy row must remain visible for deletion"
+
+            assert "gpt-5.6-sol" not in store.get_lessons_context()
+        finally:
+            store.close()
+
+    def test_vector_context_hides_legacy_knowledge_negative_pin(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        try:
+            assert (
+                store.set_semantic(
+                    "lesson.legacynegative",
+                    {
+                        "rule": "automatic selection is safest",
+                        "category": "knowledge",
+                        "negative": "Select gpt-5.6-sol for reviews",
+                    },
+                    1.0,
+                    "user_explicit",
+                )
+                is None
+            )
+            assert store.get_lessons(), "the legacy row must remain visible for deletion"
+
+            assert "gpt-5.6-sol" not in store.get_lessons_context()
+        finally:
+            store.close()
+
+    def test_vector_context_hides_key_confirmed_legacy_negative_pin(self, tmp_path) -> None:
+        from kiro_crew.vector_memory import _LESSON_NEGATIVE_SEP, _lesson_key
+
+        rule = "automatic selection is safest"
+        store = _store(tmp_path)
+        try:
+            assert (
+                store.set_semantic(
+                    _lesson_key(rule),
+                    f"{rule}{_LESSON_NEGATIVE_SEP}Select gpt-5.6-sol for reviews",
+                    1.0,
+                    "user_explicit",
+                )
+                is None
+            )
+            assert store.get_lessons(), "the legacy row must remain visible for deletion"
+
+            assert store.has_any_lesson() is False
+            assert "gpt-5.6-sol" not in store.get_lessons_context()
+        finally:
+            store.close()
+
+    def test_vector_context_keeps_key_confirmed_legacy_version_reference(self, tmp_path) -> None:
+        from kiro_crew.vector_memory import _LESSON_NEGATIVE_SEP, _lesson_key
+
+        rule = "check streaming compatibility before release"
+        negative = "assume gpt-5.6-sol supports the streaming flag"
+        store = _store(tmp_path)
+        try:
+            assert (
+                store.set_semantic(
+                    _lesson_key(rule),
+                    f"{rule}{_LESSON_NEGATIVE_SEP}{negative}",
+                    1.0,
+                    "user_explicit",
+                )
+                is None
+            )
+
+            assert store.has_any_lesson() is True
+            rendered = store.get_lessons_context()
+            assert rule in rendered
+            assert negative in rendered
+        finally:
+            store.close()
+
+    @pytest.mark.asyncio
+    async def test_lessons_api_marks_key_confirmed_legacy_negative_pin_withheld(
+        self, tmp_path
+    ) -> None:
+        import json as _json
+
+        from kiro_crew.dashboard.handlers import cron
+        from kiro_crew.vector_memory import _LESSON_NEGATIVE_SEP, _lesson_key
+
+        rule = "automatic selection is safest"
+        store = _store(tmp_path)
+        try:
+            assert (
+                store.set_semantic(
+                    _lesson_key(rule),
+                    f"{rule}{_LESSON_NEGATIVE_SEP}Select gpt-5.6-sol for reviews",
+                    1.0,
+                    "user_explicit",
+                )
+                is None
+            )
+            request = MagicMock()
+            state = MagicMock()
+            request.app = {"state": state}
+            request.headers = {"X-Session-Key": "dashboard:ui"}
+            request.query = {}
+            with (
+                patch.object(cron, "_blocks_reads_session", return_value=False),
+                patch.object(
+                    cron,
+                    "resolve_lesson_memory_store",
+                    new=AsyncMock(return_value=(None, None)),
+                ),
+                patch.object(
+                    cron,
+                    "_prepare_private_lesson_store",
+                    new=AsyncMock(return_value=None),
+                ),
+                patch.object(cron, "_get_memory", return_value=MagicMock(vector_store=store)),
+            ):
+                resp = await cron.api_lessons(request)
+
+            body = _json.loads(resp.text)
+            assert body["lessons"][0]["withheld_reason"] == "volatile_session_fact"
+        finally:
+            store.close()
+
+    def test_jsonl_context_hides_preexisting_volatile_lesson(self, tmp_path) -> None:
+        import json as _json
+
+        from kiro_crew.learn import LessonStore
+
+        (tmp_path / "lessons.jsonl").write_text(
+            _json.dumps(
+                {
+                    "ts": "2026-09-11T00:00:00+00:00",
+                    "rule": self.VOLATILE_IDENTITY,
+                    "category": "preference",
+                    "negative": None,
+                    "repo_scope": None,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        store = LessonStore(base_dir=tmp_path)
+        assert store.load_all(), "the legacy row must remain visible for deletion"
+
+        assert "gpt-5.6-sol" not in store.get_context()
+
+    def test_jsonl_consolidation_does_not_count_a_refusal(self, tmp_path) -> None:
+        from kiro_crew.history import HistoryConsolidator
+        from kiro_crew.learn import LessonStore
+
+        store = LessonStore(base_dir=tmp_path)
+        consolidator = HistoryConsolidator(
+            log=MagicMock(),
+            memory=MagicMock(),
+            lesson_store=store,
+        )
+        with patch("kiro_crew.history_consolidation._HISTORY_LOGGER.info") as info:
+            consolidator._save_lessons([{"rule": self.VOLATILE_IDENTITY, "category": "knowledge"}])
+
+        assert store.load_all() == []
+        info.assert_not_called()
+
+    def test_onboarding_reports_volatile_jsonl_directive_rejected(self, tmp_path) -> None:
+        from kiro_crew import onboarding_import
+        from kiro_crew.learn import LessonStore
+
+        item = onboarding_import._Item(
+            "codex",
+            "instructions",
+            "volatile",
+            {"rule": self.VOLATILE_IDENTITY},
+        )
+
+        outcome = onboarding_import._write_instruction(
+            item,
+            LessonStore(base_dir=tmp_path),
+        )
+
+        assert outcome.status == "rejected"
+
+    def test_onboarding_reports_volatile_vector_directive_rejected(self, tmp_path) -> None:
+        from kiro_crew import onboarding_import
+        from kiro_crew.learn import LessonStore
+
+        vector_store = _store(tmp_path)
+        try:
+            item = onboarding_import._Item(
+                "codex",
+                "instructions",
+                "volatile",
+                {"rule": self.VOLATILE_IDENTITY},
+            )
+
+            outcome = onboarding_import._write_instruction(
+                item,
+                LessonStore(base_dir=tmp_path),
+                vector_store,
+            )
+
+            assert outcome.status == "rejected"
+            assert vector_store.get_lessons() == []
+        finally:
+            vector_store.close()
+
+    def test_durable_model_family_preference_still_writes(self, tmp_path) -> None:
+        store = _store(tmp_path)
+        try:
+            result = store.write_lesson(
+                "prefer the latest Claude Sonnet reviewer",
+                "preference",
+                source="consolidation",
+            )
+
+            assert result.outcome is LessonWriteOutcome.INSERTED
+            assert _rule_of(store.get_lessons()[0]) == "prefer the latest Claude Sonnet reviewer"
+        finally:
+            store.close()
+
+    def test_workflow_literal_regex_matches_the_product_guard(self) -> None:
+        workflow_path = Path(__file__).parents[1] / ".github" / "workflows" / "code-review.yml"
+        workflow = workflow_path.read_text(encoding="utf-8")
+        model_gate = workflow.split(
+            'echo "::group::model-selection — no hardcoded model id as a default/fallback"',
+            1,
+        )[1].split('echo "::endgroup::"', 1)[0]
+
+        assert MODEL_ID_LITERAL_PATTERN in model_gate
+        assert "from kiro_crew.model_registry" not in model_gate
+
+
+class TestDurableModelVersionReferences:
+    """A version literal alone is durable; identity claims and imperatives are not."""
+
+    RULE = "the Python 3.12 wheel needs claude-opus-4.8 pinned in role_models"
+    NEGATIVE = "assume gpt-5.6-sol supports the streaming flag"
+    MODEL_TOOLING_RULES = (
+        ("Always use the tokenizer shipped with gpt-5.6-sol", "tool"),
+        ("Prefer the retry wrapper when calling opus-4.8 endpoints", "preference"),
+        ("Never use the streaming flag with gpt-5.6-sol", "tool"),
+        ("Always use the gpt-5-compatible tokenizer", "tool"),
+        ("Always use the gpt-5 compatible tokenizer", "tool"),
+        ("Never use gpt-5.6-sol endpoints without the retry wrapper", "tool"),
+    )
+    BACKEND_PROCESS_RULES = (
+        ("Never run as the backend service account", "tool"),
+        ("The service is running as the backend worker", "preference"),
+        ("The service is running as the active backend service account", "tool"),
+        ("The service is running as the current backend worker", "preference"),
+        ("Restart the backend after config changes", "tool"),
+        ("Run the worker as the backend user, never as root", "preference"),
+    )
+    TOOLING_RULES = MODEL_TOOLING_RULES + BACKEND_PROCESS_RULES
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            "This session is running as the current backend",
+            "This session is running as the model backend",
+            "This session is running as gpt-5.6-sol",
+            "This session is running as the backend gpt-5.6-sol",
+            "The active model is opus-4.8",
+        ],
+    )
+    def test_model_identity_controls_are_refused(self, tmp_path: Path, rule: str) -> None:
+        store = _store(tmp_path)
+        try:
+            result = store.write_lesson(rule, "knowledge")
+
+            assert result.outcome is LessonWriteOutcome.REFUSED
+            assert result.reason == "volatile_session_fact"
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize(
+        "rule,category,negative",
+        [
+            (RULE, "tool", None),
+            ("check streaming compatibility before release", "preference", NEGATIVE),
+            *[(rule, category, None) for rule, category in TOOLING_RULES],
+        ],
+    )
+    def test_learn_add_writes_durable_version_references(
+        self,
+        tmp_path: Path,
+        rule: str,
+        category: str,
+        negative: str | None,
+    ) -> None:
+        from kiro_crew.mcp_tools import learn
+
+        store = _store(tmp_path)
+
+        def _post(path: str, payload: dict[str, str]) -> dict[str, object]:
+            assert path == "/api/lessons"
+            result = store.write_lesson(
+                payload["rule"],
+                payload["category"],
+                payload.get("negative"),
+            )
+            return {
+                "ok": result.stored,
+                "outcome": result.outcome.value,
+                "reason": result.reason,
+                "superseded": list(result.superseded),
+            }
+
+        try:
+            args = {"rule": rule, "category": category}
+            if negative is not None:
+                args["negative"] = negative
+            with (
+                patch.object(learn.mcp_core, "_post", side_effect=_post),
+                patch.object(learn.mcp_core, "_resolve_session_key", return_value="dashboard:ui"),
+                patch.object(learn.mcp_core, "_vet_memory_writes_governance", return_value=None),
+            ):
+                text = learn.learn_add("learn_add", args)
+
+            assert text.startswith("Saved lesson")
+            assert store.has_any_lesson() is True
+            rendered = store.get_lessons_context()
+            assert rule in rendered
+            if negative is not None:
+                assert negative in rendered
+        finally:
+            store.close()
+
+    def test_consolidation_keeps_durable_version_references(self, tmp_path: Path) -> None:
+        from kiro_crew.history import HistoryConsolidator
+        from kiro_crew.learn import LessonStore
+
+        store = LessonStore(base_dir=tmp_path)
+        consolidator = HistoryConsolidator(
+            log=MagicMock(),
+            memory=MagicMock(),
+            lesson_store=store,
+        )
+
+        consolidator._save_lessons(
+            [
+                {"rule": self.RULE, "category": "tool"},
+                {
+                    "rule": "check streaming compatibility before release",
+                    "category": "preference",
+                    "negative": self.NEGATIVE,
+                },
+                *[
+                    {"rule": rule, "category": category}
+                    for rule, category in self.MODEL_TOOLING_RULES
+                ],
+            ]
+        )
+        consolidator._save_lessons(
+            [{"rule": rule, "category": category} for rule, category in self.BACKEND_PROCESS_RULES]
+        )
+
+        assert [lesson.rule for lesson in store.load_all()] == [
+            self.RULE,
+            "check streaming compatibility before release",
+            *[rule for rule, _category in self.TOOLING_RULES],
+        ]
+        context = store.get_context()
+        assert self.RULE in context
+        assert self.NEGATIVE in context
+        for rule, _category in self.TOOLING_RULES:
+            assert rule in context
+
+    @pytest.mark.parametrize("use_vector_store", [False, True])
+    @pytest.mark.parametrize(
+        "rule",
+        [RULE, *[rule for rule, _category in TOOLING_RULES]],
+    )
+    def test_onboarding_keeps_durable_version_reference(
+        self, tmp_path: Path, use_vector_store: bool, rule: str
+    ) -> None:
+        from kiro_crew import onboarding_import
+        from kiro_crew.learn import LessonStore
+
+        jsonl_store = LessonStore(base_dir=tmp_path)
+        vector_store = _store(tmp_path) if use_vector_store else None
+        item = onboarding_import._Item(
+            "codex",
+            "instructions",
+            "durable-model-version",
+            {"rule": rule},
+        )
+        try:
+            outcome = onboarding_import._write_instruction(
+                item,
+                jsonl_store,
+                vector_store,
+            )
+
+            assert outcome.status == "imported"
+            if vector_store is not None:
+                assert vector_store.has_any_lesson() is True
+                assert rule in vector_store.get_lessons_context()
+            else:
+                assert rule in jsonl_store.get_context()
+        finally:
+            if vector_store is not None:
+                vector_store.close()
+
+    def test_tool_description_states_the_narrow_boundary(self) -> None:
+        from kiro_crew.mcp_tools import learn
+
+        descriptor = next(item for item in learn.schemas() if item["name"] == "learn_add")
+        description = descriptor["description"]
+        assert "runtime identity assertions" in description
+        assert "'running as' phrase needs an unambiguous model noun" in description
+        assert "qualified 'backend' that ends its clause" in description
+        assert "backend service-account and process wording remains durable" in description
+        assert "model-selection imperatives" in description
+        assert "selected object is a concrete model ID" in description
+        assert "at the end of its clause" in description
+        assert "other backend IDs are not lesson-refused" in description
+        assert "not new regex branches" in description
+        assert "A model version mentioned by itself is allowed" in description
 
 
 class TestWriteLessonOutcomes:
@@ -198,7 +963,7 @@ class TestWriteLessonTruthValueIsTheOldBool:
 
 
 class TestCliLearnAddReportsTheOutcome:
-    """``kirocrew learn add`` no longer writes a second record on a decline.
+    """``kirocrew learn add`` writes no second record on a decline.
 
     It read every falsy return as "the vector store did not take it" and wrote into
     ``lessons.jsonl``. For a no-op that duplicated a lesson already stored correctly;
@@ -346,15 +1111,24 @@ class TestCliLearnAddReportsTheOutcome:
 
 @pytest.mark.asyncio
 class TestLessonsRouteReportsTheOutcome:
-    """The response used to be ``{"ok": true}`` on every success path."""
+    """The response names the outcome, not a bare ``{"ok": true}`` on every path."""
 
-    def _request(self):
+    def _request(
+        self,
+        rule: str = "a real rule",
+        negative: str | None = None,
+        category: str = "knowledge",
+    ):
         request = MagicMock()
         state = MagicMock()
+        state.conversation_log = ConversationLog()
         state._background_tasks = set()
         request.app = {"state": state}
         request.headers = {"X-Session-Key": "dashboard:ui"}
-        request.json = AsyncMock(return_value={"rule": "a real rule", "category": "knowledge"})
+        body = {"rule": rule, "category": category}
+        if negative is not None:
+            body["negative"] = negative
+        attach_body(request, body)
         return request, state
 
     async def _post(self, result):
@@ -384,7 +1158,201 @@ class TestLessonsRouteReportsTheOutcome:
         import json as _json
 
         body = _json.loads(resp.text)
-        assert body == {"ok": False, "outcome": "refused", "reason": "injection_blocked"}
+        assert body == {
+            "ok": False,
+            "outcome": "refused",
+            "reason": "injection_blocked",
+            "superseded": [],
+        }
+
+    async def test_dashboard_post_refuses_volatile_identity(self, tmp_path) -> None:
+        from kiro_crew.dashboard.handlers import cron
+
+        request, state = self._request("The active model identity is gpt-5.6-sol.")
+        store = _store(tmp_path)
+        try:
+            with (
+                patch.object(cron, "_get_memory", return_value=MagicMock(vector_store=store)),
+                patch.object(cron, "_is_restricted_session", return_value=False),
+                patch.object(cron, "_sel"),
+            ):
+                resp = await cron.api_lessons_create(request)
+
+            import json as _json
+
+            body = _json.loads(resp.text)
+            assert body == {
+                "ok": False,
+                "outcome": "refused",
+                "reason": "volatile_session_fact",
+                "superseded": [],
+            }
+            assert store.get_lessons() == []
+            state.push_refresh.assert_called_once_with("lessons")
+        finally:
+            store.close()
+
+    async def test_jsonl_fallback_refuses_volatile_negative_clause(self, tmp_path) -> None:
+        import json as _json
+
+        from kiro_crew.dashboard.handlers import cron
+        from kiro_crew.learn import LessonStore
+
+        request, state = self._request(
+            "use automatic model selection",
+            negative="use gpt-5.6-sol",
+            category="preference",
+        )
+        store = LessonStore(base_dir=tmp_path)
+        state.lessons = store
+        with (
+            patch.object(cron, "_get_memory", return_value=MagicMock(vector_store=None)),
+            patch.object(cron, "_is_restricted_session", return_value=False),
+            patch.object(cron, "_sel"),
+        ):
+            resp = await cron.api_lessons_create(request)
+
+        assert _json.loads(resp.text) == {
+            "ok": False,
+            "outcome": "refused",
+            "reason": "volatile_session_fact",
+            "superseded": [],
+        }
+        assert store.load_all() == []
+        state.push_refresh.assert_called_once_with("lessons")
+
+    async def test_list_marks_legacy_volatile_jsonl_row_withheld(self, tmp_path) -> None:
+        import json as _json
+
+        from kiro_crew.dashboard.handlers import cron
+        from kiro_crew.learn import LessonStore
+
+        (tmp_path / "lessons.jsonl").write_text(
+            _json.dumps(
+                {
+                    "ts": "2026-09-11T00:00:00+00:00",
+                    "rule": "always use gpt-5.6-sol for cron summaries",
+                    "category": "preference",
+                    "negative": None,
+                    "repo_scope": None,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        request = MagicMock()
+        state = MagicMock()
+        state.lessons = LessonStore(base_dir=tmp_path)
+        request.app = {"state": state}
+        request.headers = {"X-Session-Key": "dashboard:ui"}
+        request.query = {}
+        with (
+            patch.object(cron, "_blocks_reads_session", return_value=False),
+            patch.object(
+                cron,
+                "resolve_lesson_memory_store",
+                new=AsyncMock(return_value=(None, None)),
+            ),
+            patch.object(
+                cron,
+                "_prepare_private_lesson_store",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(cron, "_get_memory", return_value=MagicMock(vector_store=None)),
+            patch.object(cron, "_get_active_workspace", return_value="default"),
+        ):
+            resp = await cron.api_lessons(request)
+
+        body = _json.loads(resp.text)
+        assert body["lessons"][0]["withheld_reason"] == "volatile_session_fact"
+
+    async def test_list_marks_legacy_string_vector_row_withheld(self, tmp_path) -> None:
+        import json as _json
+
+        from kiro_crew.dashboard.handlers import cron
+
+        store = _store(tmp_path)
+        try:
+            assert (
+                store.set_semantic(
+                    "lesson.legacystring",
+                    "For reviews, use claude-opus-4.6",
+                    1.0,
+                    "user_explicit",
+                )
+                is None
+            )
+            request = MagicMock()
+            state = MagicMock()
+            request.app = {"state": state}
+            request.headers = {"X-Session-Key": "dashboard:ui"}
+            request.query = {}
+            with (
+                patch.object(cron, "_blocks_reads_session", return_value=False),
+                patch.object(
+                    cron,
+                    "resolve_lesson_memory_store",
+                    new=AsyncMock(return_value=(None, None)),
+                ),
+                patch.object(
+                    cron,
+                    "_prepare_private_lesson_store",
+                    new=AsyncMock(return_value=None),
+                ),
+                patch.object(cron, "_get_memory", return_value=MagicMock(vector_store=store)),
+            ):
+                resp = await cron.api_lessons(request)
+
+            body = _json.loads(resp.text)
+            assert body["lessons"][0]["withheld_reason"] == "volatile_session_fact"
+        finally:
+            store.close()
+
+    async def test_list_marks_legacy_mapping_negative_pin_withheld(self, tmp_path) -> None:
+        import json as _json
+
+        from kiro_crew.dashboard.handlers import cron
+
+        store = _store(tmp_path)
+        try:
+            assert (
+                store.set_semantic(
+                    "lesson.legacynegative",
+                    {
+                        "rule": "automatic selection is safest",
+                        "category": "knowledge",
+                        "negative": "Select gpt-5.6-sol for reviews",
+                    },
+                    1.0,
+                    "user_explicit",
+                )
+                is None
+            )
+            request = MagicMock()
+            state = MagicMock()
+            request.app = {"state": state}
+            request.headers = {"X-Session-Key": "dashboard:ui"}
+            request.query = {}
+            with (
+                patch.object(cron, "_blocks_reads_session", return_value=False),
+                patch.object(
+                    cron,
+                    "resolve_lesson_memory_store",
+                    new=AsyncMock(return_value=(None, None)),
+                ),
+                patch.object(
+                    cron,
+                    "_prepare_private_lesson_store",
+                    new=AsyncMock(return_value=None),
+                ),
+                patch.object(cron, "_get_memory", return_value=MagicMock(vector_store=store)),
+            ):
+                resp = await cron.api_lessons(request)
+
+            body = _json.loads(resp.text)
+            assert body["lessons"][0]["withheld_reason"] == "volatile_session_fact"
+        finally:
+            store.close()
 
     async def test_no_op_stays_ok_but_names_the_outcome(self):
         resp, state = await self._post(LessonWriteResult(LessonWriteOutcome.UNCHANGED))
@@ -440,7 +1408,99 @@ class TestLessonsRouteReportsTheOutcome:
         import json as _json
 
         body = _json.loads(resp.text)
-        assert body == {"ok": True, "outcome": "unchanged", "reason": None}
+        assert body == {
+            "ok": True,
+            "outcome": "unchanged",
+            "reason": None,
+            "superseded": [],
+        }
+
+
+class TestLearnAddVolatileSessionFactBoundary:
+    """``learn_add`` must not turn one session's runtime identity into policy."""
+
+    @staticmethod
+    def _call(rule: str, response: dict | None = None):
+        from kiro_crew.mcp_tools import learn
+
+        with (
+            patch.object(learn.mcp_core, "_post", return_value=response or {"ok": True}) as post,
+            patch.object(learn.mcp_core, "_resolve_session_key", return_value="dashboard:ui"),
+            patch.object(learn.mcp_core, "_vet_memory_writes_governance", return_value=None),
+        ):
+            text = learn.learn_add("learn_add", {"rule": rule, "category": "preference"})
+        return text, post
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            ("The current model identity shown by runtime/system context is " "gpt-5.6-sol."),
+            "The current model is selected by this session.",
+            "The active model identity changes per tab.",
+            "This session is running as the model chosen by the runtime.",
+        ],
+    )
+    def test_volatile_session_identity_is_rejected_by_the_shared_writer(self, rule: str) -> None:
+        text, post = self._call(
+            rule,
+            {
+                "ok": False,
+                "outcome": "refused",
+                "reason": "volatile_session_fact",
+                "superseded": [],
+            },
+        )
+
+        assert text.startswith("Error: volatile_session_fact:")
+        assert "NOT saved" in text
+        assert "reusable behavioral rule" in text
+        assert "agent.role_models.<role>" in text
+        assert "config" in text
+        post.assert_called_once_with(
+            "/api/lessons",
+            {"rule": rule, "category": "preference", "scope": "global"},
+        )
+
+    def test_cross_model_reviewer_preference_still_persists(self) -> None:
+        rule = "for cross-model review prefer the latest Claude Sonnet reviewer"
+        text, post = self._call(rule)
+
+        assert text == f"Saved lesson: {rule}"
+        post.assert_called_once_with(
+            "/api/lessons",
+            {"rule": rule, "category": "preference", "scope": "global"},
+        )
+
+    def test_descriptor_warns_before_the_model_calls_the_tool(self) -> None:
+        from kiro_crew.mcp_tools import learn
+
+        descriptor = next(item for item in learn.schemas() if item["name"] == "learn_add")
+        description = descriptor["description"]
+        assert "unrelated future sessions" in description
+        assert "active model identity" in description
+        assert "volatile" in description
+
+
+class TestLearnListWithheldRows:
+    def test_withheld_reason_is_visible(self) -> None:
+        from kiro_crew.mcp_tools import learn
+
+        with patch.object(
+            learn.mcp_core,
+            "_get",
+            return_value={
+                "lessons": [
+                    {
+                        "rule": "always use gpt-5.6-sol for cron summaries",
+                        "category": "preference",
+                        "withheld_reason": "volatile_session_fact",
+                    }
+                ]
+            },
+        ):
+            text = learn.learn_list("learn_list", {})
+
+        assert "WITHHELD: volatile_session_fact" in text
 
 
 class TestLearnAddToolReportsTheOutcome:
@@ -464,8 +1524,27 @@ class TestLearnAddToolReportsTheOutcome:
 
     def test_dedup_says_covered_by_an_existing_lesson(self):
         text = self._call({"ok": False, "outcome": "deduped", "reason": "substring_covered"})
-        assert "NOT saved as a new entry" in text
+        assert "NOT saved" in text
         assert "already covers it" in text
+        # The message quotes the SUBMITTED rule. It must say so: the old wording put
+        # that quote straight after "an existing stored lesson already covers it",
+        # which read as a quote of the stored lesson, so a caller thought it had been
+        # shown the winner and could not tell a correct dedup from a dropped
+        # correction. It must also name the replace path.
+        assert "DROPPED" in text
+        assert "NOT the stored lesson" in text
+        assert "learn_remove" in text
+
+    def test_semantic_dedup_reply_never_coaches_removing_the_protected_lesson(self):
+        """``semantic_similarity`` is only reachable when the stored row OUTRANKS
+        the write. Coaching the remove-and-re-add path there would walk an
+        automated caller through deleting the row the store just protected."""
+        text = self._call({"ok": False, "outcome": "deduped", "reason": "semantic_similarity"})
+        assert "NOT saved" in text
+        assert "higher authority" in text
+        assert "DROPPED" in text
+        assert "NOT the stored lesson" in text
+        assert "learn_remove" not in text
 
     def test_no_op_says_already_stored_without_claiming_an_exact_match(self):
         """``unchanged`` does not mean the stored row equals the submission.
@@ -500,3 +1579,511 @@ class TestLearnAddToolReportsTheOutcome:
         """Version skew during an update must not turn a real save into a scare."""
         text = self._call({"ok": True})
         assert text == "Saved lesson: a rule"
+
+
+class TestASupersedingWriteNamesWhatItRemoved:
+    """The store deletes a stored lesson the submitted rule contains, and said nothing.
+
+    From the issue: teach "never force push to a shared branch", then teach "when a
+    release is in progress, never force push to a shared branch, and tell the release
+    manager first". The second rule's text CONTAINS the first, so the substring rule
+    tombstones the general lesson. Reporting a plain ``inserted`` with ``reason=None``
+    tells the user the save succeeded while leaving no rule at all against force
+    pushing outside a release.
+
+    Deleting is deliberate (``write_lesson``'s docstring: "longer wins" / "newer
+    replaces older"), and these tests do NOT assert it stops. They assert the write
+    NAMES the rule it destroyed, which is the only recoverable trace: the row is
+    tombstoned, so it is gone from ``get_lessons``, ``learn_list`` and the injected
+    lessons block.
+
+    POSITIVE CONTROL for these tests: they fail on unpatched ``main``, where
+    ``LessonWriteResult`` has no ``superseded`` field at all -- ``result.superseded``
+    raises ``AttributeError``. That is a fail for the right reason (the field does not
+    exist), and it is distinct from a fail on the wording of a message.
+    """
+
+    GENERAL = "never force push to a shared branch"
+    NARROWER = (
+        "when a release is in progress, never force push to a shared branch, "
+        "and tell the release manager first"
+    )
+
+    def test_the_general_rule_is_still_deleted(self, tmp_path):
+        """Pinned deliberately: the fix REPORTS the supersede, it does not prevent it.
+
+        Without this, a later change could "fix" the issue by loosening the
+        containment test, and the tests below would still pass while the dedup rule
+        that keeps the store from filling with near-identical lessons had quietly
+        stopped saying no. This is the assertion that makes that visible.
+        """
+        store = _store(tmp_path)
+        try:
+            store.write_lesson(self.GENERAL, "tool")
+            store.write_lesson(self.NARROWER, "tool")
+            live = [_rule_of(row) for row in store.get_lessons()]
+            assert self.GENERAL not in live, "supersede-on-containment must still delete"
+            assert self.NARROWER in live
+        finally:
+            store.close()
+
+    def test_the_write_names_the_rule_it_superseded(self, tmp_path):
+        store = _store(tmp_path)
+        try:
+            store.write_lesson(self.GENERAL, "tool")
+            result = store.write_lesson(self.NARROWER, "tool")
+            # Still an insert, still truthy -- the submitted lesson did land.
+            assert result.outcome is LessonWriteOutcome.INSERTED
+            assert bool(result) is True
+            # ...and the call discloses what that cost.
+            assert result.superseded == (self.GENERAL,)
+        finally:
+            store.close()
+
+    def test_a_write_that_supersedes_nothing_reports_nothing(self, tmp_path):
+        """The field must not be a warning that fires on every write.
+
+        A surface renders it with a bare ``if``, so a non-empty value on an ordinary
+        insert would put a data-loss warning in front of the user for a write that
+        lost nothing -- and a warning that always fires is read as noise, which is how
+        a real one gets ignored.
+        """
+        store = _store(tmp_path)
+        try:
+            first = store.write_lesson(self.GENERAL, "tool")
+            assert first.superseded == ()
+            unrelated = store.write_lesson("write commit messages in the imperative", "tool")
+            assert unrelated.superseded == ()
+        finally:
+            store.close()
+
+    def test_one_write_names_every_rule_it_removed_not_just_the_first(self, tmp_path):
+        """The delete branch ``continue``s, so a single call can tombstone several rows.
+
+        A count would be a smaller lie than silence but still a lie: the user cannot
+        restore a rule the report does not name.
+
+        The two stored rules are deliberately unrelated to each other -- they share no
+        significant word, so neither supersedes the other and both are live when the
+        third write arrives. A chain of progressively longer rules could not set this
+        up, because each write already collapses the one before it.
+        """
+        store = _store(tmp_path)
+        try:
+            store.write_lesson("prefer tabs", "preference")
+            store.write_lesson("run ruff", "tool")
+            assert len(store.get_lessons()) == 2, "the two rules must not dedup each other"
+            result = store.write_lesson("prefer tabs and run ruff on every python file", "tool")
+            assert set(result.superseded) == {"prefer tabs", "run ruff"}
+            live = [_rule_of(row) for row in store.get_lessons()]
+            assert live == ["prefer tabs and run ruff on every python file"]
+        finally:
+            store.close()
+
+    def test_the_refuse_direction_is_unchanged_and_deletes_nothing(self, tmp_path):
+        """The OTHER direction of the same test must keep refusing.
+
+        Submitting a rule CONTAINED IN a stored one is genuinely covered by it, so it
+        is declined without mutating anything. Loosening the containment test to save
+        the general lesson would have changed this too -- accumulating a near-identical
+        row for every re-phrasing. It is pinned here so that cannot happen quietly.
+        """
+        store = _store(tmp_path)
+        try:
+            store.write_lesson("always run the linter before pushing a branch", "tool")
+            result = store.write_lesson("run the linter", "tool")
+            assert result.outcome is LessonWriteOutcome.DEDUPED
+            assert result.reason == "substring_covered"
+            assert result.superseded == ()
+            live = [_rule_of(row) for row in store.get_lessons()]
+            assert live == ["always run the linter before pushing a branch"]
+        finally:
+            store.close()
+
+    def test_the_report_keeps_the_not_clause_of_the_rule_it_removed(self, tmp_path):
+        """A report that drops the clause hands back a rule the user cannot restore.
+
+        Dedup compares rules through ``_lesson_embed_text``, which returns the ``rule``
+        field ALONE so the comparison basis matches the embedding space. Reporting on
+        that same rendering silently dropped the NOT-clause -- so the clause, which
+        carries the sharpest part of the guidance, became unrecoverable at the exact
+        moment the row was tombstoned. The report uses the display rendering instead;
+        the comparisons still use the embed one, so no dedup decision moves.
+        """
+        store = _store(tmp_path)
+        try:
+            store.write_lesson("prefer ruff over flake8", "tool", "for type checking")
+            result = store.write_lesson(
+                "in CI prefer ruff over flake8 and fail the build on any finding", "tool"
+            )
+            assert result.outcome is LessonWriteOutcome.INSERTED
+            assert len(result.superseded) == 1
+            reported = result.superseded[0]
+            assert reported.startswith("prefer ruff over flake8")
+            assert "for type checking" in reported, "the NOT-clause was dropped from the report"
+            assert reported == "prefer ruff over flake8 \u2014 NOT: for type checking"
+        finally:
+            store.close()
+
+    def test_a_clause_less_rule_is_reported_verbatim_with_no_separator(self, tmp_path):
+        """The display rendering must not decorate a row that has no clause."""
+        store = _store(tmp_path)
+        try:
+            store.write_lesson(self.GENERAL, "tool")
+            result = store.write_lesson(self.NARROWER, "tool")
+            assert result.superseded == (self.GENERAL,)
+            assert "NOT:" not in result.superseded[0]
+        finally:
+            store.close()
+
+    def test_the_advice_it_prints_describes_a_recovery_the_policy_permits(self, tmp_path):
+        """The warning's purpose is restorability, so its advice must actually work.
+
+        Measured, because the wording was weaker than this before: a VERBATIM re-add of
+        the superseded rule is declined by the substring branch (the narrower rule now
+        contains it), so telling the user only to "re-add it" would send them into a
+        refusal. Two recoveries do work, and both are what the text now names.
+        """
+        store = _store(tmp_path)
+        try:
+            store.write_lesson(self.GENERAL, "tool")
+            store.write_lesson(self.NARROWER, "tool")
+
+            # 1. Verbatim re-add: declined, and it changes nothing.
+            again = store.write_lesson(self.GENERAL, "tool")
+            assert again.outcome is LessonWriteOutcome.DEDUPED
+            assert again.reason == "substring_covered"
+            assert again.superseded == ()
+            assert [_rule_of(r) for r in store.get_lessons()] == [self.NARROWER]
+
+            # 2. Wording sharing few significant words: coexists, nothing superseded.
+            other = store.write_lesson(
+                "protected branches reject a forced update at all times", "tool"
+            )
+            assert other.outcome is LessonWriteOutcome.INSERTED
+            assert other.superseded == (), "a non-overlapping rule must not ping-pong"
+            assert len(store.get_lessons()) == 2
+        finally:
+            store.close()
+
+    def test_removing_the_narrower_rule_first_restores_the_general_one_exactly(self, tmp_path):
+        """The other recovery the text names, and the only one that restores verbatim."""
+        store = _store(tmp_path)
+        try:
+            store.write_lesson(self.GENERAL, "tool")
+            store.write_lesson(self.NARROWER, "tool")
+            narrower_key = next(
+                r["key"] for r in store.get_lessons() if _rule_of(r) == self.NARROWER
+            )
+            store.delete_semantic(narrower_key, "user_explicit")
+            restored = store.write_lesson(self.GENERAL, "tool")
+            assert restored.outcome is LessonWriteOutcome.INSERTED
+            assert [_rule_of(r) for r in store.get_lessons()] == [self.GENERAL]
+        finally:
+            store.close()
+
+    def test_removing_only_the_substring_branch_would_not_have_saved_the_lesson(self):
+        """Why the fix reports instead of preventing: the collapse is over-determined.
+
+        Verbatim containment at word boundaries makes the stored rule's keyword set a
+        SUBSET of the submitted rule's, so the topic-overlap rule three lines below
+        scores 100% and deletes the same row anyway. Deleting the substring branch
+        alone therefore changes nothing a user would notice -- the general lesson is
+        still gone, just via the next rule down. Preventing the collapse means editing
+        all three dedup rules, which is the design call the issue reserved for
+        maintainers.
+
+        Computed from the store's own keyword helper so it cannot drift from the
+        arithmetic the branch actually performs.
+        """
+        keywords = VectorMemoryStore._lesson_keywords
+        general = keywords(self.GENERAL.lower())
+        narrower = keywords(self.NARROWER.lower())
+        assert general, "the general rule must contribute keywords for the branch to run"
+        assert general <= narrower, "containment should make the keyword set a subset"
+        ratio = len(general & narrower) / min(len(narrower), len(general))
+        assert ratio == 1.0
+        assert ratio >= 0.5, "topic overlap would delete the general lesson regardless"
+
+
+class TestSupersedeReachesTheSurfacesAHumanReads:
+    """A field nothing renders is not a fix. These pin the two report surfaces."""
+
+    @pytest.mark.asyncio
+    async def test_the_route_forwards_the_superseded_rules(self):
+        """Drives the real route, so it fails on main where the response omits the key."""
+        resp, _state = await TestLessonsRouteReportsTheOutcome()._post(
+            LessonWriteResult(
+                LessonWriteOutcome.INSERTED,
+                None,
+                ("never force push to a shared branch",),
+            )
+        )
+        import json as _json
+
+        body = _json.loads(resp.text)
+        assert body["ok"] is True, "the submitted lesson did land"
+        assert body["outcome"] == "inserted"
+        assert body["superseded"] == ["never force push to a shared branch"]
+
+    def _tool_call(self, response):
+        from kiro_crew.mcp_tools import learn
+
+        with (
+            patch.object(learn.mcp_core, "_post", return_value=response),
+            patch.object(learn.mcp_core, "_resolve_session_key", return_value="dashboard:ui"),
+            patch.object(learn.mcp_core, "_vet_memory_writes_governance", return_value=None),
+        ):
+            return learn.learn_add("learn_add", {"rule": "a rule", "category": "tool"})
+
+    def test_the_tool_warns_and_quotes_the_removed_rule_in_full(self):
+        text = self._tool_call(
+            {
+                "ok": True,
+                "outcome": "inserted",
+                "reason": None,
+                "superseded": ["never force push to a shared branch"],
+            }
+        )
+        assert "Saved lesson" in text
+        assert "REMOVED 1 stored lesson" in text
+        # Quoted in full, not counted or previewed: this text is the last readable
+        # copy of a tombstoned row.
+        assert "never force push to a shared branch" in text
+
+    def test_the_tool_says_nothing_when_nothing_was_superseded(self):
+        text = self._tool_call({"ok": True, "outcome": "inserted", "reason": None})
+        assert "Saved lesson" in text
+        assert "REMOVED" not in text
+
+    def test_the_tool_ignores_a_superseded_field_that_is_not_a_list_of_text(self):
+        """It crosses HTTP, so the shape is not this tool's to trust.
+
+        A malformed value must read as "none reported" -- which is what every gateway
+        older than this field says -- rather than rendering a repr into a warning.
+        """
+        for junk in ({"a": 1}, "a string", [None, 3, "  "], 7):
+            text = self._tool_call(
+                {"ok": True, "outcome": "inserted", "reason": None, "superseded": junk}
+            )
+            assert "REMOVED" not in text, f"rendered a warning for {junk!r}"
+
+
+class TestASupersededRuleIsSanitizedBeforeItIsShown:
+    """The reported rule is stored USER TEXT, so echoing it raw is a new exposure.
+
+    Reporting a superseded rule means printing text a user typed once, on a path that
+    did not print it before. Both surfaces already had the right treatment for stored
+    text and this write path was simply not routed through it -- `learn list` strips
+    terminal control sequences on every print, and `api_lessons_create` already sends
+    the lesson's own rule through `_redact_memory_field`.
+    """
+
+    def test_the_cli_strips_terminal_control_sequences_from_a_removed_rule(self, tmp_path):
+        """An OSC payload stored in a lesson must not be executed by reporting it.
+
+        This is the one write path guaranteed to print a rule the user is NOT looking
+        at, so an escape sequence here retitles the window or writes the clipboard for
+        a rule the user never asked to see.
+        """
+        import argparse
+
+        from kiro_crew import cli_commands
+
+        store = _store(tmp_path)
+        # A stored general rule carrying an OSC window-title payload and a CSI clear.
+        evil = "never \x1b]0;pwned\x07force \x1b[2Jpush"
+        store.write_lesson(evil, "tool")
+        args = argparse.Namespace(
+            learn_action="add",
+            rule=f"during a release {evil} and tell the release manager",
+            category="tool",
+            negative=None,
+        )
+        with (
+            patch.object(cli_commands, "VectorMemoryStore", return_value=store),
+            patch.object(cli_commands, "LessonStore", return_value=MagicMock()),
+            patch.object(cli_commands.KiroCrewConfig, "load", return_value=MagicMock()),
+        ):
+            import io
+            from contextlib import redirect_stdout
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                cli_commands._learn(args)
+            out = buf.getvalue()
+        assert "REMOVED 1 stored lesson" in out, "the supersede must still be reported"
+        # Scoped to the REMOVED block, which is what this change prints. The `Saved:`
+        # line above it echoes the rule the user just typed on their own command line,
+        # unsanitized on main and unchanged here -- a different threat model (their own
+        # input, in the same breath) from a STORED rule, which consolidation, an import
+        # or a subagent may have written and which this block prints when the user is
+        # not looking at it. Masking a string the user literally just typed would tell
+        # them nothing and hide their own command from them.
+        removed_block = out[out.index("REMOVED") :]
+        # The readable rule survives around the sequences. "pwned" is deliberately NOT
+        # asserted present: it is the OSC sequence's own payload, and the regex consumes
+        # a whole OSC run, so removing it is correct rather than over-broad.
+        assert "never" in removed_block and "push" in removed_block
+        assert "pwned" not in removed_block, "the OSC payload itself must not survive"
+        assert "\x1b]" not in removed_block, "raw OSC reached the terminal"
+        assert "\x1b[" not in removed_block, "raw CSI reached the terminal"
+        assert "\x07" not in removed_block
+
+    def test_the_cli_redacts_a_credential_in_a_removed_rule(self, tmp_path):
+        """The CLI must agree with the route about whether a superseded rule may leak.
+
+        Both deliver the same field, so a secret redacted on one path and printed on the
+        other is one feature disagreeing with itself. A lesson written by history
+        consolidation carries model output the user never typed, so this is not
+        "their own secret in their own terminal".
+        """
+        import argparse
+        import io
+        from contextlib import redirect_stdout
+
+        from kiro_crew import cli_commands
+
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        store = _store(tmp_path)
+        store.write_lesson(f"never commit {secret} to the repository", "tool")
+        args = argparse.Namespace(
+            learn_action="add",
+            rule=f"during a release never commit {secret} to the repository and tell the lead",
+            category="tool",
+            negative=None,
+        )
+        with (
+            patch.object(cli_commands, "VectorMemoryStore", return_value=store),
+            patch.object(cli_commands, "LessonStore", return_value=MagicMock()),
+            patch.object(cli_commands.KiroCrewConfig, "load", return_value=MagicMock()),
+        ):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                cli_commands._learn(args)
+            out = buf.getvalue()
+        assert "REMOVED 1 stored lesson" in out, "the supersede must still be reported"
+        removed_block = out[out.index("REMOVED") :]
+        assert secret not in removed_block, "raw credential printed for a removed rule"
+        assert "never commit" in removed_block, "the rule is redacted, not dropped"
+
+    def test_the_cli_cannot_reassemble_a_credential_split_by_a_control_sequence(self, tmp_path):
+        """Pins the ORDER of the two treatments, which is where this went wrong once.
+
+        The intuitive order is the unsafe one. Redacting first leaves
+        ``AKIA<CSI>IOSFODNN7EXAMPLE`` untouched -- the escape breaks the token so the
+        credential regex does not match -- and the control-strip then REASSEMBLES the
+        complete credential and prints it. Stripping first can only JOIN characters,
+        never split a token, so the regex sees the whole credential.
+
+        This is why the two earlier tests are not enough between them: each shows one
+        treatment happens, neither shows they compose in the safe order. A stored
+        credential is planted pre-split here so a future reordering reddens.
+        """
+        import argparse
+        import io
+        from contextlib import redirect_stdout
+
+        from kiro_crew import cli_commands
+
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        split = "AKIA\x1b[0mIOSFODNN7EXAMPLE"
+        store = _store(tmp_path)
+        store.write_lesson(f"never commit {split} to the repository", "tool")
+        args = argparse.Namespace(
+            learn_action="add",
+            rule=f"during a release never commit {split} to the repository and tell the lead",
+            category="tool",
+            negative=None,
+        )
+        with (
+            patch.object(cli_commands, "VectorMemoryStore", return_value=store),
+            patch.object(cli_commands, "LessonStore", return_value=MagicMock()),
+            patch.object(cli_commands.KiroCrewConfig, "load", return_value=MagicMock()),
+        ):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                cli_commands._learn(args)
+            out = buf.getvalue()
+        assert "REMOVED 1 stored lesson" in out, "the supersede must still be reported"
+        removed_block = out[out.index("REMOVED") :]
+        assert secret not in removed_block, "control stripping reassembled the credential"
+        assert split not in removed_block, "the split credential was printed as stored"
+
+    @pytest.mark.asyncio
+    async def test_the_route_redacts_a_credential_in_a_removed_rule(self):
+        """A credential a user once put in a lesson must not be echoed on deletion.
+
+        Worse than a read: the row is being deleted, so this response is the only place
+        that text is returned at all, and it reaches both the dashboard and the
+        ``learn_add`` tool.
+        """
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        resp, _state = await TestLessonsRouteReportsTheOutcome()._post(
+            LessonWriteResult(
+                LessonWriteOutcome.INSERTED, None, (f"never commit the key {secret}",)
+            )
+        )
+        import json as _json
+
+        body = _json.loads(resp.text)
+        assert len(body["superseded"]) == 1, "the supersede must still be reported"
+        assert secret not in body["superseded"][0], "raw credential returned in a response"
+        assert secret not in resp.text
+
+    def test_no_dedup_log_line_carries_lesson_text(self, tmp_path, caplog):
+        """The whole scan logs IDENTITIES, never content, on every branch.
+
+        A lesson holds whatever the user once told the agent -- credentials, paths,
+        names -- so a log line carrying its text turns a silent-deletion bug into a
+        disclosure bug, on a sink that persists to disk and may reach a notification
+        channel. Filtering the text on the way out only narrows that; logging the
+        store's own row ids removes it, and those ids are what let an operator join the
+        line to the tombstoned row and to the ``delete_semantic`` audit record.
+
+        The result is the read path where the text belongs, and the last assertion
+        checks it still carries the full rule -- so this test cannot be satisfied by
+        losing the recovery channel along with the exposure.
+
+        Each of the three dedup branches is driven separately, and every record emitted
+        is checked, because the three lines are independent and only one of them was
+        added by this change.
+        """
+        import logging
+
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        cases = {
+            # label -> (stored rule, submitted rule) selecting one branch each
+            "substring-delete": (
+                f"never commit {secret} to the repository",
+                f"during a release never commit {secret} to the repository and tell the lead",
+            ),
+            "substring-covered": (
+                f"always rotate {secret} on the first of the month",
+                f"rotate {secret}",
+            ),
+            "topic-overlap": (
+                f"rotate the deployment key {secret} monthly and audit the log",
+                f"rotate the deployment key {secret} weekly instead",
+            ),
+        }
+        for label, (stored, submitted) in cases.items():
+            store = _store(tmp_path / label.replace("-", "_"))
+            try:
+                store.write_lesson(stored, "tool")
+                caplog.clear()
+                with caplog.at_level(logging.DEBUG, logger="kiro_crew.vector_memory"):
+                    result = store.write_lesson(submitted, "tool")
+                emitted = [r.getMessage() for r in caplog.records]
+                assert emitted, f"{label}: no log record, so this asserts nothing"
+                for message in emitted:
+                    assert secret not in message, f"{label}: a credential reached the log"
+                    assert "rotate" not in message, f"{label}: rule text reached the log"
+                    assert "commit" not in message, f"{label}: rule text reached the log"
+                    assert "lesson." in message, f"{label}: rows should be named by id"
+                if label == "substring-delete":
+                    # The recovery channel still carries the full text.
+                    assert result.superseded, "the supersede must have happened"
+                    assert secret in result.superseded[0], "the result carries the text"
+            finally:
+                store.close()

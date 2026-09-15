@@ -23,10 +23,12 @@ from typing import Any
 
 from aiohttp import web
 
+from kiro_crew.apps.builtins.meetings.backend import calendar_poller
 from kiro_crew.apps.builtins.meetings.backend import constants as k
 from kiro_crew.apps.builtins.meetings.backend import store
 from kiro_crew.apps.builtins.meetings.backend.domain import session as sess
 from kiro_crew.apps.builtins.meetings.backend.routes import agents as agents_routes
+from kiro_crew.apps.builtins.meetings.backend.routes import audio_import as import_routes
 from kiro_crew.apps.builtins.meetings.backend.routes import calendar as calendar_routes
 from kiro_crew.apps.builtins.meetings.backend.routes import meeting_lifecycle as lifecycle_routes
 from kiro_crew.apps.builtins.meetings.backend.routes import settings as settings_routes
@@ -166,16 +168,12 @@ def register_routes(app: web.Application) -> None:
     router.add_post(
         f"{BASE}/dictionary/remove", route(settings_routes.handle_remove_dictionary_term)
     )
-    router.add_post(
-        f"{BASE}/dictionary/reload", route(settings_routes.handle_reload_dictionary)
-    )
+    router.add_post(f"{BASE}/dictionary/reload", route(settings_routes.handle_reload_dictionary))
 
     # Calendar
     router.add_get(f"{BASE}/calendar", route(calendar_routes.handle_get_calendar))
     router.add_post(f"{BASE}/calendar/sync", route(calendar_routes.handle_calendar_sync))
-    router.add_get(
-        f"{BASE}/calendar/providers", route(calendar_routes.handle_calendar_providers)
-    )
+    router.add_get(f"{BASE}/calendar/providers", route(calendar_routes.handle_calendar_providers))
 
     # Agents + dispatcher
     router.add_get(f"{BASE}/agents", route(agents_routes.handle_get_agents))
@@ -184,9 +182,7 @@ def register_routes(app: web.Application) -> None:
 
     # Meetings
     router.add_get(f"{BASE}/meetings", route(lifecycle_routes.handle_list_meetings))
-    router.add_get(
-        BASE + "/meetings/{meeting_id}", route(lifecycle_routes.handle_get_meeting)
-    )
+    router.add_get(BASE + "/meetings/{meeting_id}", route(lifecycle_routes.handle_get_meeting))
     router.add_delete(
         BASE + "/meetings/{meeting_id}", route(lifecycle_routes.handle_delete_meeting)
     )
@@ -209,6 +205,19 @@ def register_routes(app: web.Application) -> None:
     router.add_get(
         BASE + "/meetings/{meeting_id}/outputs", route(lifecycle_routes.handle_get_outputs)
     )
+    router.add_get(
+        BASE + "/meetings/{meeting_id}/translations",
+        route(lifecycle_routes.handle_get_translations),
+    )
+    # Editable minutes. PUT/DELETE on the same path as the GET, with the agent id in
+    # the body — the shape the task routes already use, and the reason there is no
+    # `{agent_id}` path segment to validate.
+    router.add_put(
+        BASE + "/meetings/{meeting_id}/outputs", route(lifecycle_routes.handle_put_output)
+    )
+    router.add_delete(
+        BASE + "/meetings/{meeting_id}/outputs", route(lifecycle_routes.handle_delete_output)
+    )
     router.add_post(
         BASE + "/meetings/{meeting_id}/attachments",
         route(lifecycle_routes.handle_attachments),
@@ -218,28 +227,26 @@ def register_routes(app: web.Application) -> None:
     router.add_post(
         BASE + "/meetings/{meeting_id}/agents", route(agents_routes.handle_toggle_agent)
     )
-    router.add_post(
-        BASE + "/meetings/{meeting_id}/mute", route(agents_routes.handle_mute_agent)
-    )
+    router.add_post(BASE + "/meetings/{meeting_id}/mute", route(agents_routes.handle_mute_agent))
     router.add_post(
         BASE + "/meetings/{meeting_id}/dispatch", route(agents_routes.handle_dispatch_text)
     )
     router.add_post(
         BASE + "/meetings/{meeting_id}/message", route(agents_routes.handle_agent_message)
     )
+    router.add_post(BASE + "/meetings/{meeting_id}/reset", route(agents_routes.handle_reset_agents))
+
+    # Import an existing recording. A transcript PRODUCER, like /dispatch — it needs a
+    # live meeting for the same reason, and shares `_common.dispatch_line`.
     router.add_post(
-        BASE + "/meetings/{meeting_id}/reset", route(agents_routes.handle_reset_agents)
+        BASE + "/meetings/{meeting_id}/import", route(import_routes.handle_import_audio)
     )
 
     # Tasks
     router.add_get(BASE + "/meetings/{meeting_id}/tasks", route(tasks_routes.handle_get_tasks))
     router.add_post(BASE + "/meetings/{meeting_id}/tasks", route(tasks_routes.handle_add_task))
-    router.add_patch(
-        BASE + "/meetings/{meeting_id}/tasks", route(tasks_routes.handle_update_task)
-    )
-    router.add_delete(
-        BASE + "/meetings/{meeting_id}/tasks", route(tasks_routes.handle_delete_task)
-    )
+    router.add_patch(BASE + "/meetings/{meeting_id}/tasks", route(tasks_routes.handle_update_task))
+    router.add_delete(BASE + "/meetings/{meeting_id}/tasks", route(tasks_routes.handle_delete_task))
     router.add_post(
         BASE + "/meetings/{meeting_id}/tasks/file", route(tasks_routes.handle_file_task)
     )
@@ -252,6 +259,10 @@ def register_routes(app: web.Application) -> None:
     # so a hook-append failure can never break gateway startup.
     try:
         app.on_startup.append(_on_startup)
+        app.on_startup.append(calendar_poller.start_poller)
+        # Cleanup runs in order: stop the poller first so no tick can pre-create
+        # a meeting while the live session is being torn down.
+        app.on_cleanup.append(calendar_poller.stop_poller)
         app.on_cleanup.append(_on_cleanup)
     except Exception:  # pragma: no cover — defensive
         logger.warning("meetings: could not register lifecycle hooks", exc_info=True)

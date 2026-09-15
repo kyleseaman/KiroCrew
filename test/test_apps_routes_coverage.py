@@ -27,6 +27,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from aiohttp import web
+from aiohttp.client_exceptions import ClientConnectionResetError
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 import kiro_crew.apps.routes as routes_mod
@@ -308,8 +309,12 @@ async def test_list_apps_enriches_running_backend(
         routes_mod,
         "list_app_processes",
         lambda: [
-            {"app_name": APP, "port": 7999, "healthy": True, "pid": 4242},
-            {"app_name": "other-app", "port": 7998, "healthy": False, "pid": 1},
+            # Mirrors AppProcess.to_dict(): `running` is a real observation of the
+            # tracked process, not something the handler asserts from the row existing.
+            {"app_name": APP, "port": 7999, "healthy": True, "pid": 4242,
+             "running": True},
+            {"app_name": "other-app", "port": 7998, "healthy": False, "pid": 1,
+             "running": True},
         ],
     )
     async with TestClient(TestServer(_make_app())) as client:
@@ -323,6 +328,214 @@ async def test_list_apps_enriches_running_backend(
         "healthy": True,
         "pid": 4242,
     }
+
+
+@pytest.mark.asyncio
+async def test_list_apps_overwrites_the_trust_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _setup_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        routes_mod,
+        "list_apps",
+        lambda: [
+            {
+                "name": APP,
+                "sourceUrl": "HTTPS://Clone.Example.test/Owner/App.git/",
+                "trustRepository": "https://evil.example/spoof",
+            }
+        ],
+    )
+    monkeypatch.setattr(routes_mod, "list_app_processes", lambda: [])
+
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.get("/api/apps")
+        assert resp.status == 200
+        [entry] = await resp.json()
+
+    assert entry["trustRepository"] == "https://clone.example.test/Owner/App"
+
+
+@pytest.mark.asyncio
+async def test_list_apps_never_returns_embedded_clone_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _setup_env(tmp_path, monkeypatch)
+    secret = "SuperSecret"
+    monkeypatch.setattr(
+        routes_mod,
+        "list_apps",
+        lambda: [
+            {
+                "name": APP,
+                "sourceUrl": f"HTTPS://User:{secret}@Clone.Example.test/Owner/App.git/",
+                "manifest": {
+                    "name": APP,
+                    "repo": f"https://Manifest:{secret}@Clone.Example.test/Owner/App",
+                },
+            }
+        ],
+    )
+    monkeypatch.setattr(routes_mod, "list_app_processes", lambda: [])
+
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.get("/api/apps")
+        assert resp.status == 200
+        raw = await resp.text()
+
+    assert secret not in raw
+    [entry] = json.loads(raw)
+    assert entry["sourceUrl"] == "HTTPS://Clone.Example.test/Owner/App.git/"
+    assert entry["manifest"]["repo"] == "https://Clone.Example.test/Owner/App"
+    assert entry["trustRepository"] == "https://clone.example.test/Owner/App"
+
+
+@pytest.mark.asyncio
+async def test_list_apps_legacy_query_source_never_exposes_a_trust_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _setup_env(tmp_path, monkeypatch)
+    secret = "legacy-query-secret"
+    raw_source = (
+        f"https://clone.example.test/Owner/App.git?repo=A&access_token={secret}"
+    )
+    monkeypatch.setattr(
+        routes_mod,
+        "list_apps",
+        lambda: [
+            {
+                "name": APP,
+                "source": f"registry:{APP}",
+                "sourceUrl": raw_source,
+                "trustRepository": "https://evil.example/spoof",
+            }
+        ],
+    )
+    monkeypatch.setattr(routes_mod, "list_app_processes", lambda: [])
+
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.get("/api/apps")
+        body = await resp.text()
+
+    assert resp.status == 200
+    assert secret not in body
+    assert raw_source not in body
+    [entry] = json.loads(body)
+    assert entry["sourceUrl"] == "https://clone.example.test/Owner/App.git"
+    assert "trustRepository" not in entry
+
+
+@pytest.mark.asyncio
+async def test_get_app_overwrites_the_trust_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _setup_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        routes_mod,
+        "get_app",
+        lambda name: {
+            "name": name,
+            "sourceUrl": "https://clone.example.test/Owner/App.git",
+            "trustRepository": "https://evil.example/spoof",
+        },
+    )
+
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.get(f"/api/apps/{APP}")
+        assert resp.status == 200
+        entry = await resp.json()
+
+    assert entry["trustRepository"] == "https://clone.example.test/Owner/App"
+
+
+@pytest.mark.asyncio
+async def test_list_apps_resolves_legacy_registry_trust_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-provenance registry install must show the current clone target."""
+    _setup_env(tmp_path, monkeypatch)
+    clone_target = "https://clone.example.test/Owner/legacy-app"
+    monkeypatch.setattr(
+        routes_mod,
+        "list_apps",
+        lambda: [
+            {
+                "name": APP,
+                "source": f"registry:{APP}",
+                "trustRepository": "https://evil.example/spoof",
+            }
+        ],
+    )
+    monkeypatch.setattr(routes_mod, "list_app_processes", lambda: [])
+    monkeypatch.setattr(
+        "kiro_crew.apps.registry.get_registry_app",
+        lambda name: {"name": name, "gitUrl": f"{clone_target}.git"},
+    )
+
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.get("/api/apps")
+        assert resp.status == 200
+        [entry] = await resp.json()
+
+    assert entry["trustRepository"] == clone_target
+
+
+@pytest.mark.asyncio
+async def test_get_app_keeps_genuinely_local_app_repositoryless(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-named registry row must not be attached to a local install."""
+    _setup_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        routes_mod,
+        "get_app",
+        lambda name: {
+            "name": name,
+            "source": str(tmp_path / "local-source"),
+            "origin": "local",
+            "trustRepository": "https://evil.example/spoof",
+        },
+    )
+
+    def _must_not_resolve(_name: str):
+        pytest.fail("a local install must not fall through to the registry")
+
+    monkeypatch.setattr("kiro_crew.apps.registry.get_registry_app", _must_not_resolve)
+
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.get(f"/api/apps/{APP}")
+        assert resp.status == 200
+        entry = await resp.json()
+
+    assert "trustRepository" not in entry
+
+
+@pytest.mark.asyncio
+async def test_list_apps_reports_a_tracked_but_exited_backend_as_not_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A record outliving its process must not be reported as running.
+
+    The handler must not hardcode ``running: True`` for anything present in the process
+    table: a backend that has exited would be reported as up until something popped it.
+    """
+    _setup_env(tmp_path, monkeypatch)
+    _install(tmp_path)
+    monkeypatch.setattr(
+        routes_mod,
+        "list_app_processes",
+        lambda: [
+            {"app_name": APP, "port": 7999, "healthy": False, "pid": 4242,
+             "running": False},
+        ],
+    )
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.get("/api/apps")
+        assert resp.status == 200
+        rows = await resp.json()
+    entry = next(a for a in rows if a["name"] == APP)
+    assert entry["backend_status"]["running"] is False
+    assert entry["backend_status"]["healthy"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -382,19 +595,50 @@ class TestInstallValidation:
         assert not (home / "apps" / APP).exists()
 
     @pytest.mark.asyncio
-    async def test_unreadable_manifest_falls_back_to_path_lock(
+    async def test_unreadable_manifest_refuses_without_ownership_identity(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # A corrupt app.json must not 500 in the pre-flight version check —
-        # it falls through to install_app, which rejects it as a bad manifest.
         _setup_env(tmp_path, monkeypatch)
         src = tmp_path / "source" / APP
         src.mkdir(parents=True)
         (src / APP_MANIFEST_FILENAME).write_text("{ corrupt", encoding="utf-8")
+
+        def _must_not_install(*args: Any, **kwargs: Any) -> AppResult:
+            raise AssertionError("install must not proceed without a stable app identity")
+
+        monkeypatch.setattr(routes_mod, "install_app", _must_not_install)
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.post("/api/apps/install", json={"source": str(src)})
+            assert resp.status == 409
+            body = await resp.json()
+        assert body["code"] == "app_identity_unavailable"
+        assert body["retryable"] is True
+
+    @pytest.mark.asyncio
+    async def test_manifest_name_change_refuses_before_copy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = _setup_env(tmp_path, monkeypatch)
+        src = _make_app_source(tmp_path)
+        real_install = routes_mod.install_app
+
+        def _change_identity_then_install(
+            source: str, *, expected_name: str | None = None
+        ) -> AppResult:
+            manifest_path = Path(source) / APP_MANIFEST_FILENAME
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["name"] = "other-app"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            return real_install(source, expected_name=expected_name)
+
+        monkeypatch.setattr(routes_mod, "install_app", _change_identity_then_install)
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.post("/api/apps/install", json={"source": str(src)})
             assert resp.status == 400
-            assert (await resp.json())["ok"] is False
+            body = await resp.json()
+        assert body["code"] == "app_identity_changed"
+        assert not (home / "apps" / APP).exists()
+        assert not (home / "apps" / "other-app").exists()
 
     @pytest.mark.asyncio
     async def test_install_failure_is_reported_as_400(
@@ -406,6 +650,38 @@ class TestInstallValidation:
                 "/api/apps/install", json={"source": str(tmp_path / "nope")}
             )
             assert resp.status == 400
+            assert (await resp.json())["code"] == "source_not_directory"
+
+    @pytest.mark.asyncio
+    async def test_live_detached_startup_hook_refuses_fresh_reinstall(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        source = _make_app_source(tmp_path)
+        calls: list[tuple[str, bool]] = []
+
+        async def _stop_retained(app_name: str, *, bounded: bool) -> bool:
+            calls.append((app_name, bounded))
+            return False
+
+        monkeypatch.setattr(
+            routes_mod, "stop_retained_startup_hooks", _stop_retained
+        )
+
+        def _must_not_install(*args: Any, **kwargs: Any) -> AppResult:
+            raise AssertionError("install must not replace files while old code runs")
+
+        monkeypatch.setattr(routes_mod, "install_app", _must_not_install)
+
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.post(
+                "/api/apps/install", json={"source": str(source)}
+            )
+            assert resp.status == 409
+            body = await resp.json()
+        assert body["code"] == "startup_hook_still_running"
+        assert body["retryable"] is True
+        assert calls == [(APP, True)]
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +744,355 @@ class TestRegisterExternal:
             data = await resp.json()
         assert data["ok"] is True
         assert data["secret"]
+
+    @pytest.mark.asyncio
+    async def test_public_registration_cannot_mint_registry_provenance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.apps.manager import _read_installed
+
+        _setup_env(tmp_path, monkeypatch)
+        async with TestClient(TestServer(_make_app())) as client:
+            response = await client.post(
+                "/api/apps/register",
+                json={
+                    "name": "ext-app",
+                    "version": "1.0.0",
+                    "displayName": "External App",
+                    "source": "registry:ext-app",
+                    "origin": "registry",
+                },
+            )
+
+        assert response.status == 201
+        meta = _read_installed("ext-app")
+        assert meta is not None
+        assert meta.source == ""
+        assert meta.sourceUrl == ""
+        assert meta.origin == "external"
+
+    @pytest.mark.asyncio
+    async def test_public_registration_cannot_mint_builtin_ownership(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.apps.manager import _builtin_owns_install, _read_installed
+
+        _setup_env(tmp_path, monkeypatch)
+        async with TestClient(TestServer(_make_app())) as client:
+            first = await client.post(
+                "/api/apps/register",
+                json={
+                    "name": "ext-app",
+                    "version": "1.0.0",
+                    "displayName": "External App",
+                    "source": "builtin",
+                    "origin": "builtin",
+                },
+            )
+            second = await client.post(
+                "/api/apps/register",
+                json={
+                    "name": "ext-app",
+                    "version": "2.0.0",
+                    "displayName": "External App v2",
+                    "source": "builtin-app",
+                },
+            )
+
+        assert first.status == 201
+        assert second.status == 201
+        meta = _read_installed("ext-app")
+        assert meta is not None
+        assert meta.version == "2.0.0"
+        assert meta.source == "builtin-app"
+        assert meta.origin == "external"
+        assert not _builtin_owns_install(meta)
+
+    @pytest.mark.asyncio
+    async def test_registration_never_persists_or_returns_source_credentials(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.apps.manager import INSTALLED_META_FILENAME, app_dir
+
+        _setup_env(tmp_path, monkeypatch)
+        credential = "register-source-secret"
+        source = (
+            f"https://register-user:{credential}@clone.example.test/owner/ext-app.git"
+        )
+        safe_source = "https://clone.example.test/owner/ext-app.git"
+
+        async with TestClient(TestServer(_make_app())) as client:
+            registered = await client.post(
+                "/api/apps/register",
+                json={
+                    "name": "ext-app",
+                    "version": "1.0.0",
+                    "displayName": "External App",
+                    "source": source,
+                    "lifecycle": "app",
+                    "resources": "app",
+                },
+            )
+            assert registered.status == 201
+            assert credential not in await registered.text()
+
+            persisted = (
+                app_dir("ext-app") / INSTALLED_META_FILENAME
+            ).read_text(encoding="utf-8")
+            assert credential not in persisted
+            assert json.loads(persisted)["source"] == safe_source
+
+            detail = await client.get("/api/apps/ext-app")
+            listing = await client.get("/api/apps")
+            assert detail.status == 200
+            assert listing.status == 200
+            detail_text = await detail.text()
+            listing_text = await listing.text()
+
+        assert credential not in detail_text
+        assert credential not in listing_text
+        assert json.loads(detail_text)["source"] == safe_source
+        [listed] = json.loads(listing_text)
+        assert listed["source"] == safe_source
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "source,safe_source,secret",
+        [
+            (
+                "ssh://deploy:register-ssh-password@clone.example.test/owner/ext-app.git",
+                "ssh://deploy@clone.example.test/owner/ext-app.git",
+                "register-ssh-password",
+            ),
+            (
+                "deploy@clone.example.test:owner/ext-app.git",
+                "deploy@clone.example.test:owner/ext-app.git",
+                "",
+            ),
+            (
+                "deploy:scp-password@clone.example.test:owner/ext-app.git",
+                "deploy:scp-password@clone.example.test:owner/ext-app.git",
+                "",
+            ),
+            (
+                "https://clone.example.test/owner/ext-app.git?access_token=query-secret#private",
+                "https://clone.example.test/owner/ext-app.git",
+                "query-secret",
+            ),
+            (
+                "ftp://user:ftp-secret@clone.example.test/owner/ext-app.git?token=query-secret#private",
+                "ftp://clone.example.test/owner/ext-app.git",
+                "ftp-secret",
+            ),
+        ],
+    )
+    async def test_registration_source_preserves_paths_and_sanitizes_explicit_uris(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        source: str,
+        safe_source: str,
+        secret: str,
+    ) -> None:
+        from kiro_crew.apps.manager import INSTALLED_META_FILENAME, app_dir
+
+        _setup_env(tmp_path, monkeypatch)
+        async with TestClient(TestServer(_make_app())) as client:
+            registered = await client.post(
+                "/api/apps/register",
+                json={
+                    "name": "ext-app",
+                    "version": "1.0.0",
+                    "displayName": "External App",
+                    "source": source,
+                    "lifecycle": "app",
+                    "resources": "app",
+                },
+            )
+            assert registered.status == 201
+            detail = await client.get("/api/apps/ext-app")
+            listing = await client.get("/api/apps")
+            registered_text = await registered.text()
+            detail_text = await detail.text()
+            listing_text = await listing.text()
+
+        persisted = (app_dir("ext-app") / INSTALLED_META_FILENAME).read_text(
+            encoding="utf-8"
+        )
+        visible = "\n".join([registered_text, persisted, detail_text, listing_text])
+        if secret:
+            assert secret not in visible
+            assert source not in visible
+        assert json.loads(persisted)["source"] == safe_source
+        assert json.loads(detail_text)["source"] == safe_source
+        assert json.loads(listing_text)[0]["source"] == safe_source
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("repository_bound", [False, True])
+    async def test_registry_owned_refresh_preserves_server_provenance(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        repository_bound: bool,
+    ) -> None:
+        from kiro_crew.apps.manager import _read_installed, set_app_provenance
+        from kiro_crew.config.loader import _invalidate_config_cache
+
+        home = _setup_env(tmp_path, monkeypatch)
+        _invalidate_config_cache()
+        repository = "https://clone.example.test/owner/ext-app.git"
+        seeded = register_external_app(
+            "ext-app",
+            "1.0.0",
+            "External App",
+            source="registry:ext-app",
+            origin="registry",
+            resources="app",
+            lifecycle="app",
+            source_repository=repository,
+        )
+        assert seeded.ok, seeded.error
+        assert set_app_provenance(
+            "ext-app",
+            source="registry:ext-app",
+            url=repository,
+            registry="registry-A",
+            commit="a" * 40,
+            signer="release-key",
+        )
+        if repository_bound:
+            (home / "config.json").write_text(
+                json.dumps(
+                    {
+                        "agent": {
+                            "apps_allow_third_party": False,
+                            "apps_trusted": ["ext-app"],
+                            "apps_trusted_repositories": {"ext-app": repository},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _invalidate_config_cache()
+
+        async with TestClient(TestServer(_make_app())) as client:
+            response = await client.post(
+                "/api/apps/register",
+                json={
+                    "name": "ext-app",
+                    "version": "2.0.0",
+                    "displayName": "External App v2",
+                    "source": "https://caller.example.test/spoof.git",
+                    "origin": "external",
+                    "resources": "app",
+                    "lifecycle": "app",
+                },
+            )
+
+        assert response.status == 201
+        meta = _read_installed("ext-app")
+        assert meta is not None
+        assert meta.version == "2.0.0"
+        assert meta.displayName == "External App v2"
+        assert meta.source == "registry:ext-app"
+        assert meta.sourceUrl == repository
+        assert meta.sourceRegistry == "registry-A"
+        assert meta.sourceCommit == "a" * 40
+        assert meta.sourceSigner == "release-key"
+        assert meta.origin == "registry"
+
+    @pytest.mark.asyncio
+    async def test_public_refresh_waits_for_registry_transition_and_keeps_latest_pin(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The route lock prevents a stale pre-transition snapshot write-back."""
+        from kiro_crew.apps.manager import (
+            _read_installed,
+            app_lifecycle_lock,
+            set_app_provenance,
+        )
+
+        _setup_env(tmp_path, monkeypatch)
+        initial = register_external_app(
+            "ext-app",
+            "1.0.0",
+            "Local App",
+            source="C:/local/source",
+            origin="external",
+        )
+        assert initial.ok, initial.error
+
+        original_register = routes_mod.register_external_app
+        route_call_started = threading.Event()
+
+        def _observed_register(*args: Any, **kwargs: Any) -> AppResult:
+            route_call_started.set()
+            return original_register(*args, **kwargs)
+
+        monkeypatch.setattr(routes_mod, "register_external_app", _observed_register)
+        request_entered = asyncio.Event()
+
+        @web.middleware
+        async def _mark_request(request: web.Request, handler: Any) -> web.StreamResponse:
+            if request.path == "/api/apps/register":
+                request_entered.set()
+            return await handler(request)
+
+        app = web.Application(middlewares=[_mark_request])
+        register_app_routes(app)
+        repository = "https://clone.example.test/owner/ext-app.git"
+
+        async with TestClient(TestServer(app)) as client:
+            lock = app_lifecycle_lock("ext-app")
+            async with lock:
+                pending = asyncio.create_task(
+                    client.post(
+                        "/api/apps/register",
+                        json={
+                            "name": "ext-app",
+                            "version": "3.0.0",
+                            "displayName": "Refreshed App",
+                            "source": "C:/stale/request-source",
+                            "origin": "external",
+                        },
+                    )
+                )
+                await asyncio.wait_for(request_entered.wait(), timeout=2)
+                await asyncio.sleep(0)
+                assert not route_call_started.is_set()
+
+                transitioned = original_register(
+                    "ext-app",
+                    "2.0.0",
+                    "Registry App",
+                    source="registry:ext-app",
+                    origin="registry",
+                    source_repository=repository,
+                )
+                assert transitioned.ok, transitioned.error
+                assert set_app_provenance(
+                    "ext-app",
+                    source="registry:ext-app",
+                    url=repository,
+                    registry="registry-A",
+                    commit="a" * 40,
+                    signer="release-key",
+                )
+
+            response = await pending
+
+        assert response.status == 201
+        assert route_call_started.is_set()
+        meta = _read_installed("ext-app")
+        assert meta is not None
+        assert meta.version == "3.0.0"
+        assert meta.displayName == "Refreshed App"
+        assert meta.source == "registry:ext-app"
+        assert meta.sourceUrl == repository
+        assert meta.sourceRegistry == "registry-A"
+        assert meta.sourceCommit == "a" * 40
+        assert meta.sourceSigner == "release-key"
+        assert meta.origin == "registry"
 
     @pytest.mark.asyncio
     async def test_rejected_name_is_400(
@@ -534,12 +1159,50 @@ class TestUpdateApp:
             assert "source path required" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
-    async def test_registry_update_failure_keeps_resources(
+    async def test_live_detached_startup_hook_refuses_update(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        calls: list[tuple[str, bool]] = []
+
+        async def _stop_retained(
+            app_name: str, *, bounded: bool
+        ) -> bool:
+            calls.append((app_name, bounded))
+            return False
+
+        monkeypatch.setattr(
+            routes_mod, "stop_retained_startup_hooks", _stop_retained
+        )
+
+        def _must_not_update(*args: Any, **kwargs: Any) -> AppResult:
+            raise AssertionError("update must not replace files while old code runs")
+
+        monkeypatch.setattr(routes_mod, "update_app", _must_not_update)
+
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.post(f"/api/apps/{APP}/update", json={})
+            assert resp.status == 409
+            body = await resp.json()
+        assert body["code"] == "startup_hook_still_running"
+        assert body["retryable"] is True
+        assert calls == [(APP, True)]
+
+    @pytest.mark.asyncio
+    async def test_registry_update_delegates_admission_and_keeps_resources(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
         _install(tmp_path)
         deregistered: list[str] = []
+
+        async def _must_not_preflight(*args: Any, **kwargs: Any) -> bool:
+            raise AssertionError("registry admission belongs to install_from_registry")
+
+        monkeypatch.setattr(
+            routes_mod, "stop_retained_startup_hooks", _must_not_preflight
+        )
 
         async def _failed_install(name: str, **kwargs: Any) -> dict[str, Any]:
             return {"ok": False, "name": name, "error": "clone failed"}
@@ -589,8 +1252,11 @@ class TestUpdateApp:
             data = await resp.json()
         assert data["ok"] is True
         assert "registration" in data
-        # Old resources are only swapped out AFTER the re-install succeeded.
-        assert calls == ["deregister", "stop", "start"]
+        # Old resources are only swapped out AFTER the re-install succeeded — and the
+        # backend is stopped BEFORE they are scrubbed, so the health watch has lost its
+        # tracking record and cannot re-register the old manifest's MCP servers in
+        # between (see app-kit-platform §17).
+        assert calls == ["stop", "deregister", "start"]
 
     @pytest.mark.asyncio
     async def test_local_update_failure_restores_registration(
@@ -651,6 +1317,70 @@ class TestUpdateApp:
             data = await resp.json()
         assert data["ok"] is True
         assert "registration" in data
+
+    @pytest.mark.asyncio
+    async def test_app_token_cannot_replace_repository_bound_code_from_local_source(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The app-owned update API cannot turn repo A's grant into repo B code."""
+        home = _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+
+        from kiro_crew.apps.manager import get_app, set_app_provenance
+        from kiro_crew.config.loader import _invalidate_config_cache
+        from kiro_crew.dashboard.token_auth import generate_token, token_auth_middleware
+
+        reviewed = "https://clone.example.test/Owner/reviewed-app"
+        assert set_app_provenance(
+            APP,
+            source=f"registry:{APP}",
+            url=reviewed,
+        )
+        (home / "config.json").write_text(
+            json.dumps(
+                {
+                    "agent": {
+                        "apps_allow_third_party": False,
+                        "apps_trusted": [APP],
+                        "apps_trusted_repositories": {APP: reviewed},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        _invalidate_config_cache()
+        enabled = enable_app(APP)
+        assert enabled.ok, enabled.error
+
+        attacker_source = _make_app_source(
+            tmp_path / "attacker", version="9.9.9", displayName="Rebound Code"
+        )
+        (attacker_source / "attacker.py").write_text(
+            "raise RuntimeError('repository binding bypassed')\n", encoding="utf-8"
+        )
+
+        # This is a real app-claim token, not a handler-only identity stub. The
+        # auth middleware deliberately permits an app token on its own
+        # /api/apps/<name>/ namespace, so the lifecycle handler must enforce the
+        # repository boundary itself.
+        token = generate_token(APP, ttl_seconds=300, app=APP)
+        app = web.Application(middlewares=[token_auth_middleware()])
+        register_app_routes(app)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                f"/api/apps/{APP}/update",
+                params={"token": token},
+                json={"source": str(attacker_source)},
+            )
+            assert resp.status == 400
+            body = await resp.json()
+
+        assert body["code"] == "app_trust_repository_mismatch"
+        installed = get_app(APP)
+        assert installed is not None
+        assert installed["version"] == "1.0.0"
+        assert installed["sourceUrl"] == reviewed
+        assert not (home / "apps" / APP / "attacker.py").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -752,6 +1482,37 @@ class TestUninstallRefusals:
             resp = await client.post("/api/apps/locked-app/uninstall")
             assert resp.status == 400
             assert "lifecycle=locked" in (await resp.json())["error"]
+
+    @pytest.mark.asyncio
+    async def test_live_detached_startup_hook_refuses_uninstall(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        calls: list[tuple[str, bool]] = []
+
+        async def _stop_retained(
+            app_name: str, *, bounded: bool
+        ) -> bool:
+            calls.append((app_name, bounded))
+            return False
+
+        monkeypatch.setattr(
+            routes_mod, "stop_retained_startup_hooks", _stop_retained
+        )
+
+        def _must_not_uninstall(*args: Any, **kwargs: Any) -> AppResult:
+            raise AssertionError("uninstall must not delete files while old code runs")
+
+        monkeypatch.setattr(routes_mod, "uninstall_app", _must_not_uninstall)
+
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.post(f"/api/apps/{APP}/uninstall", json={})
+            assert resp.status == 409
+            body = await resp.json()
+        assert body["code"] == "startup_hook_still_running"
+        assert body["retryable"] is True
+        assert calls == [(APP, True)]
 
     @pytest.mark.asyncio
     async def test_removable_dependencies_are_cleaned_and_reported(
@@ -971,6 +1732,42 @@ class TestEnableBranches:
 
 class TestDisableBranches:
     @pytest.mark.asyncio
+    async def test_live_detached_startup_hook_refuses_disable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path)
+        enable_app(APP)
+        calls: list[tuple[str, bool]] = []
+
+        async def _stop_retained(app_name: str, *, bounded: bool) -> bool:
+            calls.append((app_name, bounded))
+            return False
+
+        monkeypatch.setattr(
+            routes_mod, "stop_retained_startup_hooks", _stop_retained
+        )
+
+        async def _must_not_teardown(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("disable must not wait on retained startup work")
+
+        def _must_not_disable(*args: Any, **kwargs: Any) -> AppResult:
+            raise AssertionError("disable metadata must remain unchanged on refusal")
+
+        monkeypatch.setattr(routes_mod, "teardown_app_runtime", _must_not_teardown)
+        monkeypatch.setattr(routes_mod, "disable_app", _must_not_disable)
+
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.post(f"/api/apps/{APP}/disable")
+            assert resp.status == 409
+            body = await resp.json()
+            app_resp = await client.get(f"/api/apps/{APP}")
+            assert (await app_resp.json())["enabled"] is True
+        assert body["code"] == "startup_hook_still_running"
+        assert body["retryable"] is True
+        assert calls == [(APP, True)]
+
+    @pytest.mark.asyncio
     async def test_not_installed_is_404(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -996,7 +1793,7 @@ class TestDisableBranches:
         # Patched on the SHARED teardown, not on `routes`: this PR routes the
         # disable path's hook/backend/onDisable work through
         # `apps/teardown.py::teardown_app_runtime`, the one implementation the
-        # trust-revocation path also calls, so `routes` no longer holds these
+        # trust-revocation path also calls, so `routes` does not hold these
         # symbols. The behaviour these tests pin is unchanged — the warnings still
         # surface on the disable response — only the module that owns the step moved.
         from kiro_crew.apps import teardown as teardown_mod
@@ -1036,7 +1833,7 @@ class TestDisableBranches:
         # Patched on the SHARED teardown, not on `routes`: this PR routes the
         # disable path's hook/backend/onDisable work through
         # `apps/teardown.py::teardown_app_runtime`, the one implementation the
-        # trust-revocation path also calls, so `routes` no longer holds these
+        # trust-revocation path also calls, so `routes` does not hold these
         # symbols. The behaviour these tests pin is unchanged — the warnings still
         # surface on the disable response — only the module that owns the step moved.
         from kiro_crew.apps import teardown as teardown_mod
@@ -1059,12 +1856,13 @@ class TestDisableBranches:
         enable_app(APP)
 
         async def _hooks(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            assert kwargs["bounded_startup_cleanup"] is False
             return {"cron_cleanup": "2 job(s) left enabled", "other": 1}
 
         # Patched on the SHARED teardown, not on `routes`: this PR routes the
         # disable path's hook/backend/onDisable work through
         # `apps/teardown.py::teardown_app_runtime`, the one implementation the
-        # trust-revocation path also calls, so `routes` no longer holds these
+        # trust-revocation path also calls, so `routes` does not hold these
         # symbols. The behaviour these tests pin is unchanged — the warnings still
         # surface on the disable response — only the module that owns the step moved.
         from kiro_crew.apps import teardown as teardown_mod
@@ -1466,6 +2264,50 @@ class TestRegistryInstallStream:
             events = _sse_events(await resp.text())
         assert json.loads(events[-1][1])["error"] == "clone exploded"
 
+    @pytest.mark.asyncio
+    async def test_client_gone_at_write_eof_is_not_an_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A browser tab closed mid-install makes the final write_eof raise
+        # ClientConnectionResetError ("Cannot write to closing transport").
+        # That is a routine disconnect, not a server error — it must not
+        # escape the handler, where aiohttp would log an unhandled
+        # "Error handling request" traceback.
+        _setup_env(tmp_path, monkeypatch)
+
+        async def _failed(name: str, log_lines: Any = None, **kw: Any) -> dict:
+            return {"ok": False, "name": name, "error": "build failed"}
+
+        monkeypatch.setattr(routes_mod, "install_from_registry", _failed)
+
+        writes: list[bytes] = []
+
+        async def _prepare(self, request):  # noqa: ANN001 - stub mirrors aiohttp
+            return None
+
+        async def _write(self, data):  # noqa: ANN001 - stub mirrors aiohttp
+            writes.append(bytes(data))
+
+        async def _gone(self, data=b""):  # noqa: ANN001 - stub mirrors aiohttp
+            raise ClientConnectionResetError("Cannot write to closing transport")
+
+        monkeypatch.setattr(web.StreamResponse, "prepare", _prepare)
+        monkeypatch.setattr(web.StreamResponse, "write", _write)
+        monkeypatch.setattr(web.StreamResponse, "write_eof", _gone)
+
+        request = MagicMock()
+
+        async def _json() -> dict:
+            return {"name": "some-app"}
+
+        request.json = _json
+
+        resp = await routes_mod.handle_registry_install_stream(request)
+
+        assert isinstance(resp, web.StreamResponse)
+        # The done event was still flushed before the client vanished.
+        assert any(b"event: done" in w for w in writes)
+
 
 # ---------------------------------------------------------------------------
 # GET /apps/{name}/ui/{path} — path and type validation
@@ -1779,7 +2621,7 @@ class TestNoEntryBlobCloneUrlResolution:
     async def test_no_entry_branch_does_not_re_read_the_registry(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # REGRESSION (PR 5027 round 4 — GPT 5.6 BLOCKING: registry cache re-read
+        # Invariant (registry cache re-read
         # blocks the event loop).  Before the subtraction the no-entry branch ran
         # ``clone_url = _registry_git_url(repo)``, which re-consulted
         # ``get_registry_app_by_repo`` — an unbounded SYNCHRONOUS registry
@@ -1862,7 +2704,7 @@ class TestBlobProxy:
     async def test_ref_with_traversal_is_rejected_400(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ref: str
     ) -> None:
-        # REGRESSION (PR 5027 round 6 — GPT 5.6 BLOCKING: ``ref`` cache-path
+        # Invariant (``ref`` cache-path
         # traversal).  ``ref`` becomes a path segment in the blob cache tree
         # (``.../{repo_key}/{ref}/{file_path}``).  ``_SAFE_REF_RE`` permits ``.``
         # and ``/``, so ``../<other-repo-key>/main`` matches the regex; the
@@ -1934,7 +2776,7 @@ class TestBlobProxy:
     async def test_repo_key_reuse_across_registries_does_not_serve_stale_bytes(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # REGRESSION (PR 5027 round 6 — GPT 5.6 BLOCKING: private cache entries
+        # Invariant (private cache entries
         # outlive their provenance).  ``_blob_cache_key`` once keyed the cache dir
         # on the ``repo`` STRING alone.  Chain: registry A (private) caches a blob
         # under repo key X; A is removed and registry B is later configured reusing
@@ -2063,7 +2905,7 @@ class TestBlobProxy:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # The resolved-path check must fire BEFORE any mkdir, so a symlinked
-        # cache subtree cannot be used to write outside the blob cache root.
+        # cache subtree cannot write outside the blob cache root.
         _setup_env(tmp_path, monkeypatch)
         monkeypatch.setattr(routes_mod, "known_registry_repos", lambda: {"acme"})
         # The cache key is provenance-bound, so the handler resolves a clone URL
@@ -2111,7 +2953,7 @@ class TestBlobProxy:
         assert not _is_safe_repo_identifier("org/app")
 
 # ---------------------------------------------------------------------------
-# Blob-fetch credential posture (same-repo carve-out, PR 918 extended to the
+# Blob-fetch credential posture (same-repo carve-out at the
 # third clone chokepoint).  These pin the env + sandbox-mode PAIR the blob
 # clone uses per origin, without asserting raw git argv (wrap_argv is patched
 # to capture only the mode it was handed).
@@ -2137,6 +2979,98 @@ class _FakeProc:
 class TestFetchGitBlobCredentialPosture:
     """``_fetch_git_blob`` picks env + sandbox mode from ``owner_designated``."""
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "deploy:password@example.invalid:Owner/Repo.git",
+            "ssh://deploy:password@example.invalid/Owner/Repo.git",
+        ],
+    )
+    async def test_ambiguous_git_target_refuses_before_ssrf_gate_or_clone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str
+    ) -> None:
+        import kiro_crew.apps.registry as reg_mod
+
+        def _must_not_check_host(url: str) -> bool:
+            raise AssertionError("ambiguous Git target must fail before the host gate")
+
+        async def _must_not_spawn(*args: Any, **kwargs: Any):
+            raise AssertionError("ambiguous Git target must fail before clone")
+
+        monkeypatch.setattr(reg_mod, "is_clone_host_trusted", _must_not_check_host)
+        monkeypatch.setattr(routes_mod, "create_subprocess_limited", _must_not_spawn)
+
+        assert not await routes_mod._fetch_git_blob(
+            "acme",
+            "main",
+            "assets/logo.png",
+            tmp_path / "out.png",
+            git_url=raw,
+        )
+
+    @pytest.mark.asyncio
+    async def test_embedded_http_credential_uses_split_fetch_only(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Blob checkout must never inherit the one-shot HTTP credential."""
+        import kiro_crew.apps.registry as reg_mod
+
+        raw = "https://user:secret@example.invalid/owner/registry.git"
+        safe = "https://example.invalid/owner/registry.git"
+        captured: dict[str, Any] = {}
+
+        monkeypatch.setattr(reg_mod, "is_clone_host_trusted", lambda url: True)
+        monkeypatch.setattr(routes_mod, "minimal_env", lambda **extra: {"BASE": "1"})
+        monkeypatch.setattr(
+            routes_mod, "_context_clone_sandbox_mode", lambda url: "context-mode"
+        )
+        monkeypatch.setattr(routes_mod, "_sel_credential_grant", lambda *args: None)
+
+        async def _split_fetch(
+            git_url: str,
+            branch: str,
+            dest: Path,
+            log_lines: list[str],
+            **kwargs: Any,
+        ) -> None:
+            captured.update(
+                git_url=git_url,
+                branch=branch,
+                dest=dest,
+                credential_target=kwargs["credential_target"],
+                clone_env=kwargs["clone_env"],
+                sandbox_mode=kwargs["sandbox_mode"],
+            )
+            (dest / "assets").mkdir(parents=True)
+            (dest / "assets" / "logo.png").write_bytes(b"png")
+            return None
+
+        async def _must_not_clone(*args: Any, **kwargs: Any) -> None:
+            raise AssertionError("credentialed blob path must not use combined git clone")
+
+        monkeypatch.setattr(routes_mod, "_git_fetch_branch", _split_fetch)
+        monkeypatch.setattr(routes_mod, "create_subprocess_limited", _must_not_clone)
+
+        cache_path = tmp_path / "cache" / "logo.png"
+        assert await routes_mod._fetch_git_blob(
+            "acme",
+            "main",
+            "assets/logo.png",
+            cache_path,
+            git_url=raw,
+            owner_designated=True,
+        )
+
+        assert cache_path.read_bytes() == b"png"
+        assert captured["git_url"] == safe
+        assert captured["credential_target"] == raw
+        assert captured["branch"] == "main"
+        assert captured["clone_env"] == {"BASE": "1"}
+        assert captured["sandbox_mode"] == "context-mode"
+        assert "secret" not in repr(captured["clone_env"])
+        assert not captured["dest"].parent.exists()
+
     def _capture(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -2155,7 +3089,7 @@ class TestFetchGitBlobCredentialPosture:
         # ``_fetch_git_blob`` (part of the untouched SSRF gate), so it is patched on
         # the registry module.  The credential-posture helpers, by contrast, were
         # hoisted to ``routes`` module scope, so they are patched there — patching
-        # ``reg_mod`` would no longer intercept the module-level name.
+        # ``reg_mod`` would not intercept the module-level name.
         monkeypatch.setattr(reg_mod, "is_clone_host_trusted", lambda url: True)
         # Sentinel env dicts so the test asserts WHICH builder was used without
         # depending on the host's real environment contents.
@@ -2202,7 +3136,7 @@ class TestFetchGitBlobCredentialPosture:
 
         # Control: an owner-designated entry whose URL is ``url``.  The caller
         # threads ``git_url=url`` — the SAME URL the carve-out was decided for —
-        # so the carve-out is honored.  ``_fetch_git_blob`` no longer re-resolves
+        # so the carve-out is honored.  ``_fetch_git_blob`` does not re-resolve
         # from ``repo``; it uses the threaded value for both the decision and the
         # clone.
         ok = await routes_mod._fetch_git_blob(
@@ -2252,7 +3186,7 @@ class TestFetchGitBlobCredentialPosture:
     async def test_injected_cloneurl_never_becomes_the_credentialed_clone_target(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # REGRESSION (PR 5027 cross-registry finding), now enforced by CONSTRUCTION
+        # Enforced by CONSTRUCTION
         # rather than a downgrade recheck.  Two registries are configured — A
         # (repo=urlA) and B (repo=urlB, a separately-configured PRIVATE registry).
         # A's untrusted index injects an app entry that carries an explicit
@@ -2262,7 +3196,7 @@ class TestFetchGitBlobCredentialPosture:
         # injected ``cloneUrl`` while the credential decision used ``_entry_git_url``,
         # so the two resolvers named different URLs and the clone could reach urlB
         # with owner credentials.  The subtraction deletes the divergence: that
-        # resolver is gone and ``cloneUrl`` is no longer read anywhere, so the only
+        # resolver is gone and ``cloneUrl`` is not read anywhere, so the only
         # URL that can reach the clone is the one the caller threads — urlA, the
         # entry's own ``gitUrl``, byte-identical to the URL the carve-out was
         # decided for.  urlB is never the clone target, credentialed or otherwise,
@@ -2392,6 +3326,64 @@ class TestBlobProxyOwnerDesignatedWiring:
         assert await self._owner_designated_for(tmp_path, monkeypatch, entry=entry) is True
 
     @pytest.mark.asyncio
+    async def test_sanitized_same_repo_row_rehydrates_transport_for_split_fetch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Retained rows stay public while the exact config target reaches fetch."""
+        import kiro_crew.apps.registry as reg_mod
+
+        _setup_env(tmp_path, monkeypatch)
+        raw = "https://user:secret@example.invalid/org/registry.git"
+        safe = "https://example.invalid/org/registry.git"
+        entry = {
+            "repo": safe,
+            "gitUrl": safe,
+            "branch": "main",
+            "_registry": "corp",
+        }
+        monkeypatch.setattr(routes_mod, "known_registry_repos", lambda: {"acme"})
+        monkeypatch.setattr(routes_mod, "get_registry_app_by_repo", lambda repo: entry)
+        monkeypatch.setattr(routes_mod, "_repo_key_owner_count", lambda repo: 1)
+        monkeypatch.setattr(
+            reg_mod,
+            "_effective_registries",
+            lambda: [SimpleNamespace(name="corp", repo=raw)],
+        )
+
+        seen: dict[str, Any] = {}
+
+        async def _record(
+            repo: str,
+            ref: str,
+            file_path: str,
+            cache_path: Path,
+            *,
+            git_url: str,
+            owner_designated: bool = False,
+            credential_target: str | None = None,
+        ) -> bool:
+            seen.update(
+                git_url=git_url,
+                owner_designated=owner_designated,
+                credential_target=credential_target,
+                cache_path=cache_path,
+            )
+            return False
+
+        monkeypatch.setattr(routes_mod, "_fetch_git_blob", _record)
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(
+                "/api/apps/blob",
+                params={"repo": "acme", "path": "logo.png", "ref": "main"},
+            )
+            assert resp.status == 502
+
+        assert seen["git_url"] == safe
+        assert seen["credential_target"] == raw
+        assert seen["owner_designated"] is True
+        assert "secret" not in str(seen["cache_path"])
+
+    @pytest.mark.asyncio
     async def test_configured_branch_ref_is_owner_designated(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2416,7 +3408,7 @@ class TestBlobProxyOwnerDesignatedWiring:
     async def test_query_ref_differing_from_configured_branch_is_not_owner_designated(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # REGRESSION (PR 5027 round 6 — GPT 5.6 BLOCKING: the credential grant
+        # Invariant (the credential grant
         # ignored the effective ref).  ``ref`` falls back to the entry's
         # configured branch ONLY when the query param is empty; a caller can
         # otherwise supply any ``_SAFE_REF_RE``-valid ``ref`` (e.g.
@@ -2520,7 +3512,7 @@ class TestBlobProxyOwnerDesignatedWiring:
     async def test_concurrent_refresh_cannot_redirect_credentialed_clone(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # REGRESSION (PR 5027 round 3 — TOCTOU between the credential decision and
+        # Invariant (TOCTOU between the credential decision and
         # the clone).  ``handle_blob_proxy`` decides ``owner_designated`` and
         # resolves the clone URL from ONE registry entry, then threads that URL
         # into ``_fetch_git_blob``.  The bug this pins: if the callee re-resolved
@@ -2611,7 +3603,7 @@ class TestBlobProxyOwnerDesignatedWiring:
     async def test_ambiguous_provenance_downgrades_to_anonymous_strict(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # REGRESSION (PR 5027 round 5 — GPT 5.6 BLOCKING: cross-registry confused
+        # Invariant (cross-registry confused
         # deputy).  ``get_registry_app_by_repo`` selects the entry by ``repo`` key
         # alone (bundled first, then each external registry), provenance-blind.  If
         # two configured registries — A (owner-designated for repo key X) and B (a
@@ -2696,7 +3688,7 @@ class TestBlobProxyOwnerDesignatedWiring:
     async def test_owner_designated_branch_resolves_sandbox_mode_off_the_event_loop(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # REGRESSION (PR 5027 round 5 — Opus 4.8 BLOCKING: synchronous config-load
+        # Invariant (synchronous config-load
         # on the event loop).  Inside ``_fetch_git_blob``'s ``owner_designated``
         # branch, ``_context_clone_sandbox_mode(git_url)`` flows
         # ``_configured_registry_hosts`` -> ``_effective_registries`` ->
@@ -2875,11 +3867,24 @@ class _FakeSession:
         return None
 
 
-async def _swap_proxy_session(app: web.Application, exc: BaseException) -> None:
-    real = app.get("_proxy_session")
-    if real is not None and not real.closed:
-        await real.close()
-    app["_proxy_session"] = _FakeSession(exc)
+def _fail_proxy_backend_with(app: web.Application, exc: BaseException) -> None:
+    """Make the proxy's outbound session raise ``exc``, installed BEFORE start.
+
+    ``register_app_routes`` creates the real ``ClientSession`` in an
+    ``on_startup`` hook; hooks run in registration order, so this one runs
+    right after it, closes the real session (its connector would otherwise
+    outlive the test) and installs the fake while the app is still mutable.
+    An ``app[...]`` write after the test server has started is deprecated by
+    aiohttp.
+    """
+
+    async def _swap(app_: web.Application) -> None:
+        real = app_.get("_proxy_session")
+        if real is not None and not real.closed:
+            await real.close()
+        app_["_proxy_session"] = _FakeSession(exc)
+
+    app.on_startup.append(_swap)
 
 
 class TestApiProxyAuthorization:
@@ -2967,8 +3972,8 @@ class TestApiProxyAuthorization:
             routes_mod, "_resolve_app_backend_url", lambda n: "http://127.0.0.1:1"
         )
         app = _make_app()
+        _fail_proxy_backend_with(app, aiohttp.ClientError("refused"))
         async with TestClient(TestServer(app)) as client:
-            await _swap_proxy_session(client.app, aiohttp.ClientError("refused"))
             resp = await client.get(f"/apps/{APP}/api/ping")
             assert resp.status == 502
             assert (await resp.json())["error"] == "backend unreachable"
@@ -2986,8 +3991,8 @@ class TestApiProxyAuthorization:
             routes_mod, "_resolve_app_backend_url", lambda n: "http://127.0.0.1:1"
         )
         app = _make_app()
+        _fail_proxy_backend_with(app, asyncio.TimeoutError())
         async with TestClient(TestServer(app)) as client:
-            await _swap_proxy_session(client.app, asyncio.TimeoutError())
             resp = await client.post(f"/apps/{APP}/api/run", json={"x": 1})
             assert resp.status == 504
             assert (await resp.json())["error"] == "backend timeout"
@@ -3189,3 +4194,203 @@ def test_disable_route_normalizes_the_name_before_the_builtin_lookup():
     assert 'name.replace("-", "_")' in src, (
         "the disable handler must normalize the manifest name before testing "
         "membership in BUILTIN_NAMES / importing the package")
+
+
+@pytest.mark.asyncio
+async def test_update_stops_the_backend_before_deregistering_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Teardown order is load-bearing, not cosmetic.
+
+    `stop_app_backend` pops the tracking record, which is what stops the health watch
+    from reconciling MCP for the app. Deregistering first leaves a window in which a
+    recovering backend re-registers the OLD manifest's servers, so entries the update
+    removed survive it. Uninstall and the disable rollback already stop first; these are
+    the paths that did not.
+    """
+    _setup_env(tmp_path, monkeypatch)
+    _install(tmp_path)
+    order: list[str] = []
+
+    async def _fake_deregister(name: str):
+        order.append("deregister")
+        return SimpleNamespace(to_dict=lambda: {})
+
+    monkeypatch.setattr(routes_mod, "_deregister_app_off_loop", _fake_deregister)
+    monkeypatch.setattr(
+        routes_mod, "stop_app_backend", lambda name: order.append("stop") or True
+    )
+    monkeypatch.setattr(
+        routes_mod, "update_app", lambda *a, **k: {"success": False, "error": "stop here"}
+    )
+
+    async with TestClient(TestServer(_make_app())) as client:
+        await client.post(f"/api/apps/{APP}/update", json={"source": str(tmp_path / "src")})
+
+    assert order[:2] == ["stop", "deregister"], (
+        f"backend must be stopped before its resources are scrubbed, got {order}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_enable_does_not_re_register_after_the_backend_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Enable must not re-register MCP after start_app_backend returns.
+
+    A call made here is queued behind the handler, so the adopted backend's watch can
+    demote and scrub in between — and the queued write would then restore the dead url,
+    without updating `mcp_healthy`, so the watch would never notice the disagreement.
+    The adoption path registers through the serialized transition instead, before its
+    watch is armed.
+    """
+    _setup_env(tmp_path, monkeypatch)
+    _install(tmp_path)
+    called: list[str] = []
+    import kiro_crew.apps.bridges as bridges_mod
+    monkeypatch.setattr(
+        bridges_mod, "reregister_app_mcp_servers",
+        lambda name, live_port=None, io_failures=None: called.append(name) or [],
+    )
+    monkeypatch.setattr(
+        routes_mod, "start_app_backend",
+        lambda name: SimpleNamespace(
+            healthy=True, port=7999, to_dict=lambda: {"port": 7999}
+        ),
+    )
+
+    async with TestClient(TestServer(_make_app())) as client:
+        await client.post(f"/api/apps/{APP}/enable", json={})
+
+    assert called == [], "enable re-registered after start; the adoption path owns that"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["prepare", "write", "write_eof"])
+async def test_app_ui_stream_client_disconnect_is_quiet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    """A closed tab is routine at every UI-file response boundary."""
+    home = _setup_env(tmp_path, monkeypatch)
+    ui = home / "apps" / APP / "ui"
+    ui.mkdir(parents=True)
+    (ui / "app.js").write_bytes(b"console.log('ok')")
+
+    calls: list[str] = []
+
+    async def _prepare(self: web.StreamResponse, request: web.Request) -> None:
+        calls.append("prepare")
+        if boundary == "prepare":
+            raise ClientConnectionResetError("Cannot write to closing transport")
+
+    async def _write(self: web.StreamResponse, data: bytes) -> None:
+        calls.append("write")
+        if boundary == "write":
+            raise ClientConnectionResetError("Cannot write to closing transport")
+
+    async def _write_eof(self: web.StreamResponse, data: bytes = b"") -> None:
+        calls.append("write_eof")
+        if boundary == "write_eof":
+            raise ClientConnectionResetError("Cannot write to closing transport")
+
+    monkeypatch.setattr(web.StreamResponse, "prepare", _prepare)
+    monkeypatch.setattr(web.StreamResponse, "write", _write)
+    monkeypatch.setattr(web.StreamResponse, "write_eof", _write_eof)
+
+    request = MagicMock()
+    request.match_info = {"name": APP, "path": "app.js"}
+    request.if_none_match = ()
+    request.if_modified_since = None
+
+    response = await routes_mod.handle_app_ui_file(request)
+
+    assert isinstance(response, web.StreamResponse)
+    expected = {
+        "prepare": ["prepare"],
+        "write": ["prepare", "write"],
+        "write_eof": ["prepare", "write", "write_eof"],
+    }
+    assert calls == expected[boundary]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["prepare", "write", "write_eof"])
+async def test_app_proxy_stream_client_disconnect_is_quiet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    """A closed browser must not turn a successful upstream stream into 502."""
+    _setup_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(routes_mod, "is_app_enabled", lambda name: True)
+    monkeypatch.setattr(
+        routes_mod,
+        "_resolve_app_backend_url",
+        lambda name: "http://127.0.0.1:7777",
+    )
+    monkeypatch.setattr(routes_mod, "_get_app_secret", lambda name: "proxy-secret")
+
+    class _Content:
+        async def iter_any(self):  # noqa: ANN202 - aiohttp stream stub
+            yield b"upstream payload"
+
+    class _Upstream:
+        status = 200
+        headers: dict[str, str] = {}
+        content = _Content()
+
+    class _Context:
+        async def __aenter__(self) -> _Upstream:
+            return _Upstream()
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+    class _Session:
+        closed = False
+
+        def request(self, **kwargs: Any) -> _Context:
+            return _Context()
+
+    calls: list[str] = []
+
+    async def _prepare(self: web.StreamResponse, request: web.Request) -> None:
+        calls.append("prepare")
+        if boundary == "prepare":
+            raise ClientConnectionResetError("Cannot write to closing transport")
+
+    async def _write(self: web.StreamResponse, data: bytes) -> None:
+        calls.append("write")
+        if boundary == "write":
+            raise ClientConnectionResetError("Cannot write to closing transport")
+
+    async def _write_eof(self: web.StreamResponse, data: bytes = b"") -> None:
+        calls.append("write_eof")
+        if boundary == "write_eof":
+            raise ClientConnectionResetError("Cannot write to closing transport")
+
+    monkeypatch.setattr(web.StreamResponse, "prepare", _prepare)
+    monkeypatch.setattr(web.StreamResponse, "write", _write)
+    monkeypatch.setattr(web.StreamResponse, "write_eof", _write_eof)
+
+    request = MagicMock()
+    request.match_info = {"name": APP, "path": "ping"}
+    request.get = lambda key, default="": default
+    request.rel_url = routes_mod.yarl.URL("/apps/cov-test-app/api/ping")
+    request.headers = {}
+    request.can_read_body = False
+    request.method = "GET"
+    request.app = {"_proxy_session": _Session()}
+
+    response = await routes_mod.handle_app_api_proxy(request)
+
+    assert isinstance(response, web.StreamResponse)
+    assert response.status == 200
+    expected = {
+        "prepare": ["prepare"],
+        "write": ["prepare", "write"],
+        "write_eof": ["prepare", "write", "write_eof"],
+    }
+    assert calls == expected[boundary]

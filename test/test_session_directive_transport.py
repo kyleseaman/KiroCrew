@@ -1,4 +1,4 @@
-"""Transport-level regression tests for session directives (#755).
+"""Transport-level tests for session directives.
 
 These lock the hops that the existing seam tests CANNOT see. Those tests build
 ``AcpEvent`` objects directly with ``tool_output`` already set to a pristine
@@ -9,17 +9,25 @@ feature shipped dead with 21,840 tests green.
 Each test here drives a REAL boundary end-to-end:
 
 * ``build_tool_response`` — the MCP server's single response exit point, which
-  used to strip every category-``Cf`` character and so removed the sentinel's
-  U+2063 prefix before the response reached the wire.
+  must not strip every category-``Cf`` character, or it removes the sentinel's
+  U+2063 prefix before the response reaches the wire.
 * ``_build_tool_result_event`` — the ACP result parser, whose ``rawOutput``
-  ``Json`` branch used to ``json.dumps`` the MCP content envelope, escaping the
-  payload's quotes and non-ASCII so the marker line could not be parsed.
+  ``Json`` branch must not ``json.dumps`` the MCP content envelope, which escapes the
+  payload's quotes and non-ASCII so the marker line cannot be parsed.
+
+These pin the kiro-cli marker path only. A backend that reshapes the result body
+(KAS re-serialises, duplicates and caps it) is not a transport concern for
+directives: the out-of-band record is claimed by the tool CALL's input digest,
+never by anything read out of the result -- see
+``test_session_directive_input_digest.py``.
 """
 
 import json
 
 from kiro_crew import session_directive as sd
 from kiro_crew.acp._dispatch import _build_tool_result_event, _mcp_content_text
+from kiro_crew.mcp_apps_render import find_marker
+from kiro_crew.mcp_gateway.apps import append_marker
 from kiro_crew.validation import build_tool_response, strip_hidden_unicode
 
 DIRECTIVE_ARGS = {"questions": [{"question": "pick one"}]}
@@ -167,3 +175,54 @@ class TestRefusalMarkerSurvivesTransport:
         assert event is not None
         assert event.tool_final is True
         assert sd.is_refusal(event.tool_output)
+
+
+class TestMcpAppMarkerSurvivesResultCuts:
+    """The MCP App render marker must survive both truncation cuts in
+    ``_build_tool_result_event`` — the per-part 4000-char cut and the 8000-char
+    join cut — or ``mcp_apps_render.find_marker`` never sees it and the app
+    never mounts. The gateway prepends the marker at offset 0 of
+    the first text block, and the parser re-injects it after the join cut."""
+
+    def _marker(self) -> str:
+        # A valid marker carries a 32-lowercase-hex spool id.
+        return "[kirocrew-mcp-app:" + "a" * 32 + "]"
+
+    def _id(self) -> str:
+        return "a" * 32
+
+    def test_marker_survives_long_single_block(self):
+        # Drive the marker through the real producer ``append_marker`` on a
+        # LONG (>4000-char) first block, then feed the marked envelope through
+        # the parser. The producer decides the marker's byte offset, so this
+        # regresses the fix: with the prepend it sits at offset 0 and rides the
+        # per-part 4000-char cut, but the old end-append put it past 20000 chars
+        # where the ``[:4000]`` slice drops it and ``find_marker`` returns None.
+        marked = append_marker({"content": [{"type": "text", "text": "x" * 20000}]}, self._id())
+        update = {
+            "toolCallId": "tc-long",
+            "status": "completed",
+            "rawOutput": {"items": [{"Json": marked}]},
+        }
+        event = _build_tool_result_event(update)
+        assert event is not None
+        assert find_marker(event.tool_output) == self._id()
+
+    def test_marker_survives_multi_part_join_cut(self):
+        # Two prior ~4000-char parts push the marker part's offset-0 marker
+        # past the 8000-char join cut; the parser must re-inject it so it stays
+        # detectable.
+        update = {
+            "toolCallId": "tc-multi",
+            "status": "completed",
+            "rawOutput": {
+                "items": [
+                    {"Text": "a" * 4000},
+                    {"Text": "b" * 4000},
+                    {"Json": _mcp_envelope(self._marker() + " drawn")},
+                ]
+            },
+        }
+        event = _build_tool_result_event(update)
+        assert event is not None
+        assert find_marker(event.tool_output) == self._id()

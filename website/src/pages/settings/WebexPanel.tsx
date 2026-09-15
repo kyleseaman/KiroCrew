@@ -5,6 +5,7 @@ import { WebexIcon } from '../../components/WebexIcon'
 import { SettingsSection, SettingsCard, SettingsInput, SettingsToggle } from '../../components/settings'
 import { SecretField } from '../../components/SecretField'
 import { Btn } from '../../components/ui'
+import ErrorNotice from '../../components/ErrorNotice'
 import { TagListEditor } from './SlackPanel'
 import { api, type WebexConfigData, type WebexConfigSave } from '../../api/client'
 
@@ -27,6 +28,12 @@ function isValidEmail(v: string): boolean {
 type Draft = {
   enabled: boolean
   allowed_emails: string[]
+  allow_group_rooms: boolean
+  allowed_room_ids: string[]
+  reply_in_thread: boolean
+  /** Kept as strings while editing, so a half-typed value is not coerced. */
+  soft_threshold_pct: string
+  hard_threshold_pct: string
   /** Whether this channel files its sessions in a folder at all (off = unfiled). */
   session_folder_on: boolean
   /** Folder name, kept while the toggle is off so turning it back on restores it. */
@@ -37,6 +44,11 @@ function draftFrom(c: WebexConfigData): Draft {
   return {
     enabled: c.enabled,
     allowed_emails: [...c.allowed_emails],
+    allow_group_rooms: !!c.allow_group_rooms,
+    allowed_room_ids: [...(c.allowed_room_ids ?? [])],
+    reply_in_thread: c.reply_in_thread ?? true,
+    soft_threshold_pct: String(c.soft_threshold_pct ?? 80),
+    hard_threshold_pct: String(c.hard_threshold_pct ?? 95),
     // A configured name IS the on-state — the backend has one field, where ""
     // means off, so the toggle is derived rather than separately persisted.
     session_folder_on: !!c.session_folder,
@@ -59,13 +71,33 @@ function StatusBadge({ config }: { config: WebexConfigData }) {
   )
 }
 
+/**
+ * The bot's startup failure (`connect_error`), kept apart from
+ * {@link connectionHint}: it is the outcome of something that FAILED, so it
+ * renders through `ErrorNotice`, while the hints describe a state that has not
+ * gone wrong yet.
+ */
+function connectError(config: WebexConfigData): string {
+  if (config.connected || !config.connect_error) return ''
+  return i18nT('pages.settings.webexPanel.connection_failed', { error: config.connect_error })
+}
+
 /** One-line explanation of WHY Webex is not active, with the fix. */
 function connectionHint(config: WebexConfigData): string {
-  if (config.connected || !config.configured) return ''
-  if (config.connect_error) {
-    return i18nT('pages.settings.webexPanel.connection_failed', { error: config.connect_error })
+  // A startup failure is shown by `connectError`; the status hints would only
+  // repeat "not running" under it.
+  if (config.connected || config.connect_error) return ''
+  if (config.configured) {
+    return i18nT('pages.settings.webexPanel.settings_are_saved_but_the_channel_is_not_runnin')
   }
-  return i18nT('pages.settings.webexPanel.settings_are_saved_but_the_channel_is_not_runnin')
+  // A token with no allowed email is the one "misconfigured" state that looks
+  // finished: the backend counts the allow-list as part of `configured`, so
+  // returning early on `!configured` leaves this operator with no explanation at
+  // all while every other channel names the missing piece.
+  if (config.bot_token_set && config.enabled && config.allowed_emails.length === 0) {
+    return i18nT('pages.settings.webexPanel.empty_allowlist_hint')
+  }
+  return ''
 }
 
 /** Webex channel-integration settings. */
@@ -88,7 +120,12 @@ export function WebexPanel() {
   const [restartHint, setRestartHint] = useState(false)
   const [verifyWarning, setVerifyWarning] = useState('')
   const [tokenVerified, setTokenVerified] = useState(false)
-  const [error, setError] = useState('')
+  // Two states on purpose: `saveError` is the server's rejection (an error
+  // surface), `thresholdError` is a client-side validation hint that never
+  // reached the server — routing it through ErrorNotice would offer the agent
+  // nothing to diagnose.
+  const [saveError, setSaveError] = useState('')
+  const [thresholdError, setThresholdError] = useState('')
 
   // Sync the local draft when server config arrives. Guarded so only the
   // initial load and post-save invalidation reseed it — a background refetch
@@ -113,8 +150,10 @@ export function WebexPanel() {
           msg = e.message
         }
       }
-      setError(msg)
-      setTimeout(() => setError(''), 8000)
+      // Persist until the next save attempt clears it: the rejected draft is
+      // still in the form, and a notice that erases itself after a few seconds
+      // leaves a quiet form that reads as saved.
+      setSaveError(msg)
     },
     onSuccess: (res, vars) => {
       setSaved(true)
@@ -130,12 +169,39 @@ export function WebexPanel() {
 
   const handleSave = useCallback(() => {
     if (!draft) return
-    setError('')
+    setSaveError('')
+    setThresholdError('')
+    // Validate the thresholds BEFORE sending. `Number(x) || 80` silently
+    // substitutes the default for a typo, and the pair is silently reordered
+    // server-side when soft exceeds hard — so a user who typed "8 5", or who
+    // inverted the pair, would see a different number appear after a successful
+    // save with nothing saying why. The hard threshold governs automatic
+    // compaction, so a value the user did not choose changes behaviour they
+    // believe they set.
+    const soft = Number(draft.soft_threshold_pct)
+    const hard = Number(draft.hard_threshold_pct)
+    const bad = [
+      [soft, i18nT('pages.settings.webexPanel.soft_threshold_must_be_1_to_100')] as const,
+      [hard, i18nT('pages.settings.webexPanel.hard_threshold_must_be_1_to_100')] as const,
+    ].find(([v]) => !Number.isInteger(v) || v < 1 || v > 100)
+    if (bad) {
+      setThresholdError(bad[1])
+      return
+    }
+    if (soft > hard) {
+      setThresholdError(i18nT('pages.settings.webexPanel.soft_threshold_must_not_exceed_hard'))
+      return
+    }
     const payload: Partial<WebexConfigSave> = {
       enabled: draft.enabled,
       allowed_emails: draft.allowed_emails,
       // Off sends "" (the field's off-state); on with a blank name falls back
       // to "Webex", which is what the toggle's description promises.
+      allow_group_rooms: draft.allow_group_rooms,
+      allowed_room_ids: draft.allowed_room_ids,
+      reply_in_thread: draft.reply_in_thread,
+      soft_threshold_pct: soft,
+      hard_threshold_pct: hard,
       session_folder: draft.session_folder_on ? (draft.session_folder.trim() || CHANNEL_NAME) : '',
     }
     if (botClear) payload.bot_token_clear = true
@@ -144,10 +210,13 @@ export function WebexPanel() {
   }, [draft, botToken, botClear, saveMut])
 
   if (isLoading) return <p className="text-[13px] text-muted p-4">{i18nT('pages.settings.webexPanel.loading_webex_config')}</p>
-  if (isError || !data || !draft) return <p className="text-[13px] text-danger p-4">{i18nT('pages.settings.webexPanel.cannot_load_webex_config_is_the_gateway_running')}</p>
+  // Nothing to lose here: the form is not mounted in this branch.
+  if (isError || !data || !draft) return <ErrorNotice className="m-4" message={i18nT('pages.settings.webexPanel.cannot_load_webex_config_is_the_gateway_running')} askAgent />
 
   const upd = (patch: Partial<Draft>) => setDraft(d => (d ? { ...d, ...patch } : d))
   const ro = data.read_only
+  const startupError = connectError(data)
+  const hint = connectionHint(data)
 
   return (
     <>
@@ -164,10 +233,15 @@ export function WebexPanel() {
           <p className="text-[12px] text-muted mt-1">
             {i18nT('pages.settings.webexPanel.talk_to_your_agents_from_cisco_webex_no_public_u')}
           </p>
-          {connectionHint(data) && (
+          {/* No hand-off: `botToken` (SecretField draft, never persisted) and the
+              unsaved `draft` (allowed emails, room ids, thresholds, session
+              folder) live in this panel's local state — navigating to the chat
+              would discard them. */}
+          <ErrorNotice message={startupError} className="mt-2" />
+          {hint && (
             <p className="text-[12px] text-warn mt-1 flex items-center gap-1.5">
               <AlertTriangle size={12} className="flex-none" />
-              {connectionHint(data)}
+              {hint}
             </p>
           )}
         </div>
@@ -244,6 +318,41 @@ export function WebexPanel() {
             validate={isValidEmail}
             readOnly={ro}
           />
+          {/* Group spaces are their own decision, and a riskier one: a reply in a
+              space is readable by every member, including people the email
+              allow-list excludes. Off by default, and the room allow-list is
+              deny-all, so the switch alone grants nothing. */}
+          <div className="border-t border-border mt-4 pt-4">
+            <SettingsToggle
+              label={i18nT('pages.settings.webexPanel.allow_group_spaces')}
+              description={i18nT('pages.settings.webexPanel.allow_group_spaces_desc')}
+              checked={draft.allow_group_rooms}
+              onChange={v => upd({ allow_group_rooms: v })}
+              disabled={ro}
+            />
+            {draft.allow_group_rooms && (
+              <div className="mt-4">
+                <TagListEditor
+                  label={i18nT('pages.settings.webexPanel.allowed_room_ids')}
+                  description={i18nT('pages.settings.webexPanel.allowed_room_ids_desc')}
+                  values={draft.allowed_room_ids}
+                  placeholder={i18nT('pages.settings.webexPanel.room_id_placeholder')}
+                  onChange={v => upd({ allowed_room_ids: v })}
+                  readOnly={ro}
+                />
+                {/* Amber, not grey: the switch is ON and nothing is answered, so
+                    the operator is looking at a configuration that silently does
+                    nothing. Same treatment the shared bot panel gives its own
+                    empty forum allow-list. */}
+                {draft.allowed_room_ids.length === 0 && (
+                  <p className="text-[12px] text-warn mt-2 mb-0 flex items-start gap-1.5">
+                    <AlertTriangle size={13} className="flex-none mt-0.5" />
+                    <span>{i18nT('pages.settings.webexPanel.allowed_room_ids_empty_hint')}</span>
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
           {/* Optional per-channel session filing. Off by default: Webex
               conversations stay unfiled in the sidebar, as before. */}
           <div className="border-t border-border mt-4 pt-4">
@@ -270,6 +379,35 @@ export function WebexPanel() {
         </SettingsCard>
       </SettingsSection>
 
+      {/* ── Behaviour ── */}
+      <SettingsSection title={i18nT('pages.settings.webexPanel.behaviour')}>
+        <SettingsCard index={3}>
+          <SettingsToggle
+            label={i18nT('pages.settings.webexPanel.reply_in_thread')}
+            description={i18nT('pages.settings.webexPanel.reply_in_thread_desc')}
+            checked={draft.reply_in_thread}
+            onChange={v => upd({ reply_in_thread: v })}
+            disabled={ro}
+          />
+          <SettingsInput
+            label={i18nT('pages.settings.webexPanel.soft_context_threshold')}
+            description={i18nT('pages.settings.webexPanel.soft_context_threshold_desc')}
+            value={draft.soft_threshold_pct}
+            onChange={v => upd({ soft_threshold_pct: v })}
+            placeholder="80"
+            disabled={ro}
+          />
+          <SettingsInput
+            label={i18nT('pages.settings.webexPanel.hard_context_threshold')}
+            description={i18nT('pages.settings.webexPanel.hard_context_threshold_desc')}
+            value={draft.hard_threshold_pct}
+            onChange={v => upd({ hard_threshold_pct: v })}
+            placeholder="95"
+            disabled={ro}
+          />
+        </SettingsCard>
+      </SettingsSection>
+
       {/* ── Save (hidden on read-only remote sessions) ── */}
       {!ro && <div className="flex items-center gap-3 mt-1 mb-4">
         <Btn primary onClick={handleSave} disabled={saveMut.isPending}>
@@ -277,7 +415,7 @@ export function WebexPanel() {
         </Btn>
         {saved && (
           <span className="inline-flex items-center gap-1.5 text-[12px] text-ok">
-            <Check size={14} /> {tokenVerified ? i18nT('pages.settings.webexPanel.verified_with_webex_and_saved_restart_the_gatewa') : restartHint ? i18nT('pages.settings.webexPanel.saved_restart_the_gateway_to_apply') : i18nT('pages.settings.webexPanel.saved')}
+            <Check size={14} /> {tokenVerified ? (restartHint ? i18nT('pages.settings.webexPanel.verified_with_webex_and_saved_restart_the_gatewa') : i18nT('pages.settings.webexPanel.verified_and_saved')) : restartHint ? i18nT('pages.settings.webexPanel.saved_restart_the_gateway_to_apply') : i18nT('pages.settings.webexPanel.saved')}
           </span>
         )}
         {saved && verifyWarning && (
@@ -285,11 +423,18 @@ export function WebexPanel() {
             <AlertTriangle size={14} /> {verifyWarning}
           </span>
         )}
-        {error && (
+        {/* Client-side validation hint (the thresholds never left the browser) —
+            not an error surface, so it stays plain text rather than ErrorNotice. */}
+        {thresholdError && (
           <span className="inline-flex items-center gap-1.5 text-[12px] text-danger">
-            <AlertTriangle size={14} /> {error}
+            <AlertTriangle size={14} /> {thresholdError}
           </span>
         )}
+        {/* No hand-off: `botToken` (SecretField draft, never persisted) and the
+            unsaved `draft` are exactly what a failed save did not store — the
+            hand-off unmounts this panel and would lose them. Same shape as
+            SlackPanel's save row. */}
+        <ErrorNotice message={saveError} variant="inline" />
       </div>}
     </>
   )

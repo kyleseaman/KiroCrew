@@ -14,11 +14,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
-import { setUpdateProgress } from '../store/dashboardSlice'
+import { setUpdateProgress, sseConnected, sseDisconnected } from '../store/dashboardSlice'
 
 vi.mock('../pages/ChatPage', () => ({ default: () => <div data-testid="chat-page">ChatPage</div> }))
 vi.mock('../pages/SystemPage', () => ({ default: () => null }))
-vi.mock('../pages/AgentsPage', () => ({ default: () => null }))
 vi.mock('../pages/ProjectsPage', () => ({ default: () => null }))
 vi.mock('../pages/LogsPage', () => ({ default: () => <div data-testid="logs-page">LogsPage</div> }))
 vi.mock('../pages/DeveloperPage', () => ({ default: () => <div data-testid="developer-page">DeveloperPage</div> }))
@@ -160,6 +159,50 @@ describe('App — version-change changelog gate', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }))
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Changelog' })).toBeNull())
   })
+
+  it('shows nothing when the running build is ahead of every section', async () => {
+    // The reported bug. `main` is bumped a minor ahead of the released line and
+    // a release's notes are written when it ships, so between releases the
+    // newest section in the file is OLDER than the running build: a 0.6.0 build
+    // opened a modal titled `v0.6.0` whose body was headed `[0.4.0]` and offered
+    // to update to it. There is nothing to say here, so nothing is said.
+    vi.mocked(api.status).mockResolvedValue({ ...STATUS, version: '0.6.0' } as never)
+    localStorage.setItem('mc-last-version', '0.5.0')
+    renderWithProviders(<App />, { route: '/chat' })
+
+    await screen.findByTestId('dashboard-shell')
+    // The baseline still advances, so the check does not re-run every load.
+    await waitFor(() => expect(localStorage.getItem('mc-last-version')).toBe('0.6.0'))
+    expect(screen.queryByRole('dialog', { name: 'Changelog' })).toBeNull()
+  })
+
+  it('keeps an unversioned heading out of the section above it', async () => {
+    // Any level-2 heading ends the preceding section, matching the renderer.
+    // Keying only on `## [` left this body inside 0.4.0's notes.
+    vi.mocked(api.changelog).mockResolvedValue({
+      content: '## [0.4.0]\n- adds the resource capsule\n\n## Notes\n- housekeeping prose\n',
+    } as never)
+    renderShell()
+
+    const dialog = await changelogDialog()
+    expect(within(dialog).getByText(/adds the resource capsule/)).toBeInTheDocument()
+    expect(within(dialog).queryByText(/housekeeping prose/)).toBeNull()
+  })
+
+  it('delivers the notes when no further update is pending', async () => {
+    // The state right after a successful update is "current", and the body used
+    // to be gated on an update being available -- so the one moment the modal
+    // exists for replaced its notes with "You're on the latest version".
+    vi.mocked(api.status).mockResolvedValue({
+      ...STATUS, update_available: false, update_can_apply: false,
+    } as never)
+    renderShell()
+
+    const dialog = await changelogDialog()
+    expect(within(dialog).getByText(/adds the resource capsule/)).toBeInTheDocument()
+    expect(within(dialog).getByText("You're on the latest version")).toBeInTheDocument()
+    expect(within(dialog).queryByRole('button', { name: 'Update Now' })).toBeNull()
+  })
 })
 
 describe('App — changelog modal controls', () => {
@@ -229,6 +272,54 @@ describe('App — update progress overlay', () => {
     expect(screen.getByText('Rebuilding package')).toBeInTheDocument()
     expect(screen.getByText('Restarting server')).toBeInTheDocument()
     expect(screen.getByText('0s')).toBeInTheDocument()
+  })
+
+  it('names the restart when the socket drops mid-update', async () => {
+    // The restart step kills the socket BY DESIGN (the gateway execs itself)
+    // and progress events stop with it. Before this state existed the overlay
+    // froze on the last step with its idle waiting copy — indistinguishable
+    // from a hang. Disconnected-while-updating must say the gateway is
+    // restarting and that reconnection is in progress.
+    const { store } = await startUpdate()
+    await screen.findByText('Updating Kiro Crew…')
+
+    act(() => { store.dispatch(setUpdateProgress({ step: 'restarting', detail: 'Restarting server…' })) })
+    expect(screen.getByText('Page will reconnect when ready…')).toBeInTheDocument()
+
+    act(() => { store.dispatch(sseDisconnected()) })
+    const note = screen.getByTestId('update-reconnecting')
+    expect(note.textContent).toContain('Gateway is restarting — reconnecting…')
+    // The idle copy stands down: both lines together would say "waiting" and
+    // "dialing" about the same moment.
+    expect(screen.queryByText('Page will reconnect when ready…')).toBeNull()
+
+    // Reconnected (the gateway is back, the reload latch takes it from here):
+    // the transient line yields back to the idle copy.
+    act(() => { store.dispatch(sseConnected()) })
+    expect(screen.queryByTestId('update-reconnecting')).toBeNull()
+    expect(screen.getByText('Page will reconnect when ready…')).toBeInTheDocument()
+  })
+
+  it.each(['failed', 'error'] as const)('treats the %s step as terminal', async (step) => {
+    // The apply worker pushes `failed` from its outer handler and `error` from
+    // its per-step handlers (a fast-forward that will not apply, pip refusing
+    // the merged revision). Both must end the overlay with the failure card:
+    // an unrecognised step rendered as a stall until the five-minute stuck
+    // timer, with the spinner still pulsing above the reason.
+    const { store } = await startUpdate()
+    await screen.findByText('Updating Kiro Crew…')
+
+    act(() => { store.dispatch(setUpdateProgress({ step, detail: 'Fast-forward to 9f8202496fcf failed (git merge --ff-only)' })) })
+
+    const card = screen.getByTestId('update-overlay-error')
+    expect(card.textContent).toContain('Fast-forward to 9f8202496fcf failed')
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeInTheDocument()
+    // No step is "active", and the header glyph is the terminal one, not the
+    // in-progress spinner.
+    expect(screen.queryByText('Page will reconnect when ready…')).toBeNull()
+    const icon = screen.getByTestId('update-overlay-step-icon')
+    expect(icon.className).not.toContain('animate-pulse')
+    expect(icon.className).toContain('text-danger')
   })
 
 })
@@ -381,6 +472,24 @@ describe('App — Electron bridges', () => {
     // Protocol-relative targets are refused by construction, so the route holds.
     act(() => navigateFromMenu?.('//example.com/steal'))
     expect(screen.getByTestId('logs-page')).toBeInTheDocument()
+  })
+
+  it('a session deep link SELECTS the session, not just the route', async () => {
+    // The Crew Companion's "Open session" CTA arrives on this same channel. A
+    // bare navigate would be enough only from another page: ChatPage reads `?sid`
+    // while it MOUNTS, so from an already-open /chat the window would come
+    // forward with the previous session still on screen — the notification would
+    // appear to have opened nothing, which is the bug the CTA is meant to fix.
+    let navigateFromMain: ((path: string) => void) | undefined
+    setElectronBridge({ onNavigate: cb => { navigateFromMain = cb; return () => { navigateFromMain = undefined } } })
+    const { store } = renderWithProviders(<App />, { route: '/chat' })
+    await screen.findByTestId('chat-page')
+    expect(store.getState().chat.activeSlot).not.toBe('chat-2-200')
+
+    act(() => navigateFromMain?.('/chat?sid=chat-2-200'))
+
+    expect(store.getState().chat.activeSlot).toBe('chat-2-200')
+    expect(screen.getByTestId('chat-page')).toBeInTheDocument()
   })
 })
 

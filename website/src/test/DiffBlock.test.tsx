@@ -1,9 +1,17 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import DiffBlock, { extractFilePath } from '../components/DiffBlock'
 
+// These assertions exercise controls rendered by the lazy Pierre implementation,
+// not the Suspense fallback. Warm that chunk once so a saturated full-suite worker
+// cannot make Testing Library's default query timeout race module loading.
+beforeAll(() => import('../pierre/PierreImpl'))
+
 beforeEach(() => {
   globalThis.fetch = vi.fn(() => Promise.resolve({ ok: true })) as unknown as typeof fetch
+  // The split/unified layout persists app-wide (`mc-diff-split`); start each
+  // test from the unseeded default so no test inherits another's toggle.
+  localStorage.clear()
 })
 
 const simpleDiff = `--- a/file.ts
@@ -54,10 +62,21 @@ describe('DiffBlock', () => {
     expect(await screen.findByTitle('Copy patch')).toBeInTheDocument()
   })
 
-  it('toggles between unified and split view', async () => {
+  it('toggles between unified and split view and persists the choice', async () => {
     render(<DiffBlock code={simpleDiff} complete={true} />)
-    fireEvent.click(await screen.findByTitle('Split view'))
-    expect(await screen.findByTitle('Unified view')).toBeInTheDocument()
+    // Unseeded default is split — the shared `mc-diff-split` preference's
+    // default — so the button offers the way back to unified.
+    fireEvent.click(await screen.findByTitle('Unified view'))
+    expect(await screen.findByTitle('Split view')).toBeInTheDocument()
+    // The choice lands in the shared preference (#6024), not per-block state.
+    expect(localStorage.getItem('mc-diff-split')).toBe('0')
+  })
+
+  it('seeds the layout from the shared mc-diff-split preference', async () => {
+    localStorage.setItem('mc-diff-split', '0')
+    render(<DiffBlock code={simpleDiff} complete={true} />)
+    // Persisted unified → the button offers split.
+    expect(await screen.findByTitle('Split view')).toBeInTheDocument()
   })
 
   it('shows View file button when onFileOpen is provided', async () => {
@@ -289,6 +308,57 @@ describe('DiffBlock', () => {
       expect(screen.queryByTitle(/^Open .* in side panel$/)).not.toBeInTheDocument()
       await new Promise(r => setTimeout(r, 10))
       expect(screen.queryByTitle(/^Open .* in side panel$/)).not.toBeInTheDocument()
+    })
+  })
+
+  /* Plain mode (Settings → Chat → Messages → Plain diffs) replaces the whole
+   * Pierre surface with a `<pre>`, so unlike every other case above these
+   * assertions are SYNCHRONOUS on purpose: nothing here waits on the lazy
+   * chunk, because in this mode the chunk is never requested. */
+  describe('plain-diff preference', () => {
+    it('renders the raw patch text and keeps Copy reachable without Pierre’s header', () => {
+      localStorage.setItem('mc-diff-plain', '1')
+      render(<DiffBlock code={simpleDiff} complete={true} />)
+      // The patch text is in the light DOM (Pierre would have put its rows in a
+      // shadow root), and DiffBlock's own header row stands in for Pierre's —
+      // so the filename and Copy survive the switch.
+      expect(screen.getByText(/-const b = 2/)).toBeInTheDocument()
+      expect(screen.getByText('file.ts')).toBeInTheDocument()
+      expect(screen.getByTitle('Copy patch')).toBeInTheDocument()
+    })
+
+    /* Review finding (gpt, `website/src/pierre/index.tsx:236`): the patch handed
+       to Pierre has its `---`/`+++` paths shortened to basenames, because Pierre
+       consumes those lines to draw its file header and never shows them as text.
+       The plain render prints the patch VERBATIM, so reusing that copy would put
+       `a/file.ts` where the reader — and anyone copying the patch out of the page
+       to apply it — expects the original path. Plain mode must render `code`. */
+    it('keeps the original header paths, which the highlighted render shortens', () => {
+      localStorage.setItem('mc-diff-plain', '1')
+      const deep = `--- a/src/deep/nested/file.ts\n+++ b/src/deep/nested/file.ts\n@@ -1,1 +1,1 @@\n-old\n+new`
+      render(<DiffBlock code={deep} complete={true} />)
+      expect(screen.getByText(/--- a\/src\/deep\/nested\/file\.ts/)).toBeInTheDocument()
+      expect(screen.getByText(/\+\+\+ b\/src\/deep\/nested\/file\.ts/)).toBeInTheDocument()
+      // The stand-in header still shows the basename alone; it shortens
+      // `headerPath` itself rather than the patch body.
+      expect(screen.getByText('file.ts')).toBeInTheDocument()
+    })
+
+    it('drops the split/unified control, which only means something to Pierre', () => {
+      localStorage.setItem('mc-diff-plain', '1')
+      render(<DiffBlock code={simpleDiff} complete={true} />)
+      // Copy being present proves the header row rendered, so these absences are
+      // the guard's doing rather than an unrendered header.
+      expect(screen.getByTitle('Copy patch')).toBeInTheDocument()
+      expect(screen.queryByTitle('Unified view')).not.toBeInTheDocument()
+      expect(screen.queryByTitle('Split view')).not.toBeInTheDocument()
+    })
+
+    it('is off unless the preference is set — the highlighted diff stays the default', async () => {
+      render(<DiffBlock code={simpleDiff} complete={true} />)
+      // Pierre's header arriving is the observable that the chunk was requested.
+      expect(await headerMounted()).toBeInTheDocument()
+      expect(await screen.findByTitle('Unified view')).toBeInTheDocument()
     })
   })
 })

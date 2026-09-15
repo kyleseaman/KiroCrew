@@ -7,6 +7,7 @@ import { useImeGuard } from '../hooks/useImeGuard'
 import { i18nT } from '../i18n/t'
 import { parseRecoveryMessage } from '../pages/chat/RecoveryCard'
 import { hasSubagentCompletionPrefix } from '../pages/chat/subagentCompletion'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 /** System-injected sub-agent completion deliveries waiting for the busy slot.
  *  These are NOT user messages: they must not be editable/cancellable (either
  *  would silently lose a finished agent's result) and rendering each as a
@@ -65,7 +66,14 @@ export function SubagentDeliveryProgress({ count }: { count: number }) {
   if (count <= 0) return null
   return (
     <div
-      className="mx-auto w-full px-4"
+      // `relative z-[2]` clears the transcript's bottom mask. That mask is
+      // `z-[1]` and deliberately overshoots COMPOSER_MASK_OVERSHOOT_PX BELOW the
+      // scrollport edge to sit flush against the composer box — an overshoot
+      // sized for an EMPTY composer status stack. This bar is the first thing in
+      // that stack, so at auto z-index the mask's opaque tail painted over its
+      // top 10px: top border, both top corners and the first line's ascenders
+      // were shaved, which reads as the card being clipped by the UI.
+      className="relative z-[2] mx-auto w-full px-4"
       style={{ maxWidth: 'var(--mc-content-width, 900px)' }}
       data-testid="subagent-delivery-progress"
     >
@@ -91,19 +99,47 @@ const OVERLAP = 11 // overlap to fuse with input area below
 const DEPTH_BRIGHTNESS = [1, 0.88, 0.76]
 const SPRING = { type: 'spring' as const, stiffness: 400, damping: 30 }
 
-/** Inline editor (input + save) swapped in for the message text while editing.
- *  Owns the live value so its own controls commit the typed text, never stale content. */
+/** Inline editor (textarea + save) swapped in for the message text while editing.
+ *  Owns the live value so its own controls commit the typed text, never stale content.
+ *
+ *  A textarea, not an `<input>`: a queued message can span several lines --
+ *  the attachment serializer writes one `[attached_file N] path` marker per
+ *  line -- and a single-line input drops every newline from its value, so an
+ *  ordinary edit would glue the markers together and the queue edit's
+ *  whitespace-bounded marker match would prune every attachment but the last.
+ *  Enter commits (the composer's own contract); Shift+Enter inserts a line. */
 function EditInput({ initial, onCommit, onCancel }: {
   initial: string
   onCommit: (value: string) => void
   onCancel: () => void
 }) {
-  const ref = useRef<HTMLInputElement>(null)
+  const ref = useRef<HTMLTextAreaElement>(null)
   const ime = useImeGuard()
   const [value, setValue] = useState(initial)
   // Guard so blur and an explicit save/Enter don't both fire onCommit.
   const committedRef = useRef(false)
-  useEffect(() => { ref.current?.focus(); ref.current?.select() }, [])
+  // Select the FIRST line only, never the whole value: the marker lines sit
+  // below the single visible row, and a select-all would let an ordinary
+  // retype replace them unseen -- the queue edit then prunes every
+  // attachment from the send with nothing on screen to say so.
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    el.focus()
+    const nl = initial.indexOf('\n')
+    el.setSelectionRange(0, nl === -1 ? initial.length : nl)
+  }, [initial])
+  // Lines below the visible one, surfaced as a count so the hidden part of
+  // the value is never a surprise. When every hidden line is an attachment
+  // marker (the serializer's `[attached_file N] path` / `[attached_dir N]
+  // path` lines) the cue names them as attachments -- "+2 attachments" says
+  // what is there, where "+2 lines" only says how much.
+  const hidden = value.split('\n').slice(1)
+  const hiddenLines = hidden.length
+  const hiddenAreAttachments = hiddenLines > 0 && hidden.every(l => /^\[attached_(?:file|dir) \d+\] /.test(l))
+  const hiddenCue = hiddenAreAttachments
+    ? i18nT('components.queueStack.hidden_attachments', { count: hiddenLines })
+    : i18nT('components.queueStack.hidden_lines', { count: hiddenLines })
   // Commit only a real change: skip empty and unchanged values so a stray
   // focus→blur (or clear→blur) doesn't fire a no-op PATCH + WS broadcast.
   const commit = () => {
@@ -116,9 +152,14 @@ function EditInput({ initial, onCommit, onCancel }: {
   const cancel = () => { if (committedRef.current) return; committedRef.current = true; onCancel() }
   return (
     <>
-      <input
+      <textarea
         ref={ref}
         value={value}
+        // One visible row: the card is a fixed-height stack slot (CARD_H) and
+        // shows the content itself truncated to one line, so the editor shows
+        // the same line the card does. The value keeps every newline; the
+        // textarea scrolls to the caret as the user moves through the lines.
+        rows={1}
         onChange={e => setValue(e.target.value)}
         // Stop the card's expand/collapse + drag handlers from swallowing pointer + key events.
         onPointerDown={e => e.stopPropagation()}
@@ -126,14 +167,21 @@ function EditInput({ initial, onCommit, onCancel }: {
         onKeyDown={e => {
           e.stopPropagation()
           if (e.key === 'Enter' && !e.shiftKey) {
-            // The commit's own emptiness check stays in commit().
+            // The commit's own emptiness check stays in commit(). claimEnter
+            // consumes the keypress, so a committing Enter never inserts a line.
             if (ime.claimEnter(e)) commit()
           } else if (e.key === 'Escape') { e.preventDefault(); ime.reset(); cancel() }
         }}
         {...ime.bindComposition({ onBlur: commit })}
-        className="flex-1 min-w-0 bg-[var(--bg)] text-[var(--text)] placeholder:text-[var(--muted)] rounded px-1.5 py-0.5 text-[13px] outline-none border border-[var(--border)] focus-visible:border-[var(--accent)]"
+        className="flex-1 min-w-0 resize-none overflow-hidden bg-[var(--bg)] text-[var(--text)] placeholder:text-[var(--muted)] rounded px-1.5 py-0.5 text-[13px] leading-5 outline-none border border-[var(--border)] focus-visible:border-[var(--accent)]"
         aria-label={i18nT('components.queueStack.edit_queued_message')}
       />
+      {hiddenLines > 0 && (
+        <span className="shrink-0 text-[11px] text-[var(--muted)] tabular-nums" data-testid="queue-edit-hidden-lines"
+          title={hiddenCue}>
+          {hiddenCue}
+        </span>
+      )}
       <button className="shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)] transition-colors text-[var(--text)]"
         title={i18nT('components.queueStack.save')} aria-label={i18nT('components.queueStack.save_edit')}
         // mousedown commits before the input's blur can fire with the same value.
@@ -166,6 +214,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
    *  of overlapping it. */
   fuseBelow?: boolean
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [_expanded, setExpanded] = useState(false)
   const expanded = _expanded && messages.length > 1
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -226,7 +275,14 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
   }
 
   return (
-    <div className="px-4 mx-auto w-full relative" style={{ maxWidth: 'var(--mc-content-width, 900px)', zIndex: 0 }}>
+    // `zIndex: 2` clears the transcript's bottom mask (`z-[1]`), whose
+    // COMPOSER_MASK_OVERSHOOT_PX tail reaches below the scrollport edge on the
+    // premise that the composer's own gap is what sits there. When this stack is
+    // the first thing under the transcript the tail lands on the front card
+    // instead and shaved its top border and corners. Still far below the
+    // composer's own `z-10`, so the collapsed card's -OVERLAP fuse keeps sliding
+    // UNDER the input box rather than over it.
+    <div className="px-4 mx-auto w-full relative" style={{ maxWidth: 'var(--mc-content-width, 900px)', zIndex: 2 }}>
       <motion.div
         className="relative cursor-pointer"
         animate={{ height: targetHeight }}

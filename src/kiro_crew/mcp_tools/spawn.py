@@ -20,21 +20,23 @@ import asyncio
 import json
 import os
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import urlencode
 
 from kiro_crew import mcp_core
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.context_management import COMPLETION_KEEP_DEFAULT_CHARS
-from kiro_crew.effort import model_supports_effort
 from kiro_crew.mcp_shared import ToolCancelled, is_tool_cancelled
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
-from kiro_crew.subagent import UNADVERTISED_AGENTS, resolve_max_subagents
+from kiro_crew.subagent import (
+    AGENT_NOT_FOUND_CODE,
+    resolve_max_subagents,
+    visible_agent_names,
+)
 from kiro_crew.subagent_persistence import agent_dir_for_display
 from kiro_crew.validation import (
-    _AGENT_NAME_RE,
     MAX_MEDIUM_STRING,
     MAX_SHORT_STRING,
     SPAWN_CONTINUE_SCHEMA,
@@ -50,13 +52,42 @@ from kiro_crew.validation import (
 # self-correction for a few dozen characters, not a full agent listing.
 _MAX_ROSTER_NAMES = 8
 
+# Owner recorded on an audit record when the resolver named no session. An empty
+# owner is ambiguous by construction: a resolver whose every identity source
+# failed and a spawn with genuinely no owning session both produce ``""``, and
+# nothing downstream can recover which one it was. This marker names the failed
+# resolution where it happens, so the audit trail says "the owner was lost"
+# rather than naming no session at all.
+#
+# Same ``unresolved:<pid>`` wire format the computer-use shim already writes
+# (``mcp_computer.UNRESOLVED_SESSION_PREFIX``), so one audit-reader vocabulary
+# covers both producers. Deliberately NOT trustworthy attribution -- the prefix
+# says it is not, so a reader cannot mistake a pid for a session identity.
+_OWNER_UNRESOLVED_PREFIX = "unresolved:"
+
+
+def _audit_owner(parent_session: str) -> str:
+    """The owner to record on an audit record for *parent_session*.
+
+    A resolved key is recorded verbatim. An empty one becomes the unresolved
+    marker for THIS process, read at call time so a forked child cannot report
+    its parent's pid.
+
+    Audit-only. The spawn REQUEST keeps the empty owner, because
+    ``parent_session_key`` addresses per-slot frame delivery and a synthetic key
+    there would route frames at a slot that does not exist.
+    """
+    if parent_session:
+        return parent_session
+    return f"{_OWNER_UNRESOLVED_PREFIX}{os.getpid()}"
+
 
 def _agent_roster_hint() -> str:
     """Valid agent names, for the ``agent``/``agents`` parameter descriptions.
 
-    The roster used to be reachable only through ``spawn_list``'s OUTPUT, so a
-    caller that went straight to ``spawn_run`` had never seen it and invented
-    plausible-sounding names instead (#4842). Putting it in the parameter
+    The roster is otherwise reachable only through ``spawn_list``'s OUTPUT, so a
+    caller that goes straight to ``spawn_run`` never sees it and invents
+    plausible-sounding names instead. Putting it in the parameter
     description puts it in front of exactly the caller that needs it.
 
     ADVISORY only, and deliberately never a gate: this process scans the
@@ -66,12 +97,15 @@ def _agent_roster_hint() -> str:
     this reading would reject an agent kiro-cli can load.
 
     Every name is matched against ``_AGENT_NAME_RE`` before it is rendered, then
-    redacted. The grammar is what makes this safe to put in front of a model: an
-    agent spec's ``name`` field is taken verbatim by discovery with no validation,
-    so a spec can declare a newline plus instruction-shaped text -- pure ASCII, and
-    an isascii check would pass it straight into every session's tool list. The
-    same grammar already gates the ``agent`` parameter in ``SPAWN_RUN_SCHEMA``, so
-    a name that fails it is one no caller could pass here anyway.
+    redacted, then the list is bounded -- all of it in
+    ``subagent.visible_agent_names``, shared with the refusal roster and
+    ``spawn_list`` so the filter cannot drift between them. The grammar is what
+    makes this safe to put in front of a model: an agent spec's ``name`` field is
+    taken verbatim by discovery with no validation, so a spec can declare a
+    newline plus instruction-shaped text -- pure ASCII, and an isascii check would
+    pass it straight into every session's tool list. The same grammar already
+    gates the ``agent`` parameter in ``SPAWN_RUN_SCHEMA``, so a name that fails it
+    is one no caller could pass here anyway.
 
     Skipped entirely when an event loop is running, because then this is NOT the
     stdio server: ``mcp_discovery._managed_tools_in_process`` imports this package
@@ -89,19 +123,20 @@ def _agent_roster_hint() -> str:
     else:
         return ""
     try:
-        names = [
-            redact(a.name)
-            for a in mcp_core.list_agents()
-            if a.name and _AGENT_NAME_RE.fullmatch(a.name) and a.name not in UNADVERTISED_AGENTS
-        ]
+        # Sorted by DECLARED name, before redaction, so the order matches the
+        # refusal roster's and a credential-shaped name is rewritten in place
+        # rather than re-sorted into a different slot.
+        shown, withheld = visible_agent_names(
+            sorted(a.name for a in mcp_core.list_agents() if a.name),
+            limit=_MAX_ROSTER_NAMES,
+        )
     except Exception:
         return ""  # never let a directory read break the tool advertisement
-    if not names:
+    if not shown:
         return ""
-    shown = sorted(names)[:_MAX_ROSTER_NAMES]
     hint = f" Valid names right now: {', '.join(shown)}"
-    if len(names) > len(shown):
-        hint += f" (+{len(names) - len(shown)} more)"
+    if withheld:
+        hint += f" (+{withheld} more)"
     return hint + "."
 
 
@@ -110,8 +145,10 @@ def schemas() -> list[dict[str, Any]]:
     # Advertise the live concurrent sub-agent cap so the model fans out with
     # confidence instead of self-limiting. resolve_max_subagents is the single
     # source of truth (auto-sizes from host mem/CPU + learned cost, or the
-    # explicit agent.max_subagents). A snapshot at tool-list time is fine: this
-    # is advisory guidance, not an enforced limit, and SubagentManager
+    # explicit agent.max_subagents) and the gateway's SubagentManager re-derives
+    # its ENFORCED cap through the same function on every config reload, so the
+    # two agree after a write from any writer. A snapshot at tool-list time is
+    # fine: this is advisory guidance, not an enforced limit, and SubagentManager
     # auto-queues any overflow regardless.
     try:
         _max_sub = resolve_max_subagents(KiroCrewConfig.load())
@@ -126,7 +163,7 @@ def schemas() -> list[dict[str, Any]]:
         else ""
     )
     # The valid agent names, read once and shared by every agent-taking field
-    # below, so a caller that never called spawn_list still sees them (#4842).
+    # below, so a caller that never called spawn_list still sees them.
     _agent_hint = _agent_roster_hint()
     # Context-scope switches, shared by spawn_run and spawn_sub_agents so the
     # rule cannot drift between them. The model reads these descriptions at
@@ -465,20 +502,45 @@ def schemas() -> list[dict[str, Any]]:
     ]
 
 
-def _is_unknown_agent_refusal(err: str, agent: str) -> bool:
-    """True when *err* is the gateway refusing *agent* as a name it cannot load.
+def _is_unknown_agent_refusal(resp: Mapping[str, Any], agent: str) -> bool:
+    """True when *resp* is the gateway refusing *agent* as a name it cannot load.
 
-    Matched on the message text because the refusal has no wire code of its own,
-    and the two sides are pinned together by a test that feeds
-    ``subagent._validate_agent``'s real output through this predicate -- so the
-    wording cannot drift out from under it silently.
+    Reads the response's machine-readable ``code`` (``AGENT_NOT_FOUND_CODE``,
+    spelled once in ``subagent`` and imported by both sides), not its prose. The
+    refusal text is advisory and free to be reworded; before this it WAS the
+    contract, so any rewording silently disabled the wave short-circuit until a
+    test caught it.
 
-    Fail-soft by construction: a miss reproduces today's behavior (every member
-    is dispatched and refused individually), never a refusal of a name the
-    gateway would have accepted. That asymmetry is why matching text is safe
-    here, while matching text to REJECT a spawn would not be.
+    The response answers the POST that named *agent*, so no name re-check is
+    needed -- pairing is what the old text match had to reconstruct from the
+    message. ``agent`` is still required, because an unnamed request means "use
+    the default" and can never produce this refusal.
+
+    Fail-soft by construction: a miss reproduces today's behavior (every member is
+    dispatched and refused individually), never a refusal of a name the gateway
+    would have accepted. That asymmetry is what makes a missing code safe -- a
+    client newer than the gateway simply loses the short-circuit -- while using it
+    to REJECT a spawn would not be.
     """
-    return bool(agent) and err.startswith(f"agent {agent!r} not found")
+    return bool(agent) and resp.get("code") == AGENT_NOT_FOUND_CODE
+
+
+def _collapse_effort_verdicts(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Group (subagent id, verdict text) pairs into (id list, verdict text) rows.
+
+    ``reasoning_effort`` and ``model`` are batch-wide, so a wide fan-out
+    usually yields the IDENTICAL verdict for every member — rendering it once
+    per subagent injects N copies of the same line into the calling agent's
+    context. Collapse each group of 2+ ids sharing a verdict into one
+    row naming all of them ("a1, a2, a3"); a verdict unique to one subagent
+    keeps its own row, so mixed batches keep full per-id attribution. Groups
+    preserve first-seen dispatch order, and ids keep their dispatch order
+    within a group, so the collapsed output remains deterministic.
+    """
+    grouped: dict[str, list[str]] = {}
+    for sid, text in pairs:
+        grouped.setdefault(text, []).append(sid)
+    return [(", ".join(ids), text) for text, ids in grouped.items()]
 
 
 def spawn_run(name: str, args: dict[str, Any]) -> str:
@@ -501,6 +563,12 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     # Fire-and-forget — gateway's SubagentManager queues excess tasks
     # and auto-spawns them as slots free up.
     agent = args.get("agent") or ""
+    # The crew this run is DELEGATED to, distinct from `agent`: `agent` names a
+    # kiro-cli template, `crew` names a crew member and is what gives the child
+    # that crew's memory silo. Read here and forwarded below; the schema accepting
+    # the field is not enough, and a field the handler drops makes every documented
+    # `spawn_run(crew=...)` a silent no-op that runs on the operator's own memory.
+    crew = args.get("crew") or ""
     agents_list = args.get("agents") or []
     max_turns = args.get("max_turns") or 0
     cwd = args.get("cwd") or ""
@@ -513,10 +581,19 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     inc_lessons = args.get("include_lessons", True) is not False
     inc_project = args.get("include_project", True) is not False
     if agents_list and len(agents_list) != len(task_list):
-        return f"Error: agents length ({len(agents_list)}) must match tasks length ({len(task_list)})"
+        return (
+            f"Error: agents length ({len(agents_list)}) must match tasks length ({len(task_list)})"
+        )
 
     agent_ids: list[str] = []
     agent_names: list[str] = []
+    # (subagent id, reason) pairs from the server's effort verdict — the
+    # gateway resolves the effective model (per-call value, else role pin,
+    # else unpinned) and reports when the requested effort cannot apply.
+    effort_drops: list[tuple[str, str]] = []
+    # (subagent id, note) pairs for the delivery mirror: the resolved model and
+    # the family settings key a requested effort is delivered under.
+    effort_applies: list[tuple[str, str]] = []
     agent_tasks: list[str] = []
     errors: list[str] = []
     transport_errors: list[str] = []
@@ -562,7 +639,7 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     # Re-posting one cannot succeed: the refusal is a property of the NAME, not
     # of the task, so the rest of a wave that shares it is dead on arrival. The
     # observed cost of not knowing that was a whole wave of doomed dispatches on
-    # one invented name (#4842).
+    # one invented name.
     refused_agents: dict[str, str] = {}
     for i, t in enumerate(task_list):
         a = agents_list[i] if agents_list else agent
@@ -574,6 +651,8 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
             _reconcile_lost(refused_agents[a])
             continue
         body: dict[str, Any] = {"task": t, "agent": a, "parent_session": parent_session}
+        if crew:
+            body["crew"] = crew
         if batch_id:
             body["batch_id"] = batch_id
             body["batch_total"] = len(task_list)
@@ -606,7 +685,7 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
                 transport_errors.append(error_line)
                 continue
             errors.append(error_line)
-            if a and _is_unknown_agent_refusal(str(d["error"]), a):
+            if a and _is_unknown_agent_refusal(d, a):
                 refused_agents[a] = str(d["error"])
             # Wave-liveness reconcile: every sibling's batch_total counts
             # THIS member,
@@ -623,26 +702,33 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
         agent_ids.append(d.get("id", "?"))
         agent_names.append(a)
         agent_tasks.append(t)
+        if d.get("effort_dropped"):
+            effort_drops.append((str(d.get("id", "?")), str(d["effort_dropped"])))
+        if d.get("effort_applied"):
+            effort_applies.append((str(d.get("id", "?")), str(d["effort_applied"])))
 
     spawn_lines: list[str] = []
-    # Best-effort effort-capability report (never a rejection — gated on
-    # agent_ids so a total-failure result keeps its "Error:" first line, which
-    # SEL and callers test as a prefix). Only possible when the caller ALSO
-    # pinned a per-call model: with no explicit model the effective model
-    # resolves server-side (role pin / provider default) after this tool has
-    # returned, so this layer cannot know it and stays silent rather than
-    # guessing.
-    if agent_ids and reasoning_effort and model and not model_supports_effort(model):
-        spawn_lines.append(
-            f"ℹ reasoning_effort='{reasoning_effort}' was requested but model "
-            f"'{model}' does not support effort configuration — the level will "
-            "not be applied to these subagent(s)."
-        )
+    # Server-computed effort verdicts (never a rejection — gated on agent_ids
+    # so a total-failure result keeps its "Error:" first line, which SEL and
+    # callers test as a prefix). The gateway resolves the effective model
+    # (per-call value, else the subagent role pin, else unpinned/"auto") at
+    # accept time, so — unlike the old client-side check — this also reports
+    # the default case where no per-call model was passed and the effort
+    # would otherwise be dropped silently.
+    if agent_ids:
+        for drop_ids, drop_reason in _collapse_effort_verdicts(effort_drops):
+            spawn_lines.append(
+                f"ℹ reasoning_effort='{reasoning_effort}' dropped for {drop_ids}: {drop_reason}"
+            )
+        for applied_ids, applied_note in _collapse_effort_verdicts(effort_applies):
+            spawn_lines.append(
+                f"✓ reasoning_effort='{reasoning_effort}' applied for {applied_ids} ({applied_note})"
+            )
     if not parent_session and agent_ids:
         # Orphan alert: without a parent session key the subagents cannot
         # deliver completion events back to this conversation and will
-        # not appear in the Subagents panel for this session. This has
-        # historically failed silently — say it
+        # not appear in the Subagents panel for this session. This
+        # fails silently — say it
         # loudly so the agent/user can fall back to spawn_list +
         # result.txt polling instead of waiting forever.
         spawn_lines.append(
@@ -694,8 +780,7 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
             )
         else:
             spawn_lines.append(
-                f"Error: acceptance status is unknown for "
-                f"{len(transport_errors)} task(s):"
+                f"Error: acceptance status is unknown for " f"{len(transport_errors)} task(s):"
             )
         for e in transport_errors:
             spawn_lines.append(f"  - {e}")
@@ -798,7 +883,17 @@ def spawn_list(name: str, args: dict[str, Any]) -> str:
         lines.append("No subagents running.")
     else:
         for a in agents:
-            status = "done" if a.get("done") else "running"
+            # A run parked on an unanswered spawn-approval prompt has launched
+            # no process and produced no turn, so reporting it as "running" is
+            # actively misleading to a caller this module itself points here
+            # ("Check spawn_list", above) -- it reads as work in progress when
+            # the truth is that a human has not approved it yet.
+            if a.get("done"):
+                status = "done"
+            elif a.get("awaiting_approval"):
+                status = "awaiting-approval"
+            else:
+                status = "running"
             err = f" error: {_redact(a['error'])}" if a.get("error") else ""
             progress = ""
             if not a.get("done"):
@@ -813,18 +908,20 @@ def spawn_list(name: str, args: dict[str, Any]) -> str:
                 progress = f" ({', '.join(parts)})"
             _withheld = a.get("context_withheld") or []
             scope = f"  ctx-withheld: {','.join(_withheld)}" if _withheld else ""
-            lines.append(
-                f"{a['id']}  [{status}]{err}{progress}{scope}  {_redact(a['task'])[:60]}"
-            )
-    # Always append available agents (fresh read from disk). Same grammar filter as
-    # the two rosters above: this output is a tool RESULT, so it lands in the same
-    # model context, and a spec's ``name`` field arrives unvalidated.
+            lines.append(f"{a['id']}  [{status}]{err}{progress}{scope}  {_redact(a['task'])[:60]}")
+    # Always append available agents (fresh read from disk). Same grammar filter and
+    # redaction as the two rosters above, via the shared helper: this output is a
+    # tool RESULT, so it lands in the same model context, and a spec's ``name``
+    # field arrives unvalidated.
+    #
+    # Unbounded and ``exclude=()`` on purpose, and this is the one surface where
+    # that is right: both bounded rosters cap themselves and point the caller HERE
+    # ("call spawn_list", "which lists them all"), so withholding names from this
+    # listing would falsify what they promise. The reserved pair is not suggested
+    # elsewhere because it is reached by omitting ``agent`` -- but it is still a
+    # name the gateway accepts, so a full listing shows it.
     try:
-        names = [
-            _redact(a.name)
-            for a in mcp_core.list_agents()
-            if _AGENT_NAME_RE.fullmatch(a.name or "")
-        ]
+        names, _ = visible_agent_names((a.name or "" for a in mcp_core.list_agents()), exclude=())
         if names:
             lines.append(f"\nAvailable agents: {', '.join(names)}")
     except Exception:
@@ -905,7 +1002,7 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
             entry["agent_or_mode"] = a[:MAX_SHORT_STRING]
 
     mcp_core.sel().log_tool_invocation(
-        session_key=parent_session or "",
+        session_key=_audit_owner(parent_session),
         source="mcp_core",
         tool_name="spawn_sub_agents",
         outcome="attempt",
@@ -929,13 +1026,13 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
             sa_body["cwd"] = cwd
         d = mcp_core._post("/api/spawn", sa_body)
         if d.get("error"):
-            sa_errors.append(f"{_redact_sa(prompt[:60])}: {_redact_sa(d['error'])}")
+            sa_errors.append(f"{_redact_sa(prompt)[:60]}: {_redact_sa(d['error'])}")
         else:
             aid = d.get("id", "")
             if aid:
                 sa_ids.append(aid)
             else:
-                sa_errors.append(f"{_redact_sa(prompt[:60])}: spawn returned no agent id")
+                sa_errors.append(f"{_redact_sa(prompt)[:60]}: spawn returned no agent id")
 
     if not sa_ids and sa_errors:
         return "Error spawning sub-agents:\n" + "\n".join(f"  - {e}" for e in sa_errors)
@@ -1038,7 +1135,7 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
     if sa_errors:
         sa_results.append(json.dumps({"status": "spawn_errors", "errors": sa_errors}))
     mcp_core.sel().log_tool_invocation(
-        session_key=parent_session or "",
+        session_key=_audit_owner(parent_session),
         source="mcp_core",
         tool_name="spawn_sub_agents",
         outcome="completed" if not timed_out and not errored else "partial",

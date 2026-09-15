@@ -21,6 +21,7 @@ from kiro_crew.acp.kas_agents import (
     KAS_MAX_CUSTOM_AGENTS,
     KasAgentTranslationError,
     build_kas_custom_agents,
+    load_agent_spec,
     resolve_prompt,
     to_client_custom_agent,
 )
@@ -99,13 +100,14 @@ class TestToolsFailClosed:
 class TestDeliberateOmissions:
     """Fields left out on purpose; each would misbehave if projected.
 
-    ``mcpServers`` would double-register against the session-level injection,
-    and ``model`` would compete with the dedicated model verb. ``permissions``
-    is NOT in this list — see :class:`TestPermissionsProjection`; it is absent
-    only when the spec gives nothing to derive it from.
+    ``model`` would compete with the dedicated model verb. ``permissions`` is NOT
+    in this list — see :class:`TestPermissionsProjection`; it is absent only when
+    the spec gives nothing to derive it from. ``mcpServers`` is not in this
+    list either: omitting it left a KAS session with ``@server`` refs naming
+    nothing — see :class:`TestMcpServersProjection`.
     """
 
-    @pytest.mark.parametrize("key", ["mcpServers", "model", "welcomeMessage"])
+    @pytest.mark.parametrize("key", ["model", "welcomeMessage"])
     def test_key_is_not_projected(self, key):
         assert key not in to_client_custom_agent("a", _spec(), "p")
 
@@ -119,9 +121,7 @@ class TestOptionalPassThrough:
 
     def test_include_mcp_json_is_a_bool_passthrough(self):
         assert to_client_custom_agent("a", _spec(), "p")["includeMcpJson"] is False
-        assert "includeMcpJson" not in to_client_custom_agent(
-            "a", _spec(includeMcpJson="no"), "p"
-        )
+        assert "includeMcpJson" not in to_client_custom_agent("a", _spec(includeMcpJson="no"), "p")
 
     def test_resources_and_excluded_tools_when_non_empty(self):
         out = to_client_custom_agent(
@@ -205,12 +205,8 @@ class TestTheCeilingIsReAskedAtProjectionTime:
     """
 
     def test_a_withheld_entry_is_dropped_from_the_projected_policy(self, monkeypatch):
-        monkeypatch.setattr(
-            kas_agents, "may_skip_gate_now", lambda ref: ref != "@denied-srv"
-        )
-        out = to_client_custom_agent(
-            "a", _spec(allowedTools=["@denied-srv", "@ok-srv"]), "p"
-        )
+        monkeypatch.setattr(kas_agents, "may_skip_gate_now", lambda ref: ref != "@denied-srv")
+        out = to_client_custom_agent("a", _spec(allowedTools=["@denied-srv", "@ok-srv"]), "p")
         assert _rule(out["permissions"], "mcp")["match"] == ["ok-srv/*"]
 
     def test_withholding_everything_omits_the_field(self, monkeypatch):
@@ -247,9 +243,7 @@ class TestTheCeilingIsReAskedAtProjectionTime:
         monkeypatch.setattr(
             kas_agents,
             "sel",
-            lambda: types.SimpleNamespace(
-                log_api_access=lambda **kw: events.append(kw)
-            ),
+            lambda: types.SimpleNamespace(log_api_access=lambda **kw: events.append(kw)),
         )
 
         to_client_custom_agent("kirocrew", _spec(allowedTools=["@denied-srv"]), "p")
@@ -266,9 +260,7 @@ class TestTheCeilingIsReAskedAtProjectionTime:
         monkeypatch.setattr(
             kas_agents,
             "sel",
-            lambda: types.SimpleNamespace(
-                log_api_access=lambda **kw: events.append(kw)
-            ),
+            lambda: types.SimpleNamespace(log_api_access=lambda **kw: events.append(kw)),
         )
 
         to_client_custom_agent("a", _spec(allowedTools=["web_fetch"]), "p")
@@ -386,9 +378,7 @@ class TestPromptResolution:
 
     def test_relative_prompt_escaping_the_agents_dir_is_refused(self, tmp_path):
         with pytest.raises(KasAgentTranslationError, match="escapes"):
-            resolve_prompt(
-                {"prompt": "file://../../etc/passwd"}, agent_id="a", agents_dir=tmp_path
-            )
+            resolve_prompt({"prompt": "file://../../etc/passwd"}, agent_id="a", agents_dir=tmp_path)
 
     @pytest.mark.parametrize("bad", [None, "", "   "])
     def test_empty_prompt_falls_back_to_the_kas_constant(self, bad, tmp_path, caplog):
@@ -424,7 +414,8 @@ class TestPromptResolution:
         (tmp_path / "kirocrew-lite.json").write_text(
             json.dumps({"name": "kirocrew-lite", "tools": [], "prompt": ""}), encoding="utf-8"
         )
-        agents = build_kas_custom_agents(tmp_path, "kirocrew-lite")
+        spec = load_agent_spec(tmp_path, "kirocrew-lite")
+        agents = build_kas_custom_agents(tmp_path, "kirocrew-lite", spec)
         assert agents[0]["prompt"] == _KAS_FALLBACK_PROMPT
         # Tool restriction is preserved — the fallback only supplies a prompt.
         assert agents[0]["tools"] == []
@@ -464,4 +455,471 @@ class TestAgainstTheRealBundledSpec:
         assert spec.get("allowedTools"), "expected the real spec to still carry allowedTools"
         out = to_client_custom_agent(spec["name"], spec, "p")
         assert "allowedTools" not in out
+
+    def test_the_bundled_template_carries_refs_but_declares_no_servers(self):
+        """Why the ref list alone cannot be the fixture for the test below.
+
+        ``defaults.json`` ships ``@kirocrew-*`` refs with NO ``mcpServers`` key:
+        the entries are written at rebuild time by ``agent.build_agent_config``.
+        So the shipped template is not a spec any session ever runs, and asserting
+        ref/declaration parity against it would be asserting the wrong thing.
+        """
+        spec = self._bundled()
+        assert any(t.startswith("@") for t in spec["tools"])
+        assert "mcpServers" not in spec
+
+    def test_every_mcp_ref_resolves_to_a_declaration_on_a_materialized_spec(self):
+        """The defect this change fixes, on the real ref list.
+
+        Takes the shipped template's own ``@`` refs and adds the ``mcpServers``
+        block ``rebuild_agent_config`` writes for them, which is the shape a live
+        session actually loads. A ``@server`` ref with no matching entry mounts
+        nothing, so before this projection a stock KAS session advertised Crew's
+        whole tool surface and could reach none of it.
+        """
+        spec = self._bundled()
+        refs = [t[1:] for t in spec["tools"] if t.startswith("@")]
+        assert refs, "expected the real template to still carry @server refs"
+        spec["mcpServers"] = {
+            name: {"command": "/opt/kirocrew", "args": [f"mcp-{name.split('-')[-1]}"]}
+            for name in refs
+        }
+
+        out = to_client_custom_agent(spec["name"], spec, "p")
+
+        declared = set(out.get("mcpServers") or {})
+        assert set(refs) <= declared, f"refs naming nothing: {sorted(set(refs) - declared)}"
+
+
+class TestMcpServersProjection:
+    """``mcpServers`` reaches KAS, minus three things.
+
+    KAS honouring an agent-declared block is not an assumption here: it was
+    verified with an A/B probe against a live session using a uniquely-named
+    witness server, twice per arm. Without the block a stock KAS session gets
+    ``tools: ["@kirocrew-core", ...]`` and no definition of what that names.
+    """
+
+    def test_declared_server_is_projected(self):
+        out = to_client_custom_agent("a", _spec(), "p")
+        assert out["mcpServers"] == {"kirocrew-core": {"command": "x"}}
+
+    def test_absent_or_malformed_block_emits_nothing(self):
+        assert "mcpServers" not in to_client_custom_agent("a", _spec(mcpServers={}), "p")
+        assert "mcpServers" not in to_client_custom_agent("a", _spec(mcpServers=None), "p")
+        assert "mcpServers" not in to_client_custom_agent("a", _spec(mcpServers=[]), "p")
+
+    def test_malformed_entries_are_skipped_not_fatal(self):
+        out = to_client_custom_agent(
+            "a",
+            _spec(mcpServers={"good": {"command": "x"}, "bad": "nope", "": {"command": "y"}}),
+            "p",
+        )
+        assert out["mcpServers"] == {"good": {"command": "x"}}
+
+    def test_stubbed_names_are_withheld(self):
+        """A stubbed server arrives as the session-level param, which outranks an
+        agent-declared entry — declaring both is the double registration this
+        block was originally omitted to avoid."""
+        out = to_client_custom_agent(
+            "a",
+            _spec(mcpServers={"kirocrew-core": {"command": "x"}, "other": {"command": "y"}}),
+            "p",
+            stub_server_names=frozenset({"kirocrew-core"}),
+        )
+        assert out["mcpServers"] == {"other": {"command": "y"}}
+
+    def test_all_names_stubbed_emits_nothing(self):
+        out = to_client_custom_agent(
+            "a", _spec(), "p", stub_server_names=frozenset({"kirocrew-core"})
+        )
         assert "mcpServers" not in out
+
+    def test_auto_approve_is_never_relayed(self):
+        """An autoApproved MCP tool is approved by the host and emits no permission
+        request, so Crew's deny floor / sensitive-path check / governance ceiling
+        never run for it. Auto-approve reaches KAS only as ``permissions``."""
+        out = to_client_custom_agent(
+            "a",
+            _spec(mcpServers={"third-party": {"command": "x", "autoApprove": ["dangerous"]}}),
+            "p",
+        )
+        assert out["mcpServers"] == {"third-party": {"command": "x"}}
+
+    def test_auto_approve_is_stripped_from_a_managed_server_too(self):
+        out = to_client_custom_agent(
+            "a",
+            _spec(mcpServers={"kirocrew-core": {"command": "x", "autoApprove": ["t"]}}),
+            "p",
+        )
+        assert "autoApprove" not in out["mcpServers"]["kirocrew-core"]
+
+    def test_managed_server_keeps_the_one_env_key_it_needs(self):
+        """Crew's own env pins KIROCREW_HOME; dropping it would have the shims
+        read a different data home than the gateway."""
+        out = to_client_custom_agent(
+            "a",
+            _spec(mcpServers={"kirocrew-core": {"command": "x", "env": {"KIROCREW_HOME": "/h"}}}),
+            "p",
+        )
+        assert out["mcpServers"]["kirocrew-core"]["env"] == {"KIROCREW_HOME": "/h"}
+
+    def test_a_hand_added_env_key_under_a_managed_name_is_withheld(self):
+        """A managed entry still lives in a user-editable agent file, so being
+        managed cannot mean "every key now in this env is Crew's". Only
+        KIROCREW_HOME survives; the neighbouring secret does not reach the wire.
+        """
+        out = to_client_custom_agent(
+            "a",
+            _spec(
+                mcpServers={
+                    "kirocrew-core": {
+                        "command": "x",
+                        "env": {"KIROCREW_HOME": "/h", "OPENAI_API_KEY": "sk-live"},
+                    }
+                }
+            ),
+            "p",
+        )
+        assert out["mcpServers"]["kirocrew-core"]["env"] == {"KIROCREW_HOME": "/h"}
+
+    def test_a_managed_env_of_only_secrets_leaves_no_env_at_all(self):
+        out = to_client_custom_agent(
+            "a",
+            _spec(mcpServers={"kirocrew-cron": {"command": "x", "env": {"T": "s"}}}),
+            "p",
+        )
+        entry = out["mcpServers"]["kirocrew-cron"]
+        assert "env" not in entry
+        assert entry == {"command": "x"}
+
+    def test_headers_are_withheld_from_a_managed_server_too(self):
+        """All four managed servers are local stdio processes with no legitimate
+        headers, so retaining the field would only forward a hand edit."""
+        out = to_client_custom_agent(
+            "a",
+            _spec(
+                mcpServers={
+                    "kirocrew-core": {
+                        "command": "x",
+                        "headers": {"Authorization": "Bearer live"},
+                    }
+                }
+            ),
+            "p",
+        )
+        assert out["mcpServers"]["kirocrew-core"] == {"command": "x"}
+
+    def test_a_malformed_managed_env_is_dropped_not_filtered(self):
+        """A non-dict env cannot be filtered key-by-key, so it fails toward
+        withholding rather than forwarding an unknown shape."""
+        out = to_client_custom_agent(
+            "a",
+            _spec(mcpServers={"kirocrew-core": {"command": "x", "env": "TOKEN=s"}}),
+            "p",
+        )
+        assert out["mcpServers"]["kirocrew-core"] == {"command": "x"}
+
+    def test_a_withheld_managed_key_is_not_named_in_the_log(self, caplog):
+        with caplog.at_level("INFO"):
+            to_client_custom_agent(
+                "a",
+                _spec(
+                    mcpServers={
+                        "kirocrew-core": {
+                            "command": "x",
+                            "env": {"KIROCREW_HOME": "/h", "SECRET_TOKEN": "sekrit"},
+                        }
+                    }
+                ),
+                "p",
+            )
+        assert "sekrit" not in caplog.text
+        assert "SECRET_TOKEN" not in caplog.text
+
+    @pytest.mark.parametrize("field", ["env", "headers"])
+    def test_credential_bearing_field_is_withheld_from_an_unmanaged_server(self, field):
+        out = to_client_custom_agent(
+            "a",
+            _spec(mcpServers={"third-party": {"command": "x", field: {"TOKEN": "secret"}}}),
+            "p",
+        )
+        entry = out["mcpServers"]["third-party"]
+        assert field not in entry
+        # Withheld, not dropped: the server is still declared and still mounts.
+        assert entry == {"command": "x"}
+
+    def test_withheld_credential_is_not_logged_by_value(self, caplog):
+        with caplog.at_level("INFO"):
+            to_client_custom_agent(
+                "a",
+                _spec(mcpServers={"third-party": {"command": "x", "env": {"K": "sekrit"}}}),
+                "p",
+            )
+        assert "third-party" in caplog.text
+        assert "sekrit" not in caplog.text
+
+    def test_wrapper_marker_never_reaches_the_wire(self):
+        """Crew-internal bookkeeping on a rewritten entry. An unknown field can
+        fail a strict schema and means nothing to the backend."""
+        out = to_client_custom_agent(
+            "a",
+            _spec(
+                mcpServers={
+                    "srv": {"command": "x", "_kirocrew_mcp_gateway_wrapped": True},
+                }
+            ),
+            "p",
+        )
+        assert out["mcpServers"]["srv"] == {"command": "x"}
+
+    def test_the_spec_is_not_mutated(self):
+        spec = _spec(mcpServers={"third-party": {"command": "x", "autoApprove": ["t"]}})
+        to_client_custom_agent("a", spec, "p")
+        assert spec["mcpServers"]["third-party"]["autoApprove"] == ["t"]
+
+    def test_the_managed_name_set_is_the_shared_one(self):
+        """Not a third spelling of the four names: this is the set
+        ``mcp_cleanup`` already ratchet-pins to ``agent._MANAGED_MCP_SERVERS``."""
+        from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
+
+        assert kas_agents.MANAGED_MCP_SERVER_NAMES == frozenset(KIROCREW_BIN_MCP_SERVERS)
+
+
+class TestRuntimeSuppliesTheStubbedSet:
+    """The seam between the overlay and the projection.
+
+    ``_project_mcp_servers`` can be perfect and the feature still wrong if the
+    runtime never tells it which names are stubbed: every stubbed server would be
+    declared twice. Only the runtime holds the overlay, so this is the one place
+    that can get it right, and nothing else asserts it.
+    """
+
+    @staticmethod
+    def _runtime(monkeypatch, overlay, seen):
+        from kiro_crew.acp import runtime as runtime_mod
+
+        rt = object.__new__(runtime_mod.AcpRuntime)
+        rt._acp_backend = runtime_mod.ACP_BACKEND_KAS
+        rt._mcp_gateway_overlay = overlay
+
+        import kiro_crew.acp.kas_agents as kas_agents_mod
+        import kiro_crew.agent as agent_mod
+        import kiro_crew.config.paths as paths_mod
+
+        monkeypatch.setattr(agent_mod, "ensure_agent_materialized", lambda _a: None)
+        monkeypatch.setattr(paths_mod, "kiro_agents_dir", lambda: Path("/agents"))
+        # The projection is handed the spec the harness read under the gate, so the read
+        # is the harness's own and is stubbed here rather than inside the builder.
+        monkeypatch.setattr(
+            kas_agents_mod, "load_agent_spec", lambda _dir, agent: {"name": agent, "prompt": "p"}
+        )
+
+        def _capture(_dir, agent, _spec, *, stub_server_names=frozenset(), member_dispatch=False):
+            seen.append(stub_server_names)
+            return [{"id": agent}]
+
+        monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", _capture)
+        return rt
+
+    @pytest.mark.asyncio
+    async def test_the_overlay_set_is_forwarded(self, monkeypatch):
+        seen: list[frozenset] = []
+        rt = self._runtime(monkeypatch, "/overlay", seen)
+        import kiro_crew.mcp_gateway.session_servers as session_servers_mod
+
+        monkeypatch.setattr(
+            session_servers_mod,
+            "injection_server_names",
+            lambda _o, _a: frozenset({"kirocrew-core"}),
+        )
+
+        await rt._kas_custom_agents("kirocrew")
+
+        assert seen == [frozenset({"kirocrew-core"})]
+
+    @pytest.mark.asyncio
+    async def test_no_overlay_forwards_an_empty_set(self, monkeypatch):
+        """The default install: nothing stubbed, so nothing is subtracted."""
+        seen: list[frozenset] = []
+        rt = self._runtime(monkeypatch, None, seen)
+        import kiro_crew.mcp_gateway.session_servers as session_servers_mod
+
+        monkeypatch.setattr(
+            session_servers_mod, "injection_server_names", lambda _o, _a: frozenset()
+        )
+
+        await rt._kas_custom_agents("kirocrew")
+
+        assert seen == [frozenset()]
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_overlay_still_yields_an_agent(self, monkeypatch):
+        """Fail toward declaring too much, never toward an agent with no servers:
+        a double declaration is harmless (the injection outranks it), while
+        withholding a server nothing else supplies is the bug being fixed."""
+        seen: list[frozenset] = []
+        rt = self._runtime(monkeypatch, "/overlay", seen)
+
+        def _boom(_o, _a):
+            raise OSError("overlay unreadable")
+
+        import kiro_crew.mcp_gateway.session_servers as session_servers_mod
+
+        monkeypatch.setattr(session_servers_mod, "injection_server_names", _boom)
+
+        out = await rt._kas_custom_agents("kirocrew")
+
+        assert seen == [frozenset()]
+        assert out.custom_agents == [{"id": "kirocrew"}]
+
+
+class TestSpecLookup:
+    """Which file on disk the projection reads for an ``agent_id``.
+
+    A spec's filename and its declared ``name`` are allowed to differ, and a
+    package manager that installs several agents namespaces them as
+    ``<package>-<name>.json``. ``kiro_crew.agent.agent_spec_path`` already
+    resolves those by declared name, so a filename-only lookup here fails the
+    projection on agents the config, the CLI and the dashboard all resolve.
+    """
+
+    @staticmethod
+    def _write(agents_dir: Path, filename: str, **over) -> Path:
+        path = agents_dir / filename
+        path.write_text(json.dumps(_spec(**over)), encoding="utf-8")
+        return path
+
+    def test_the_filename_match_is_read(self, tmp_path):
+        self._write(tmp_path, "kirocrew.json", description="direct")
+
+        assert load_agent_spec(tmp_path, "kirocrew")["description"] == "direct"
+
+    def test_a_namespaced_filename_resolves_by_declared_name(self, tmp_path):
+        self._write(tmp_path, "SomePackage-kirocrew.json", description="namespaced")
+
+        assert load_agent_spec(tmp_path, "kirocrew")["description"] == "namespaced"
+
+    def test_a_declared_name_outranks_a_misnamed_direct_file(self, tmp_path):
+        """`kirocrew.json` declaring some OTHER agent must not be projected as
+        `kirocrew` while the spec that declares `kirocrew` sits beside it: that
+        would run the other agent's tools and prompt under this name. Declared
+        name first is the order `agent_spec_path` uses for the same reason."""
+        self._write(tmp_path, "kirocrew.json", name="other", description="misnamed")
+        self._write(tmp_path, "SomePackage-kirocrew.json", description="namespaced")
+
+        assert load_agent_spec(tmp_path, "kirocrew")["description"] == "namespaced"
+
+    def test_a_direct_file_declaring_another_name_is_the_fallback(self, tmp_path):
+        """With nothing declaring the id, `<agent_id>.json` still resolves even
+        when its declared name differs -- the filename-stem fallback
+        `agent_spec_path` and config.md rung 2 describe."""
+        self._write(tmp_path, "kirocrew.json", name="other", description="stem fallback")
+
+        assert load_agent_spec(tmp_path, "kirocrew")["description"] == "stem fallback"
+
+    def test_no_match_still_names_the_direct_path(self, tmp_path):
+        """The scan must not blur the error: the operator is told which file to
+        create, not which of the dir's specs failed to match."""
+        self._write(tmp_path, "SomePackage-other.json", name="other")
+
+        with pytest.raises(KasAgentTranslationError) as exc:
+            load_agent_spec(tmp_path, "kirocrew")
+
+        assert str(tmp_path / "kirocrew.json") in str(exc.value)
+
+    def test_an_unparseable_sibling_does_not_break_the_scan(self, tmp_path):
+        """The agents dir is user-writable and shared, so a stray file is normal;
+        the hardened reader skips it and the real match is still found."""
+        (tmp_path / "broken.json").write_text("{not json", encoding="utf-8")
+        (tmp_path / "list.json").write_text("[]", encoding="utf-8")
+        self._write(tmp_path, "SomePackage-kirocrew.json", description="namespaced")
+
+        assert load_agent_spec(tmp_path, "kirocrew")["description"] == "namespaced"
+
+    def test_a_missing_agents_dir_is_a_translation_error(self, tmp_path):
+        with pytest.raises(KasAgentTranslationError):
+            load_agent_spec(tmp_path / "absent", "kirocrew")
+
+    def test_the_scanned_spec_is_used_without_a_second_read(self, tmp_path, monkeypatch):
+        """The hardened reader resolves the symlink and vets the target it lands
+        on. Reopening that path afterwards would read whatever it points at by
+        then, so the vetted parse itself has to be what the projection uses."""
+        self._write(tmp_path, "SomePackage-kirocrew.json", description="on disk")
+        monkeypatch.setattr(
+            kas_agents,
+            "spec_by_declared_name",
+            lambda *_a, **_k: _spec(description="what the reader vetted"),
+        )
+
+        spec = load_agent_spec(tmp_path, "kirocrew")
+
+        assert spec["description"] == "what the reader vetted"
+
+    def test_two_specs_declaring_one_name_are_refused(self, tmp_path):
+        """`agent_spec_path` refuses this ambiguity because which spec is live is
+        undefined. Picking one here would project an agent the operator did not
+        name, with its tools and its prompt, and say nothing about it.
+        """
+        self._write(tmp_path, "AlphaPackage-kirocrew.json", description="alpha")
+        self._write(tmp_path, "BetaPackage-kirocrew.json", description="beta")
+
+        with pytest.raises(KasAgentTranslationError) as exc:
+            load_agent_spec(tmp_path, "kirocrew")
+
+        message = str(exc.value)
+        assert "AlphaPackage-kirocrew.json" in message
+        assert "BetaPackage-kirocrew.json" in message
+
+    def test_a_direct_file_does_not_settle_a_duplicate_declared_name(self, tmp_path):
+        """Two specs declaring the id are refused even when `<agent_id>.json`
+        exists: which of the two is live is undefined, and a misnamed direct
+        file is not a tie-breaker between them. `agent_spec_path` refuses the
+        same input."""
+        self._write(tmp_path, "kirocrew.json", name="other", description="misnamed")
+        self._write(tmp_path, "AlphaPackage-kirocrew.json", description="alpha")
+        self._write(tmp_path, "BetaPackage-kirocrew.json", description="beta")
+
+        with pytest.raises(KasAgentTranslationError) as exc:
+            load_agent_spec(tmp_path, "kirocrew")
+
+        assert "AlphaPackage-kirocrew.json" in str(exc.value)
+        assert "BetaPackage-kirocrew.json" in str(exc.value)
+
+    def test_an_unsearchable_dir_is_a_translation_error_at_the_direct_read(
+        self, tmp_path, monkeypatch
+    ):
+        """``Path.read_text`` propagates a permission error on every supported
+        version, so an agents dir the process cannot search reaches the
+        fallback read as an ``OSError``. Callers of this module handle
+        ``KasAgentTranslationError``, so an ``OSError`` escaping here aborts
+        session startup instead of failing the projection.
+        """
+
+        def _denied(_self, *_a, **_k):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(Path, "read_text", _denied)
+
+        with pytest.raises(KasAgentTranslationError) as exc:
+            load_agent_spec(tmp_path, "kirocrew")
+
+        assert str(tmp_path / "kirocrew.json") in str(exc.value)
+
+    def test_an_unsearchable_dir_is_a_translation_error_during_the_scan(
+        self, tmp_path, monkeypatch
+    ):
+        """On Python 3.12 ``Path.glob`` probes the directory with ``is_dir``
+        before walking it and propagates that error, so the scan raises even
+        though it suppresses per-entry ``scandir`` failures.
+        """
+
+        def _denied(_self, _pattern):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(Path, "glob", _denied)
+
+        with pytest.raises(KasAgentTranslationError) as exc:
+            load_agent_spec(tmp_path, "kirocrew")
+
+        assert str(tmp_path / "kirocrew.json") in str(exc.value)

@@ -196,193 +196,27 @@ rendering, including the computed-`className` case.
 Any new primitive that pairs a `md:`-prefixed base padding with `twMerge` re-opens
 the same hole, so either yield the axis the same way or keep the base unprefixed.
 Stated honestly: `Card` is currently the ONLY primitive in `ui.tsx` with a
-breakpoint-scoped base padding — `Btn`, `Input`, `StatCard` and `Chip` are all
+breakpoint-scoped base padding — `Btn`, `Input` and `StatCard` are all
 unprefixed — so this note has no other instance to fix today. It is here because the
 failure is silent and desktop-only, which is exactly the kind a reader will not
 re-derive when they reach for `md:px-*` in a new primitive.
 
-### Other narrow-viewport recommendations
+### Where the narrow-viewport rules live
 
-Also recommendations, not gates. Each earned its place by breaking on a real screen,
-and each carries the measurement that settled it — reach for the measurement before
+The measurement record sits in [narrow-viewport.md](narrow-viewport.md), one hop
+away. Everything in it is a recommendation rather than a gate, and each item
+carries the measurement that settled it, so reach for the measurement before
 arguing with the rule.
 
-**A collapsed side rail becomes a horizontal bar across the TOP, never a thin vertical
-strip.** Horizontal is the one axis a phone cannot spare; vertical it can. A 44px strip
-overflows nothing, so it looks fixed while the reading column still pays for it.
-
-**Hiding is not collapsing.** A control removed below `md` needs an entry point at that
-width — an overflow menu, a drawer, a disclosure. A pane that hides the only host of the
-phase-advance controls leaves the phone user unable to advance the phase at all.
-
-**Gate on the constraint, not the viewport.** When a pane can be narrow at any viewport
-(a split, a resizable rail, an embedded panel), measure the PANE with a `ResizeObserver`
-rather than calling `useIsMobile()`. A 1280px window can hold a 200px pane.
-
-**A tabbed shell's pane needs its own top inset once the header goes away — and it
-must be the only one.** `SidePanelLayout` drops the desktop header block below `md` —
-the block whose `pb-3` put 12px between a tab's title and its content — and replaces it
-with a pill strip that ends in a drawn `border-b`. The pane kept no inset of its own, so
-a tab whose first element is a `Card` or a `StatCard` rendered that element's own border
-ON the divider: two lines touching, measured at a 0px gap on four of Agent Capabilities'
-seven tabs and on seven of Developer's eight renderable ones at 390px. The pane carries
-`pt-3` on the narrow branch only — desktop must stay at 0 or the two insets stack.
-
-That inset is shared by all three pages built on the shell (Agent Capabilities,
-Developer, Settings), which makes the second half of the rule as load-bearing as the
-first: **a tab must not add a top margin to its own first element.** Doing so stacks on
-the pane and lands that tab 28px down while its siblings sit at 12px — the inconsistency
-reads as sloppiness precisely because the tabs are one keystroke apart. Two shapes, and
-the difference is whether the heading can ever have a sibling above it:
-
-- **A heading at the tab's root** (`SkillsTab`, `SteeringTab`) drops the margin outright.
-  Do NOT reach for `first:mt-0` here: `SkillsTab` renders `PendingSkillsPanel` above the
-  heading, and that panel returns `null` when nothing is pending — so the heading moves in
-  and out of `:first-child` with the pending count, and a positional rule would make the
-  gap depend on it. (A conditionally rendered `Modal` does NOT have this effect: it
-  `createPortal`s to `document.body` and never occupies a sibling slot.)
-- **A heading that repeats within one tab** (`SettingsSection`, used many times per
-  Settings tab; `LocalStorageDebug`'s section headings) keeps `mt-4`, because the gap
-  between two sections is real, and pairs it with `first:mt-0`. The fragment adds no DOM
-  node, so every section header is a sibling in one parent and only the leading one
-  matches — and when a tab renders something of its own above the first section, the
-  header stops being first and correctly keeps the margin.
-
-Measured at 390px with `website/scripts/capture-side-panel-pane-inset.mjs`, which reports
-the divider→first-in-flow-box distance per tab: all 31 renderable tabs across the three
-pages now read 12px. Residual differences in where the first *pixel* lands (21px on
-Connections, on Developer > System, on Settings > Instances) are a control's own internal
-padding — a sub-tab's or a segmented button's tap target — not stacked page padding, and
-tightening those would shrink a touch target.
-
-**An unbounded action cluster leaves the text row; it does not shrink it.** A row of
-actions whose count depends on state (enabled, updatable, uninstallable) and that carries
-`shrink-0` takes its natural width, and the text column gets the remainder — measured at
-34px on a 390px screen, and 0px at 320px. Move the cluster to its own row below the text.
-
-**A per-character-breaking script collapses instead of overflowing, so overflow metrics
-cannot see it.** CJK text reaches `scrollWidth == clientWidth` while wrapping to one or
-two characters per line. Judge a reading column by its WIDTH, not by whether anything
-overflowed.
-
-**Two coupled numbers must be pinned by a test.** A negative margin that cancels an inset
-(`-mx-2 md:mx-0` against `Card`'s own `px-2`), or a pull-back sized to a tile's width plus a
-gap, is ONE number written twice. Changing one alone misaligns silently — nothing
-overflows, so only a test that asserts the pair catches it.
-
-**An icon alone cannot carry a state-changing action.** `aria-label` fixes the screen
-reader, not the sighted user, who is left guessing what a bare glyph does. Icon-only is
-for neutral, recoverable affordances (refresh, expand), not for a write.
-
-**Verify at 320px, not only 390px.** 320 is the floor every major design system bottoms
-out at, and it is where a layout that merely looks tight at 390 actually breaks — the
-Apps card measured a 34px text column at 390px and 0px at 320px.
-
-**Build touch targets to 44px; grade them in two tiers.** 44px is the number every system
-recommends. WCAG 2.2 SC 2.5.8's floor is 24x24, but it carries a **spacing** exception: an
-undersized target still conforms if a 24px circle centred on it does not intersect a
-neighbour's. So under 24x24 *and* crowded is a conformance failure; under 44x44 alone is a
-convention miss. Reporting every sub-44 control as a violation over-reports by roughly 3x.
-
-**`overflow: hidden` on ANY ancestor kills `position: sticky` — use `overflow: clip`.**
-Same family: a `transform` on an ancestor re-anchors `position: fixed` children, and
-`align-self: start` is the most common silent sticky failure in flex and grid. A sticky
-element also cannot escape its own parent's box, so a bar that must outlive a scrolling
-sibling has to be that sibling's SIBLING, not its child.
-
-**`100vh` resolves against the LARGE viewport.** A `100vh` panel overflows while the URL
-bar is showing and its bottom controls fall off screen. Use `svh` for app shells, since it
-does not reflow as the bar animates, and `dvh` only for surfaces that must track the exact
-visible area (a chat container, a modal). Safe area is **padding, not size**:
-`padding-bottom: env(safe-area-inset-bottom)`, which resolves to 0 without
-`viewport-fit=cover`.
-
-**Use the line-length cap in reverse to tell "ugly" from "broken".** WCAG 1.4.8 caps a
-reading measure at 80 characters, 40 for CJK. Run it backwards and a squeezed pane stops
-being a matter of taste: a 50px column at 13px holds three CJK glyphs, which is a defect
-you can state as a number.
-
-**Reach for a `Card` less often on a phone.** A card buys grouping with a drawn border
-plus its own inset — on a 390px screen that is 16px of width and a line the screen edge
-already implies. Where a section is the only thing on the page, or where the grouping is
-already obvious from a heading, prefer a heading plus content and let the page gutter do
-the work. Cards earn their keep when several peer groups must be told apart on one
-screen; they cost the most when they are nested, since each level charges its inset
-again.
-
-**An overflowing action row belongs in an overflow menu — not wrapped, not silently
-scrolled.** This is the one place the design systems are unanimous (Primer's `ActionBar`,
-Carbon's five-action cap, Apple's "define which items move to the overflow menu"), and it
-is what `AUTOSDE.yaml`'s `max-two-buttons-per-row` encodes. Wrapping such a row below `md`
-keeps the controls reachable, but it is an interim, not the answer.
-
-### Horizontal insets below the breakpoint
-
-Padding stacks, and the eye reads the SUM. On a wide viewport a page gutter plus a card
-inset plus a row inset is comfortable; at 390px it is not. The skill-budget row measured
-16px (page) + 20px (`Card`) + 16px (row) = **52px** before its text, against 16px for the
-same text in chat.
-
-The page container keeps the `px-4 md:px-6 pb-8` the skeleton above prescribes -- that is what
-`AUTOSDE.yaml`'s `page-layout-pattern` requires, and it is not the layer to change. The
-third layer is the one to drop:
-
-**Below `md`, prefer no horizontal padding on a row that is a DIRECT child of a `Card`.**
-The page gutter and the card's own inset already supply it:
-
-```tsx
-<div className="… py-2 md:px-4">   {/* row: the card supplies the inset while narrow */}
-```
-
-Gate **every** row in that card the same way -- section header, group header, data row,
-footnote. Gating only some of them leaves the data rows sitting to the left of the headers
-that label them, which reads as rows escaping their own section.
-
-**The direct-child part is the precondition, not a detail.** The rule works because the
-card is what supplies the inset the row gives up. Put an unpadded bordered pane between
-them and that stops being true:
-
-```tsx
-<Card>                                                   {/* 20px */}
-  <div className="… border border-border rounded-md">    {/* 0px, draws a visible edge */}
-    <div className="… px-4 py-2.5 border-b">             {/* row: px-4 is its ONLY gutter */}
-```
-
-Here the row's `px-4` is load-bearing -- gating it puts the text flush against the border.
-The excess inset belongs to the card, but the card is NOT what yields: halve the card's inset
-below `md` and pull the pane out by exactly that amount, on the shell the pane and its
-loading skeleton share so the layout does not jump when data arrives. The two numbers
-are ONE number -- changing the inset without the margin pushes the pane past the border:
-
-```tsx
-const PANE_SHELL_CLASS = 'flex gap-3 -mx-2 md:mx-0 …'  /* cancels `Card`'s own px-2 */
-```
-
-From the boxes at 390px on the Skills tab: the pane goes from left 25 / width 340 to
-left 17 / width 356, so a row inside it starts at ~34px instead of ~42px, against 16px
-for the same text in chat. (The pattern was first measured on a page that ran a 16px
-gutter and a 20px card inset, where the same pull-back moved the pane from left 37 /
-width 316 to left 17 / width 356.)
-
-**Do not flush the card itself** (a `px-0` override). Its padding is also the only gutter the
-toolbar above the pane has, and removing it puts the search field's rounded border
-directly against the card's border -- measured as a 0px gap, and the first thing a reader
-calls ugly. `Card`'s own narrow inset (`px-2`, 8px) keeps the field off the border
-while giving the row back most of the width. An inset toolbar above a full-bleed list is the ordinary phone pattern; the
-two do not need to share a left edge.
-
-This does not touch the page container's `px-4 md:px-6 pb-8`, which is what `AUTOSDE.yaml`'s
-`page-layout-pattern` names and is not the layer to change. For a pane that must reach the
-SCREEN edge, past the page gutter, cancel the gutter itself inside the pane (`-mx-3` while
-narrow) -- the same one-number-written-twice pairing, so pin it with a test.
-
-**Status: a direction, not a description of the repo.** Two shapes are migrated --
-`SkillContextBudget` (direct-child rows) and the `SkillsTab` / `SteeringTab` split panes
-(card flush). A scan for `className="…px-4…py-2"` under `website/src/pages` matches ~27
-rows across 15 files, but a hit is not a work item: most are toolbars, banners, sticky
-bars and buttons that own the only gutter their content has, and rows inside a bordered
-pane must keep theirs. There is no lint gate for this. Read the structure around a hit
-before gating it, and see kirodotdev/KiroCrew#3939 for the triage of all 27.
+| Rule | Where it is stated |
+|---|---|
+| Page zoom off on touch, and the surfaces that own their own zoom | [narrow-viewport.md](narrow-viewport.md#layout-and-sizing) |
+| The 44px touch-target rule and its two-tier grading | [narrow-viewport.md](narrow-viewport.md#layout-and-sizing) |
+| The drag-widget `touch-action: none` exemption | [narrow-viewport.md](narrow-viewport.md#a-horizontal-drag-on-mobile-belongs-to-the-nav-drawer-unless-a-page-claims-it) |
+| The 16px gutter derivation and the field floor that was not adopted | [narrow-viewport.md](narrow-viewport.md#layout-and-sizing) |
+| The nav-drawer swipe contract and `data-owns-swipe` | [narrow-viewport.md](narrow-viewport.md#a-horizontal-drag-on-mobile-belongs-to-the-nav-drawer-unless-a-page-claims-it) |
+| Binding a panel's gesture live to its offset | [narrow-viewport.md](narrow-viewport.md#a-panel-that-gains-a-gesture-must-be-bound-live-to-its-offset) |
+| Horizontal insets below the breakpoint, and `Card`'s measured budget | [narrow-viewport.md](narrow-viewport.md#horizontal-insets-below-the-breakpoint) |
 
 ## Stat cards
 
@@ -469,9 +303,14 @@ Inline within a `Card`, built from the shared primitives:
   reliably hand a finger drag to that shape — Settings → Voice → Language showed
   7 of its ~41 codes with the rest unreachable. A themed list nobody can scroll
   is worse than an OS-drawn list that works. Because the choice lives inside
-  `SimpleSelect`, no call site makes it: keep reaching for the components above
-  and the touch case is already handled. `NativeSelect` is the single file
-  exempted from the `no-restricted-syntax` rule; do not add a second.
+  `SimpleSelect`, no call site makes it — and `SettingsSelect` inherits it by
+  wrapping `SimpleSelect`. It goes no further: `SearchableSelect`,
+  `DropdownMenu` and `AgentSelector` keep the themed popup on a coarse pointer,
+  since a native `<select>` cannot host a filter box, per-option sublabels or a
+  command menu. Reaching for one of those does not mean the touch case has been
+  handled for you; whether that scroller is a real defect on a phone is
+  unresolved in #5551. `NativeSelect` is the single file exempted from the
+  `no-restricted-syntax` rule; do not add a second.
 - `Toggle` for a boolean switch. It carries `role="switch"`, `aria-checked` and
   `aria-disabled` itself, so do not re-add them.
 
@@ -509,3 +348,31 @@ are Tailwind utilities defined in `tailwind.config.js`, and both use
 - Use raw status text. Use `Badge` or `SourceBadge`.
 - Use `text-xs`. Use `text-[13px]`.
 - Add a new CSS `@keyframes`. Use Framer Motion, or an existing utility.
+
+
+### Split view: leading edge and focus
+
+The surface's top-left is the sessions-sidebar toggle's. In single chat the
+title row carries it (mobile) or clears the shell's stationary button with a
+60px inset and a hairline at 52px (desktop, sidebar collapsed). Split view does
+not render that row, so `SessionGridLayout` hands `ownsTopLeft` to the one
+geometric top-left leaf and `SessionGridView` gives that pane `leading`:
+`inset` reserves the toggle's column on the pane's own row (`ChatPane`:
+`pl-[49px]`, hairline at 41px; the picker card: `pl-[44px]`, hairline at 36px —
+both are container x 52 and 44, the single-chat row's columns, measured from
+where each pane's content starts), `control` renders the toggle inline ahead
+of the title. The shell's toggle keeps its normal rect (`TOGGLE_RECT`) in split
+view: the pane title row is the same height as the single-chat row, so it
+already centres on it.
+
+Split view marks focus by dimming every other pane as well as by the pane's
+accent border: `PaneDim` lays a background-coloured rectangle over the pane at
+`--pane-dim-opacity` (0.4), the way Ghostty fades an unfocused split, so
+message text, code highlighting and status colours keep their own values
+underneath and only the whole pane reads as "not the one with focus". The
+overlay is always mounted while the pane knows its focus state (opacity 0 when
+focused, so the cue fades both ways), sits at `z-20` above the message chrome
+and below the drop overlay and every shell layer, and takes no pointer events,
+so the click that claims focus lands on the pane. A pane outside split view
+(`focused` undefined) never mounts it. The placeholder pane keeps its accent
+dot as well.

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """The worker writes ``data/results/<id>.json``; the run reads its own dir.
 
-Regression for a real failure: per-run isolation moved the READ path to
-``data/runs/<run_id>/results/`` but the reviewing worker's prompt (and the
-`sage-review` skill) still name the shared ``data/results/<id>.json``. The run
-dir stayed empty, so a review that had genuinely completed reported
-``result_records: 0`` and the UI showed an empty report while claiming "done".
+Per-run isolation puts the READ path at ``data/runs/<run_id>/results/`` while the
+reviewing worker's prompt (and the `sage-review` skill) name the shared
+``data/results/<id>.json``. Without adoption the run dir stays empty, so a review
+that genuinely completed reports ``result_records: 0`` and the UI shows an empty
+report while claiming "done".
 
 The driver owns run scoping, so it adopts the worker's record after each turn.
 """
@@ -167,7 +167,11 @@ class TestDriverAdopts(_Base):
                            root=self.root, run_id="run-a", progress=prog)
         self.assertEqual(seen["CR-1"], "failed")
         self.assertEqual(out["result_records"], 0)
+        # The residual "turn completed, nothing written" case keeps this value —
+        # discriminated causes (runtime preflight, incomplete record) carry
+        # their own reasons and must never collapse back into it.
         self.assertEqual(out["per_change"][0]["skipped_reason"], "no_review_recorded")
+        self.assertFalse(out["per_change"][0]["result_recorded"])
 
 
 if __name__ == "__main__":  # pragma: no cover

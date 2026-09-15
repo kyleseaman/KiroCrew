@@ -67,6 +67,58 @@ class TestInventory:
         (row,) = oc.inventory([catalog_git()])
         assert "author" not in row
 
+    def test_a_git_entrys_star_count_is_carried(self):
+        """The publisher bakes ``stargazersCount`` into git entries, and this
+        projection is the production path that turns the catalog into store
+        rows -- dropping the field here silently disables the whole feature
+        (the row never reaches ``_merge_manifest``'s allowlist)."""
+        (row,) = oc.inventory([catalog_git(stargazersCount=1234)])
+        assert row["stargazersCount"] == 1234
+
+    def test_a_zero_star_count_is_carried(self):
+        """Zero is a real count; only ABSENCE means unknown."""
+        (row,) = oc.inventory([catalog_git(stargazersCount=0)])
+        assert row["stargazersCount"] == 0
+
+    @pytest.mark.parametrize(
+        "bad",
+        [-1, "1234", True, False, 3.5, None, [1], {"n": 1}, 9_007_199_254_740_992],
+        ids=["negative", "string", "true", "false", "float", "none", "list", "dict", "over-js-max"],
+    )
+    def test_a_malformed_star_count_is_dropped_not_coerced(self, bad):
+        """The document arrived over the network: a wrong type or an
+        implausible magnitude (beyond the JS safe-integer range) degrades this
+        one field, never the row and never the run."""
+        (row,) = oc.inventory([catalog_git(stargazersCount=bad)])
+        assert "stargazersCount" not in row
+
+    def test_a_builtin_entry_never_carries_a_star_count(self):
+        """Stars are a git-repo fact; a builtin has no repository of its own,
+        so even a document that claims one publishes no field."""
+        entry = catalog_git(stargazersCount=1234)
+        entry["source"] = {"type": "builtin", "url": URL, "ref": SHA}
+        rows = oc.inventory([entry])
+        assert all("stargazersCount" not in r for r in rows)
+
+    def test_list_catalog_rows_never_carries_the_star_count(self, monkeypatch):
+        """This projection reads the agent-writable CACHE
+        (``load_official_catalog``): a poisoned cache forging display copy is
+        survivable, but a forged trust cue beside Install is not — the count
+        flows only through the fresh-TLS-fetch projections."""
+        monkeypatch.setattr(oc, "load_official_catalog", lambda: [catalog_git(stargazersCount=77)])
+        (row,) = oc.list_catalog_rows()
+        assert "stargazersCount" not in row
+
+    def test_annotate_never_overlays_the_star_count(self):
+        """``annotate`` matches by NAME, and a same-name seed row can pin a
+        DIFFERENT repository (seed collisions keep the pin by design) — so an
+        overlay here would show the catalog repo's stars beside an Install
+        that clones another repo. The count flows through ``inventory()``
+        alone, where identity and count come from the same entry."""
+        row = {"name": "demo-app"}
+        oc.annotate([row], [catalog_git(stargazersCount=55)])
+        assert "stargazersCount" not in row
+
     @pytest.mark.parametrize(
         "name",
         [
@@ -141,6 +193,85 @@ class TestInventory:
         assert "displayName" not in row
         assert "tags" not in row, "a bare string must not become one tag per character"
         assert row["commit"] == SHA, "the row itself survives"
+
+
+class TestResolveRefList:
+    """``screenshotRefs`` resolution, where "absent" and "unreadable" must not
+    collapse: absent leaves the caller's field unset, and an unreadable member
+    is dropped rather than emitted as a ref a browser cannot load."""
+
+    def test_each_member_resolves_against_the_catalog(self):
+        assert oc._resolve_ref_list(["assets/s/1.png", "assets/s/2.png"]) == [
+            "https://apps.crew.kiro.dev/assets/s/1.png",
+            "https://apps.crew.kiro.dev/assets/s/2.png",
+        ]
+
+    def test_an_absolute_member_is_a_client_local_path(self):
+        assert oc._resolve_ref_list(["/app-assets/x/s.png"]) == ["/app-assets/x/s.png"]
+
+    @pytest.mark.parametrize("refs", [None, {}, "assets/s.png", 5, True])
+    def test_a_non_list_answers_empty(self, refs):
+        """A bare string is iterable and would resolve one ref per character, so
+        the list contract is 'a list, or nothing'."""
+        assert oc._resolve_ref_list(refs) == []
+
+    def test_an_unreadable_member_is_dropped_not_emitted(self):
+        """The readable members survive in order; the URL-shaped and traversal
+        members are dropped rather than handed to an ``<img>`` as a guaranteed
+        404. This is the absent-vs-unreadable line the wrapper must hold."""
+        out = oc._resolve_ref_list([
+            "assets/s/1.png",
+            "https://evil.example/x.png",
+            "../secret.png",
+            "assets/s/2.png",
+        ])
+        assert out == [
+            "https://apps.crew.kiro.dev/assets/s/1.png",
+            "https://apps.crew.kiro.dev/assets/s/2.png",
+        ]
+
+    def test_a_list_of_only_unreadable_members_answers_empty(self):
+        """So the caller leaves the field UNSET rather than emitting a
+        present-but-empty gallery."""
+        assert oc._resolve_ref_list(["https://evil.example/x.png", 5, None]) == []
+
+
+class TestInventoryArt:
+    """``heroDetailRef`` and ``screenshotRefs`` reach the row as
+    catalog-hosted URLs, so the detail page for a not-installed catalog app
+    has a wide detail banner and screenshots to render. Their bytes live on
+    the CDN, addressed by the published refs."""
+
+    def test_a_detail_hero_ref_becomes_a_catalog_url(self):
+        (row,) = oc.inventory([catalog_git(heroDetailRef="assets/hero/detail.png")])
+        assert row["heroImageDetail"] == "https://apps.crew.kiro.dev/assets/hero/detail.png"
+        assert "/api/apps/blob" not in row["heroImageDetail"], "never the SSRF-gated proxy"
+
+    def test_an_absolute_detail_hero_ref_is_a_client_local_path(self):
+        (row,) = oc.inventory([catalog_git(heroDetailRef="/app-assets/demo/detail.svg")])
+        assert row["heroImageDetail"] == "/app-assets/demo/detail.svg"
+
+    def test_screenshot_refs_become_catalog_urls(self):
+        (row,) = oc.inventory(
+            [catalog_git(screenshotRefs=["assets/s/1.png", "assets/s/2.png"])]
+        )
+        assert row["screenshots"] == [
+            "https://apps.crew.kiro.dev/assets/s/1.png",
+            "https://apps.crew.kiro.dev/assets/s/2.png",
+        ]
+
+    def test_absent_art_leaves_the_fields_unset(self):
+        """Absent must stay absent: most apps publish neither, and a
+        present-but-empty value would render a titled-but-blank gallery."""
+        (row,) = oc.inventory([catalog_git()])
+        assert "heroImageDetail" not in row
+        assert "screenshots" not in row
+
+    def test_an_unreadable_detail_hero_ref_is_a_swallowed_miss(self):
+        """A URL-shaped ref is dropped, and the field stays UNSET rather than
+        carrying a value the ref contract forbids."""
+        (row,) = oc.inventory([catalog_git(heroDetailRef="https://evil.example/d.png")])
+        assert "heroImageDetail" not in row
 
 
 class TestInstallCoordinatesDoNotTrustTheCache:
@@ -304,8 +435,8 @@ class TestPinnedFetchNeverEatsUserData:
     async def test_a_spawn_failure_after_init_leaves_nothing_behind(self, tmp_path, monkeypatch):
         """The exit three rounds of patches all missed.
 
-        Cleanup used to sit on each failure BRANCH, so an exception between
-        `git init` and `git remote add` bypassed every one of them and left a `.git`
+        Cleanup on each failure BRANCH would let an exception between
+        `git init` and `git remote add` bypass every one of them and leave a `.git`
         directory with no origin -- which then wedges each later attempt on
         `unreadable_clone_origin`, a fail-closed path that deliberately does not
         clean up after itself. Cleanup now belongs to the destination's lifetime.
@@ -563,7 +694,7 @@ class TestPinnedInstallNeverReusesAnExistingTree:
 
     @pytest.mark.asyncio
     async def test_a_checkout_already_at_the_pin_is_still_not_reused(self, tmp_path, monkeypatch):
-        """HEAD equality is no longer consulted at all -- it described placement,
+        """HEAD equality is not consulted at all -- it described placement,
         never contents."""
         dest = tmp_path / "source"
         (dest / ".git").mkdir(parents=True)
@@ -663,6 +794,31 @@ class TestCatalogFailureNeverDowngradesToAnUnpinnedSeed:
         row, reason = reg._resolve_registry_row("dup")
         assert row is None, "an unpinned seed must not stand in for an unknown pin"
         assert "could not be reached" in reason
+
+    def test_failure_log_and_reason_omit_name_and_exception_text(
+        self, monkeypatch, caplog
+    ):
+        secret_shaped_name = "secrettoken123"
+        monkeypatch.setattr(reg, "_load_registry_file", lambda: [])
+
+        def _unavailable(name):
+            raise reg.official_catalog.CatalogUnavailable(
+                f"catalog rejected {name} with embedded-secret"
+            )
+
+        monkeypatch.setattr(
+            reg.official_catalog,
+            "inventory_for_install",
+            _unavailable,
+        )
+
+        row, reason = reg._resolve_registry_row(secret_shaped_name)
+
+        assert row is None
+        assert secret_shaped_name not in reason
+        assert "embedded-secret" not in reason
+        assert secret_shaped_name not in caplog.text
+        assert "embedded-secret" not in caplog.text
 
     def test_an_authoritative_no_catalog_row_still_uses_the_seed(self, monkeypatch):
         """The other half: refusing on a successful "no row" would break every
@@ -868,12 +1024,12 @@ class TestTheCacheMayNotIntroduceInventory:
 
     @pytest.mark.asyncio
     async def test_a_poisoned_cache_cannot_relabel_a_fresh_row(self, monkeypatch):
-        """Round 11 stopped the cache INTRODUCING a row; this stops it REWRITING one.
+        """A poisoned cache cannot RELABEL a freshly fetched row.
 
         `annotate` overlays `displayName` and `description` -- exactly what the consent
-        modal renders -- and it used to read the cache, so a poisoned entry could
-        re-label a freshly fetched first-party row while the name-scoped grant executed
-        the real app.
+        modal renders -- from the fresh catalog fetch, never the agent-writable cache,
+        so a poisoned cache entry cannot re-label a first-party row while the
+        name-scoped grant executes the real app.
         """
         real = {
             "name": "demo-app",

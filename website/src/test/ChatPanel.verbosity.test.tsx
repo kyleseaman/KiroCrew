@@ -17,7 +17,7 @@ const BASE_DASH = {
 
 const { dashboardConfigMock, selectProps } = vi.hoisted(() => ({
   dashboardConfigMock: vi.fn(),
-  selectProps: [] as { label: string; value: unknown }[],
+  selectProps: [] as { label: string; value: unknown; options?: readonly string[]; optionLabels?: readonly string[] }[],
 }))
 
 vi.mock('../api/client', () => ({
@@ -33,6 +33,14 @@ vi.mock('../api/client', () => ({
     updateSttConfig: () => Promise.resolve({}),
     tipsStatus: () => Promise.resolve({ enabled_config: true, opted_out: false }),
     tipsFeedback: () => Promise.resolve({ ok: true }),
+    // The panel reads the feature-video cache on mount. Downloads OFF here, so
+    // the readout renders its policy line and no button -- these files measure
+    // other settings, and a live control would put a stray button in their reach.
+    featureVideoStatus: () => Promise.resolve({
+      enabled: true, download_enabled: false, release: 'r1',
+      cached: 0, total: 0, downloading: null,
+    }),
+    featureVideoFetchAll: () => Promise.resolve({ ok: true }),
   },
 }))
 
@@ -48,7 +56,7 @@ vi.mock('../components/settings', async importOriginal => {
   return {
     ...actual,
     SettingsSelect: (props: Parameters<typeof actual.SettingsSelect>[0]) => {
-      selectProps.push({ label: props.label, value: props.value })
+      selectProps.push({ label: props.label, value: props.value, options: props.options, optionLabels: props.optionLabels })
       return actual.SettingsSelect(props)
     },
   }
@@ -56,9 +64,16 @@ vi.mock('../components/settings', async importOriginal => {
 
 import { ChatPanel } from '../pages/settings/ChatPanel'
 
+import { Provider } from 'react-redux'
+
+// ChatPanel reads the active slot from redux to name the session on its
+// feature-video calls, so these renders need a store. A FRESH one per file,
+// not the app singleton: a shared store would carry `activeSlot` across suites.
+import { createTestStore } from './helpers'
+
 function wrap(ui: React.ReactElement) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={qc}>{ui}</QueryClientProvider>)
+  return render(<Provider store={createTestStore()}><QueryClientProvider client={qc}>{ui}</QueryClientProvider></Provider>)
 }
 
 async function verbosityValueAfterLoad(persisted: unknown): Promise<unknown> {
@@ -87,8 +102,24 @@ describe('ChatPanel settings – Response Verbosity is narrowed before render', 
     ['default', 'default'],
     ['concise', 'concise'],
     ['ultra', 'ultra'],
+    ['answer_only', 'answer_only'],
   ])('passes through the known level %s', async (persisted, expected) => {
     expect(await verbosityValueAfterLoad(persisted)).toBe(expected)
+  })
+
+  // Every level the backend enum accepts needs a row here, and a label for it —
+  // an option list short by one entry renders that level as a bare enum value,
+  // and a level missing from the list cannot be selected at all.
+  it('offers a labelled option for every level the config enum accepts', async () => {
+    dashboardConfigMock.mockResolvedValue({ ...BASE_DASH, verbosity: 'answer_only' })
+    wrap(<ChatPanel />)
+    await screen.findByText('Response Verbosity')
+    await waitFor(() => expect(selectProps.some(p => p.label === 'Response Verbosity')).toBe(true))
+    const seen = selectProps.filter(p => p.label === 'Response Verbosity')
+    const row = seen[seen.length - 1]
+    expect(row.options).toEqual(['default', 'concise', 'ultra', 'answer_only'])
+    expect(row.optionLabels).toHaveLength(4)
+    expect(row.optionLabels?.every(label => !!label && label.trim().length > 0)).toBe(true)
   })
 
   // `an object` is the exact shape from the report: {"dashboard":{"verbosity":{}}}.

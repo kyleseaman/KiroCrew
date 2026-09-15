@@ -31,7 +31,7 @@
  * is faked: grouping, the render dispatch and the handlers run for real.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, act, waitFor, fireEvent } from '@testing-library/react'
+import { render, screen, act, waitFor, fireEvent, within } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
@@ -40,7 +40,11 @@ import { createTestStore } from './helpers'
 import { ApiError } from '../api/client'
 import { ThemeProvider } from '../hooks/useTheme'
 import type { RootState } from '../store'
+import { sseConnected, sseDisconnected } from '../store/dashboardSlice'
+import { sseAutomation } from '../store/chatSlice'
 import type { ChatMessage } from '../types'
+import { structuredMonitorLoop } from './monitorFixtures'
+import { normalizeAutomationRecord, type AutomationRecord } from '../monitoring/automation'
 
 // --- Prop recorders for the two panels whose callbacks are under test --------
 
@@ -71,6 +75,10 @@ let userMsgProps: UserMessageProps | null = null
 
 interface ChatInputProps {
   onAgentClick?: (rect: DOMRect) => void
+  automation?: { kind?: string } | null
+  automationCreationReady?: boolean
+  automationSnapshotFailed?: boolean
+  onAutomationChange?: (automation: AutomationRecord | null) => void
 }
 let chatInputProps: ChatInputProps | null = null
 
@@ -106,8 +114,14 @@ vi.mock('../pages/chat', async () => {
       userMsgProps = props
       return React.createElement('div', { 'data-testid': 'user-msg' }, props.content)
     },
-    AssistantMessage: ({ content }: { content: string }) =>
-      React.createElement('div', { 'data-testid': 'assistant-msg' }, content),
+    // The two props the memoized renderMessage derives from the paging cursor, so a
+    // test can see a STALE closure: both go quiet when the flag is read from one.
+    AssistantMessage: ({ content, forkIndex, onLoadEarlier }: { content: string; forkIndex?: number; onLoadEarlier?: () => void }) =>
+      React.createElement('div', {
+        'data-testid': 'assistant-msg',
+        'data-fork-index': forkIndex === undefined ? 'none' : String(forkIndex),
+        'data-can-page': onLoadEarlier ? 'yes' : 'no',
+      }, content),
   }
 })
 vi.mock('react-virtuoso', () => ({ Virtuoso: () => null }))
@@ -173,8 +187,11 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
         data,
       })),
       isAtBottom: false,
+      getFollow: () => true,
       scrollToBottom: vi.fn(),
       mountIndex: vi.fn(() => false),
+      farmIsMeasured: () => true,
+      farmRecord: vi.fn(() => true),
       measureRef: () => () => {},
       topSentinelRef: { current: null },
       bottomSentinelRef: { current: null },
@@ -322,7 +339,7 @@ function renderChatPage(messages: ChatMessage[], opts: RenderOpts = {}) {
   if (messages.length) {
     act(() => { store.dispatch({ type: 'chat/replaceMessages', payload: messages }) })
   }
-  return { store }
+  return { store, qc }
 }
 
 /** All text currently on screen — ChatPage spans several sibling roots. */
@@ -356,6 +373,171 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers()
+})
+
+describe('ChatPage active-slot automation hydration', () => {
+  it('surfaces a failed snapshot and keeps bounded creation guarded', async () => {
+    apiMocks.autonudgeForSlot = vi.fn().mockResolvedValue({ enabled: true, loop: null })
+    apiMocks.monitorForSlot = vi.fn().mockRejectedValue(new Error('owner unavailable'))
+
+    renderChatPage([])
+
+    await waitFor(() => expect(chatInputProps?.automationSnapshotFailed).toBe(true))
+    expect(chatInputProps?.automationCreationReady).toBe(false)
+  })
+
+  it('hydrates a structured monitor alongside its reduced compatibility row', async () => {
+    const monitor = structuredMonitorLoop()
+    const {
+      message: _withheldMessage,
+      monitor: _withheldMonitor,
+      ...reducedMonitor
+    } = monitor
+    apiMocks.autonudgeForSlot = vi.fn().mockResolvedValue({
+      enabled: true,
+      loop: reducedMonitor,
+    })
+    apiMocks.monitorForSlot = vi.fn().mockResolvedValue({ enabled: true, monitor })
+
+    renderChatPage([])
+
+    await waitFor(() => {
+      expect(chatInputProps?.automation).toMatchObject({
+        kind: 'structured_monitor',
+        id: monitor.id,
+      })
+    })
+    expect(chatInputProps?.automationSnapshotFailed).toBe(false)
+  })
+
+  it('caches a non-null mutation result before updating the store', async () => {
+    const next = normalizeAutomationRecord(structuredMonitorLoop({ probe_count: 2 }))!
+    apiMocks.autonudgeForSlot = vi.fn().mockResolvedValue({ enabled: true, loop: null })
+    apiMocks.monitorForSlot = vi.fn().mockResolvedValue({ enabled: true, monitor: null })
+    const { qc, store } = renderChatPage([])
+    await waitFor(() => expect(chatInputProps?.automationCreationReady).toBe(true))
+
+    act(() => { chatInputProps?.onAutomationChange?.(next) })
+
+    expect(qc.getQueryData(['session-automation', 'chat-1'])).toEqual(next)
+    expect(store.getState().chat.automations['chat-1']).toEqual(next)
+  })
+
+  it('forgets the cached legacy snapshot after a successful stop', async () => {
+    const loop = {
+      id: 'legacy-1', slot_key: 'chat-1', message: 'Keep going', idle_secs: 60,
+      max_cycles: 24, cycle_count: 7, active: true, last_fire_ts: 123,
+    }
+    apiMocks.autonudgeForSlot = vi.fn().mockResolvedValue({ enabled: true, loop })
+    apiMocks.monitorForSlot = vi.fn().mockResolvedValue({ enabled: true, monitor: null })
+
+    const { qc } = renderChatPage([])
+    await waitFor(() => {
+      expect(chatInputProps?.automation).toMatchObject({ kind: 'legacy_goal_loop' })
+    })
+
+    act(() => { chatInputProps?.onAutomationChange?.(null) })
+
+    expect(qc.getQueryData(['session-automation', 'chat-1'])).toBeNull()
+    await waitFor(() => expect(chatInputProps?.automation).toBeNull())
+  })
+
+  it('blocks creation until REST discovers a monitor without a websocket frame', async () => {
+    let resolveLegacy!: (value: { enabled: boolean; loop: unknown }) => void
+    let resolveMonitor!: (value: { enabled: boolean; monitor: unknown }) => void
+    apiMocks.autonudgeForSlot = vi.fn().mockReturnValue(new Promise(resolve => {
+      resolveLegacy = resolve
+    }))
+    apiMocks.monitorForSlot = vi.fn().mockReturnValue(new Promise(resolve => {
+      resolveMonitor = resolve
+    }))
+
+    renderChatPage([])
+    await waitFor(() => expect(chatInputProps?.automationCreationReady).toBe(false))
+    expect(apiMocks.autonudgeForSlot).toHaveBeenCalledWith('chat-1')
+    expect(apiMocks.monitorForSlot).toHaveBeenCalledWith('chat-1')
+
+    const loop = structuredMonitorLoop()
+    act(() => {
+      resolveLegacy({ enabled: true, loop })
+      resolveMonitor({ enabled: true, monitor: loop })
+    })
+    await waitFor(() => {
+      expect(chatInputProps?.automation).toMatchObject({ kind: 'structured_monitor' })
+      expect(chatInputProps?.automationCreationReady).toBe(true)
+    })
+  })
+
+  it('keeps a disconnected REST snapshot query-local', async () => {
+    const freshLoop = structuredMonitorLoop({ active: false, stopped_reason: 'user_stop' })
+    const fresh = normalizeAutomationRecord(freshLoop)!
+    apiMocks.autonudgeForSlot = vi.fn().mockResolvedValue({ enabled: true, loop: null })
+    apiMocks.monitorForSlot = vi.fn().mockResolvedValue({ enabled: true, monitor: freshLoop })
+
+    const { store } = renderChatPage([])
+
+    await waitFor(() => {
+      expect(chatInputProps?.automation).toEqual(fresh)
+    })
+    expect(store.getState().chat.automations?.['chat-1']).toBeUndefined()
+  })
+
+  it('does not replace a live frame with cached data during or after a failed refetch', async () => {
+    const cachedLoop = structuredMonitorLoop({ probe_count: 1 })
+    const live = normalizeAutomationRecord(structuredMonitorLoop({ probe_count: 2 }))!
+    apiMocks.autonudgeForSlot = vi.fn().mockResolvedValue({ enabled: true, loop: null })
+    apiMocks.monitorForSlot = vi.fn().mockResolvedValue({ enabled: true, monitor: cachedLoop })
+
+    const { store, qc } = renderChatPage([])
+    act(() => { store.dispatch(sseConnected()) })
+    await waitFor(() => expect(qc.getQueryData(['session-automation', 'chat-1'])).toBeTruthy())
+    act(() => { store.dispatch(sseAutomation(live)) })
+
+    let rejectMonitor!: (reason: Error) => void
+    apiMocks.autonudgeForSlot = vi.fn().mockResolvedValue({ enabled: true, loop: null })
+    apiMocks.monitorForSlot = vi.fn().mockReturnValue(new Promise((_resolve, reject) => {
+      rejectMonitor = reject
+    }))
+    const refetch = qc.refetchQueries({ queryKey: ['session-automation', 'chat-1'] })
+    await waitFor(() => {
+      expect(qc.getQueryState(['session-automation', 'chat-1'])?.fetchStatus).toBe('fetching')
+    })
+
+    act(() => { store.dispatch(sseDisconnected()) })
+    expect(store.getState().chat.automations['chat-1']).toEqual(live)
+
+    act(() => { rejectMonitor(new Error('offline')) })
+    await refetch
+    await waitFor(() => {
+      expect(qc.getQueryState(['session-automation', 'chat-1'])?.fetchStatus).toBe('idle')
+    })
+    expect(store.getState().chat.automations['chat-1']).toEqual(live)
+  })
+
+  it('does not delete a live monitor when an older REST absence settles after disconnect', async () => {
+    let resolveLegacy!: (value: { enabled: boolean; loop: null }) => void
+    let resolveMonitor!: (value: { enabled: boolean; monitor: null }) => void
+    apiMocks.autonudgeForSlot = vi.fn().mockReturnValue(new Promise(resolve => {
+      resolveLegacy = resolve
+    }))
+    apiMocks.monitorForSlot = vi.fn().mockReturnValue(new Promise(resolve => {
+      resolveMonitor = resolve
+    }))
+    const live = normalizeAutomationRecord(structuredMonitorLoop({ probe_count: 2 }))!
+
+    const { store } = renderChatPage([])
+    act(() => {
+      store.dispatch(sseConnected())
+      store.dispatch(sseAutomation(live))
+      store.dispatch(sseDisconnected())
+      resolveLegacy({ enabled: true, loop: null })
+      resolveMonitor({ enabled: true, monitor: null })
+    })
+
+    await waitFor(() => expect(chatInputProps?.automationCreationReady).toBe(true))
+    expect(store.getState().chat.automations['chat-1']).toEqual(live)
+    expect(chatInputProps?.automation).toEqual(live)
+  })
 })
 
 describe('ChatPage agent-switch failure feedback', () => {
@@ -414,9 +596,12 @@ describe('ChatPage default-agent footer row', () => {
     act(() => { chatInputProps!.onAgentClick!({ left: 40, top: 80 } as DOMRect) })
     await waitFor(() => expect(defaultAgentRowProps).not.toBeNull())
 
-    expect(defaultAgentRowProps!.agentName).toBe('default')
+    // An agent-less slot resolves to the configured default agent (the
+    // useAgents mock above returns defaultAgent: 'kirocrew'), not the
+    // literal 'default' placeholder the pre-fix fallback rendered.
+    expect(defaultAgentRowProps!.agentName).toBe('kirocrew')
     act(() => { defaultAgentRowProps!.onSetDefault() })
-    await waitFor(() => expect(setDefault).toHaveBeenCalledWith('default'))
+    await waitFor(() => expect(setDefault).toHaveBeenCalledWith('kirocrew'))
   })
 })
 
@@ -758,7 +943,7 @@ describe('ChatPage pinned-messages panel', () => {
     expect(await screen.findByText(UNAVAILABLE)).toBeInTheDocument()
   })
 
-  it('surfaces an unpin failure and auto-dismisses the notice', async () => {
+  it('surfaces an unpin failure that stays until dismissed', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     pinsRemoveMock.mockRejectedValue(new Error('nope'))
     await openPins([msg('user', 'pinned', { ts: 'u1', meta: { mid: 'm-1' } })])
@@ -766,7 +951,13 @@ describe('ChatPage pinned-messages panel', () => {
     act(() => pinsProps!.onUnpin('pin-1'))
     expect(await screen.findByText('Could not unpin the message. Try again.')).toBeInTheDocument()
 
+    // A failure is not a status line: the 8-second timer that clears "not in
+    // this history" must leave it alone.
     await act(async () => { vi.advanceTimersByTime(8100) })
+    const notice = screen.getByTestId('pin-error')
+    expect(notice).toHaveTextContent('Could not unpin the message. Try again.')
+
+    fireEvent.click(within(notice).getByRole('button', { name: 'Dismiss' }))
     await waitFor(() =>
       expect(screen.queryByText('Could not unpin the message. Try again.')).not.toBeInTheDocument(),
     )
@@ -898,5 +1089,106 @@ describe('ChatPage URL prompt hand-off', () => {
     await waitFor(() => expect(window.location.search).toBe(''))
     expect(prefillWrites()).toHaveLength(0)
     expect(createSpy).not.toHaveBeenCalled()
+  })
+})
+
+describe('ChatPage search scope disclosure', () => {
+  /** Open the find pane the real way -- the Cmd+F handler in useMessageSearch --
+   *  and type a term, so the count span renders. */
+  const openSearchAndType = (term: string) => {
+    act(() => { fireEvent.keyDown(document, { key: 'f', metaKey: true }) })
+    fireEvent.change(screen.getByPlaceholderText('Find in chat…'), { target: { value: term } })
+  }
+
+  it('qualifies the scope while the paging cursor does not describe the active slot', async () => {
+    // switchSlot.pending nulls the cursor key while leaving slotHasMore describing
+    // the outgoing slot, so false here is not this slot's answer (chatSlice:3575).
+    const { store } = renderChatPage([msg('assistant', 'hello there', { ts: 'a1' })], {
+      chat: { slotMessages: {} },
+    })
+    await waitFor(() => expect(shown()).toContain('hello there'))
+    expect(store.getState().chat.slotHasMore).toBe(false)
+    act(() => { store.dispatch({ type: 'chat/switchSlot/pending', meta: { arg: 'chat-1', requestId: 'r-scope' } }) })
+    expect(store.getState().chat.slotCursorKey).toBeNull()
+
+    openSearchAndType('zzz-no-match')
+    await waitFor(() => expect(shown()).toMatch(/in loaded history/i))
+  })
+
+  it('reads as complete once the cursor DOES describe the active slot', async () => {
+    // Opposite direction: the qualifier must not become unconditional, or every
+    // fully-loaded chat claims its search was partial.
+    const { store } = renderChatPage([msg('assistant', 'hello there', { ts: 'a1' })])
+    await waitFor(() => expect(shown()).toContain('hello there'))
+    expect(store.getState().chat.slotCursorKey).toBe('chat-1')
+
+    openSearchAndType('zzz-no-match')
+    await waitFor(() => expect(shown()).toContain('No results'))
+    expect(shown()).not.toMatch(/in loaded history/i)
+  })
+})
+
+/** `renderMessage` is memoized, and a switch BACK to an already-loaded chat is the
+ *  one path that restores the paging cursor while leaving every one of its deps
+ *  untouched. Activating another slot leaves the URL slug behind, so ChatPage's own
+ *  slug effect switches straight back: `switchSlot.pending` installs the target's
+ *  CACHED array — a new reference, so the renderer is rebuilt while the cursor is
+ *  still null — and `fulfilled` then restores the cursor while `sameTranscript`
+ *  skips the `messages` write. With the cursor flag missing from the dep list the
+ *  rebuilt renderer keeps `cursorIsForActiveSlot === false`, so Fork/Plan stay shut
+ *  on a chat that is fully loaded and holds a valid cursor. */
+describe('ChatPage fork affordance — cursor recovery on a switch back', () => {
+  const A = () => msg('assistant', 'alpha transcript', { ts: 'a1' })
+  const B = () => msg('assistant', 'bravo transcript', { ts: 'b1' })
+  /** What the memoized renderer currently believes, read off the row it produced. */
+  const row = () => screen.getAllByTestId('assistant-msg').slice(-1)[0]
+
+  /** Activate another slot through the real reducers. ChatPage's slug effect then
+   *  drives the switch back on its own, which is the sequence under test. */
+  const activateOtherSlot = (store: { dispatch: (a: unknown) => void }) => {
+    act(() => { store.dispatch({ type: 'chat/switchSlot/pending', meta: { arg: 'chat-2', requestId: 'r-to-b' } }) })
+    act(() => {
+      store.dispatch({
+        type: 'chat/switchSlot/fulfilled',
+        meta: { arg: 'chat-2', requestId: 'r-to-b' },
+        payload: { key: 'chat-2', messages: [B()], running: false, hasMore: false, queue: [], nextBefore: 0, total: 1 },
+      })
+    })
+  }
+
+  it('re-opens Fork once the cursor lands on a switch back to an identical transcript', async () => {
+    const { store } = renderChatPage([A()], { chat: { slotMessages: {} } })
+    await waitFor(() => expect(shown()).toContain('alpha transcript'))
+    expect(store.getState().chat.slotCursorKey).toBe('chat-1')
+    expect(row().getAttribute('data-fork-index')).not.toBe('none')
+
+    activateOtherSlot(store)
+
+    // The slug effect's switch back has landed: cursor valid, nothing left to page.
+    await waitFor(() => {
+      expect(store.getState().chat.activeSlot).toBe('chat-1')
+      expect(store.getState().chat.slotCursorKey).toBe('chat-1')
+    })
+    expect(store.getState().chat.slotHasMore).toBe(false)
+    await waitFor(() => expect(shown()).toContain('alpha transcript'))
+
+    // Fork is operable again, and the cursor-gated paging handler came back with it.
+    expect(row().getAttribute('data-fork-index')).not.toBe('none')
+    expect(row().getAttribute('data-can-page')).toBe('yes')
+  })
+
+  it('keeps Fork shut while the cursor genuinely still names the chat we left', async () => {
+    // Opposite direction, so the fix cannot buy an operable Fork by making the trust
+    // predicate unconditional: a frozen fetch holds the switch back genuinely in flight.
+    const { store } = renderChatPage([A()], { chat: { slotMessages: {} } })
+    await waitFor(() => expect(shown()).toContain('alpha transcript'))
+
+    apiMocks.chatSlotDetail = vi.fn(() => new Promise(() => {}))
+    activateOtherSlot(store)
+
+    await waitFor(() => expect(store.getState().chat.slotCursorKey).toBeNull())
+
+    expect(row().getAttribute('data-fork-index')).toBe('none')
+    expect(row().getAttribute('data-can-page')).toBe('no')
   })
 })

@@ -8,21 +8,38 @@ import logging
 import os
 import unicodedata
 import uuid
+import weakref
 from typing import Any
 
 from aiohttp import web
 
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
-from kiro_crew.dashboard.chat_utils import effective_session_key
+from kiro_crew.dashboard.chat_tags import tags_write_lock, validate_folder_tag_ids
+from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_key
+from kiro_crew.dashboard.create_rate_limit import FOLDER_CREATE, allow_create
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.dashboard.token_auth import caller_names_a_missing_slot, derive_caller_app
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.sandbox import voice_runtime_workspace_conflict
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
+
+#: The ceiling on chat folders, the folder-tree counterpart to
+#: :data:`~kiro_crew.dashboard.state.MAX_LIVE_SLOTS`. Folder creation had no bound
+#: at all: every other create path in the dashboard tests a ceiling, so an
+#: automated caller looping on this one was the single way to grow durable
+#: on-disk state without limit.
+#:
+#: Chosen to sit far above any hand-built tree -- a person organizing chats works
+#: in tens of folders, not hundreds -- so the only thing that ever reaches it is a
+#: runaway loop. Tested under ``mutate_folders``, not before it: the count is only
+#: authoritative while the lock is held, which is the same reason the parent is
+#: re-checked and ``order`` recounted there.
+MAX_CHAT_FOLDERS = 500
 
 _folder_icon_lock = LoopBoundLock()
 
@@ -42,10 +59,10 @@ def _is_single_emoji(s: str) -> bool:
         o = ord(c)
         return (
             unicodedata.category(c).startswith("So")  # symbol, other
-            or o > 0x1F000                            # supplementary emoji planes
+            or o > 0x1F000  # supplementary emoji planes
             or o in modifiers
-            or 0x1F3FB <= o <= 0x1F3FF                 # skin-tone modifiers
-            or 0x1F1E6 <= o <= 0x1F1FF                 # regional indicators (flags)
+            or 0x1F3FB <= o <= 0x1F3FF  # skin-tone modifiers
+            or 0x1F1E6 <= o <= 0x1F1FF  # regional indicators (flags)
         )
 
     if not all(_emoji_char(c) for c in s):
@@ -86,8 +103,18 @@ _FOLDER_ICON_MODEL = "auto"
 # it, and test_folder_color_palette_matches_frontend_catalog pins the two.
 _FOLDER_COLOR_PALETTE = frozenset(
     {
-        "#ef4444", "#f97316", "#f59e0b", "#84cc16", "#22c55e", "#14b8a6",
-        "#06b6d4", "#3b82f6", "#6366f1", "#8b5cf6", "#ec4899", "#94a3b8",
+        "#ef4444",
+        "#f97316",
+        "#f59e0b",
+        "#84cc16",
+        "#22c55e",
+        "#14b8a6",
+        "#06b6d4",
+        "#3b82f6",
+        "#6366f1",
+        "#8b5cf6",
+        "#ec4899",
+        "#94a3b8",
     }
 )
 
@@ -95,6 +122,38 @@ _FOLDER_COLOR_PALETTE = frozenset(
 def _is_valid_folder_color(s: str) -> bool:
     """True for a palette color value (lowercase hex, allowlisted)."""
     return s in _FOLDER_COLOR_PALETTE
+
+
+def _validate_folder_tags(state: DashboardState, raw: Any) -> tuple[list[str] | None, str | None]:
+    """Validate a folder ``tags`` payload against the tag vocabulary.
+
+    Returns ``(clean_ids, None)`` on success or ``(None, error)`` on rejection.
+    Only the payload SHAPE is rejected (``tags`` must be an array) — matching
+    ``api_chat_slot_tags``, the sibling this endpoint mirrors, unknown ids and
+    non-string entries are silently FILTERED, not 400ed. That leniency is
+    load-bearing: a dangling id can legitimately exist on a folder (the
+    acknowledged best-effort strip failure in ``api_chat_tag_delete``), and a
+    strict endpoint would make every subsequent save of that folder fail —
+    the "permanently uneditable folder" class. Filtering at the write means a
+    stale reference is shed on the next save instead of bricking it.
+    ``clean_ids`` is deduped preserving first-seen order, with no count cap
+    (vocabulary membership plus dedupe already bounds the list). An empty list
+    is valid — it means "no tags", the same way an absent ``color`` means
+    "default color".
+
+    Only the payload SHAPE is owned here (``tags`` must be an array → 400,
+    matching the sibling ``api_chat_slot_tags``); everything after the shape
+    check DELEGATES to ``validate_folder_tag_ids`` — the single definition of
+    a usable folder tag id — so the filter-not-400 leniency, dedupe, string
+    guard, and the authority-gated fail-open vocabulary intersection cannot
+    drift from the inheritance paths that read these same ids back. See that
+    helper's docstring for why filtering (not 400) and failing open (not
+    intersecting an unknown vocabulary) are both load-bearing.
+    """
+    if not isinstance(raw, list):
+        return None, "tags must be an array"
+
+    return validate_folder_tag_ids(raw, state), None
 
 
 async def generate_emoji_for_name(state: DashboardState, name: str) -> str:
@@ -107,7 +166,7 @@ async def generate_emoji_for_name(state: DashboardState, name: str) -> str:
     """
 
     prompt = (
-        f"Reply with exactly ONE emoji that best represents a project folder named \"{name}\". "
+        f'Reply with exactly ONE emoji that best represents a project folder named "{name}". '
         "No text, no explanation, just the single emoji character."
     )
 
@@ -192,7 +251,7 @@ async def _unhide_folder(state: DashboardState, folder_id: str) -> bool:
 # caller here must be a conscious edit paired with a test, never a silent
 # widen — the point of the header is that a NEW internal caller surfaces as
 # ``unknown-internal`` in the audit until someone decides what to call it,
-# instead of silently inheriting another component's label (#3503).
+# instead of silently inheriting another component's label.
 _KNOWN_INTERNAL_CALLERS = frozenset({"kirocrew-dashboard"})
 
 
@@ -246,9 +305,7 @@ async def api_chat_folders(request: web.Request) -> web.Response:
     # maintenance_executor, whose fast periodic sweeps — the orphan reaper — must
     # stay responsive and could otherwise be starved by frequent polling.
     loop = asyncio.get_running_loop()
-    folders = await loop.run_in_executor(
-        subprocess_executor(), _folders_with_history_counts, state
-    )
+    folders = await loop.run_in_executor(subprocess_executor(), _folders_with_history_counts, state)
     return web.json_response(folders)
 
 
@@ -257,17 +314,69 @@ def _validate_project_dir(raw: str) -> tuple[str, str | None]:
     if not raw:
         return "", None
     if not os.path.isabs(raw) and not raw.startswith("~"):
-        return "", "project_dir must be an absolute path"
+        return "", "Project directory must be an absolute path"
     resolved = os.path.realpath(os.path.expanduser(raw))
     if is_sensitive_path(resolved):
         sel().log_api_access(
-            caller="dashboard", operation="chat.folder_project_dir",
-            outcome="denied", resources=resolved, error="sensitive path",
+            caller="dashboard",
+            operation="chat.folder_project_dir",
+            outcome="denied",
+            resources=resolved,
+            error="sensitive path",
         )
         return "", "project_dir refers to a sensitive path"
     if not os.path.isdir(resolved):
-        return "", "project_dir must be an existing directory"
+        return "", "Project directory must be an existing directory"
     return resolved, None
+
+
+def _folder_project_overlap_denied(resolved: str) -> str | None:
+    """Pre-flight the voice-runtime workspace guard for a folder's project_dir.
+
+    A folder's linked project lands on slots verbatim, so without this check
+    "link a folder to ~" is refused only at agent spawn.
+    Same shared scan and message as the project endpoint and set_project — the
+    user-driven moments of choice agree. Returns the refusal message or None.
+
+    Synchronous on purpose (realpath/mkdir priming on first use):
+    callers on the event loop MUST run it via ``asyncio.to_thread``, exactly
+    like the project endpoint does. It is deliberately NOT part of
+    ``_validate_project_dir``: that validator also re-checks STORED values on
+    the slot-create read path, where re-priming per read would be loop-blocking
+    and where the spawn guard remains the authority.
+    """
+    conflict = voice_runtime_workspace_conflict(resolved)
+    if conflict is None:
+        return None
+    sel().log_api_access(
+        caller="dashboard",
+        operation="chat.folder_project_dir",
+        outcome="denied",
+        resources=resolved,
+        error="voice runtime overlap",
+    )
+    return conflict
+
+
+def _resolve_folder_project_dir(
+    folders: list[dict[str, Any]], folder_id: str
+) -> tuple[str, str | None]:
+    """Return the nearest validated project directory inherited by a folder."""
+    by_id = {str(folder.get("id") or ""): folder for folder in folders if isinstance(folder, dict)}
+    seen: set[str] = set()
+    current_id = folder_id
+    while current_id and current_id not in seen:
+        seen.add(current_id)
+        folder = by_id.get(current_id)
+        if folder is None:
+            break
+        raw_project = folder.get("project_dir")
+        if raw_project:
+            if not isinstance(raw_project, str):
+                return "", "project_dir must be a string"
+            return _validate_project_dir(raw_project.strip())
+        current_id = str(folder.get("parent_id") or "")
+    return "", None
 
 
 def _refuse_unattributable_caller(
@@ -384,36 +493,154 @@ def _is_descendant(folders: list[dict], *, ancestor_id: str, folder_id: str) -> 
     return False
 
 
-async def api_chat_folder_create(request: web.Request) -> web.Response:
-    """POST /api/chat/folders — create a project folder."""
-    state: DashboardState = request.app["state"]
-    if (refusal := _refuse_unattributable_caller(state, request)) is not None:
-        return refusal
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    name = (body.get("name") or "").strip()[:100]
+class FolderCreateError(ValueError):
+    """A folder could not be created because the request was refused.
+
+    Carries the two halves of the folder API's 400 body: ``str(exc)`` is the
+    advisory prose a surface renders, ``code`` the machine-readable id it
+    branches on (empty for the refusals the folder API answers without one).
+    """
+
+    def __init__(self, message: str, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class FolderOwnershipError(FolderCreateError):
+    """Refused because an app tried to nest under a folder it does not own.
+
+    Split from :class:`FolderCreateError` because the folder API answers it
+    differently (403 plus a denied SEL entry, not a plain 400), and the
+    response shape belongs to the caller — so the caller must be able to tell
+    this refusal apart without string-matching the message.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "cannot create a folder inside one this app does not own",
+            "folder_not_owned",
+        )
+
+
+class FolderCapError(FolderCreateError):
+    """Refused because the folder store is at its ceiling.
+
+    Split from :class:`FolderCreateError` for the same reason
+    :class:`FolderOwnershipError` is: the folder API answers it differently
+    (429, a retryable capacity refusal, not a plain 400), so a caller must be
+    able to tell it apart without string-matching the message.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            f"folder cap reached ({MAX_CHAT_FOLDERS})",
+            "folder_cap_reached",
+        )
+
+
+async def create_folder_record(
+    state: DashboardState,
+    *,
+    name: str,
+    parent_id: str = "",
+    project_dir: str = "",
+    default_agent: str = "",
+    color: str = "",
+    request_app: str = "",
+    tags: list[str] | None = None,
+    unique_project_dir: bool = False,
+    require_resolved_project_dir: bool = False,
+) -> dict[str, Any]:
+    """Validate one folder and append it to the store under the folders lock.
+
+    The single create path. Callers that build folders for the user — the folder
+    API below, project scaffolding — go through here, so none of them can end up
+    with weaker path validation, a dangling ``parent_id``, weaker app-ownership
+    isolation, or an unserialized store write than the others get. What stays
+    with the caller is what differs between them: the response shape, the audit
+    entry, and when to push a slots update (once per folder for a single create,
+    once for a whole scaffold).
+
+    ``request_app`` is the calling app's identity (empty when a person is
+    calling): it is stamped as ``owner_app`` and gates nesting under folders
+    other apps own. Never taken from a request body — a caller that could name
+    its own owner could name someone else's (see ``_folder_owner_app``).
+
+    ``tags`` is a shape-checked list of tag ids the caller wants copied onto
+    every new chat filed into this folder (the folder API validates the request
+    shape and answers 400 ``tags_invalid`` itself). The AUTHORITATIVE vocabulary
+    intersection still runs here, under ``tags_write_lock``, at the point of
+    application — the invariant every tag consumer follows (see
+    api_chat_slot_tags / the channel filing): a tag deletion committing between
+    the caller's shape check and this write must not be persisted onto the new
+    folder, and the strip pass a deletion runs cannot see a folder that is not
+    yet in the store. Included in the folder dict only when the intersection is
+    non-empty — the same optional-key shape as ``color``, so a tagless folder
+    keeps the record it has on disk today.
+
+    Returns:
+        The created folder, exactly as it was appended to the store.
+
+    ``unique_project_dir`` makes "one folder per directory" atomic: the check
+    runs inside the locked append, so two concurrent creators of the same
+    ``project_dir`` cannot both observe it absent and both persist a folder —
+    the loser is refused with code ``folder_project_dir_exists`` and can read
+    the winner's folder after the fact. Off by default because the folder API
+    has always allowed a person to point two folders at one directory by hand;
+    only a caller whose own contract is "additive, skip what exists" (the
+    scaffold) opts in.
+
+    ``require_resolved_project_dir`` refuses a ``project_dir`` whose validation
+    resolves to a different path than the caller named (code
+    ``folder_project_dir_moved``). A caller that sets it is asserting its input
+    is already canonical — the scaffold passes paths its scan just resolved and
+    walked, so a resolution that lands elsewhere means a path component was
+    swapped (typically for a symlink) between the scan and this create, and
+    persisting the resolved target would bind the folder to a directory the
+    scan never confirmed. Off by default because the folder API proper accepts
+    ``~`` and symlinked paths from a person by design; resolution moving those
+    is the feature, not an attack.
+
+    Raises:
+        FolderCreateError: if the folder was refused (unusable name, missing
+            parent, unusable ``project_dir``, unknown color, or a
+            ``unique_project_dir`` collision).
+        FolderOwnershipError: if an app tried to nest under a folder it does
+            not own.
+    """
+
+    name = name.strip()[:100]
     if not name:
-        return web.json_response({"error": "name required"}, status=400)
-    parent_id = str(body.get("parent_id") or "")
+        raise FolderCreateError("name required")
     if parent_id and not any(f["id"] == parent_id for f in state._folders):
-        return web.json_response({"error": "parent folder not found"}, status=400)
-    project_dir = str(body.get("project_dir") or "").strip()
-    project_dir, err = _validate_project_dir(project_dir)
+        raise FolderCreateError("parent folder not found")
+    requested_dir = project_dir.strip()
+    # Off-loop: realpath + isdir + the sensitive-path scan touch the filesystem,
+    # and the scaffold calls this once per folder in a loop, so a slow or
+    # network-mounted directory would otherwise stall every other request.
+    project_dir, err = await asyncio.to_thread(_validate_project_dir, requested_dir)
     if err:
-        return web.json_response({"error": err}, status=400)
-    default_agent = str(body.get("default_agent") or "").strip()
-    color = str(body.get("color") or "").strip().lower()
+        raise FolderCreateError(err)
+    if require_resolved_project_dir and project_dir != requested_dir:
+        # The caller vouched its path was already canonical, so a resolution
+        # that lands elsewhere means the directory on disk is no longer the one
+        # the caller confirmed — refuse rather than persist the substitute.
+        raise FolderCreateError(
+            "That directory was moved or replaced after the scan — re-scan and retry",
+            "folder_project_dir_moved",
+        )
+    if project_dir:
+        # Off-loop: the shared scan primes runtime paths on first use.
+        conflict = await asyncio.to_thread(_folder_project_overlap_denied, project_dir)
+        if conflict is not None:
+            raise FolderCreateError(conflict, "workspace_overlaps_data_home")
+    color = color.strip().lower()
     if color and not _is_valid_folder_color(color):
         # `code` is the contract, `error` is advisory prose (RFC 9457 3.1.3) —
         # the dashboard renders `error` verbatim into a localized UI, so a new
         # error response without an id is untranslatable by construction.
-        return web.json_response(
-            {"error": "color must be one of the folder palette values", "code": "color_invalid"},
-            status=400,
-        )
-    folder = {
+        raise FolderCreateError("color must be one of the folder palette values", "color_invalid")
+    folder: dict[str, Any] = {
         "id": uuid.uuid4().hex[:12],
         "name": name,
         "order": len(state._folders),
@@ -425,11 +652,6 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
     }
     if color:
         folder["color"] = color
-    # Never from the body: a caller that could name its own owner could name
-    # someone else's. Written only when an app is calling, so the person's rows
-    # keep the shape they have on disk today and "absent means the person"
-    # stays the one representation (see _folder_owner_app).
-    request_app = _effective_request_app(state, request)
     if request_app:
         folder["owner_app"] = request_app
 
@@ -441,6 +663,12 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
         parent = next((f for f in folders if f["id"] == parent_id), None) if parent_id else None
         if parent_id and parent is None:
             return False, "parent_not_found"
+        # The ceiling is tested here, under the lock, for the same reason the parent
+        # is re-checked here: `len(folders)` is only authoritative while the lock is
+        # held, so a pre-lock test lets concurrent creators each pass a cap that is
+        # already full.
+        if len(folders) >= MAX_CHAT_FOLDERS:
+            return False, "folder_cap_reached"
         # Nesting into a folder writes to THAT folder's child list, so an app may
         # only nest under one of its own. The top level is not a folder row and
         # so has no owner to violate — that is where an app's own tree starts.
@@ -448,35 +676,132 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
         # request can change who the parent belongs to.
         if request_app and parent is not None and _folder_owner_app(parent) != request_app:
             return False, "forbidden_parent"
+        # Under the lock, not pre-lock: a pre-lock read is exactly the
+        # check-then-act gap that lets two concurrent creators both see the
+        # directory unclaimed.
+        if (
+            unique_project_dir
+            and project_dir
+            and any(str(f.get("project_dir") or "") == project_dir for f in folders)
+        ):
+            return False, "project_dir_exists"
         folder["order"] = len(folders)  # recount under the lock
         folders.append(folder)
         return True, ""
 
-    create_err = await state.mutate_folders(_append)
+    if tags:
+        async with tags_write_lock(state):
+            refreshed, _ = _validate_folder_tags(state, tags)
+            if refreshed:
+                folder["tags"] = refreshed
+            create_err = await state.mutate_folders(_append)
+    else:
+        create_err = await state.mutate_folders(_append)
+    if create_err == "folder_cap_reached":
+        raise FolderCapError()
     if create_err == "parent_not_found":
         # The parent was deleted while this request waited for the lock.
-        return web.json_response(
-            {"error": "parent folder not found", "code": "folder_parent_not_found"},
-            status=400,
-        )
+        raise FolderCreateError("parent folder not found", "folder_parent_not_found")
     if create_err == "forbidden_parent":
-        sel().log_api_access(
-            caller=request_app, operation="chat.folder_create",
-            outcome="denied", source="app_isolation", resources=f"parent={parent_id}",
-            error="app cannot create inside a folder it does not own",
+        raise FolderOwnershipError()
+    if create_err == "project_dir_exists":
+        raise FolderCreateError(
+            "a folder for this directory already exists", "folder_project_dir_exists"
         )
+    return folder
+
+
+async def api_chat_folder_create(request: web.Request) -> web.Response:
+    """POST /api/chat/folders — create a project folder."""
+    state: DashboardState = request.app["state"]
+    if (refusal := _refuse_unattributable_caller(state, request)) is not None:
+        return refusal
+    # Rate-limit INTERNAL callers only. This endpoint is mixed-path: the browser's
+    # own "new folder" control posts here too, and a person organizing their chats
+    # can legitimately create a dozen in one sitting, so throttling them would be a
+    # regression with no security value. The threat is an automated loop on an
+    # auto-approved verb, and `_audit_origin` already tells the two apart -- a
+    # request without the internal secret is the browser.
+    #
+    # Keyed on the VALIDATED caller name, not the session key. The session key would
+    # give finer granularity but is partly caller-supplied:
+    # `_refuse_unattributable_caller` only refuses a `dashboard:` key naming a dead
+    # slot, so a caller could present rotating non-dashboard keys and earn a fresh
+    # budget for each. The caller name is checked against `_KNOWN_INTERNAL_CALLERS`,
+    # so it cannot be varied to escape the bucket. The cost is that internal callers
+    # share one folder budget, which is acceptable when a goal needs exactly one.
+    rl_source, rl_caller = _audit_origin(request)
+    if rl_source != "dashboard" and not allow_create(FOLDER_CREATE, rl_caller):
         return web.json_response(
             {
-                "error": "cannot create a folder inside one this app does not own",
-                "code": "folder_not_owned",
+                "error": "too many folders created recently; retry shortly",
+                "code": "create_rate_limited",
             },
-            status=403,
+            status=429,
         )
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+    # Organizational tags copied onto every new chat filed into this folder.
+    # Shape-checked here — the request-facing half, so a non-array payload is
+    # refused before any folder work happens — while the AUTHORITATIVE
+    # vocabulary intersection runs in ``create_folder_record``, under the tags
+    # write lock, at the point of application.
+    folder_tags: list[str] = []
+    if "tags" in body:
+        clean_tags, tags_err = _validate_folder_tags(state, body.get("tags"))
+        if tags_err or clean_tags is None:
+            return web.json_response(
+                {"error": tags_err or "tags invalid", "code": "tags_invalid"}, status=400
+            )
+        folder_tags = clean_tags
+    # Never from the body: a caller that could name its own owner could name
+    # someone else's. Written only when an app is calling, so the person's rows
+    # keep the shape they have on disk today and "absent means the person"
+    # stays the one representation (see _folder_owner_app).
+    request_app = _effective_request_app(state, request)
+    parent_id = str(body.get("parent_id") or "")
+    try:
+        folder = await create_folder_record(
+            state,
+            name=str(body.get("name") or ""),
+            parent_id=parent_id,
+            project_dir=str(body.get("project_dir") or ""),
+            default_agent=str(body.get("default_agent") or "").strip(),
+            color=str(body.get("color") or ""),
+            request_app=request_app,
+            tags=folder_tags,
+        )
+    except FolderOwnershipError as exc:
+        sel().log_api_access(
+            caller=request_app,
+            operation="chat.folder_create",
+            outcome="denied",
+            source="app_isolation",
+            resources=f"parent={parent_id}",
+            error="app cannot create inside a folder it does not own",
+        )
+        return web.json_response({"error": str(exc), "code": exc.code}, status=403)
+    except FolderCapError as exc:
+        return web.json_response({"error": str(exc), "code": exc.code}, status=429)
+    except FolderCreateError as exc:
+        # Inline literals rather than one hoisted payload dict: the error-code
+        # contract scan reads the body at the `json_response` site, and a local
+        # reads as an opaque body there (test/test_error_code_contract.py). The
+        # wire shape is unchanged — `code` appears only when the refusal carries
+        # one, exactly as the pre-extraction handler answered.
+        if exc.code:
+            return web.json_response({"error": str(exc), "code": exc.code}, status=400)
+        return web.json_response({"error": str(exc)}, status=400)
     state.push_slots_update()
     source, caller = _audit_origin(request)
     sel().log_api_access(
-        caller=caller, operation="chat.folder_create",
-        outcome="allowed", source=source, resources=str(folder["id"]),
+        caller=caller,
+        operation="chat.folder_create",
+        outcome="allowed",
+        source=source,
+        resources=str(folder["id"]),
     )
     return web.json_response(folder, status=201)
 
@@ -556,6 +881,13 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
         pd, err = _validate_project_dir(str(body["project_dir"] or "").strip())
         if err:
             return web.json_response({"error": err}, status=400)
+        if pd:
+            # Off-loop: the shared scan primes runtime paths on first use.
+            conflict = await asyncio.to_thread(_folder_project_overlap_denied, pd)
+            if conflict is not None:
+                return web.json_response(
+                    {"error": conflict, "code": "workspace_overlaps_data_home"}, status=400
+                )
         changes["project_dir"] = pd
     if "color" in body:
         # Palette color for the folder glyph. None or empty string clears back
@@ -564,10 +896,20 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
         color_val = str(raw_color).strip().lower() if raw_color is not None else ""
         if color_val and not _is_valid_folder_color(color_val):
             return web.json_response(
-                {"error": "color must be one of the folder palette values", "code": "color_invalid"},
+                {
+                    "error": "color must be one of the folder palette values",
+                    "code": "color_invalid",
+                },
                 status=400,
             )
         changes["color"] = color_val
+    if "tags" in body:
+        # Vocabulary-constrained tag list. An empty list clears the folder's
+        # tags; anything else must be ids that exist in the tag vocabulary.
+        clean_tags, tags_err = _validate_folder_tags(state, body["tags"])
+        if tags_err:
+            return web.json_response({"error": tags_err, "code": "tags_invalid"}, status=400)
+        changes["tags"] = clean_tags
     # All fields validated — apply atomically under the store lock, re-finding
     # the folder there so a concurrent delete cannot resurrect it, and
     # re-deciding the tree-shape rules there so two concurrent reparents cannot
@@ -590,8 +932,10 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
             dest = next((f for f in folders if f["id"] == new_parent), None)
             if request_app and dest is not None and _folder_owner_app(dest) != request_app:
                 return False, "forbidden_parent"
-        if reparenting and request_app and _subtree_holds_foreign_folder(
-            folders, root_id=fid, request_app=request_app
+        if (
+            reparenting
+            and request_app
+            and _subtree_holds_foreign_folder(folders, root_id=fid, request_app=request_app)
         ):
             # A move takes the whole subtree with it, so a folder the person
             # nested inside this one would be relocated by an app's write. Only
@@ -602,14 +946,27 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
         target.update(changes)
         if not target.get("color"):
             target.pop("color", None)
+        if not target.get("tags"):
+            # Empty list clears the key entirely, so "absent means no tags"
+            # stays the single on-disk representation (mirrors color above).
+            target.pop("tags", None)
         return True, ""
 
-    err = await state.mutate_folders(_apply)
+    if "tags" in changes:
+        # Same point-of-application rule as create: the authoritative
+        # intersection and the store write are one critical section under
+        # ``tags_write_lock``, so a concurrent tag deletion cannot slip a
+        # just-deleted id past the strip pass and back onto this folder.
+
+        async with tags_write_lock(state):
+            refreshed, _ = _validate_folder_tags(state, changes["tags"])
+            changes["tags"] = refreshed if refreshed is not None else []
+            err = await state.mutate_folders(_apply)
+    else:
+        err = await state.mutate_folders(_apply)
     if err == "not_found":
         # Deleted between the validation above and acquiring the store lock.
-        return web.json_response(
-            {"error": "not found", "code": "folder_not_found"}, status=404
-        )
+        return web.json_response({"error": "not found", "code": "folder_not_found"}, status=404)
     if err in ("not_owned", "forbidden_parent", "foreign_descendant"):
         # Distinguished in the audit, not to the caller: one code for all three
         # keeps the response from reporting which folder was foreign.
@@ -619,8 +976,10 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
             "foreign_descendant": "app cannot move a folder holding one it does not own",
         }[err]
         sel().log_api_access(
-            caller=request_app, operation="chat.folder_update",
-            outcome="denied", source="app_isolation",
+            caller=request_app,
+            operation="chat.folder_update",
+            outcome="denied",
+            source="app_isolation",
             resources=(f"parent={new_parent}" if err == "forbidden_parent" else fid),
             error=_reason,
         )
@@ -650,8 +1009,11 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
     state.push_slots_update()
     source, caller = _audit_origin(request)
     sel().log_api_access(
-        caller=caller, operation="chat.folder_update",
-        outcome="allowed", source=source, resources=fid,
+        caller=caller,
+        operation="chat.folder_update",
+        outcome="allowed",
+        source=source,
+        resources=fid,
     )
     return web.json_response(folder)
 
@@ -673,8 +1035,11 @@ async def api_chat_folder_delete(request: web.Request) -> web.Response:
     # cannot go stale while the request runs.
     if request_app and _folder_owner_app(target) != request_app:
         sel().log_api_access(
-            caller=request_app, operation="chat.folder_delete",
-            outcome="denied", source="app_isolation", resources=fid,
+            caller=request_app,
+            operation="chat.folder_delete",
+            outcome="denied",
+            source="app_isolation",
+            resources=fid,
             error="app cannot delete a folder it does not own",
         )
         return web.json_response(
@@ -701,8 +1066,11 @@ async def api_chat_folder_delete(request: web.Request) -> web.Response:
     # cleanup is the person's, who can delete a full folder as they always could.
     if request_app:
         sel().log_api_access(
-            caller=request_app, operation="chat.folder_delete",
-            outcome="denied", source="app_isolation", resources=fid,
+            caller=request_app,
+            operation="chat.folder_delete",
+            outcome="denied",
+            source="app_isolation",
+            resources=fid,
             error="app cannot delete folders",
         )
         return web.json_response(
@@ -726,8 +1094,29 @@ async def api_chat_folder_delete(request: web.Request) -> web.Response:
     for slot in state._slots.values():
         if slot.folder_id == fid:
             unfiled.append((slot, slot.folder_id))
+            # Pin the write to the transcript this iteration's membership
+            # check covered: the save awaits inside the loop, so a rebind can
+            # land mid-persist and the save would otherwise resolve its
+            # target from the moved routing at write time. No await between
+            # this capture and the unfile below.
+            authorized_history_key = slot_history_key(slot)
             slot.folder_id = ""
-            await save_slot_off_loop(state, slot, force=True)
+            if not await save_slot_off_loop(
+                state, slot, force=True, expected_history_key=authorized_history_key
+            ):
+                # Refused without writing (session permanently deleted or
+                # rebound mid-persist). The in-memory unfile stands — the
+                # folder is being removed — so mark dirty and let the
+                # periodic flush persist wherever the slot now routes; a
+                # dangling folder_id left on the old transcript is ignored
+                # on the next load.
+                slot._dirty = True
+                logger.warning(
+                    "folder delete: unfile save refused for %s "
+                    "(session deleted or rebound); marked dirty for "
+                    "periodic-flush retry",
+                    getattr(slot, "key", "?"),
+                )
 
     async def _restore_unfiled() -> None:
         for slot, previous in unfiled:
@@ -738,16 +1127,39 @@ async def api_chat_folder_delete(request: web.Request) -> web.Response:
             # slot back into the folder this request was trying to delete.
             if slot.folder_id:
                 continue
+            # Same pin as the unfile: no await between this capture and the
+            # restore below, so the rollback write cannot land on a
+            # transcript this slot was rebound to mid-restore.
+            authorized_history_key = slot_history_key(slot)
             slot.folder_id = previous
             try:
-                await save_slot_off_loop(state, slot, force=True)
+                applied = await save_slot_off_loop(
+                    state,
+                    slot,
+                    force=True,
+                    expected_history_key=authorized_history_key,
+                )
             except Exception:
                 # Best-effort restore; a slot left unfiled renders at the top
                 # level, which the sidebar handles, so keep restoring the rest.
                 logger.warning(
                     "folder delete rollback: could not restore slot %s to folder %s",
-                    slot.key, previous, exc_info=True,
+                    slot.key,
+                    previous,
+                    exc_info=True,
                 )
+            else:
+                if not applied:
+                    # Refused without writing (session deleted or rebound).
+                    # Keep the restored live field and mark dirty so the
+                    # periodic flush persists it wherever the slot now routes.
+                    slot._dirty = True
+                    logger.warning(
+                        "folder delete rollback: restore save refused for %s "
+                        "(session deleted or rebound); marked dirty for "
+                        "periodic-flush retry",
+                        getattr(slot, "key", "?"),
+                    )
         state.push_slots_update()
 
     def _remove(folders: list[dict[str, Any]]) -> tuple[bool, None]:
@@ -767,8 +1179,11 @@ async def api_chat_folder_delete(request: web.Request) -> web.Response:
     state.push_slots_update()
     source, caller = _audit_origin(request)
     sel().log_api_access(
-        caller=caller, operation="chat.folder_delete",
-        outcome="allowed", source=source, resources=fid,
+        caller=caller,
+        operation="chat.folder_delete",
+        outcome="allowed",
+        source=source,
+        resources=fid,
     )
     return web.json_response({"ok": True})
 
@@ -779,13 +1194,11 @@ def _effective_request_app(state: DashboardState, request: web.Request) -> str:
     Reads the claim ``token_auth_middleware`` publishes, and re-derives through
     the SAME shared rule (``token_auth.derive_caller_app``) when it is absent.
 
-    This route used to carry its own copy of the derivation, because the
-    internal-secret transport (the managed MCP set) carries no app claim of its
-    own and this was the only route compensating. The middleware now derives it
-    once for every route on that transport (issue #3690); the re-derivation here
-    is defense-in-depth for a caller that reaches the handler without having
-    passed that branch, and it calls the shared function rather than restating
-    the rule so the two can never disagree.
+    The internal-secret transport (the managed MCP set) carries no app claim of
+    its own, so the middleware derives one for every route on that transport.
+    The re-derivation here is defense-in-depth for a caller that reaches the
+    handler without having passed that branch, and it calls the shared function
+    rather than restating the rule so the two can never disagree.
 
     Never read from request BODY or tool arguments — a caller that could name
     its own scope could name someone else's.
@@ -798,6 +1211,33 @@ def _effective_request_app(state: DashboardState, request: web.Request) -> str:
         request.headers.get("X-Session-Key", ""),
     )
     return app_name
+
+
+# Per-STATE metadata-write transaction lock for the slot metadata PATCH
+# endpoints (folder / pin / mode), same rationale as the autocompact txn lock:
+# with awaits inside a mutate/save/rollback span, a second concurrent request
+# would otherwise capture the first one's value as its rollback snapshot, and
+# value-based rollback cannot tell "my write survived" from "someone else
+# wrote the same value" — so a refused request could erase an equal,
+# acknowledged concurrent commit. Under the lock exactly one request is inside
+# the span, so a rollback can only undo its own write.
+#
+# Keyed by the STATE, not the transcript: a transcript-keyed lock changes
+# identity when the slot is rebound mid-request (review-caught), so a second
+# request entering after the rebind would acquire a DIFFERENT lock and the
+# spans would interleave anyway. The state key is stable across rebinds and
+# covers alias slots resolving onto one file too — the same identity
+# chat_tags._TAGS_WRITE_LOCKS uses for the tags writers. These are rare,
+# human-driven sidebar operations, so one lock per state does not contend.
+_SLOT_META_TXN_LOCKS: "weakref.WeakKeyDictionary[Any, LoopBoundLock]" = weakref.WeakKeyDictionary()
+
+
+def _slot_meta_txn_lock(state: Any) -> LoopBoundLock:
+    lock = _SLOT_META_TXN_LOCKS.get(state)
+    if lock is None:
+        lock = LoopBoundLock()
+        _SLOT_META_TXN_LOCKS[state] = lock
+    return lock
 
 
 async def api_chat_slot_folder(request: web.Request) -> web.Response:
@@ -829,9 +1269,15 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
                 else "app does not own this slot"
             ),
         )
-        return web.json_response(
-            {"error": "not found", "code": "slot_not_found"}, status=404
-        )
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    # Capture the transcript key the ownership decision above just covered,
+    # BEFORE the body-parse await: ``linked_session_key`` is rebound on
+    # already-live slots with no ``running`` gate (cron completions, workflow
+    # injections), so a slow caller can be authorized against its own session
+    # and land on somebody else's conversation. The re-check below and the
+    # save's expected_history_key pin together keep this request's write on
+    # the transcript it was authorized against.
+    authorized_history_key = slot_history_key(slot)
     try:
         body = await request.json()
     except Exception:
@@ -839,26 +1285,99 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
     folder_id = str(body.get("folder_id") or "")
     if folder_id and not any(f["id"] == folder_id for f in state._folders):
         return web.json_response({"error": "folder not found"}, status=400)
-    previous = slot.folder_id
-    if folder_id != slot.folder_id:
-        slot._folder_changed = True  # re-inject [FOLDER] breadcrumb on next turn
-    slot.folder_id = folder_id
-    # The check above reads the store unlocked, so a delete can land between it
-    # and here. _unhide_folder re-checks existence under the store lock, which
-    # is the only place the answer cannot go stale — reject rather than persist a
-    # placement into a folder that no longer exists.
-    if not await _unhide_folder(state, folder_id):
-        slot.folder_id = previous
-        slot._folder_changed = False
-        return web.json_response(
-            {"error": "folder not found", "code": "folder_not_found"}, status=400
-        )
-    await save_slot_off_loop(state, slot, force=True)
+    # Optional generation token. The identity re-check below covers THIS
+    # request's own awaits, but a caller that resolved the slot in an earlier
+    # request (``chat_folder_file_self`` reads ``/api/chat/slots`` first) has a
+    # gap this handler cannot see: its tab can close and the same slot key be
+    # recreated for a different conversation before its PATCH arrives, and the
+    # recreated slot carries the same ``dashboard:<key>`` transcript key, so the
+    # history pin alone cannot tell them apart. ``created_at`` is minted once
+    # per slot object and persisted, so echoing it back is the caller's proof
+    # that the slot it is filing is the one it resolved.
+    expected_created = str(body.get("expected_created") or "")
+    # Serialize the whole re-check/mutate/persist/rollback span under the
+    # state-wide metadata txn lock (rebind-stable; see _slot_meta_txn_lock):
+    # with awaits inside the span, a second concurrent request would capture
+    # this one's value as its rollback snapshot, and value-based rollback
+    # cannot tell "my write survived" from "someone else wrote the same
+    # value". Under the lock a rollback can only undo its own write; the
+    # compare-and-set below stays as defense for the non-endpoint writers
+    # (the folder-delete unfile loop) that do not take this lock.
+    async with _slot_meta_txn_lock(state):
+        # Re-authorize after the awaits above (body parse, lock acquisition):
+        # same slot OBJECT still registered under the name, routing still on
+        # the transcript captured before the first await. No await between
+        # this check and the mutation below; the _unhide_folder and persist
+        # awaits after it are covered by the save's pin. The generation token
+        # is checked in the same breath: a mismatch means the caller resolved a
+        # slot that has since been replaced under its key.
+        if (
+            state._slots.get(name) is not slot
+            or slot_history_key(slot) != authorized_history_key
+            or (expected_created and slot.created_at != expected_created)
+        ):
+            source, caller = _audit_origin(request)
+            sel().log_api_access(
+                caller=caller,
+                operation="chat.slot_folder",
+                outcome="denied",
+                source=source,
+                resources=name,
+                error="session was deleted or rebound",
+            )
+            return web.json_response(
+                {"error": "session was deleted or rebound", "code": "session_gone"}, status=409
+            )
+        previous = slot.folder_id
+        previous_changed = slot._folder_changed
+        if folder_id != slot.folder_id:
+            slot._folder_changed = True  # re-inject [FOLDER] breadcrumb on next turn
+        slot.folder_id = folder_id
+        # The check above reads the store unlocked, so a delete can land between it
+        # and here. _unhide_folder re-checks existence under the store lock, which
+        # is the only place the answer cannot go stale — reject rather than persist a
+        # placement into a folder that no longer exists.
+        if not await _unhide_folder(state, folder_id):
+            slot.folder_id = previous
+            slot._folder_changed = previous_changed
+            return web.json_response(
+                {"error": "folder not found", "code": "folder_not_found"}, status=400
+            )
+        if not await save_slot_off_loop(
+            state, slot, force=True, expected_history_key=authorized_history_key
+        ):
+            # Refused without writing: the session was permanently deleted or
+            # rebound mid-persist. Roll back the live fields — but only while
+            # they still hold THIS request's value: a non-endpoint writer may
+            # have committed a newer placement that an unconditional restore
+            # would erase (the same guard _restore_unfiled applies).
+            if slot.folder_id == folder_id:
+                slot.folder_id = previous
+                slot._folder_changed = previous_changed
+            # The UNPINNED periodic flush may have persisted the provisional
+            # value while this save awaited (review-caught): mark dirty so the
+            # next flush reconverges the durable record to the live state.
+            slot._dirty = True
+            source, caller = _audit_origin(request)
+            sel().log_api_access(
+                caller=caller,
+                operation="chat.slot_folder",
+                outcome="denied",
+                source=source,
+                resources=name,
+                error="session was deleted or rebound",
+            )
+            return web.json_response(
+                {"error": "session was deleted or rebound", "code": "session_gone"}, status=409
+            )
     state.push_slots_update()
     source, caller = _audit_origin(request)
     sel().log_api_access(
-        caller=caller, operation="chat.slot_folder",
-        outcome="allowed", source=source, resources=name,
+        caller=caller,
+        operation="chat.slot_folder",
+        outcome="allowed",
+        source=source,
+        resources=name,
     )
     return web.json_response({"ok": True, "folder_id": slot.folder_id})
 
@@ -871,21 +1390,81 @@ async def api_chat_slot_pin(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
+    # Capture the transcript key the lookup above just covered, BEFORE the
+    # body-parse await — the same rebind window api_chat_slot_folder
+    # documents. The re-check below and the save's expected_history_key pin
+    # together keep this request's write on the transcript it was authorized
+    # against.
+    authorized_history_key = slot_history_key(slot)
     try:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
-    slot.pinned = bool(body.get("pinned", False))
-    await save_slot_off_loop(state, slot, force=True)
+    # Serialize the re-check/mutate/persist/rollback span under the
+    # state-wide metadata txn lock — same rationale as api_chat_slot_folder.
+    async with _slot_meta_txn_lock(state):
+        # Re-authorize after the awaits above (body parse, lock acquisition):
+        # same slot OBJECT still registered under the name, routing still on
+        # the transcript captured before the first await. No await between
+        # this check and the save dispatch.
+        if state._slots.get(name) is not slot or slot_history_key(slot) != authorized_history_key:
+            sel().log_api_access(
+                caller="dashboard",
+                operation="chat.slot_pin",
+                outcome="denied",
+                source="dashboard",
+                resources=name,
+                error="session was deleted or rebound",
+            )
+            return web.json_response(
+                {"error": "session was deleted or rebound", "code": "session_gone"}, status=409
+            )
+        prior_pinned = slot.pinned
+        new_pinned = body.get("pinned", False)
+        # Do not use Python truthiness for API booleans: JSON strings such as
+        # "false" are non-empty and therefore truthy.  The sibling metadata
+        # fields validate their types before mutating; pin must do the same.
+        if not isinstance(new_pinned, bool):
+            return web.json_response(
+                {"error": "pinned must be a boolean", "code": "pinned_not_bool"}, status=400
+            )
+        slot.pinned = new_pinned
+        if not await save_slot_off_loop(
+            state, slot, force=True, expected_history_key=authorized_history_key
+        ):
+            # Refused without writing: the session was permanently deleted or
+            # rebound mid-persist. Roll back the live field — but only while
+            # it still holds THIS request's value, so a non-endpoint writer's
+            # newer commit is not erased.
+            if slot.pinned == new_pinned:
+                slot.pinned = prior_pinned
+            # The UNPINNED periodic flush may have persisted the provisional
+            # value while this save awaited (review-caught): mark dirty so the
+            # next flush reconverges the durable record to the live state.
+            slot._dirty = True
+            sel().log_api_access(
+                caller="dashboard",
+                operation="chat.slot_pin",
+                outcome="denied",
+                source="dashboard",
+                resources=name,
+                error="session was deleted or rebound",
+            )
+            return web.json_response(
+                {"error": "session was deleted or rebound", "code": "session_gone"}, status=409
+            )
     state.push_slots_update()
     sel().log_api_access(
-        caller="dashboard", operation="chat.slot_pin",
-        outcome="allowed", source="dashboard", resources=name,
+        caller="dashboard",
+        operation="chat.slot_pin",
+        outcome="allowed",
+        source="dashboard",
+        resources=name,
     )
     return web.json_response({"ok": True, "pinned": slot.pinned})
 
 
-_VALID_MODES = ("", "orchestrator", "crew")
+_VALID_MODES = ("", "orchestrator")
 
 
 async def api_chat_slot_mode(request: web.Request) -> web.Response:
@@ -896,6 +1475,12 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
+    # Capture the transcript key the lookup above just covered, BEFORE the
+    # body-parse and busy-check awaits — the same rebind window
+    # api_chat_slot_folder documents. The re-check before the mutation and
+    # the save's expected_history_key pin together keep this request's write
+    # on the transcript it was authorized against.
+    authorized_history_key = slot_history_key(slot)
     # App ownership (App Kit §5.2) — the same deny-by-default rule api_chat_send
     # and api_chat_slot_create apply, and it matters HERE because the mode
     # decides which execution model a session runs under: an app holding
@@ -917,9 +1502,7 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
                 else "app does not own this slot"
             ),
         )
-        return web.json_response(
-            {"error": "not found", "code": "slot_not_found"}, status=404
-        )
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
     try:
         body = await request.json()
     except Exception:
@@ -927,74 +1510,123 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
     mode = body.get("mode", "")
     if mode not in _VALID_MODES:
         return web.json_response({"error": "invalid mode"}, status=400)
-    # Crew keeps its durable queue in a directory named after the slot, and a
-    # key that folds to nothing but dots has no such directory (see
-    # `CrewStore`). That refusal would otherwise land on the first crew MESSAGE
-    # — an unhandled 500 on a tab the switch had already reported as crew, and
-    # on every message after it. Refuse the switch instead, while it is still a
-    # request with an answer.
-    # Deferred import: this module is reachable from the gateway's boot path
-    # (gateway -> kiro_crew.dashboard -> chat_folders), and crew is a
-    # dashboard-only subsystem, so importing it at module scope made
-    # `--no-dashboard` pay for it before the API was ready to serve. Inside a
-    # mode-switch handler the cost is a sys.modules hit.
-    from kiro_crew.crew_chat import CrewOrchestrator, is_crew_capable_slot_key
-
-    if mode == "crew" and not is_crew_capable_slot_key(slot.key):
+    # Member DM threads (mode="member") are pinned to their crew, and every
+    # pin guard is conditioned on this very field — so the mode writer is the
+    # one door that would unlock all of them at once (PATCH mode -> "", then
+    # the agent switch endpoint passes its guard). "member" is deliberately
+    # absent from _VALID_MODES (mode cannot be SET here), and here it cannot
+    # be UNSET either: member slots are born and retired only through the
+    # member-thread endpoint.
+    if slot.mode == "member":
         return web.json_response(
-            {"error": "this session name cannot run crew mode",
-             "code": "crew_unsupported_slot"},
-            status=400,
+            {"error": "member thread mode is locked", "code": "member_mode_locked"},
+            status=409,
         )
-    # Work in SUBAGENTS keeps `slot.running` false the whole time, so that flag
-    # alone lets the mode flip mid-flight and interleave two execution models in
-    # one session. Two separate questions are needed, because the risk is not
-    # symmetric:
-    #  * ANY direction — a plain-chat subagent may be running on this slot right
-    #    now, and its completion follows the default `_run_chat` path, so
-    #    ENTERING crew mode has to be refused for that too, not just leaving it.
-    #    (Gating the whole check on `slot.mode == "crew"` missed exactly this.)
-    #  * LEAVING crew — the orchestrator may still hold crew topics or a live
-    #    queue, which only it can answer for.
-    busy = False
-    subs = getattr(state, "subagents", None)
-    if subs is not None:
-        try:
-            # The key the SPAWN ran under, which for a channel-linked slot is the
-            # channel session, not `dashboard:<tab>` — `has_pending_work_for`
-            # matches `parent_session_key` exactly, so deriving it differently
-            # here reports "idle" while that slot's subagents are still running
-            # and flips the execution model out from under them.
-            busy = bool(subs.has_pending_work_for(effective_session_key(slot)))
-        except Exception:
-            busy = True       # fail closed: refuse rather than risk the flip
-    if not busy and slot.mode == "crew":
-        # isinstance, not `is not None` — matching gateway.py's own check on this
-        # attribute. A stand-in object passes an identity check and then answers
-        # `has_live_work` with something truthy, refusing a switch that is fine.
-        crew = getattr(state, "crew", None)
-        if isinstance(crew, CrewOrchestrator):
+    # A crew-bound (remote) session runs PLAIN chat only — the same rule
+    # api_chat_slot_create enforces at birth, applied here to the post-create
+    # switch that would otherwise reopen it. A non-plain mode (orchestrator,
+    # design-critique) is consumed by an earlier dispatch branch in api_chat that
+    # runs its tools and filesystem work on THIS machine, not on the peer the
+    # session is bound to. Keyed on ``executor`` rather than
+    # ``is_remote`` so even a half-bound slot can never be switched into one.
+    if slot.executor == "remote" and mode:
+        return web.json_response(
+            {
+                "error": "a crew-bound session runs plain chat only; mode-specific work runs on the crew, not here",
+                "code": "remote_mode_unsupported",
+            },
+            status=409,
+        )
+    # Serialize the busy-check/re-check/mutate/persist/rollback span under
+    # the state-wide metadata txn lock — same rationale as
+    # api_chat_slot_folder. The busy guard runs INSIDE the lock: waiting on a
+    # concurrent metadata save can take long enough for a turn to start, so a
+    # guard evaluated before the acquisition would be stale by the time the
+    # mutation runs (review-caught).
+    async with _slot_meta_txn_lock(state):
+        # Re-authorize after the awaits above (body parse, lock acquisition):
+        # same slot OBJECT still registered under the name, routing still on
+        # the transcript captured before the first await.
+        if state._slots.get(name) is not slot or slot_history_key(slot) != authorized_history_key:
+            sel().log_api_access(
+                caller="dashboard",
+                operation="chat.slot_mode",
+                outcome="denied",
+                source="dashboard",
+                resources=name,
+                error="session was deleted or rebound",
+            )
+            return web.json_response(
+                {"error": "session was deleted or rebound", "code": "session_gone"}, status=409
+            )
+        # Work in SUBAGENTS keeps `slot.running` false the whole time, so that
+        # flag alone lets the mode flip mid-flight and interleave two execution
+        # models in one session: a plain-chat subagent may be running on this
+        # slot right now, and its completion follows the default `_run_chat`
+        # path, so the switch has to be refused in EITHER direction while one
+        # is pending.
+        busy = False
+        subs = getattr(state, "subagents", None)
+        if subs is not None:
             try:
-                busy = bool(await crew.has_live_work(name))
+                # The key the SPAWN ran under, which for a channel-linked slot
+                # is the channel session, not `dashboard:<tab>` —
+                # `has_pending_work_for` matches `parent_session_key` exactly,
+                # so deriving it differently here reports "idle" while that
+                # slot's subagents are still running and flips the execution
+                # model out from under them.
+                busy = bool(subs.has_pending_work_for(effective_session_key(slot)))
             except Exception:
-                busy = True
-    if slot.running or busy:
-        sel().log_api_access(
-            caller="dashboard", operation="chat.slot_mode",
-            outcome="denied", source="dashboard", resources=name,
-        )
-        return web.json_response(
-            {"error": "cannot switch mode while session is running"}, status=409
-        )
-    slot.mode = mode
-    # Clear orchestrator auto-run flag when leaving orchestrator mode to
-    # prevent stale "Go All" state from triggering on re-entry.
-    if mode != "orchestrator" and getattr(slot, "_auto_run", False):
-        slot._auto_run = False
-    await save_slot_off_loop(state, slot, force=True)
+                busy = True  # fail closed: refuse rather than risk the flip
+        if slot.running or busy:
+            sel().log_api_access(
+                caller="dashboard",
+                operation="chat.slot_mode",
+                outcome="denied",
+                source="dashboard",
+                resources=name,
+            )
+            return web.json_response(
+                {"error": "cannot switch mode while session is running"}, status=409
+            )
+        prior_mode = slot.mode
+        prior_auto_run = getattr(slot, "_auto_run", False)
+        slot.mode = mode
+        # Clear orchestrator auto-run flag when leaving orchestrator mode to
+        # prevent stale "Go All" state from triggering on re-entry.
+        if mode != "orchestrator" and getattr(slot, "_auto_run", False):
+            slot._auto_run = False
+        if not await save_slot_off_loop(
+            state, slot, force=True, expected_history_key=authorized_history_key
+        ):
+            # Refused without writing: the session was permanently deleted or
+            # rebound mid-persist. Roll back the live fields — but only while
+            # the mode still holds THIS request's value, so a non-endpoint
+            # writer's newer commit is not erased.
+            if slot.mode == mode:
+                slot.mode = prior_mode
+                slot._auto_run = prior_auto_run
+            # The UNPINNED periodic flush may have persisted the provisional
+            # value while this save awaited (review-caught): mark dirty so the
+            # next flush reconverges the durable record to the live state.
+            slot._dirty = True
+            sel().log_api_access(
+                caller="dashboard",
+                operation="chat.slot_mode",
+                outcome="denied",
+                source="dashboard",
+                resources=name,
+                error="session was deleted or rebound",
+            )
+            return web.json_response(
+                {"error": "session was deleted or rebound", "code": "session_gone"}, status=409
+            )
     state.push_slots_update()
     sel().log_api_access(
-        caller="dashboard", operation="chat.slot_mode",
-        outcome="allowed", source="dashboard", resources=name,
+        caller="dashboard",
+        operation="chat.slot_mode",
+        outcome="allowed",
+        source="dashboard",
+        resources=name,
     )
     return web.json_response({"ok": True, "mode": slot.mode})

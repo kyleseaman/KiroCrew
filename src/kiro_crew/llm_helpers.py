@@ -11,14 +11,25 @@ import json
 import logging
 import random
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.acp.client import AcpError, AcpPromptBusy
+from kiro_crew import name_grant
+from kiro_crew.acp.client import AcpError, AcpPromptBusy, advertised_model_ids
 from kiro_crew.acp.types import EVENT_STEER_CONSUMED, TurnUsage
-from kiro_crew.hooks import fire_tool_hooks, get_global_hook_store
+from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
+from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.credential_errors import is_credential_propagation_delay
+from kiro_crew.hooks import _EDIT_TOOL_KIND, fire_tool_hooks, get_global_hook_store
+from kiro_crew.platform.tool_paths import (
+    command_shaped_strings,
+    edit_target_candidates,
+    is_document_writing_tool,
+)
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -26,8 +37,17 @@ from kiro_crew.providers.base import (
     EVENT_TOOL_CALL,
     LLMEvent,
     LLMProvider,
+    resolve_billing_stats,
 )
-from kiro_crew.security import is_denied, is_sensitive_bash_command, is_sensitive_path
+from kiro_crew.security import (
+    MAX_SCANNABLE_COMMAND_CHARS,
+    is_denied,
+    is_sensitive_bash_command,
+    is_sensitive_path,
+    is_sensitive_write_path,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 from kiro_crew.sel import sel as _sel
 
 _PROMPT_BUSY_RETRIES = 2
@@ -72,7 +92,10 @@ _JITTER_RNG = random.Random()
 # Matched against the formatted AcpError message (see acp.client._format_acp_error).
 # Auth/validation markers are deliberately ABSENT so those fail fast — a retry
 # cannot fix an expired token or a bad request, and silently retrying them would
-# only delay the correct "re-auth"/"fix the request" signal to the operator.
+# only delay the correct "re-auth"/"fix the request" signal to the operator. The
+# one auth-shaped exception (a credential IAM has not propagated yet) is handled
+# structurally in _is_transient_acp_error, ABOVE the exclusion list, because no
+# marker here could ever be reached for it — see is_credential_propagation_delay.
 _TRANSIENT_MARKERS = (
     "internal server error",
     "internal error: api error",
@@ -105,6 +128,23 @@ _TRANSIENT_MARKERS = (
     # straight and typographic quotes both match the substring.
     "selected is temporarily unavailable",
     "transient error (http 5xx)",  # _format_acp_error's generic-5xx message
+    # IAM credential-propagation race, matched against _format_acp_error's
+    # rewritten wording. The RAW provider sentence ("The security token included
+    # in the request is invalid") is matched structurally instead — see the
+    # is_credential_propagation_delay call below.
+    "credential-propagation delay",
+    # Connection-level failures (client._RE_CONNECTION): raw errno tokens for
+    # restored errors, plus the formatter's wording for fresh ones.
+    "econnrefused",
+    "econnreset",
+    "econnaborted",
+    "etimedout",
+    "epipe",
+    "ehostunreach",
+    "eai_again",
+    "socket hang up",
+    "fetch failed",
+    "could not reach the model backend",
 )
 
 
@@ -112,6 +152,12 @@ def _is_transient_acp_error(msg: str) -> bool:
     """True iff an AcpError message looks like a retryable transient backend
     failure. Auth failures are explicitly excluded (they need re-auth, not retry)."""
     low = msg.lower()
+    if is_credential_propagation_delay(msg):
+        # The one auth-shaped failure a retry DOES fix: a credential IAM has not
+        # propagated yet. Checked BEFORE the exclusions below because Bedrock
+        # ships this rejection AS UnrecognizedClientException, so the
+        # short-circuit would return False and no marker could ever be reached.
+        return True
     if (
         "authentication failed" in low
         or "accessdenied" in low
@@ -141,6 +187,27 @@ def is_transient_backend_error(msg: str) -> bool:
     backend failure (5xx / throttle / stream-reset) rather than an
     auth/validation error. Public alias of :func:`_is_transient_acp_error`."""
     return _is_transient_acp_error(msg)
+
+
+def is_prompt_busy(exc: BaseException) -> bool:
+    """True when *exc* says the backend already holds an in-flight prompt.
+
+    Structural first, with the substring as a fallback: ``_format_acp_error``
+    rewrites the backend's "prompt already in progress" into friendly prose that
+    drops the marker, so a string-only check silently loses the recovery for
+    every producer that formats before raising — which the shared-runtime
+    ``AcpSessionHandle`` does. The fallback still covers unformatted /
+    history-restored messages, and stays scoped to ``AcpError`` so an unrelated
+    exception that happens to mention progress is never mistaken for a wedge.
+
+    Shared with ``channel.run_channel_agent``, whose recovery is the same
+    contract (replace the session, replay once) reached from a different surface.
+    One predicate, so the two cannot come to disagree about what a wedge IS —
+    and so a consumer outside this module never needs the ACP layer to ask.
+    """
+    return isinstance(exc, AcpPromptBusy) or (
+        isinstance(exc, AcpError) and "already in progress" in str(exc)
+    )
 
 
 def acp_error_is_transient(exc: BaseException) -> bool:
@@ -191,6 +258,650 @@ def first_advertised_fallback(advertised: Any, rejected: str | None) -> str | No
             continue
         return m
     return None
+
+
+# ── Throttle-exhaustion fallback chain (agent.fallback_model) ──
+#
+# When the active model's same-model transient budget (_TRANSIENT_RETRIES)
+# exhausts on a throttle/capacity error, an ordered chain of fallback models is
+# tried instead of surfacing the error. This lives entirely on the Kiro Crew
+# side (kiro-cli
+# has no fallback mechanism) and is NEVER silent: every swap is logged at
+# warning, published on the provider (TURN_FALLBACK_ATTR) so the delivering
+# surface can prepend a visible notice, and — on the interactive path —
+# announced in chat (see dashboard/chat_runner). An empty chain (the default)
+# disables the feature: behavior is byte-for-byte the pre-feature error surface.
+
+# Attempts per fallback candidate: initial + ONE ~2s retry — deliberately NOT a
+# fresh _TRANSIENT_RETRIES budget. Throttle-exhaustion events are often
+# cell-scoped and model-agnostic (a frontend admission-tier outage takes out
+# ALL models in the cell), so deep per-candidate retries mostly re-confirm a
+# correlated outage slowly. One retry covers the uncorrelated single-shot 5xx
+# on a healthy candidate while keeping the worst case bounded (~35s of backoff
+# across a 4-candidate chain).
+FALLBACK_CANDIDATE_ATTEMPTS = 2
+
+
+def fallback_rewound_transient_budget() -> int:
+    """Same-model counter value that grants a fresh fallback candidate its budget.
+
+    The dashboard's interactive ladder does not hold a :class:`FallbackState`
+    between turns — after a swap it rewinds ``slot._transient_5xx_retries`` so
+    the candidate gets exactly :data:`FALLBACK_CANDIDATE_ATTEMPTS` - 1 further
+    passes through the same-model retry branch (the re-queued turn itself is
+    the first attempt) before the next exhaustion advances the chain. Deriving
+    the rewind here keeps the per-candidate budget in ONE place with
+    :meth:`FallbackState.should_retry_active`, the encoding the unattended
+    surfaces use. Clamped at zero so the counter can never go negative:
+    a FALLBACK_CANDIDATE_ATTEMPTS above TRANSIENT_RETRIES + 1 cannot be
+    expressed by this counter encoding at all — it collapses to the full
+    same-model budget (the documented "deliberately not a fresh full budget"
+    stance caps the useful range at TRANSIENT_RETRIES + 1).
+    """
+    return max(0, TRANSIENT_RETRIES - (FALLBACK_CANDIDATE_ATTEMPTS - 1))
+
+
+# Provider attribute carrying the active fallback as ``(primary, candidate)``.
+# Doubles as (a) the sticky-restore marker — the next stream_and_collect call
+# on the same provider probes one ``set_model(primary)`` restore — and (b) the
+# visibility source for unattended surfaces (cron/heartbeat read it after the
+# turn and prepend a warning line to the delivered result). Cleared on a
+# successful restore, never on turn completion: the swap is sticky for the
+# remainder of the session by design.
+TURN_FALLBACK_ATTR = "_kc_active_fallback"
+
+# Exception attribute carrying the chain-exhaustion story (set by the fallback
+# walks when every candidate also failed). The delivering surface appends it to
+# the terminal error text via :func:`append_fallback_story` so an unattended
+# failure names the whole walk, not just the last candidate's error.
+FALLBACK_STORY_ATTR = "_kc_fallback_story"
+
+# Bound on the story text a consumer will accept. The walked ids originate in
+# ``agent.fallback_model`` config (LLM-reachable via MCP) and the advertised
+# check fails OPEN on an empty list, so an arbitrarily long config string can
+# reach the walk — bound and redact it centrally before it rides any error
+# surface (WS frames, Slack alerts, log lines).
+_FALLBACK_STORY_CAP = 500
+
+
+def fallback_story_of(exc: BaseException) -> str:
+    """The chain-exhaustion story carried on *exc*, redacted+capped, or ``""``.
+
+    Reads :data:`FALLBACK_STORY_ATTR`; anything but a non-empty string is
+    treated as absent (the attribute is best-effort — a frozen exception type
+    may have refused the set, and a hostile ``__getattribute__`` must not
+    break error delivery). Redaction and the :data:`_FALLBACK_STORY_CAP`
+    bound live HERE so every consumer (cron alert, sub-agent error, heartbeat
+    log) gets the same safe text — no per-surface drift. Never raises.
+    """
+    try:
+        story = getattr(exc, FALLBACK_STORY_ATTR, None)
+        if not isinstance(story, str) or not story:
+            return ""
+        story = redact_credentials(redact_exfiltration_urls(story)[0])[0]
+    except Exception:  # noqa: BLE001 — a story must never break error delivery
+        logger.debug("fallback story read/redaction failed", exc_info=True)
+        return ""
+    return story[:_FALLBACK_STORY_CAP]
+
+
+def append_fallback_story(text: str, exc: BaseException, *, budget: int | None = None) -> str:
+    """Append *exc*'s chain-exhaustion story to terminal error *text*.
+
+    THE consumer for :data:`FALLBACK_STORY_ATTR` on unattended surfaces
+    (cron failure alerts, sub-agent ``info.error``, the heartbeat failure
+    log). The interactive dashboard does not use it — it rebuilds a richer
+    story from ``slot._fallback_walked``. No story ⇒ *text* is returned
+    unchanged (capped at *budget* when one is given). The story arrives
+    redacted+capped from :func:`fallback_story_of`. Never raises.
+
+    :param budget: optional total length bound for the composite. The ERROR
+        text is trimmed to leave the story room — the story is the part a
+        verbose backend error must never push out — but keeps a FLOOR of half
+        the budget: an oversized story (config-sourced ids can approach
+        :data:`_FALLBACK_STORY_CAP`, which may equal a caller's cap) must not
+        evict the actual error either, so past the floor it is the story tail
+        that truncates. Degenerate budgets (a handful of characters — no real
+        caller passes one) keep the error head and may lose the story
+        entirely. ``None`` appends unbounded (caller owns the cap); a
+        negative value is normalized to 0 (a negative slice would DROP the
+        bound instead of tightening it).
+    """
+    if budget is not None and budget < 0:
+        budget = 0
+    story = fallback_story_of(exc)
+    if not story:
+        return text if budget is None else text[:budget]
+    if budget is not None:
+        # Reserve " [" + story + "]" out of the budget, but never trim the
+        # error text below half the budget; the final cap then truncates the
+        # story tail instead.
+        text = text[: max(budget // 2, budget - len(story) - 3)]
+    out = f"{text} [{story}]" if text else story
+    return out if budget is None else out[:budget]
+
+
+def annotate_model_fallback(text: str, provider: Any) -> str:
+    """Prepend the throttle-fallback warning to a delivered unattended result.
+
+    Unattended surfaces (cron/heartbeat results, the sub-agent completion
+    event) have no chat card to announce a fallback swap on, so the delivered
+    result text itself carries the warning — the same visibility contract as
+    the interactive notice card. The marker is read from
+    :data:`TURN_FALLBACK_ATTR` (set by the shared fallback walk) and left in
+    place: the swap is sticky for the session, so every run served by the
+    fallback repeats the warning until the restore probe moves the session
+    back. Model ids come from config, which is LLM-reachable via MCP — redact
+    before they reach Slack/dashboard. One body for every surface (was two
+    spellings: ``slack/gateway`` + an inline block in ``subagent``). Never
+    raises: an annotation failure must not turn a successful run into a
+    failed one — the un-annotated *text* is returned instead.
+    """
+    try:
+        fb = getattr(provider, TURN_FALLBACK_ATTR, None)
+        if not fb:
+            return text
+        primary, candidate = fb
+        # Same threat model as _FALLBACK_STORY_CAP: the ids originate in
+        # config (LLM-reachable via MCP), so bound them as well as redacting.
+        safe_primary = redact_credentials(redact_exfiltration_urls(str(primary))[0])[0][
+            :_FALLBACK_STORY_CAP
+        ]
+        safe_candidate = redact_credentials(redact_exfiltration_urls(str(candidate))[0])[0][
+            :_FALLBACK_STORY_CAP
+        ]
+        line = (
+            f"⚠️ Model '{safe_primary}' throttled; this run was served by fallback "
+            f"'{safe_candidate}'."
+        )
+        return f"{line}\n\n{text}" if text else line
+    except Exception:  # noqa: BLE001 — annotation is best-effort visibility
+        logger.debug("fallback annotation failed", exc_info=True)
+        return text
+
+
+def provider_fallback_active(provider: Any) -> bool:
+    """True while *provider* carries an active fallback marker.
+
+    THE shared usage-attribution guard: while a fallback serves the session,
+    an explicit model pin (``job.model`` / ``info.model`` / ``slot.model``)
+    must NOT be recorded as the turn's model — the durable usage row would
+    bill the fallback's spend to a model that never executed. Callers blank
+    the explicit value when this is true (mirroring the ``_seq_downgraded``
+    precedent), deferring to ``model_source`` — which reads the model that
+    actually ran.
+    """
+    marker = getattr(provider, TURN_FALLBACK_ATTR, None)
+    return isinstance(marker, (tuple, list)) and len(marker) >= 2
+
+
+def next_fallback_candidate(
+    chain: Sequence[str],
+    active_model: str,
+    advertised: Sequence[str] | None,
+) -> str | None:
+    """First usable fallback candidate from *chain*, or ``None``.
+
+    Skips empties, the currently-active model (a chain entry equal to what is
+    already failing cannot help), and — when an advertised list is known — any
+    id the backend did not advertise (unentitled/unknown). ``"auto"`` is a
+    legitimate candidate (the backend's availability-aware routing) and is
+    filtered by the same advertised check: a partition that does not serve
+    ``"auto"`` skips it rather than sending a no-op swap. An EMPTY advertised
+    list fails OPEN (candidates accepted): entitlement unknown is not
+    entitlement denied, matching ``model_is_unusable``'s stance, and the
+    substitute ``set_model`` path re-validates against the live list anyway.
+
+    A persisted chain entry can carry a stale ``<namespace>::<bare-id>``
+    qualifier from the catalog that advertised it (the catalog/session
+    spelling-mismatch class)
+    while the session advertises the bare id, so membership is judged through
+    :func:`resolve_pin_spelling` (the shared fold) rather than literally — an
+    entry absent under BOTH spellings is still skipped, and the active-model
+    skip applies to the folded spelling too. The CHAIN's own spelling is what
+    is returned (``FallbackState.next_candidate`` locates the applied
+    candidate with ``remaining.index``); wire-facing consumers re-fold it via
+    :func:`_fallback_wire_spelling`.
+    """
+    adv = [a for a in (advertised or []) if isinstance(a, str) and a.strip()]
+    act = (active_model or "").strip().lower()
+    for cand in chain:
+        if not isinstance(cand, str):
+            continue
+        low = cand.strip().lower()
+        if not low or low == act:
+            continue
+        if adv:
+            served = resolve_pin_spelling(cand, adv)
+            if not served:
+                logger.debug("model fallback: skipping %r (not advertised)", cand)
+                continue
+            if served.strip().lower() == act:
+                # Post-fold active skip: a qualified entry that resolves to
+                # the currently-failing model cannot help.
+                continue
+        return cand
+    return None
+
+
+def _fallback_wire_spelling(candidate: str, advertised: Sequence[str] | None) -> str:
+    """The spelling of *candidate* to send on the wire and keep in records.
+
+    A chain entry stays in its OWN spelling for ``FallbackState`` bookkeeping
+    (``remaining.index``), but everything later compared against SERVED models
+    — the substitute ``set_model`` call, the swap witness, the sticky
+    :data:`TURN_FALLBACK_ATTR` marker the restore probe reads, and the
+    active/walked records — must carry the ADVERTISED spelling: a
+    ``<namespace>::``-qualified spelling there is one the backend never
+    advertised (``AcpClient.set_model``'s explicit-pick guard would raise) and
+    desynchronizes the restore probe from the session it watches. Falls back
+    to the candidate's own spelling when the advertised set cannot resolve it
+    (empty/unknown fails open, matching :func:`next_fallback_candidate`).
+    """
+    ids = [a for a in (advertised or []) if isinstance(a, str) and a.strip()]
+    return (resolve_pin_spelling(candidate, ids) if ids else "") or candidate
+
+
+@dataclass
+class FallbackState:
+    """Walk state for one logical turn's fallback-chain traversal.
+
+    ``pos`` is the next chain index to consider (monotonic — a candidate is
+    never revisited), ``active`` the candidate currently being attempted,
+    ``attempts`` how many attempts the active candidate has consumed (capped at
+    :data:`FALLBACK_CANDIDATE_ATTEMPTS`), ``primary`` the model that was active
+    when the chain walk started, and ``walked`` every candidate actually tried
+    (for the chain-exhausted error story).
+    """
+
+    chain: tuple[str, ...]
+    pos: int = 0
+    active: str | None = None
+    attempts: int = 0
+    primary: str = ""
+    walked: list[str] = dataclass_field(default_factory=list)
+
+    def next_candidate(self, active_model: str, advertised: Sequence[str] | None) -> str | None:
+        """Advance to and return the next usable candidate, or ``None``."""
+        remaining = self.chain[self.pos :]
+        cand = next_fallback_candidate(remaining, active_model, advertised)
+        if cand is None:
+            self.pos = len(self.chain)
+            return None
+        self.pos += remaining.index(cand) + 1
+        return cand
+
+    def should_retry_active(self) -> bool:
+        """Consume one more attempt on the active candidate, if budget remains.
+
+        THE single home of the per-candidate retry budget/trigger (was three
+        spellings: ``stream_and_collect`` Case 2.75, the sub-agent ladder, and
+        the dashboard's counter rewind — the last derives its counter from the
+        same constant via :func:`fallback_rewound_transient_budget`). ``True``
+        means the caller retries the active candidate once more (the attempt is
+        already recorded); ``False`` means no candidate is active or its
+        :data:`FALLBACK_CANDIDATE_ATTEMPTS` budget is spent — advance the chain
+        via :func:`advance_fallback_candidate`.
+        """
+        if self.active is None or self.attempts >= FALLBACK_CANDIDATE_ATTEMPTS:
+            return False
+        self.attempts += 1
+        return True
+
+    def exhaustion_story(self) -> str | None:
+        """One-line story of a spent chain walk, or ``None`` when none ran.
+
+        ``None`` (nothing was actually walked — e.g. every candidate was
+        skipped as unadvertised) means the error should surface exactly as it
+        did before the fallback feature existed, with no story attached.
+        """
+        if not self.walked:
+            return None
+        return (
+            f"{self.primary or 'the selected model'} throttled; "
+            f"fallbacks {', '.join(self.walked)} also unavailable"
+        )
+
+
+async def advance_fallback_candidate(
+    provider: Any,
+    fb_state: "FallbackState",
+    *,
+    surface: str,
+    log_suffix: str = "",
+) -> str | None:
+    """One chain-walk step — THE shared advance used by every fallback surface.
+
+    ``stream_and_collect`` (Case 2.75), the sub-agent transient ladder, and the
+    dashboard's ``_fallback_swap_for_turn`` all advance the chain through this
+    single body so throttle classification, marker semantics, and skip rules
+    cannot diverge across surfaces. It: seeds ``fb_state.primary`` from a
+    surviving sticky marker first (a session already on a fallback whose true
+    primary only the marker remembers) and the active model second; walks the
+    chain skipping the primary, unadvertised ids, and the currently-active
+    (failing) candidate; applies the first candidate whose substitute
+    ``set_model`` lands; publishes the sticky marker
+    (:data:`TURN_FALLBACK_ATTR`); and emits the greppable swap warning. A
+    ``<namespace>::``-qualified chain entry is applied AND recorded under its
+    advertised spelling (:func:`_fallback_wire_spelling`) — the wire, the
+    marker, and the walked/active records must agree with the served model
+    the restore probe later compares against. Returns the applied candidate
+    (advertised spelling), or ``None`` when the chain is exhausted or the
+    provider exposes no ``set_model`` seam — the caller then surfaces the
+    original error exactly as before this feature existed.
+    """
+    advertised = provider_advertised_ids(provider)
+    # An empty read means the session is auto-routed (``provider_active_model``
+    # deliberately filters the ``"auto"`` sentinel) or genuinely unknown; either
+    # way ``"auto"`` is the honest primary. Seeding it (a) makes the restore
+    # probe re-enter auto routing instead of hitting the dashboard's
+    # stale-clear arm with an empty primary (which would let the backfill pin
+    # the fallback permanently), (b) suppresses the auto->auto no-op swap via
+    # the active-skip below, and (c) keeps the notice card naming a real
+    # primary instead of a placeholder.
+    active = provider_active_model(provider) or (fb_state.active or "") or "auto"
+    if not fb_state.primary:
+        _marker = getattr(provider, TURN_FALLBACK_ATTR, None)
+        _marker_primary = ""
+        if isinstance(_marker, (tuple, list)) and _marker and isinstance(_marker[0], str):
+            _marker_primary = _marker[0].strip()
+        fb_state.primary = _marker_primary or active
+    set_model_fn = resolve_substitute_set_model(provider)
+    if set_model_fn is None:
+        return None
+    while True:
+        cand = fb_state.next_candidate(fb_state.primary or active, advertised)
+        if cand is None:
+            return None
+        # The chain's own spelling drove the walk bookkeeping; the wire and
+        # every served-model comparison below use the advertised spelling.
+        wire = _fallback_wire_spelling(cand, advertised)
+        if wire.strip().lower() == (active or "").strip().lower():
+            # With a marker-seeded primary, the chain can still name the
+            # CURRENTLY-failing fallback the session sits on — retrying it is
+            # what this walk exists to escape.
+            continue
+        _raw_before = provider_raw_model(provider)
+        try:
+            await set_model_fn(wire)
+        except Exception:
+            logger.debug(
+                "model fallback: set_model(%r) failed; skipping candidate",
+                wire,
+                exc_info=True,
+            )
+            continue
+        # Witness the swap before publishing: a non-raising set_model can be a
+        # silent no-op (resolve_usable_model collapses an unservable target to
+        # "" and returns without switching). Publishing an unwitnessed swap
+        # would announce a model that never took over and retry the same
+        # failing model. Only enforceable when the model attribute is readable
+        # (a provider exposing no model string cannot be witnessed — fail open,
+        # matching the pre-existing trust in set_model for such providers).
+        _raw_after = provider_raw_model(provider)
+        if (
+            _raw_before
+            and _raw_after == _raw_before
+            and _raw_after.strip().lower() != wire.strip().lower()
+        ):
+            logger.debug(
+                "model fallback: set_model(%r) was a silent no-op (model still %r); "
+                "skipping candidate",
+                wire,
+                _raw_after,
+            )
+            continue
+        fb_state.active = wire
+        fb_state.attempts = 1
+        fb_state.walked.append(wire)
+        try:
+            setattr(provider, TURN_FALLBACK_ATTR, (fb_state.primary, wire))
+        except Exception:
+            logger.debug("publishing fallback marker failed", exc_info=True)
+        logger.warning(
+            "model fallback: %s -> %s (reason=throttle-exhaustion, surface=%s%s)",
+            fb_state.primary or "?",
+            wire,
+            surface,
+            log_suffix,
+        )
+        return wire
+
+
+def resolve_substitute_set_model(provider: Any) -> Callable[[str], Awaitable[None]] | None:
+    """The provider's substitute-path ``set_model`` coroutine, or ``None``.
+
+    Prefers ``provider.set_model``; falls back to the wrapped client
+    (``provider.client`` / ``provider._client``) for wrappers like
+    ``AcpProvider`` that do not re-export it. Callers pre-filter candidates
+    against the advertised list, so the explicit-pick guard inside
+    ``AcpClient.set_model`` / ``AcpSessionProvider.set_model`` does not fire
+    for a served candidate.
+    """
+    try:
+        fn = getattr(provider, "set_model", None)
+    except Exception:  # pragma: no cover - exotic property getters
+        fn = None
+    if callable(fn):
+        return fn
+    for attr in ("client", "_client"):
+        try:
+            inner = getattr(provider, attr, None)
+        except Exception:  # pragma: no cover - exotic property getters
+            inner = None
+        try:
+            fn = getattr(inner, "set_model", None) if inner is not None else None
+        except Exception:  # pragma: no cover - exotic property getters
+            fn = None
+        if callable(fn):
+            return fn
+    return None
+
+
+def provider_advertised_ids(provider: Any) -> list[str]:
+    """Advertised model ids from the provider, ``[]`` when unknown."""
+    getter = getattr(provider, "available_models", None)
+    if not callable(getter):
+        return []
+    try:
+        return advertised_model_ids(getter())
+    except Exception:
+        return []
+
+
+def provider_active_model(provider: Any) -> str:
+    """The model currently serving the provider's session, ``""`` if unknown."""
+    for attr in ("served_model", "_model"):
+        try:
+            val = getattr(provider, attr, "")
+        except Exception:  # pragma: no cover - exotic property getters
+            val = ""
+        if isinstance(val, str) and val.strip() and val.strip().lower() != "auto":
+            return val.strip()
+    return ""
+
+
+def provider_raw_model(provider: Any) -> str:
+    """The provider's raw model attribute, ``"auto"`` INCLUDED, ``""`` if unknown.
+
+    The witness reader for fallback state transitions: unlike
+    :func:`provider_active_model` (which filters the ``"auto"`` sentinel for
+    walk semantics), this reports the attribute verbatim so a caller can
+    observe whether a non-raising ``set_model`` actually moved the session.
+    ``resolve_usable_model`` collapses an unservable target to ``""`` and
+    ``set_model`` then returns WITHOUT switching — treating "didn't raise" as
+    "switched" is what let a no-op restore clear sticky state while still on
+    the fallback (and the backfill then pinned it permanently).
+    """
+    for attr in ("served_model", "_model"):
+        try:
+            val = getattr(provider, attr, "")
+        except Exception:  # pragma: no cover - exotic property getters
+            val = ""
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+async def probe_fallback_restore(
+    provider: Any,
+    *,
+    surface: str = "unattended",
+    state: tuple[Any, Any] | None = None,
+    stale: bool = False,
+    clear: Callable[[], None] | None = None,
+    on_restored: Callable[[], None] | None = None,
+    log_suffix: str = "",
+) -> None:
+    """One ``set_model(primary)`` restore probe at the start of a turn.
+
+    THE single restore-probe body: the unattended surfaces call it bare (state
+    read from :data:`TURN_FALLBACK_ATTR`), and the dashboard's slot probe wraps
+    it (``chat_runner._probe_fallback_restore_for_slot_locked``) with the
+    slot-held state and hooks below, so the probe/witness/clear sequencing
+    cannot diverge across surfaces. The restore only fires while the session is
+    still on the fallback this feature set (a user/session-level model change
+    in between clears the sticky state without touching the model — never
+    override an explicit later pick). Success clears the state and logs
+    (recovery is the quiet default: no chat notice); failure keeps the fallback
+    for this turn. Never raises.
+
+    :param state: ``(primary, candidate)`` override. Default: read the
+        provider's :data:`TURN_FALLBACK_ATTR` marker (no-op when absent).
+    :param stale: caller-known extra staleness the marker cannot see (the
+        dashboard's explicit-pick generation check) — treated exactly like the
+        session having moved off the fallback.
+    :param clear: replaces the default marker clear (the dashboard drops slot
+        fields AND the marker as one logical record).
+    :param on_restored: hook running after a witnessed restore, before *clear*
+        (the dashboard's slot-model heal).
+    :param log_suffix: appended inside the log parentheses, e.g. ``", slot=k"``.
+    """
+    try:
+        # The whole state read is guarded: a hostile marker property, a
+        # raising ``__bool__``/``__str__``, or a malformed tuple must not
+        # break the "never raises" contract — an unreadable state simply
+        # skips the probe.
+        if state is None:
+            marker = getattr(provider, TURN_FALLBACK_ATTR, None)
+            if not marker:
+                return
+            primary, candidate = marker
+        else:
+            primary, candidate = state
+            if not candidate:
+                return
+        # Coerce ONCE; every later comparison uses the plain string. The
+        # marker path deliberately has no empty-candidate early return (a
+        # ``(primary, "")`` marker still probes and clears — pre-existing
+        # semantics), while the state path mirrors the slot probe's
+        # no-active-fallback no-op.
+        candidate = "" if candidate is None else str(candidate)
+        primary_missing = not primary
+    except Exception:
+        logger.debug("fallback restore: unreadable fallback state; skipping probe", exc_info=True)
+        return
+
+    def _default_clear() -> None:
+        try:
+            setattr(provider, TURN_FALLBACK_ATTR, None)
+        except Exception:
+            pass
+
+    def _run_hook(fn: Callable[[], None], what: str) -> None:
+        # Caller-supplied hooks must not break the never-raises contract: a
+        # failing heal/clear aborts the TURN it runs at the start of, which is
+        # far worse than the stale state it was tidying.
+        try:
+            fn()
+        except Exception:
+            logger.debug("fallback restore %s hook failed", what, exc_info=True)
+
+    _clear = clear if clear is not None else _default_clear
+    current = provider_active_model(provider)
+    if current and candidate and current.strip().lower() != candidate.strip().lower():
+        # The session moved off our fallback by other means (explicit pick,
+        # session reset). The sticky state is stale — drop it, restore nothing.
+        _run_hook(_clear, "clear")
+        return
+    if stale or primary_missing:
+        _run_hook(_clear, "clear")
+        return
+    set_model_fn = resolve_substitute_set_model(provider)
+    if set_model_fn is None:
+        return
+    try:
+        await set_model_fn(primary)
+    except Exception as exc:
+        logger.info(
+            "model fallback: primary %s still unavailable (%s); staying on %s " "(surface=%s%s)",
+            primary,
+            exc,
+            candidate,
+            surface,
+            log_suffix,
+        )
+        return
+    # Witness the restore before clearing: a non-raising set_model(primary)
+    # can be a silent no-op (e.g. an "auto" primary on a partition that
+    # stopped advertising it resolves to "" and returns without switching).
+    # Clearing the marker while still on the fallback would let the next
+    # backfill pin the temporary fallback permanently. Keep the marker and
+    # retry at the next turn start instead.
+    _raw = provider_raw_model(provider)
+    if _raw and candidate and _raw.strip().lower() == candidate.strip().lower():
+        logger.info(
+            "model fallback: restore to %s was a silent no-op (still on %s); "
+            "keeping fallback (surface=%s%s)",
+            primary,
+            candidate,
+            surface,
+            log_suffix,
+        )
+        return
+    if on_restored is not None:
+        # A failed heal does not block the clear: the two writes are one
+        # logical record, a half-cleared record is worse than a missed heal,
+        # and the stale-state paths above never heal either — retaining the
+        # record would not buy a retry of the heal. The dashboard's actual
+        # hooks are plain attribute writes that realistically cannot raise;
+        # this guard is for the "never raises" contract, not an expected path.
+        _run_hook(on_restored, "on_restored")
+    _run_hook(_clear, "clear")
+    logger.warning(
+        "model fallback: restored %s -> %s (reason=primary-recovered, surface=%s%s)",
+        candidate,
+        primary,
+        surface,
+        log_suffix,
+    )
+
+
+def configured_fallback_chain() -> tuple[str, ...]:
+    """The throttle-fallback chain derived from ``agent.fallback_model``, or ``()``.
+
+    The config is a SINGLE value; the walk order is derived here (the one
+    derivation every surface shares): ``""`` disables the feature everywhere
+    (``()`` — callers pass it straight to ``fallback_models=`` and Case 2.75
+    stays inert); ``"auto"`` (the default) yields ``("auto",)`` — defer to the
+    backend's availability-aware routing; a concrete id yields
+    ``(id, "auto")`` — the pinned fallback first, ``"auto"`` as the final
+    fallthrough (the backend routes to whatever is actually available).
+
+    ``KiroCrewConfig.load()`` is fingerprint-cached (mtime/size/mode of both
+    config files), so the steady-state cost is two stats — the same read the
+    interactive turn path already performs inline on the event loop every
+    turn.
+    """
+    try:
+        fm = KiroCrewConfig.load().agent.fallback_model
+    except Exception:
+        return ()
+    if not fm:
+        return ()
+    if fm == "auto":
+        return ("auto",)
+    return (fm, "auto")
 
 
 class PromptBusyExhaustedError(Exception):
@@ -273,19 +984,230 @@ def _extract_tool_input_strings(tool_input: str) -> list[str]:
     return results
 
 
+# Longest single string the tool_input scan will attempt.
+#
+# The scan runs on a worker thread, but CPython's ``re`` HOLDS the GIL for the
+# whole of one match call (measured: a 5-8 s ``search`` on a worker left the
+# main thread exactly one tick on 3.10 and 3.12), so the hop yields between
+# strings, never within one. The ceiling is therefore the liveness bound for a
+# single string as well as the WORKER's: an unbounded string parks the loop and
+# the thread for as long as the scan takes, and the permission request behind
+# it -- the turn -- waits with it.
+#
+# The anchor rewrite in this change cut the constant but NOT the growth -- the
+# scan is still superlinear in the length of one line. Measured on one dev box:
+#
+#     4 KiB 0.16s | 8 KiB 0.31s | 16 KiB 1.14s | 20 KiB 1.52s | 32 KiB 3.79s
+#
+# 16->32 KiB is 3.3x for 2x the input (~n^1.7), so extrapolation is the wrong
+# instinct here and a ceiling has to be set from the measured curve. A CI runner
+# under parallel load came in roughly an order of magnitude slower than this box,
+# which is what sets the margin: 20 KiB is ~1.5s here and ~15s there, under the
+# 25s loop watchdog on both.
+#
+# Exceeding it is FAIL-CLOSED: the call is denied, never skipped. A skip would
+# convert a liveness bug into a security hole by letting unscanned input through
+# the deny surface; a denial only refuses input we cannot prove safe, and is
+# strictly better than the alternative it replaces, which was crashing the
+# gateway and losing the whole turn.
+#
+# Known cost of that trade: a permission-gated write of a benign file larger
+# than this lands its whole content in ``tool_input`` and is refused WHEN the
+# frame's provenance is unknown. An edit with trusted provenance is judged by
+# its target path instead (``_edit_target_denial``), and every other non-shell
+# tool with trusted provenance has its document-body fields skipped
+# (``platform.tool_paths.command_shaped_strings``), so neither reaches this
+# ceiling on a body; the residual is the unclassified frame, which keeps the
+# full scan by design. Tracked in https://github.com/kirodotdev/KiroCrew/issues/8053.
+#
+# One number for both tiers: the shell gate refuses a command above
+# ``security.MAX_SCANNABLE_COMMAND_CHARS`` on its own (every caller, not only
+# this one), so aliasing it here is what keeps "too long for the tool_input
+# scan" and "too long for the command gate" the same size.
+_MAX_SCANNABLE_TOOL_INPUT_CHARS = MAX_SCANNABLE_COMMAND_CHARS
+
+
+def _title_denial(
+    title: str,
+    denied_regexes: list[str] | None,
+) -> tuple[str, str] | None:
+    """Return the always-enforced denial for the tool *title*, or ``None``.
+
+    The title is the request's primary subject -- for a shell tool it IS the
+    command -- and it goes through the same three predicates as every
+    tool_input string. Pure and synchronous like :func:`_first_tool_input_denial`,
+    and run on the same worker hop: the field crash this exists for was the
+    sensitive-path gate scanning a ~9 KB TITLE for 25 s on the event loop, so
+    a hop that offloaded only the tool_input strings left the crash path in
+    place. The tuple is ``(kind, reason)`` with *kind* ``"path"`` / ``"bash"`` /
+    ``"regex"``; the reasons are the exact strings the on-loop checks produced.
+    """
+    if is_sensitive_path(title):
+        return ("path", f"Blocked: sensitive path: {title}")
+    bash_reason = is_sensitive_bash_command(title)
+    if bash_reason:
+        return ("bash", bash_reason)
+    deny_reason = is_denied(title, denied_regexes=denied_regexes)
+    if deny_reason:
+        return ("regex", deny_reason)
+    return None
+
+
+def _edit_target_denial(
+    raw_params: dict | None, diff_path: str = ""
+) -> tuple[str, str, str] | None:
+    """The always-enforced denial for a file-EDIT tool call, or ``None``.
+
+    An edit's ``tool_input`` is a DOCUMENT: ``_dispatch.derive_edit_diff`` renders
+    the file's new content (or a strReplace pair) as a unified diff, and that text
+    is what ``event.tool_input`` carries. Handing it to :func:`_first_tool_input_denial`
+    read the document as a shell command line, so writing a Markdown page that says
+    ``git push origin main``, a docstring that says ``kirocrew restart``, or prose
+    that names ``~/.ssh`` was refused -- and a body over
+    :data:`_MAX_SCANNABLE_TOOL_INPUT_CHARS` was refused for its LENGTH (the
+    tool-input length-cap defect). That is the same class the cron-script body
+    gate rework closed: a document is not the shell gate's subject.
+
+    What an edit can actually do is decided by WHERE it writes, so the gate for an
+    edit is the resolved target path, exactly as ``hooks.on_tool_call`` decides it:
+    every accepted path spelling in the params (``target_paths``) goes through
+    :func:`is_sensitive_write_path`, which is the read+write keystone PLUS the
+    write-only tier (config, the agents dir). A walk that hit its work cap is
+    denied as unverifiable, mirroring the hook gate's fail-closed shape. The
+    title-tier scan of the request still runs before this, unchanged.
+
+    The target set is the UNION of the params' path spellings and *diff_path*,
+    the path the tool_call's ``{"type": "diff"}`` content block named. A backend
+    may stream trusted params that carry no path key at all and name the file
+    only in that block (``_dispatch`` caches it per toolCallId onto the
+    permission event as ``diff_path``), so judging the params alone would judge
+    nothing. Two unverifiable shapes fail closed: an EMPTY union (an edit whose
+    params and content block together name no target has no proven target to
+    judge, and the document scan is not a fallback here -- a document that
+    happens to contain no denied text is not evidence that the write is safe),
+    and an UNANCHORED diff path (relative after ``~``/env expansion, which
+    resolves against the gateway CWD rather than the agent workspace, so its
+    sensitivity cannot be established -- see ``edit_target_candidates``). The
+    caller reaches this on trusted provenance (see ``_resolve_permission``) or
+    on a client-cached diff block, which is write-plane evidence on its own;
+    a call with neither trusted params nor a diff block never gets here and
+    keeps the document scan.
+    """
+    candidates = edit_target_candidates(raw_params, diff_path)
+    if candidates.truncated:
+        return (
+            "path",
+            "Blocked: tool arguments too large to verify for sensitive paths " "(deny-by-default)",
+            "",
+        )
+    if candidates.unanchored:
+        return (
+            "path",
+            "Blocked: file edit names a relative target path that cannot be "
+            "verified (deny-by-default)",
+            "",
+        )
+    if not candidates:
+        return (
+            "path",
+            "Blocked: file edit names no target path to verify (deny-by-default)",
+            "",
+        )
+    for path in candidates:
+        if is_sensitive_write_path(path):
+            return ("path", f"Blocked: write to protected path: {path}", path)
+    return None
+
+
+def _first_tool_input_denial(
+    strings: list[str],
+    denied_regexes: list[str] | None,
+) -> tuple[str, str, str] | None:
+    """Return the first tool_input denial among *strings*, or ``None``.
+
+    Pure, synchronous, and blocking: the three predicates are regex-heavy and
+    ``_extract_tool_input_strings`` hands over EVERY string in the payload, so a
+    single long document body can occupy the calling thread for seconds. It
+    therefore runs on a worker thread (one hop for the whole loop, not one per
+    string). CPython's ``re`` HOLDS the GIL for the whole of one match call
+    (measured: a 5-8 s ``search`` on a worker left the main thread a single
+    tick on 3.10 and 3.12), so the hop keeps the loop live BETWEEN strings,
+    not within one; within one string the only liveness guarantees are the
+    linear patterns and the length check against
+    :data:`_MAX_SCANNABLE_TOOL_INPUT_CHARS`, which also bounds the worker's
+    own wall clock -- a denied oversized string is recoverable, a worker parked
+    for minutes on a pathological payload is not -- and an oversized one is
+    denied rather than scanned or skipped.
+
+    The tuple is ``(kind, reason, matched_string)`` where *kind* is
+    ``"path"`` / ``"bash"`` / ``"regex"`` / ``"oversize"``. Mechanism
+    classification stays with the caller on the event loop, because it consults
+    the HookManager.
+    """
+    for s in strings:
+        if len(s) > _MAX_SCANNABLE_TOOL_INPUT_CHARS:
+            # Fail closed: too long to scan inside the loop's liveness budget,
+            # so it cannot be shown safe and is refused.
+            return (
+                "oversize",
+                (
+                    "Blocked: a tool_input string is too large to security-scan "
+                    f"({len(s)} chars > {_MAX_SCANNABLE_TOOL_INPUT_CHARS} limit); "
+                    "refused rather than left unscanned"
+                ),
+                s[:64],
+            )
+        if is_sensitive_path(s):
+            return ("path", f"Blocked: sensitive path in tool_input: {s}", s)
+        _input_bash = is_sensitive_bash_command(s)
+        if _input_bash:
+            return ("bash", _input_bash, s)
+        _input_deny = is_denied(s, denied_regexes=denied_regexes)
+        if _input_deny:
+            return ("regex", _input_deny, s)
+    return None
+
+
 # ── Tool Approval Policies ──
 
 
 class ToolApprovalPolicy(Enum):
-    """How to handle tool permission requests during streaming."""
+    """How to handle tool permission requests during streaming.
+
+    ``READ_ONLY`` is the dashboard "Reads" approval mode's semantics ported to
+    surfaces that have no interactive approver: provably read-only calls are
+    auto-approved through the SAME hook gate the Reads mode uses (deny floor
+    first, then the read-only classifier), and every call that is not provably
+    read-only is rejected — where the Reads mode would ask, this policy
+    refuses. Requires ``hooks``; without a gate to classify with it fails
+    closed and rejects everything, exactly like ``REJECT_ALL``.
+
+    Only the classifier's own verdict approves under ``READ_ONLY``. The hook
+    gate is asked ``classifier_only``, so its GRANT tiers — the operator's
+    ``auto_approve_tools`` globs and the app-own-server rule, which vouch for
+    the caller and say nothing about what the call does — are skipped rather
+    than honoured, and an auto-approve is then trusted only when the result
+    carries the classifier's ``read_only`` tag. A grant that shadows a
+    read-only call therefore still gets the read approved (by the classifier),
+    and a grant that shadows a write approves nothing.
+
+    With no approver to catch an over-approval, ``classifier_only`` also
+    restricts proof to HOST-TRUSTED facts: the recovered shell command judged
+    by ``is_read_only_bash``, or a built-in the host knows to be read-only
+    (``hooks._HOST_READ_ONLY_BUILTIN_TOOLS``) named by the non-model-authored
+    ``_meta.kiro.toolName`` with no MCP server behind it, and only when the
+    event carries ``mcp_identity_trusted`` (the pair came from the
+    provenance-verified caches, not an inline payload). The agent-influenced
+    ACP ``kind`` and the model-authored title may narrow but never prove, so a
+    mutating tool labelled ``kind="read"``, a read-looking title, and any
+    MCP-served tool (no host-trusted read-only marker exists for one) are
+    rejected here where the interactive Reads mode would still ask.
+    """
 
     AUTO_APPROVE = "auto_approve"
     REJECT_ALL = "reject_all"
     HOOK_BASED = "hook_based"
-
-
-# Callback type for custom tool approval logic
-OnPermissionCallback = Callable[[LLMEvent], Awaitable[bool]]
+    READ_ONLY = "read_only"
 
 
 # ── Stream and Collect ──
@@ -470,7 +1392,11 @@ async def run_bg_oneliner(
                 from kiro_crew.dashboard.handlers.usage import persist_token_record_async
 
                 usage = provider_last_turn_usage(session, since=stats_before)
-                if usage.credits or usage.input_tokens or usage.output_tokens:
+                # One shared predicate across every persist gate: a claude-seam
+                # turn recovered through the live-stats path can bill cost or
+                # cache tokens with zero credits AND zero fresh token counts;
+                # a gate testing only the kiro dimensions silently drops it.
+                if usage_has_billing(usage):
                     await persist_token_record_async(
                         sel_session_key,
                         # The model the session SERVED, never the one requested: a
@@ -497,14 +1423,28 @@ def _billing_stats(provider: Any) -> Any:
     Returned as the object rather than a value so callers can compare identity:
     the runner installs a FRESH stats object as it begins a turn, which is what
     tells a completed turn apart from one that never started.
+
+    Each holder is read through :func:`resolve_billing_stats`, the one spelling
+    the wrappers use too: a provider's declared
+    :meth:`LLMProvider.billing_stats` wins, and the ``last_prompt_stats``
+    fallback keeps every holder that was found before the capability existed --
+    the raw ``AcpClient``, and the doubles that stand in for a runner. One
+    holder's broken read is skipped rather than abandoning the walk, so a faulty
+    wrapper cannot lose a turn whose billing a later node still carries.
     """
     try:
-        for node in _billing_stat_holders(provider):
-            stats = getattr(node, "last_prompt_stats", None)
-            if stats is not None:
-                return stats
+        holders = _billing_stat_holders(provider)
     except Exception:
-        logger.debug("billing stats lookup failed", exc_info=True)
+        logger.debug("billing stats holder walk failed", exc_info=True)
+        return None
+    for node in holders:
+        try:
+            stats = resolve_billing_stats(node)
+        except Exception:
+            logger.debug("billing stats read failed for one holder", exc_info=True)
+            continue
+        if stats is not None:
+            return stats
     return None
 
 
@@ -524,10 +1464,46 @@ def _attempt_usage(provider: Any, *, since: Any = _NO_PRIOR_STATS) -> TurnUsage:
     if since is not _NO_PRIOR_STATS and stats is since:
         return TurnUsage()
     try:
+        # Prefer the stats object's own converter: it is the single source of
+        # truth for stats -> TurnUsage and carries every billing dimension the
+        # turn filled (claude seam: token counts + cache fields + cost_usd; kiro:
+        # credits). Duck-typed so the doubles in tests (and any stats holder
+        # predating the converter) fall through to the credits-only constructor,
+        # which is byte-identical for the kiro seam. The converter's failure is
+        # contained so a faulty to_turn_usage degrades to the credits read
+        # rather than silently zeroing a turn that did bill.
+        to_usage = getattr(stats, "to_turn_usage", None)
+        if callable(to_usage):
+            try:
+                usage = to_usage()
+            except Exception:
+                logger.debug("to_turn_usage failed; falling back to credits", exc_info=True)
+                usage = None
+            if isinstance(usage, TurnUsage):
+                return usage
         return TurnUsage(credits=float(getattr(stats, "credits", 0.0) or 0.0))
     except Exception:
         logger.debug("attempt usage read failed", exc_info=True)
     return TurnUsage()
+
+
+def usage_has_billing(usage: TurnUsage) -> bool:
+    """True when *usage* carries any billing dimension worth a row.
+
+    The single predicate behind every persist gate. Three hand-maintained
+    copies of ``credits or input_tokens or output_tokens`` is how the claude
+    seam's ``cost_usd`` (and a cost-free cache-only turn) got dropped in the
+    first place (#6758); a gate that reads this cannot drift from its siblings
+    when the next billing dimension is added.
+    """
+    return bool(
+        usage.credits
+        or usage.cost_usd
+        or usage.input_tokens
+        or usage.output_tokens
+        or usage.cache_creation_tokens
+        or usage.cache_read_tokens
+    )
 
 
 def _sum_usage(left: TurnUsage, right: TurnUsage) -> TurnUsage:
@@ -539,6 +1515,12 @@ def _sum_usage(left: TurnUsage, right: TurnUsage) -> TurnUsage:
             + int(getattr(right, "input_tokens", 0) or 0),
             output_tokens=int(getattr(left, "output_tokens", 0) or 0)
             + int(getattr(right, "output_tokens", 0) or 0),
+            cache_creation_tokens=int(getattr(left, "cache_creation_tokens", 0) or 0)
+            + int(getattr(right, "cache_creation_tokens", 0) or 0),
+            cache_read_tokens=int(getattr(left, "cache_read_tokens", 0) or 0)
+            + int(getattr(right, "cache_read_tokens", 0) or 0),
+            cost_usd=float(getattr(left, "cost_usd", 0.0) or 0.0)
+            + float(getattr(right, "cost_usd", 0.0) or 0.0),
         )
     except Exception:
         logger.debug("usage sum failed", exc_info=True)
@@ -575,8 +1557,10 @@ def provider_last_turn_usage(provider: Any, *, since: Any = _NO_PRIOR_STATS) -> 
     next caller preserving that pairing. A fresh turn installs fresh stats, so a
     stale total simply fails the identity check and the live read takes over.
 
-    On the ACP backend the only non-zero per-turn billing signal is ``credits``;
-    the token fields stay 0, matching the real usage record. Providers that expose
+    On the kiro (acp) seam the only non-zero per-turn billing signal is
+    ``credits``; on the claude seam the token counts, cache fields, and
+    ``cost_usd`` are filled instead. Whichever dimensions the turn's stats
+    carried come through :meth:`to_turn_usage` intact. Providers that expose
     no stats (non-ACP backends, test doubles) yield an empty ``TurnUsage``
     (credits=0). Never raises.
     """
@@ -601,13 +1585,18 @@ def provider_last_turn_usage(provider: Any, *, since: Any = _NO_PRIOR_STATS) -> 
 def _billing_stat_holders(provider: Any) -> "list[Any]":
     """Objects that may carry ``last_prompt_stats``, nearest wrapper first.
 
-    The turn-runner sits behind a different attribute per seam: the acp provider
-    keeps it on ``_client``, the session provider on ``_handle``, and the shared
-    background session hands non-kiro callers a thin adapter whose only link to
-    the runner is ``_sess.provider``. Walking all of them keeps a background turn
-    on the claude_code / bedrock seam from reporting 0 credits for a turn that
-    was billed. Bounded and identity-deduped so a self-referential wrapper chain
-    cannot loop.
+    The compatibility path behind :func:`_billing_stats`, and the lookup
+    :func:`_provider_label` still needs: the turn-runner sits behind a different
+    attribute per seam: the acp provider keeps it on ``_client``, the session
+    provider on ``_handle``, and the shared background session hands non-kiro
+    callers a thin adapter whose only link to the runner is ``_sess.provider``.
+    Walking all of them keeps a background turn on the claude_code / bedrock seam
+    from reporting 0 credits for a turn that was billed. Bounded and
+    identity-deduped so a self-referential wrapper chain cannot loop.
+
+    A name absent from this tuple is exactly how a new seam's spend went
+    unreported, which is why the billing read now prefers the provider's declared
+    :meth:`LLMProvider.billing_stats` and only falls back here.
     """
     out: list[Any] = []
     seen: set[int] = set()
@@ -658,12 +1647,37 @@ def _provider_label(provider: Any) -> str:
         return ""
 
 
+async def _cleanup_memory_consolidation_session(
+    sessions: Any, key: str, memory_store: str, log: Any
+) -> None:
+    """Retire one generated runtime before removing its private artifacts."""
+    try:
+        await sessions.remove(key)
+    except Exception:
+        # A provider that failed to retire may still have a live process or a
+        # late PID proof. Preserve both the transcript and binding in that case;
+        # deleting authority while the process survives would be unsafe.
+        logger.debug("memory consolidation session retirement failed", exc_info=True)
+        return
+    try:
+        from kiro_crew.member_memory_auth import retire_memory_consolidation_binding
+
+        # remove() waits for retirement but preserves resumable mappings. This
+        # generated UUID has no user continuation, so discard that mapping too.
+        await sessions.destroy(key)
+        await asyncio.to_thread(log.delete_memory_consolidation_session, key, memory_store)
+        await asyncio.to_thread(retire_memory_consolidation_binding, key, memory_store)
+    except Exception:
+        logger.debug("memory consolidation artifact cleanup failed", exc_info=True)
+
+
 @asynccontextmanager
 async def background_turn(
     sessions: Any,
     *,
     task: str,
     agent: "str | None" = None,
+    memory_store: str = "",
 ) -> "AsyncIterator[Any]":
     """Take the shared background session for ONE turn, then release and account.
 
@@ -695,10 +1709,34 @@ async def background_turn(
     """
     from kiro_crew.session import BACKGROUND_AGENT, BACKGROUND_KEY  # circular import
 
-    if agent is None:
-        client, _new, _resumed = await sessions.get_or_create(BACKGROUND_KEY)
-    else:
-        client, _new, _resumed = await sessions.get_or_create(BACKGROUND_KEY, agent=agent)
+    key = BACKGROUND_KEY
+    if memory_store:
+        from uuid import uuid4
+
+        from kiro_crew.history import ConversationLog
+        from kiro_crew.member_memory_auth import bind_private_session_store
+        from kiro_crew.memory_stores import memory_store_version, require_memory_store
+
+        await asyncio.to_thread(require_memory_store, memory_store)
+        if memory_store_version(memory_store) != 2:
+            raise ValueError("Dedicated member consolidation requires private V2 memory")
+        key = f"memory-consolidation:{memory_store}:{uuid4().hex}"
+        log = ConversationLog()
+        try:
+            await asyncio.to_thread(log.update_metadata, key, {"memory_store": memory_store})
+            await asyncio.to_thread(bind_private_session_store, key, memory_store)
+        except BaseException:
+            await _cleanup_memory_consolidation_session(sessions, key, memory_store, log)
+            raise
+    try:
+        if agent is None:
+            client, _new, _resumed = await sessions.get_or_create(key)
+        else:
+            client, _new, _resumed = await sessions.get_or_create(key, agent=agent)
+    except BaseException:
+        if memory_store:
+            await _cleanup_memory_consolidation_session(sessions, key, memory_store, log)
+        raise
     # The stats object as it stands BEFORE this turn. The shared session serves
     # many turns, and the runner replaces this object only once a turn actually
     # begins, so identity is what separates a turn that ran from one whose
@@ -726,7 +1764,7 @@ async def background_turn(
         # and an await ordered ahead of this would let a cancelled task hold the
         # shared semaphore forever.
         try:
-            sessions.release(BACKGROUND_KEY)
+            sessions.release(key)
         except Exception:
             logger.debug("background session release failed task=%s", task, exc_info=True)
         # Recycle sits in a finally for the same cancellation reason, and follows
@@ -743,10 +1781,12 @@ async def background_turn(
 
                 # A turn that never reached the provider bills nothing and has no
                 # row to write; the same guard the chat path applies keeps
-                # acquire-time failures from landing as zero-credit noise.
-                if usage.credits or usage.input_tokens or usage.output_tokens:
+                # acquire-time failures from landing as zero-credit noise. The
+                # shared predicate covers the claude seam's cost and cache
+                # dimensions alongside the kiro credits/token signals.
+                if usage_has_billing(usage):
                     await persist_token_record_async(
-                        BACKGROUND_KEY,
+                        key,
                         "",
                         usage,
                         _provider_label(client),
@@ -759,7 +1799,10 @@ async def background_turn(
                 logger.debug("background turn accounting failed task=%s", task, exc_info=True)
         finally:
             try:
-                await sessions.recycle_background()
+                if memory_store:
+                    await _cleanup_memory_consolidation_session(sessions, key, memory_store, log)
+                else:
+                    await sessions.recycle_background()
             except Exception:
                 logger.debug("background recycle failed task=%s", task, exc_info=True)
 
@@ -773,6 +1816,7 @@ async def stream_and_collect(
     on_chunk: Callable[[str], None] | None = None,
     on_tool_approval: Callable[[LLMEvent], Awaitable[bool]] | None = None,
     on_steer_consumed: Callable[[str], None] | None = None,
+    on_complete: Callable[[LLMEvent], None] | None = None,
     on_tool_gate: Callable[[str, bool, bool], None] | None = None,
     retry_transient: bool = True,
     max_turns: int | None = None,
@@ -780,6 +1824,7 @@ async def stream_and_collect(
     agent: str = "",
     app: str = "",
     model_fallback: bool = False,
+    fallback_models: Sequence[str] = (),
 ) -> str:
     """Stream a message through an LLM provider and collect the full response.
 
@@ -790,7 +1835,7 @@ async def stream_and_collect(
         provider: The LLM provider to stream through.
         message: The prompt to send.
         approval_policy: How to handle tool permission requests.
-        hooks: HookManager for HOOK_BASED approval policy.
+        hooks: HookManager for the HOOK_BASED and READ_ONLY approval policies.
         on_chunk: Optional callback invoked with each text chunk (for progress).
         on_tool_approval: Optional async callback for interactive approval.
         on_steer_consumed: Optional callback invoked with the backend's
@@ -798,6 +1843,10 @@ async def stream_and_collect(
             fire-and-forget write, so this echo is the ONLY authoritative signal
             that the backend injected it; a caller that steers must observe this
             to know which of its steers to requeue when the turn ends.
+        on_complete: Optional callback invoked with the provider's raw
+            ``EVENT_COMPLETE``. It is not invoked when the stream exhausts or
+            the caller cancels before that event. Raising from the callback is
+            swallowed so observation cannot fail the completed turn.
         on_tool_gate: Optional callback invoked once per tool permission
             decision with ``(tool_title, approved, security_blocked)``. Lets a
             caller tell "the model did work" apart from "every tool the model
@@ -826,13 +1875,22 @@ async def stream_and_collect(
         app: Owning app name, forwarded to the gate so the app's governance
             PROFILE is resolved — not just the enterprise ceiling.
 
-            All three matter for ``HOOK_BASED`` callers specifically. The gate
+            All three matter for ``HOOK_BASED`` and ``READ_ONLY`` callers
+            specifically. The gate
             resolves ``ceiling ∩ profile``, and it can only look up a profile it
             has been told the name of; with all three empty it applied the
             ceiling alone, so an app profile narrowing (say) ``filesystem.write``
             was silently not enforced for tools this helper approved. Callers
             using ``REJECT_ALL`` or ``AUTO_APPROVE`` are unaffected — the first
             runs no tools, the second never consults the gate.
+        fallback_models: Ordered chain of model ids tried when the same-model
+            transient budget exhausts on a throttle/capacity error (Case 2.75).
+            Empty (the default) disables the chain — behavior is byte-for-byte
+            today's fail-loudly. Requires ``retry_transient=True`` (a caller
+            that owns the outer transient loop also owns any fallback policy).
+            Every swap is logged at warning and published on the provider via
+            :data:`TURN_FALLBACK_ATTR`; the swap is sticky for the session and
+            a later call on the same provider probes one primary restore.
 
     Returns:
         The complete response text.
@@ -840,6 +1898,25 @@ async def stream_and_collect(
     transient_attempts = 0
     _model_fallback_attempted = False
     attempt = 0
+    _fb_chain = tuple(
+        m.strip() for m in (fallback_models or ()) if isinstance(m, str) and m.strip()
+    )
+    _fb_state = FallbackState(_fb_chain) if _fb_chain else None
+    # Cross-attempt tool-activity flag for the fallback chain ONLY. Case 2's
+    # same-model retry keys off ``result_text`` alone (pre-existing behavior,
+    # pinned byte-for-byte by the empty-chain regression tests), but the chain
+    # replays the ORIGINAL prompt up to FALLBACK_CANDIDATE_ATTEMPTS × len(chain)
+    # more times — a tool that completed an external mutation before any text
+    # streamed would be re-run on every one of them. Same activity predicate as
+    # the sub-agent ladder and the dashboard's ``_turn_emitted``: any fired
+    # tool call blocks the replay, text or no text.
+    _fb_tool_activity = False
+    # Sticky-restore probe (§restore policy): if an earlier turn on this
+    # provider fell back, try ONCE to move back to the primary before this
+    # turn streams. Quiet on success (log only); a still-throttled primary
+    # keeps the fallback for this turn.
+    if getattr(provider, TURN_FALLBACK_ATTR, None) is not None:
+        await probe_fallback_restore(provider, surface="stream_and_collect")
     # Accumulates across attempts, so it lives OUTSIDE the retry loop: a turn that
     # was billed and then retried must report the sum, not the last attempt.
     turn_billed = TurnUsage()
@@ -904,6 +1981,10 @@ async def stream_and_collect(
                         continue
                 elif event.kind == EVENT_TOOL_CALL:
                     tool_call_count += 1
+                    # Sticky across attempts (never reset in the retry loop):
+                    # once ANY attempt fired a tool, the fallback chain must
+                    # not replay the original prompt — see _fb_tool_activity.
+                    _fb_tool_activity = True
                     if on_tool_gate:
                         executed_calls.append((event.tool_call_id or "", event.title or ""))
                     if max_turns is not None and tool_call_count > max_turns:
@@ -937,22 +2018,23 @@ async def stream_and_collect(
                 elif event.kind == EVENT_STEER_CONSUMED:
                     consumed_this_attempt.append(event.text or "")
                 elif event.kind == EVENT_COMPLETE:
+                    if on_complete:
+                        try:
+                            on_complete(event)
+                        except Exception:
+                            logger.debug("on_complete callback failed", exc_info=True)
                     break
             return result_text
         except AcpError as exc:
             msg = str(exc)
-            # Prompt-busy is matched STRUCTURALLY first, with the substring kept
-            # as a fallback. _format_acp_error rewrites the backend's "prompt
-            # already in progress" into friendly prose that no longer carries
-            # the marker, so a string-only check silently loses BOTH arms below
-            # (cancel+retry and PromptBusyExhaustedError) for any producer that
-            # formats before raising — which the shared-runtime AcpSessionHandle
-            # now does. Unattended callers (workflows/agent_pool, handlers/side,
-            # the subagent-completion injector) depend on those arms to reset a
-            # wedged parent session, so losing them surfaces a generic failure
-            # and leaves the session stuck. The fallback still covers
-            # unformatted / history-restored messages.
-            busy = isinstance(exc, AcpPromptBusy) or "already in progress" in msg
+            # See is_prompt_busy for why this is structural rather than a
+            # substring test. Both arms below (cancel+retry and
+            # PromptBusyExhaustedError) hang off it, and the unattended callers
+            # (workflows/agent_pool, handlers/side, the subagent-completion
+            # injector) depend on them to reset a wedged parent session, so a
+            # missed wedge surfaces a generic failure and leaves the session
+            # stuck.
+            busy = is_prompt_busy(exc)
 
             # ── Case 1: prompt-busy (provider mid-turn) — cancel + retry. ──
             if busy:
@@ -1013,6 +2095,75 @@ async def stream_and_collect(
                 await asyncio.sleep(delay)
                 retrying = True
                 continue
+
+            # ── Case 2.75: throttle-exhaustion fallback chain ──
+            # The same-model budget (Case 2) is spent and the error is still
+            # transient (throttle/capacity — a throttle carries no rejection
+            # metadata, so Case 2.5 can never fire for it). Walk the configured
+            # chain: substitute set_model, then re-prompt. Two attempts per
+            # candidate (initial + one ~2s retry — see FALLBACK_CANDIDATE_
+            # ATTEMPTS), advance on transient failure, propagate non-transient
+            # immediately (the classifier gate above already ensures that).
+            # Empty chain ⇒ this block is inert and Case 3 surfaces the error
+            # exactly as before this feature existed.
+            #
+            # ``not _fb_tool_activity`` is load-bearing over and above
+            # ``not result_text``: a tool call can complete an EXTERNAL
+            # MUTATION before any text streams, and unlike Case 2's bounded
+            # same-model retry (pre-existing semantics, deliberately
+            # untouched), the chain replays the original prompt on every
+            # candidate — re-running that mutation each time. Any fired tool
+            # across ANY attempt disables the chain for this call; the error
+            # then surfaces exactly as it did before this feature.
+            if (
+                retry_transient
+                and not result_text
+                and not _fb_tool_activity
+                and _fb_state is not None
+                and acp_error_is_transient(exc)
+                and transient_attempts >= _TRANSIENT_RETRIES
+            ):
+                if _fb_state.should_retry_active():
+                    # Final attempt on the current candidate — the shared
+                    # budget body already recorded it.
+                    delay = transient_retry_delay(1)
+                    logger.warning(
+                        "model fallback: candidate %s still failing (attempt %d/%d), "
+                        "retrying in %.1fs: %s",
+                        _fb_state.active,
+                        _fb_state.attempts,
+                        FALLBACK_CANDIDATE_ATTEMPTS,
+                        delay,
+                        exc,
+                    )
+                    await asyncio.sleep(delay)
+                    retrying = True
+                    continue
+                # Advance to the next usable candidate via the shared walk
+                # step (marker-seeded primary, skip-active, substitute
+                # set_model, sticky-marker publish, greppable warning).
+                _cand = await advance_fallback_candidate(
+                    provider, _fb_state, surface="stream_and_collect"
+                )
+                if _cand is not None:
+                    await asyncio.sleep(transient_retry_delay(1))
+                    retrying = True
+                    continue
+                _story = _fb_state.exhaustion_story()
+                if _story:
+                    # Chain exhausted: surface the ORIGINAL error class with the
+                    # chain's story attached for the delivering surface, and
+                    # keep the incident greppable.
+                    logger.warning(
+                        "model fallback: chain exhausted (%s); surfacing original error: %s",
+                        _story,
+                        exc,
+                    )
+                    try:
+                        setattr(exc, FALLBACK_STORY_ATTR, _story)
+                    except Exception:
+                        pass
+                # Fall through to Case 2.5 / Case 3.
 
             # ── Case 2.5: model rejected (e.g. "auto" on GovCloud) — retry once
             # with the first advertised model. ──
@@ -1192,19 +2343,6 @@ async def _resolve_permission(
         await provider.reject_tool(event.request_id)
         _log("denied", error="Blocked: missing tool title", metadata={"mechanism": "always_deny"})
         return False
-    if is_sensitive_path(normalized):
-        await provider.reject_tool(event.request_id)
-        _log(
-            "denied",
-            error=f"Blocked: sensitive path: {normalized}",
-            metadata={"mechanism": "always_deny"},
-        )
-        return False
-    _bash_reason = is_sensitive_bash_command(normalized)
-    if _bash_reason:
-        await provider.reject_tool(event.request_id)
-        _log("denied", error=_bash_reason, metadata={"mechanism": "always_deny"})
-        return False
     # Honor the user's Settings>Security opt-out + governance pins on this
     # surface too (cron / Slack / workflow / heartbeat). Without threading the
     # effective set, is_denied() fails closed to ALL built-ins here, which would
@@ -1239,49 +2377,144 @@ async def _resolve_permission(
             return unconditional
         return unconditional if is_denied(probe, denied_regexes=_unpinned) else "policy_deny"
 
-    _deny_reason = is_denied(normalized, denied_regexes=_denied_regexes)
-    if _deny_reason:
+    # Defense-in-depth: the title AND every string in event.tool_input go through
+    # the same three predicates. The title usually carries the full path/command
+    # (kiro-cli convention), but tool_input may contain additional arguments or
+    # the actual path when the title is a generic tool name (e.g. "Read", "Bash").
+    _tool_input = event.tool_input or ""
+    # A file EDIT's tool_input is the document being written, not a command
+    # line; its gate is the target path (see _edit_target_denial). The reroute is
+    # taken only on TRUSTED provenance, never on the payload's own word:
+    # ``tool_kind`` on a permission frame is the agent-influenced ``kind`` the
+    # payload carries (display/telemetry metadata -- see _dispatch), so a shell
+    # call could forge ``kind="edit"`` to skip the command scan. What the client
+    # itself established from the preceding tool_call frame is ``shell_classified``
+    # (the shell cache hit) with ``is_shell`` False, and ``raw_params_trusted`` (the
+    # params came from that same cache, not an inline fallback). A frame missing
+    # any of those has no proven target to judge and keeps the document scan as
+    # the fail-closed fallback. Once rerouted, the target set is the params'
+    # paths plus ``event.diff_path`` (the content block's path the client
+    # cached), and an empty set is denied -- see _edit_target_denial.
+    _edit_params = (
+        event.raw_tool_params
+        if (
+            event.tool_kind == _EDIT_TOOL_KIND
+            and event.shell_classified
+            and not event.is_shell
+            and event.raw_params_trusted
+            and isinstance(event.raw_tool_params, dict)
+        )
+        else None
+    )
+    # Target-gating and document-scan suppression are SEPARATE decisions. A
+    # diff content block is write-plane evidence on its own — ``diff_path`` is
+    # the client's own cache from the preceding tool_call frame, not the
+    # agent-influenced ``kind`` — so the target denial also runs for a
+    # kindless or mislabelled non-shell call that carries one (strictly
+    # tightening: that call keeps its document scan below AND gains the
+    # target gate). Suppressing the document scan stays keyed on the fully
+    # trusted edit reroute (``_edit_params is not None``) alone.
+    _edit_target_gated = _edit_params is not None or bool(event.diff_path and not event.is_shell)
+    # Every OTHER non-shell tool with client-established provenance gets a
+    # FIELD-SCOPED scan: the same three predicates, over every string in the
+    # trusted params except a document body (``platform.tool_paths.
+    # DOCUMENT_BODY_KEYS`` -- ``content``, ``fileText``, ``newStr``, ...). A body
+    # is prose or source, and reading it as a shell command line refused a write
+    # that merely QUOTED ``rm -rf /`` or named a credential path. Provenance is
+    # the client's, never the payload's: ``shell_classified`` with ``is_shell``
+    # False (the shell cache the preceding tool_call frame populated -- a shell
+    # tool keeps the full scan, for it ``command`` IS what executes),
+    # ``raw_params_trusted`` (params from that same cache, so the strings judged
+    # are the ones that execute), and ``mcp_identity_trusted`` (the tool_name /
+    # server caches HIT, so the tool is a resolved built-in or a resolved MCP
+    # tool, not an unknown), and the resolved name must be a BUILT-IN document
+    # writer (``platform.tool_paths.is_document_writing_tool``): an MCP tool can
+    # execute whatever it calls ``content``, so its fields are all scanned. A frame
+    # missing any of those attributes, or carrying it as false, is an UNKNOWN tool
+    # and keeps the full document scan (fail closed). Every non-body string --
+    # a ``command`` word, a path, a URL -- still reaches the scan, and a walk
+    # that hits its work cap is denied as unverifiable.
+    _scoped_params = (
+        event.raw_tool_params
+        if (
+            _edit_params is None
+            and getattr(event, "shell_classified", False)
+            and not event.is_shell
+            and getattr(event, "raw_params_trusted", False)
+            and getattr(event, "mcp_identity_trusted", False)
+            and is_document_writing_tool(
+                getattr(event, "tool_name", ""), getattr(event, "mcp_server_name", "")
+            )
+            and isinstance(getattr(event, "raw_tool_params", None), dict)
+        )
+        else None
+    )
+    _scoped_truncated = False
+    if _edit_params is not None:
+        _input_strings: list[str] = []
+    elif _scoped_params is not None:
+        _scoped_strings = command_shaped_strings(_scoped_params)
+        _scoped_truncated = _scoped_strings.truncated
+        _input_strings = list(_scoped_strings)
+    else:
+        _input_strings = _extract_tool_input_strings(_tool_input) if _tool_input else []
+
+    def _scan_off_loop() -> tuple[str, str, str, str] | None:
+        # One worker hop for the title and the whole tool_input loop. Both are
+        # regex-heavy over agent-supplied text; on the event loop a ~9 KB shell
+        # title held the loop past the 25 s stall watchdog and took the gateway
+        # down (an inline title tier with only the tool_input
+        # tier offloaded leaves exactly that crash path open).
+        # ``re`` HOLDS the GIL for one match call, so the hop does not keep the
+        # loop live inside a single scan -- the linear patterns and the size
+        # ceiling do that; what the hop buys is the realpath I/O inside
+        # ``is_sensitive_path`` (which does release the GIL) and yields between
+        # the strings. Title first, so a request denied on its title
+        # reports the title-tier reason and mechanism exactly as before.
+        title_hit = _title_denial(normalized, _denied_regexes)
+        if title_hit is not None:
+            return (title_hit[0], title_hit[1], normalized, "always_deny")
+        if _edit_target_gated:
+            edit_hit = _edit_target_denial(_edit_params, event.diff_path)
+            if edit_hit is not None:
+                return (*edit_hit, "always_deny_input")
+        if _scoped_truncated:
+            # The field-scoped walk could not finish, so the strings it did
+            # collect are not the whole payload: refuse rather than scan a part.
+            return (
+                "oversize",
+                "Blocked: tool arguments too large to security-scan (deny-by-default)",
+                "",
+                "always_deny_input",
+            )
+        if _input_strings:
+            input_hit = _first_tool_input_denial(_input_strings, _denied_regexes)
+            if input_hit is not None:
+                return (*input_hit, "always_deny_input")
+        return None
+
+    _hit = await asyncio.to_thread(_scan_off_loop)
+    if _hit is not None:
+        _kind, _reason, _matched, _tier = _hit
         await provider.reject_tool(event.request_id)
         _log(
             "denied",
-            error=_deny_reason,
-            metadata={"mechanism": _regex_deny_mechanism(normalized, "always_deny")},
+            error=_reason,
+            metadata={
+                "mechanism": (_regex_deny_mechanism(_matched, _tier) if _kind == "regex" else _tier)
+            },
         )
         return False
 
-    # Defense-in-depth: also inspect event.tool_input for sensitive paths/commands.
-    # The title usually carries the full path/command (kiro-cli convention), but
-    # tool_input may contain additional arguments or the actual path when the
-    # title is a generic tool name (e.g. "Read", "Bash").
-    _tool_input = event.tool_input or ""
-    if _tool_input:
-        # Extract string values from JSON tool_input for path/command checking.
-        _input_strings = _extract_tool_input_strings(_tool_input)
-        for s in _input_strings:
-            if is_sensitive_path(s):
-                await provider.reject_tool(event.request_id)
-                _log(
-                    "denied",
-                    error=f"Blocked: sensitive path in tool_input: {s}",
-                    metadata={"mechanism": "always_deny_input"},
-                )
-                return False
-            _input_bash = is_sensitive_bash_command(s)
-            if _input_bash:
-                await provider.reject_tool(event.request_id)
-                _log("denied", error=_input_bash, metadata={"mechanism": "always_deny_input"})
-                return False
-            _input_deny = is_denied(s, denied_regexes=_denied_regexes)
-            if _input_deny:
-                await provider.reject_tool(event.request_id)
-                _log(
-                    "denied",
-                    error=_input_deny,
-                    metadata={"mechanism": _regex_deny_mechanism(s, "always_deny_input")},
-                )
-                return False
+    if policy == ToolApprovalPolicy.READ_ONLY and hooks is None:
+        # Fail closed: READ_ONLY's classifier IS the hook gate. Without one
+        # there is no way to prove a call read-only, so the policy degrades to
+        # REJECT_ALL rather than to the caller-less auto-approve below.
+        await provider.reject_tool(event.request_id)
+        _log("rejected", metadata={"reason": "read_only_policy_no_hooks"})
+        return False
 
-    if policy == ToolApprovalPolicy.HOOK_BASED and hooks:
+    if policy in (ToolApprovalPolicy.HOOK_BASED, ToolApprovalPolicy.READ_ONLY) and hooks:
         tool_result = hooks.on_tool_call(
             event.title,
             session_key=session_key,
@@ -1289,8 +2522,21 @@ async def _resolve_permission(
             app=app,
             tool_kind=event.tool_kind,
             raw_params=event.raw_tool_params,
+            diff_path=event.diff_path,
             command=event.shell_command,
             is_shell=event.is_shell,
+            mcp_server_name=event.mcp_server_name,
+            mcp_tool_name=event.tool_name,
+            mcp_identity_trusted=event.mcp_identity_trusted,
+            # READ_ONLY asks for the classifier's verdict alone: the gate skips
+            # its grant tiers (`auto_approve_tools`, app-own-server), which vouch
+            # for the caller rather than for the call's effect, so a grant that
+            # shadows a read still lets the classifier approve the read and a
+            # grant that shadows a write approves nothing. Under READ_ONLY the
+            # provenance flag above is also what lets a host-known built-in
+            # (``fs_read``) count as proven read-only. HOOK_BASED keeps the
+            # grants — its approver is the card they skip.
+            classifier_only=policy == ToolApprovalPolicy.READ_ONLY,
         )
         if tool_result.action == TOOL_DENY:
             await provider.reject_tool(event.request_id)
@@ -1309,9 +2555,68 @@ async def _resolve_permission(
             )
             return False
         if tool_result.action == TOOL_AUTO_APPROVE:
-            await provider.approve_tool(event.request_id)
-            _log("auto_approved", metadata={"reason": "hook_auto_approve"})
-            return True
+            if policy == ToolApprovalPolicy.READ_ONLY and not tool_result.read_only:
+                # READ_ONLY honours the classifier's verdict alone, and the
+                # result says which route produced it: ``read_only`` is set only
+                # by the read-only classifier, never by a grant (the operator's
+                # `auto_approve_tools` globs, the app-own-server rule), which
+                # vouches for the caller and says nothing about the call's
+                # effect. The gate is asked classifier-only above, so an
+                # untagged auto-approve here comes from a gate that does not
+                # carry the tag — a double, a tier that omits it — and this
+                # surface has no approver to hand it to. Refuse, as policy
+                # state: the same call is allowed where a card exists.
+                await provider.reject_tool(event.request_id)
+                _log("rejected", metadata={"reason": "read_only_policy_unclassified"})
+                return False
+            # The hook granted this by NAME (its `auto_approve_tools` globs, or
+            # the read-only allowlist). Verify it UNCONDITIONALLY: this helper
+            # serves unattended callers (cron / autonudge / heartbeat / Meetings
+            # transcript turns), some of which pass no approver, and the shell
+            # resolves the command's program names again through a PATH that can
+            # lead with agent-writable directories. A refusal DOWNGRADES to the
+            # caller's normal path — the interactive approver when one is
+            # present, else deny-by-default (reject) below — never a
+            # silent auto-approve of a shadowed name on an unwatched turn.
+            _ng_refusal = await name_grant.refusal_for_event(event)
+            if _ng_refusal is None:
+                await provider.approve_tool(event.request_id)
+                _log("auto_approved", metadata={"reason": "hook_auto_approve"})
+                return True
+            logger.warning(
+                "declining a hook auto-approve: %s; the request falls through "
+                "to this caller's approval path",
+                _ng_refusal.log_text,
+            )
+            name_grant.log_decline(
+                source="",
+                session_key=session_key,
+                agent=agent,
+                event=event,
+                refusal=_ng_refusal,
+                tier="hook_auto_approve",
+                sel_factory=sel,
+            )
+            # No interactive approver on this caller: the hook grant was the
+            # only positive authorization and it was withheld, so fall through
+            # to deny-by-default rather than the caller-less auto-approve below.
+            if on_tool_approval is None:
+                await provider.reject_tool(event.request_id)
+                _log("rejected", metadata={"reason": "name_grant_headless_reject"})
+                return False
+
+    if policy == ToolApprovalPolicy.READ_ONLY:
+        # Everything the hook gate did not deny (rejected above) or positively
+        # classify as read-only (approved above, name-grant verified) lands
+        # here: `allow` results, and auto-approves whose name grant was
+        # withheld (a grant-shaped auto-approve is refused above, before the
+        # name check). Where the interactive Reads mode would fall through to the
+        # approval card, this policy refuses — reject is the fallback, and it
+        # runs BEFORE the interactive callback so a caller passing one cannot
+        # widen the policy.
+        await provider.reject_tool(event.request_id)
+        _log("rejected", metadata={"reason": "read_only_policy"})
+        return False
 
     # Interactive approval if callback provided
     if on_tool_approval:
@@ -1386,7 +2691,7 @@ def _extract_json_of_type(
             # error must not escape. Fail the WHOLE scan closed: a truncated
             # scan cannot certify a preferred match as unambiguous, so keeping
             # candidates collected before the bomb would let a worked example
-            # launder past the ambiguity refusal (GPT review, #4974 round 4).
+            # launder past the ambiguity refusal.
             # Callers already have recovery paths for None (schema retry loop,
             # the spine's forcing re-emit); salvaging a prefix of a reply that
             # contains a nesting bomb is not worth defeating them.
@@ -1529,7 +2834,7 @@ async def save_conversation_turn_off_loop(
     The whole turn is written under one :meth:`~kiro_crew.history.ConversationLog.atomic_appends`
     hold. ``append`` locks per ROW, so without it two concurrent turns for the
     same session could interleave into ``user_A, user_B, assistant_A,
-    assistant_B`` -- turns that no longer pair up, which no timestamp ordering can
+    assistant_B`` -- turns that do not pair up, which no timestamp ordering can
     repair because each row's ``ts`` is individually correct. On the loop that was
     impossible (a synchronous caller never yields between its two appends), so the
     hazard is introduced BY offloading and has to be closed here rather than

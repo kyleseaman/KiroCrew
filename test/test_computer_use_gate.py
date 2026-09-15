@@ -1,15 +1,15 @@
 """The computer-use gate after the governance removal (``computer_use/gate.py``).
 
-This file used to be ~1650 lines pinning eight governance scopes, an
-unattended-surface refusal, an interactive-approval floor and an observation
-ceiling. All of that is gone by product decision: computer use is ONE operator
-opt-in, and after that the agent drives the desktop the way the operator would.
+The gate imposes no governance scopes, no unattended-surface refusal, no
+interactive-approval floor and no observation ceiling: computer use is ONE
+operator opt-in, and after that the agent drives the desktop the way the operator
+would.
 
 What is left to pin is small but worth pinning, because each item is a place where
 a future edit could quietly reintroduce a refusal (or lose the audit):
 
-* the gate PERMITS — including on surfaces that used to be refused outright
-  (cron, subagent, taskrunner), which is the behaviour change users will actually
+* the gate PERMITS on every surface, including cron, subagent and taskrunner,
+  which is the behaviour change users will actually
   notice;
 * every call is AUDITED, since with the ceiling gone the SEL trail is the
   operator's only record of what the agent did to their desktop;
@@ -21,6 +21,8 @@ a future edit could quietly reintroduce a refusal (or lose the audit):
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -34,7 +36,7 @@ from kiro_crew.computer_use.types import (
     TOOL_LIST_APPS,
 )
 
-# Surfaces that USED to be refused before any governance was even consulted. They
+# Surfaces the gate PERMITS with no special refusal. They
 # are the headline behaviour change, so they are parametrized rather than asserted
 # once — a partial revert would show up as one of these failing.
 _FORMERLY_REFUSED = ("cron:nightly", "subagent:abc123", "taskrunner", "_bg", "_hb", "")
@@ -60,11 +62,10 @@ class TestTheGatePermits:
         assert gate.require_computer_use(tool, session_key="dashboard:main") is None
 
     def test_an_unresolvable_app_identity_is_allowed(self):
-        """``requires_app_identity`` no longer refuses.
+        """``requires_app_identity`` does not refuse.
 
-        It used to be the "an app we cannot name cannot be authorized" rule. With
-        no per-app axes there is nothing to authorize against, and refusing would
-        only break windows whose bundle id the OS did not report.
+        With no per-app axes there is nothing to authorize against, so it permits;
+        refusing would only break windows whose bundle id the OS does not report.
         """
         assert (
             gate.require_computer_use(
@@ -76,9 +77,8 @@ class TestTheGatePermits:
     def test_a_mutator_is_allowed_without_a_recorded_approval(self):
         """The ``interactive`` approval floor is gone.
 
-        Previously this returned a refusal unless ``approval_recorded=True``, which
-        made the policy row observation-only in practice. Both the row and the
-        parameter's effect are removed; the parameter itself is kept for signature
+        A mutator is allowed without a recorded approval: the ``approval_recorded``
+        parameter has no effect. The parameter itself is kept for signature
         stability.
         """
         assert (
@@ -159,7 +159,7 @@ class TestObservationsArePassedThrough:
         )
 
     def test_the_ceiling_does_not_alter_a_payload(self):
-        """A renderer must not lose fields to a ceiling that no longer narrows.
+        """A renderer must not lose fields to a ceiling that does not narrow.
 
         Uses the real payload keys, so a future edit that re-adds narrowing without
         updating the renderers fails here rather than silently blanking output.
@@ -176,7 +176,7 @@ class TestObservationsArePassedThrough:
     def test_there_is_no_targets_axis_shim_to_read(self):
         """The ``targets`` ceiling is gone, and so is the predicate for it.
 
-        It used to return ``False`` with a docstring saying indexless keyboard input
+        The predicate claimed indexless keyboard input
         was "a legitimate flow again" — the INVERSE of what ships. Keyboard input
         requires an ``element_index`` (``tools._ELEMENT_REQUIRED_TOOLS``) precisely so
         the always-on secure-field refusal has a role/subrole to inspect. Nothing in
@@ -199,7 +199,7 @@ class TestAppDisclosure:
         assert gate.app_is_disclosable(bundle_id="", display_name="") is False
 
     def test_a_formerly_denylisted_app_is_now_disclosable(self):
-        """Terminals and password managers are no longer hidden from the list."""
+        """Terminals and password managers are not hidden from the list."""
         for bundle in ("com.apple.Terminal", "com.1password.app", "com.apple.systempreferences"):
             assert gate.app_is_disclosable(bundle_id=bundle, display_name="") is True
 
@@ -210,7 +210,7 @@ class TestTheOneRetainedRefusalIsNotHere:
 
         It lives in ``policy.check_app`` because that is the layer with the resolved
         ``AppRef``. Asserted from here so a future edit does not move it back into a
-        gate that no longer makes decisions — and so the invariant itself has a test
+        gate that makes no decisions — and so the invariant itself has a test
         that names it.
         """
         from kiro_crew.computer_use import policy
@@ -227,3 +227,62 @@ class TestTheOneRetainedRefusalIsNotHere:
 
         term = AppRef(name="Terminal", pid=1, bundle_id="com.apple.Terminal")
         assert policy.check_app(term, PolicyConfig()) is None
+
+
+class TestNothingInTreeStillCallsThisGateFailClosed:
+    """Ratchet: the tests above prove the gate PERMITS unconditionally, so prose
+    that calls it the fail-closed authorization point is not a stale phrasing --
+    it is a false statement about a security boundary, and it is the statement a
+    reader reasons from when wiring a new surface.
+
+    The fail-closed step is the keystone primary enable at the top of
+    ``tools._dispatch``; ``require_computer_use`` audits and returns no decision.
+    A source comment or spec paragraph that swaps those two sends the reader to
+    the wrong layer, and nothing else in the suite notices.
+
+    A mention is a violation when a fail-closed claim sits within
+    ``_WINDOW`` characters of it AND no audit-only correction sits in the same
+    window -- which is how a human reads the paragraph, and what keeps the
+    passages that name the enable's fail-closed posture *while* calling this gate
+    audit-only from being flagged.
+    """
+
+    _WINDOW = 200
+    _MENTION = re.compile(r"require_computer_use")
+    _CLAIMS_FAIL_CLOSED = re.compile(r"fail-?\s*clos|fails\s+CLOSED|authoritative gate", re.I)
+    _CORRECTS_IT = re.compile(r"audit-only|only audits|no decision|unconditionally permits", re.I)
+
+    @property
+    def _files(self):
+        root = Path(__file__).resolve().parents[1]
+        return [
+            p
+            for p in [*root.glob("src/kiro_crew/**/*.py"), *root.glob("docs/**/*.md")]
+            # gate.py is the definition; its own docstring states the contract.
+            if p.name != "gate.py"
+        ]
+
+    def _violations(self):
+        found = []
+        for path in self._files:
+            text = path.read_text(encoding="utf-8")
+            for match in self._MENTION.finditer(text):
+                window = text[max(0, match.start() - self._WINDOW) : match.end() + self._WINDOW]
+                window = " ".join(window.split())
+                if self._CLAIMS_FAIL_CLOSED.search(window) and not self._CORRECTS_IT.search(window):
+                    found.append(f"{path.name}:{text[: match.start()].count(chr(10)) + 1}")
+        return sorted(set(found))
+
+    def test_the_ratchet_actually_reads_the_mentions(self):
+        """A scan that matched nothing would pass vacuously."""
+        total = sum(len(self._MENTION.findall(p.read_text(encoding="utf-8"))) for p in self._files)
+        assert total >= 5, f"expected the known mentions of the gate, found {total}"
+
+    def test_no_source_or_spec_describes_this_gate_as_fail_closed(self):
+        violations = self._violations()
+        assert not violations, (
+            "require_computer_use permits unconditionally (see TestTheGatePermits); "
+            "the fail-closed step is the keystone primary enable at the top of "
+            "tools._dispatch. These describe it as the fail-closed authorization "
+            "point: " + ", ".join(violations)
+        )

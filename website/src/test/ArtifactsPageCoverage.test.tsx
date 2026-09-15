@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, waitFor, fireEvent, within } from '@testing-library/react'
+import { act, screen, waitFor, fireEvent, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import type { ComponentType } from 'react'
 import ArtifactsPage from '../pages/ArtifactsPage'
@@ -79,6 +79,13 @@ function seed({
   m.artifactFolders = vi.fn().mockResolvedValue({ folders })
   m.artifactSessionDocs = vi.fn().mockResolvedValue({ docs })
   m.getArtifactPublishProviders = vi.fn().mockResolvedValue({ providers: [], kind: 'widget' })
+  // Most coverage cases exercise the public-deploy edition. Keep that product
+  // capability stable from the query's loading state through its resolved
+  // state; an empty provider list legitimately removes "Not deployed" labels
+  // and made the webapp assertions race the provider response.
+  m.publishProviders = vi.fn().mockResolvedValue({
+    providers: [{ id: 'deploy-web-aws', endpoint: '/api/deploy/deploy' }],
+  })
   m.themeBoot = vi.fn().mockResolvedValue({})
   m.artifact = vi.fn().mockImplementation((slug: string) => {
     const base = artifacts.find((a) => a.slug === slug) ?? mkArtifact(slug)
@@ -117,9 +124,29 @@ afterEach(() => {
 describe('ArtifactsPage — card previews per kind', () => {
   it('renders a markdown artifact through the markdown renderer', async () => {
     const arts = [mkArtifact('daily-notes', { kind: 'markdown' })]
-    seed({ artifacts: arts, full: { content: '# Heading one\n\nbody text' } })
+    const m = seed({ artifacts: arts })
+    let resolveArtifact!: (artifact: Artifact) => void
+    let signalArtifactRequest!: () => void
+    const artifactRequested = new Promise<void>((resolve) => {
+      signalArtifactRequest = resolve
+    })
+    const pending = new Promise<Artifact>((resolve) => {
+      resolveArtifact = resolve
+    })
+    m.artifact.mockImplementation(() => {
+      signalArtifactRequest()
+      return pending
+    })
     renderWithProviders(<ArtifactsPage />)
-    await waitFor(() => expect(screen.getByRole('heading', { name: 'Heading one' })).toBeInTheDocument())
+    // Wait on the actual query call, not a polling deadline: resolving before
+    // LocalCardBody mounts can leave the cache notification behind its
+    // subscriber under a loaded full suite.
+    await artifactRequested
+    await act(async () => {
+      resolveArtifact({ ...arts[0], content: '# Heading one\n\nbody text' })
+      await pending
+    })
+    expect(screen.getByRole('heading', { name: 'Heading one' })).toBeInTheDocument()
     expect(screen.getByText('body text')).toBeInTheDocument()
   })
 
@@ -147,14 +174,23 @@ describe('ArtifactsPage — card previews per kind', () => {
     const arts = [mkArtifact('app-config', { kind: 'json' })]
     seed({ artifacts: arts, full: { content: '{"a":1,"b":[2]}' } })
     renderWithProviders(<ArtifactsPage />)
-    await waitFor(() => expect(screen.getByText(/"a": 1/)).toBeInTheDocument())
+    // Same boundary as the unparseable-JSON case below: the pretty-printed text
+    // appears only once the ['artifact', slug] query resolves and ContentThumb
+    // re-renders with `full.content`, which outlasted the default 1000ms poll
+    // under load in one of four full runs.
+    await waitFor(() => expect(screen.getByText(/"a": 1/)).toBeInTheDocument(), { timeout: 5000 })
   })
 
   it('keeps unparseable JSON as its raw text instead of blanking the preview', async () => {
     const arts = [mkArtifact('broken-config', { kind: 'json' })]
     seed({ artifacts: arts, full: { content: '{not json at all' } })
     renderWithProviders(<ArtifactsPage />)
-    await waitFor(() => expect(screen.getByText('{not json at all')).toBeInTheDocument())
+    // The raw text only appears once the ['artifact', slug] query resolves and
+    // ContentThumb re-renders with `full.content` — the same async boundary as
+    // the React.lazy chunk case in testing.md, just a data fetch instead of a
+    // module import. Under load that resolution can outlast the default 1000ms
+    // `waitFor` poll, so name the boundary explicitly with a longer timeout.
+    await waitFor(() => expect(screen.getByText('{not json at all')).toBeInTheDocument(), { timeout: 5000 })
   })
 
   it('renders a placeholder rather than an empty preview for blank content', async () => {

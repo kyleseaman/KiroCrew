@@ -33,6 +33,8 @@ const apiMocks = vi.hoisted(() => ({
   deleteTask: vi.fn(),
   fileTask: vi.fn(),
   reviewTask: vi.fn(),
+  saveOutput: vi.fn(),
+  revertOutput: vi.fn(),
 }))
 
 /**
@@ -330,6 +332,35 @@ describe('useMeetingSession transcription binding', () => {
     expect(stt.start).not.toHaveBeenCalled()
   })
 
+  it('starts the microphone while the server is HOLDING speech through agent init', async () => {
+    // The server buffers speech for the initializing agents instead of refusing
+    // it (issue #4610), so a line sent now lands — it is just replayed in order
+    // once they are ready. Keeping the mic shut here is what cost every meeting
+    // its opening ~46s, so capture must follow the hold as well as the direct
+    // fan-out.
+    apiMocks.meeting.mockResolvedValue({
+      meta: meta({ status: 'active' }),
+      live: { accepting_dispatches: false, buffering_dispatches: true },
+    })
+    await mountLoaded()
+
+    await waitFor(() => expect(stt.start).toHaveBeenCalled())
+    expect(stt.stop).not.toHaveBeenCalled()
+  })
+
+  it('keeps the microphone closed when the server neither admits nor holds', async () => {
+    // Both flags false is the genuinely closed case — stopping, reviewing, or an
+    // expired session. The hold must not widen this into "always open".
+    apiMocks.meeting.mockResolvedValue({
+      meta: meta({ status: 'active' }),
+      live: { accepting_dispatches: false, buffering_dispatches: false },
+    })
+    const view = await mountLoaded()
+    await waitFor(() => expect(view.result.current.status).toBe('active'))
+
+    expect(stt.start).not.toHaveBeenCalled()
+  })
+
   it('keeps the microphone closed when the meeting is active with no live session', async () => {
     // `active` on disk with `live: null` (a gateway restart dropped the
     // session) means a dispatch CANNOT land; unknown must read as not-ready.
@@ -478,6 +509,65 @@ describe('useMeetingSession lifecycle actions', () => {
     await waitFor(() => expect(apiMocks.setStatus).toHaveBeenCalledWith('weekly_sync', next))
   })
 
+  it('exposes the in-flight status change and clears it on settle', async () => {
+    const view = await mountLoaded()
+    let release!: (value: Record<string, never>) => void
+    apiMocks.setStatus.mockImplementationOnce(
+      () => new Promise(resolve => { release = resolve }),
+    )
+
+    expect(view.result.current.pending.settingStatus).toBeNull()
+    act(() => {
+      view.result.current.actions.pause()
+    })
+    await waitFor(() => expect(view.result.current.pending.settingStatus).toBe('paused'))
+
+    act(() => release({}))
+    await waitFor(() => expect(view.result.current.pending.settingStatus).toBeNull())
+  })
+
+  it('clears the in-flight status change when the request fails', async () => {
+    const view = await mountLoaded()
+    let fail!: (reason: Error) => void
+    apiMocks.setStatus.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => { fail = reject }),
+    )
+
+    act(() => {
+      view.result.current.actions.pause()
+    })
+    // Observe the flag SET first, so the null below proves it was cleared by
+    // settle rather than never having flipped at all.
+    await waitFor(() => expect(view.result.current.pending.settingStatus).toBe('paused'))
+
+    act(() => fail(new Error('boom')))
+    await waitFor(() => expect(view.result.current.pending.settingStatus).toBeNull())
+  })
+
+  it('drops a second status change while one is still pending', async () => {
+    const view = await mountLoaded()
+    let release!: (value: Record<string, never>) => void
+    apiMocks.setStatus.mockImplementationOnce(
+      () => new Promise(resolve => { release = resolve }),
+    )
+
+    act(() => {
+      view.result.current.actions.pause()
+    })
+    await waitFor(() => expect(view.result.current.pending.settingStatus).toBe('paused'))
+
+    // A click on another status control inside the pending window is a no-op:
+    // the mutations would otherwise overlap and the first settle would clear
+    // the pending flag while the second is still in flight.
+    act(() => {
+      view.result.current.actions.review()
+    })
+    expect(apiMocks.setStatus).toHaveBeenCalledTimes(1)
+
+    act(() => release({}))
+    await waitFor(() => expect(view.result.current.pending.settingStatus).toBeNull())
+  })
+
   it('ends the meeting and refreshes the meeting list', async () => {
     const view = await mountLoaded()
     const invalidate = vi.spyOn(view.queryClient, 'invalidateQueries')
@@ -492,6 +582,75 @@ describe('useMeetingSession lifecycle actions', () => {
       { type: 'info' },
     )
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['meetings', 'list'] })
+  })
+
+  it('holds a minutes save pending until the outputs refetch lands', async () => {
+    // Regression: `void invalidateQueries(...)` let the mutation settle before
+    // the refreshed output reached the cache — an immediate reopen then seeded
+    // the editor from the PRE-save cache, and re-saving overwrote the correction.
+    const view = await mountLoaded()
+    apiMocks.saveOutput.mockResolvedValue({
+      ok: true, agent_id: 'note-taker', updated_at: '2026-08-30T00:00:00Z', stale: false,
+    })
+
+    let releaseRefetch!: () => void
+    const refetchGate = new Promise<void>(resolve => { releaseRefetch = resolve })
+    const invalidate = vi
+      .spyOn(view.queryClient, 'invalidateQueries')
+      .mockReturnValue(refetchGate)
+
+    let settled = false
+    let savePromise!: Promise<unknown>
+    act(() => {
+      savePromise = view.result.current.saveOutput('note-taker', 'fixed name')
+      void savePromise.then(() => { settled = true })
+    })
+
+    await waitFor(() => expect(apiMocks.saveOutput).toHaveBeenCalledWith(
+      'weekly_sync', 'note-taker', 'fixed name',
+    ))
+    await waitFor(() => expect(invalidate).toHaveBeenCalled())
+    // The refetch is still in flight — the save must NOT have settled yet,
+    // because the panel closes its editor the moment this promise resolves.
+    expect(settled).toBe(false)
+
+    releaseRefetch()
+    await act(async () => { await savePromise })
+    expect(settled).toBe(true)
+  })
+
+  it('fails the save when the outputs refetch fails, instead of resolving it', async () => {
+    // Regression (sibling branch of the pending-refetch fix): invalidateQueries
+    // RESOLVES by default even when the refetch errors, so a successful PUT with
+    // a failed refetch still closed the editor over the pre-save cache — and
+    // re-saving that stale draft overwrote the correction. `throwOnError: true`
+    // routes the failure into the mutation's error path instead.
+    const view = await mountLoaded()
+    apiMocks.saveOutput.mockResolvedValue({
+      ok: true, agent_id: 'note-taker', updated_at: '2026-08-30T00:00:00Z', stale: false,
+    })
+
+    const invalidate = vi.spyOn(view.queryClient, 'invalidateQueries')
+      .mockImplementation((_filters, options) =>
+        options?.throwOnError
+          ? Promise.reject(new Error('refetch failed'))
+          : Promise.resolve())
+
+    let rejected = false
+    await act(async () => {
+      await view.result.current.saveOutput('note-taker', 'fixed name').catch(() => {
+        rejected = true
+      })
+    })
+
+    expect(invalidate).toHaveBeenCalled()
+    // The save must NOT settle successfully on a failed refetch — the panel
+    // would close the editor and the stale cache would seed the next edit.
+    expect(rejected).toBe(true)
+    expect(view.notify).toHaveBeenCalledWith(
+      i18nT('apps.meetings.session.minutesSaveFailed'),
+      { type: 'error' },
+    )
   })
 
   it('mutes and unmutes a single agent', async () => {

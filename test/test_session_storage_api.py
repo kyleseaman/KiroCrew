@@ -399,14 +399,14 @@ class TestEmpty:
         """
         done = threading.Event()
 
-        def slow_empty(batch_ids, on_progress=None, on_skip=None):  # type: ignore[no-untyped-def]
+        def slow_empty(batch_ids, on_progress=None, on_skip=None, expect=None):  # type: ignore[no-untyped-def]
             time.sleep(0.2)
             done.set()
             return 0
 
         with (
             patch.object(handler, "_sel", return_value=_sel_stub()),
-            patch.object(handler, "staged_targets", return_value=([], 0)),
+            patch.object(handler, "staged_targets", return_value=([], 0, {})),
             patch.object(handler, "empty_trash", slow_empty),
         ):
             resp = await handler.api_session_storage_empty(
@@ -420,6 +420,48 @@ class TestEmpty:
         # of waiting, `done` would still be unset when the next test starts and the
         # thread would outlive this one.
         assert not done.is_set()
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_delete_refused_by_a_failed_snapshot_is_still_audited(
+        self,
+    ) -> None:
+        """Refusing an irreversible operation must still record that it was attempted.
+
+        Every other outcome of this endpoint reaches the audit inside ``_run_empty_job``,
+        and before this change an explicit selection reached it even on a failed snapshot,
+        because it DISPATCHED anyway. Failing closed is right -- dispatching without the
+        snapshot deletes whatever answers to the names by the time the worker runs -- but it
+        moved the request off the audited path, and an unrecorded attempt at the one
+        irreversible operation in this surface is a worse hole than the one it closed.
+        """
+
+        def unreadable(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise OSError("too many open files")
+
+        sel = _sel_stub()
+        with (
+            patch.object(handler, "_sel", return_value=sel),
+            patch.object(handler, "staged_targets", unreadable),
+        ):
+            resp = await handler.api_session_storage_empty(
+                _request(
+                    "POST",
+                    "/api/system/session-storage/empty",
+                    {"batch_ids": ["20260101T000000Z-aaaa"]},
+                )
+            )
+        body = json.loads(resp.body)
+
+        assert resp.status == 202
+        assert body["error"], "the refusal must be visible on the job"
+        audited = [
+            c.kwargs
+            for c in sel.log_api_access.call_args_list
+            if c.kwargs["operation"] == "session_storage.empty"
+        ]
+        assert audited, "the refused empty must be audited"
+        assert audited[0]["outcome"] == "refused"
+        assert audited[0]["resources"] == "snapshot_unreadable"
 
     @pytest.mark.asyncio
     async def test_accepts_the_work_then_frees_the_space_and_audits_it(
@@ -486,7 +528,7 @@ class TestEmpty:
         release = asyncio.Event()
         loop = asyncio.get_running_loop()
 
-        def _slow_empty(batch_ids, on_progress=None, on_skip=None):  # type: ignore[no-untyped-def]
+        def _slow_empty(batch_ids, on_progress=None, on_skip=None, expect=None):  # type: ignore[no-untyped-def]
             if on_progress is not None:
                 on_progress(512)
             asyncio.run_coroutine_threadsafe(_wait(), loop).result()
@@ -549,13 +591,13 @@ class TestEmpty:
     ) -> None:
         """The request is already answered, so a refusal has to be readable later."""
 
-        def _refuse(batch_ids, on_progress=None, on_skip=None):  # type: ignore[no-untyped-def]
+        def _refuse(batch_ids, on_progress=None, on_skip=None, expect=None):  # type: ignore[no-untyped-def]
             raise session_storage_module.SessionStorageError("the trash root moved")
 
         sel = _sel_stub()
         with (
             patch.object(handler, "_sel", return_value=sel),
-            patch.object(handler, "staged_targets", return_value=([], 0)),
+            patch.object(handler, "staged_targets", return_value=([], 0, {})),
             patch.object(handler, "empty_trash", _refuse),
         ):
             await handler.api_session_storage_empty(
@@ -576,13 +618,13 @@ class TestEmpty:
     ) -> None:
         """A job left flagged running is a screen polling a delete that stopped."""
 
-        def _boom(batch_ids, on_progress=None, on_skip=None):  # type: ignore[no-untyped-def]
+        def _boom(batch_ids, on_progress=None, on_skip=None, expect=None):  # type: ignore[no-untyped-def]
             raise RuntimeError("disk went away")
 
         sel = _sel_stub()
         with (
             patch.object(handler, "_sel", return_value=sel),
-            patch.object(handler, "staged_targets", return_value=([], 0)),
+            patch.object(handler, "staged_targets", return_value=([], 0, {})),
             patch.object(handler, "empty_trash", _boom),
         ):
             await handler.api_session_storage_empty(
@@ -686,12 +728,12 @@ class TestEmpty:
 
         def _slow_totals(batch_ids):  # type: ignore[no-untyped-def]
             time.sleep(0.05)
-            return [], 0
+            return [], 0, {}
 
         release = asyncio.Event()
         loop = asyncio.get_running_loop()
 
-        def _held_empty(batch_ids, on_progress=None, on_skip=None):  # type: ignore[no-untyped-def]
+        def _held_empty(batch_ids, on_progress=None, on_skip=None, expect=None):  # type: ignore[no-untyped-def]
             asyncio.run_coroutine_threadsafe(release.wait(), loop).result()
             return 0
 
@@ -790,7 +832,7 @@ class TestEmpty:
         # And the slot is free again, rather than answering 409 forever.
         with (
             patch.object(handler, "_sel", return_value=_sel_stub()),
-            patch.object(handler, "staged_targets", return_value=([], 0)),
+            patch.object(handler, "staged_targets", return_value=([], 0, {})),
             patch.object(handler, "empty_trash", lambda *a, **k: 0),
         ):
             again = await handler.api_session_storage_empty(
@@ -816,12 +858,12 @@ class TestEmpty:
         """
         leak = "refused near AKIAIOSFODNN7EXAMPLE " + ("y" * 900)
 
-        def _refuse(batch_ids, on_progress=None, on_skip=None):  # type: ignore[no-untyped-def]
+        def _refuse(batch_ids, on_progress=None, on_skip=None, expect=None):  # type: ignore[no-untyped-def]
             raise session_storage_module.SessionStorageError(leak)
 
         with (
             patch.object(handler, "_sel", return_value=_sel_stub()),
-            patch.object(handler, "staged_targets", return_value=([], 0)),
+            patch.object(handler, "staged_targets", return_value=([], 0, {})),
             patch.object(handler, "empty_trash", _refuse),
         ):
             await handler.api_session_storage_empty(
@@ -845,13 +887,21 @@ class TestEmpty:
         assert "refused" in reported
 
     @pytest.mark.asyncio
-    async def test_an_explicit_selection_still_runs_without_a_denominator(
+    async def test_a_named_selection_fails_closed_when_the_snapshot_cannot_be_read(
         self, stores: tuple[Path, Path]
     ) -> None:
-        """A named selection needs no snapshot, so a failed read only costs the bar.
+        """A list of names is not approval, so a failed snapshot cancels the delete.
 
-        The widening hazard does not apply: the caller said which batches, and that
-        list is what the worker gets.
+        Dispatching anyway is wrong, even though the caller has already said WHICH
+        batches and a missing snapshot only costs the progress bar its
+        denominator: the snapshot is what turns those names into approval of the
+        DIRECTORIES they point at, so dispatching without it deletes whatever
+        answers to the names by the time the worker runs. The failure is not
+        always benign either - a staged tree deep enough to exhaust descriptors arrives
+        here as an exception, and writing into the trash is how it gets there.
+
+        Answered as a settled job carrying the reason, not a 500, so the screen has one
+        shape to read.
         """
 
         def _explode(batch_ids):  # type: ignore[no-untyped-def]
@@ -872,12 +922,14 @@ class TestEmpty:
                 )
             )
             job = handler._empty_job
-            assert job is not None and job.task is not None
-            await job.task
+            assert job is not None
 
         assert resp.status == 202
-        assert json.loads(resp.body)["total_bytes"] == 0, "no denominator, but a job"
-        assert seen == [["b-1", "b-2"]]
+        body = json.loads(resp.body)
+        assert body["running"] is False, "the job is settled, not left polling"
+        assert body["error"], "the user has to be told why nothing moved"
+        assert seen == [], "nothing may be deleted without an identity to check against"
+        assert job.task is None, "no worker was dispatched"
 
     @pytest.mark.asyncio
     async def test_empty_all_hands_the_worker_the_batches_it_resolved(
@@ -1019,6 +1071,116 @@ class TestIndexConstruction:
         assert index.active_stems == frozenset(index.stem_to_sid)
 
 
+class TestTheReclaimRefreshIsCheapToCallPerSession:
+    """``move_to_trash`` calls ``refresh`` once per selected session.
+
+    It has to, because a resume that only READS an old transcript writes nothing
+    and is invisible to the mtime guard inside the move loop — the index is where
+    it shows up. Rebuilding the index that often is what has to be made affordable:
+    the rebuild reads and parses the whole session map, and the selection is capped
+    at six figures.
+    """
+
+    def _write_map(self, payload: dict[str, str]) -> Path:
+        """Land a session map the way ``SessionMap`` does: replace, never edit.
+
+        The token includes ``st_ino`` precisely because every real write arrives
+        through ``os.replace``, so an in-place rewrite is not the case under test.
+        """
+        target = handler.config_dir() / handler.SESSION_MAP_FILENAME
+        tmp = target.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, target)
+        return target
+
+    def test_the_same_index_is_returned_while_the_map_has_not_moved(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """One stat, not one parse — and the SAME object, which is the signal.
+
+        ``move_to_trash`` reads an unchanged index by identity, so returning an
+        equal-but-new object would still pay for re-deriving its sets per session.
+        """
+        self._write_map({"dashboard:chat-1": "aaaa1111"})
+        built = []
+
+        def _spy() -> handler.SessionIndex:
+            built.append(1)
+            return handler.SessionIndex()
+
+        refresh = handler._MapBackedRefresh()
+        with patch.object(handler, "_build_index", _spy):
+            first = refresh()
+            second = refresh()
+            third = refresh()
+
+        assert first is second is third
+        assert len(built) == 1
+
+    def test_a_mapping_write_forces_a_rebuild(self, stores: tuple[Path, Path]) -> None:
+        """A resume maps the session, which replaces the file. That must be seen."""
+        self._write_map({"dashboard:chat-1": "aaaa1111"})
+
+        def _spy() -> handler.SessionIndex:
+            return handler.SessionIndex()
+
+        refresh = handler._MapBackedRefresh()
+        with patch.object(handler, "_build_index", _spy):
+            before = refresh()
+            self._write_map({"dashboard:chat-1": "aaaa1111", "dashboard:chat-2": "bbbb2222"})
+            after = refresh()
+
+        assert before is not after
+
+    def test_an_unreadable_map_is_never_treated_as_unchanged(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """Fails toward rebuilding: a missing map costs a re-read, not a skip.
+
+        Skipping on an unreadable token would turn "I cannot tell" into "nothing
+        has changed", which is exactly the wrong direction for a guard.
+        """
+        assert not (handler.config_dir() / handler.SESSION_MAP_FILENAME).exists()
+        built = []
+
+        def _spy() -> handler.SessionIndex:
+            built.append(1)
+            return handler.SessionIndex()
+
+        refresh = handler._MapBackedRefresh()
+        with patch.object(handler, "_build_index", _spy):
+            first = refresh()
+            second = refresh()
+
+        assert first is not second
+        assert len(built) == 2
+
+    def test_a_write_landing_during_a_rebuild_is_not_missed(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """The token is read BEFORE the rebuild, and that one is stored.
+
+        Stamping the rebuilt index with a token read afterwards would record a write
+        the rebuild had already raced past, and the next call would report the map
+        unchanged — losing the very resume this exists to catch.
+        """
+        self._write_map({"dashboard:chat-1": "aaaa1111"})
+        raced = {"yet": False}
+
+        def _spy_that_races() -> handler.SessionIndex:
+            if not raced["yet"]:
+                raced["yet"] = True
+                self._write_map({"dashboard:chat-2": "bbbb2222"})
+            return handler.SessionIndex()
+
+        refresh = handler._MapBackedRefresh()
+        with patch.object(handler, "_build_index", _spy_that_races):
+            first = refresh()
+            second = refresh()
+
+        assert first is not second
+
+
 class TestWhyAReclaimIsRefused:
     """A refusal must name the real reason.
 
@@ -1026,6 +1188,42 @@ class TestWhyAReclaimIsRefused:
     assert that the product stops telling a user a month-old idle conversation is
     "in use", which is a claim the user can disprove by reading the date next to it.
     """
+
+    def test_the_pre_classification_never_reads_a_cached_cotenant_pass(
+        self, stores: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_classify derives per-row refusals, so it must enumerate uncached.
+
+        A pre-pass fed a 30s-stale co-tenant set would classify a just-claimed
+        session as eligible; a stale store scan fails independently the same way
+        (a stale-older mtime reads eligible here and too_fresh inside the move).
+        Either way the authority still refuses, but as the all-or-nothing batch
+        failure ``_classify`` exists to prevent. Both halves are counted, so a
+        future change that splits the flag cannot re-cache either half here.
+        """
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        index = session_storage_module.SessionIndex(stem_to_sid={}, active_sids=frozenset())
+        # Prime both caches through the ordinary cached read path.
+        session_storage_module.list_units(index)
+
+        calls = {"cotenant": 0, "scan": 0}
+        real_cotenants = session_storage_module._replay_store_cotenants
+        real_scan = session_storage_module._scan_raw_uncached
+
+        def counted_cotenants() -> list[str]:
+            calls["cotenant"] += 1
+            return real_cotenants()
+
+        def counted_scan(sid_for_stem):
+            calls["scan"] += 1
+            return real_scan(sid_for_stem)
+
+        monkeypatch.setattr(session_storage_module, "_replay_store_cotenants", counted_cotenants)
+        monkeypatch.setattr(session_storage_module, "_scan_raw_uncached", counted_scan)
+        handler._classify([], index, now=time.time())
+
+        assert calls["cotenant"] == 1, "the trash pre-pass must re-read co-tenants, not the cache"
+        assert calls["scan"] == 1, "the trash pre-pass must re-enumerate the stores, not the cache"
 
     @staticmethod
     def _recorded_session(crew_home: Path, kiro_home: Path, sid: str, key: str) -> None:
@@ -1272,6 +1470,43 @@ class TestRefusalsAreAudited:
         )
         assert sid in denial.kwargs["resources"]
         assert "resumable" in denial.kwargs["resources"], "the reason belongs in the record"
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_raised_from_inside_the_move_is_audited_too(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """The only record for a batch refused mid-move is this one.
+
+        A selection where every session is protected DURING staging never reaches
+        the success path, so without an audit on the exception branch the
+        protection decision would leave no trace at all.
+        """
+        crew_home, kiro_home = stores
+        # Unmapped and old, so it passes pre-flight and the move is attempted --
+        # which is the only way to reach the branch under test.
+        sid = "dddddddd-0000-4000-8000-000000000009"
+        _retired(kiro_home, sid, age_days=45)
+
+        req = _request("POST", "/api/system/session-storage/trash", {"uids": [sid]})
+        req.app["state"].running_session_keys.return_value = frozenset()
+        sel = _sel_stub()
+
+        def _raise(*_args, **_kwargs):
+            raise handler.SessionStorageError(
+                "all 1 selected session(s) were resumed while being staged; nothing was moved"
+            )
+
+        with (
+            patch.object(handler, "_sel", lambda: sel),
+            patch.object(handler, "move_to_trash", _raise),
+        ):
+            resp = await handler.api_session_inventory_trash(req)
+
+        assert resp.status == 400
+        assert json.loads(resp.body)["code"] == "trash_refused"
+        outcomes = [c.kwargs["outcome"] for c in sel.log_api_access.call_args_list]
+        assert "denied" in outcomes, "a mid-move refusal must leave a denied event"
+        assert "success" not in outcomes, "nothing was taken, so nothing succeeded"
 
     @pytest.mark.asyncio
     async def test_a_partial_refusal_is_audited_alongside_the_success(

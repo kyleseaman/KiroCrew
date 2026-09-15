@@ -17,7 +17,7 @@ check fails it prints a specific fix command.
 
 ## Common Issues
 
-### "kiro-cli not found in PATH"
+### kiro-cli is not on PATH
 
 `kiro-cli` is the agent backend and is required: `agent.provider` is fixed to
 `acp`, and the gateway spawns `kiro-cli acp --agent <name>` for every session.
@@ -59,7 +59,7 @@ shell's environment to the service. Put it where the gateway reads it at boot:
 P=~/.kiro/crew/.env
 touch "$P" && chmod 600 "$P"
 printf '%s\n' "KIRO_API_KEY=$KIRO_API_KEY" >> "$P"
-kirocrew service restart   # or restart however you run the gateway
+kirocrew restart           # or restart however you run the gateway
 ```
 
 The `chmod` comes first on purpose: under a standard `022` umask a file created
@@ -194,7 +194,7 @@ cd website && npm install && npm run build 2>&1 | tail -20
 ```
 
 Node must be `20` or `>= 22`; an older Node fails the Vite build. Python must be
-`>= 3.10`.
+`>= 3.12`.
 
 ### Embedding model download failed
 
@@ -271,14 +271,21 @@ Common problems:
   model: doing so would silently swap your vector space and re-embed your whole
   corpus because of a typo. Embeddings stay unavailable (keyword search still
   works) until the path is fixed.
-- **A log line says the model produces N-dim vectors but `embedding_dim` is M,
-  and refuses to load.** Set `memory.embedding_dim` to the number in the message.
-  The width is checked at load precisely so a mismatch is a loud refusal rather
-  than an unexplained loss of semantic search.
-- **You swapped models but nothing re-embedded.** The default vector-space
-  identity is derived from the file's name and size, so two different models of
-  identical byte size look the same. Set `memory.embed_model_id` explicitly to
-  distinguish them.
+- **Embedding-model dimension mismatch.** Set `memory.embedding_dim` to the output width named in the error. The width is checked at load so a mismatch is a loud refusal rather than an unexplained loss of semantic search.
+- **You swapped models but nothing re-embedded.** The vector-space identity
+  is `<label>:sha256:<digest>` of the model file's bytes, so a different model
+  under the same name and size is detected on its own; `memory.embed_model_id`
+  is only the label and cannot pin the old space. Applying the model from the
+  dashboard (Memory → Embedding Model) records the new digest together with
+  `memory.embed_model_stamp`, and an unchanged file reuses that digest at
+  startup without re-reading the weights. A file replaced behind a stale stamp
+  is re-hashed off the event loop. Status reports the model as unverified while
+  that check runs and recovers automatically after it succeeds; applying the
+  model again is not required.
+- **Status warns about inherited legacy vectors.** Older model identities used
+  the file name and size, so they cannot prove which weights produced the
+  vectors. If you changed weights before upgrading, reapply the same file in
+  Memory settings to rebuild inherited vectors while keeping memory text.
 
 ### High memory usage with embeddings
 

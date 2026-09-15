@@ -37,7 +37,8 @@ import secrets
 import time
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.constants import OPTIONS_RE_TRAILER, split_trailing_protocol_suffix
+from kiro_crew.constants import split_trailing_protocol_suffix
+from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.outbound_files import (
     ExtractLimits,
@@ -52,6 +53,8 @@ from kiro_crew.messaging.renderer import (
     _default_redactor,
     apply_options_cap,
     new_approval_nonce,
+    session_provenance_tag,
+    split_options_trailer,
 )
 from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.messaging.transport import TransportCapabilities
@@ -107,7 +110,8 @@ _TYPING_REFRESH_S = 4.0
 _EDIT_THROTTLE_S = 1.0
 
 # Interactive approval wait; deny-by-default when it elapses with no press.
-_APPROVAL_TIMEOUT_S = 300.0
+# Owned by messaging.approval so every channel's window is the same one.
+_APPROVAL_TIMEOUT_S = APPROVAL_TIMEOUT_S
 
 # ── Stall marks on the live bubble ──
 # Telegram has no message-reaction budget to spend on a phase indicator: a bot
@@ -154,14 +158,6 @@ _THINKING_SCAFFOLD = "<blockquote expandable>💭 </blockquote>"
 # that says retrying will not help.
 _GENERIC_ERROR_TEXT = "⚠️ Error — please try again"
 
-# Trailing "[OPTIONS: a | b | c]" -- extracted for inline-keyboard rendering.
-# Matched only at the very END of the message, so use the DOTALL/trailer
-# canonical parser. Defined once in constants.py (shared with the Slack/
-# dashboard/Discord/WeCom surfaces) so the ReDoS-hardened grammar can never
-# drift; see OPTIONS_RE_TRAILER for the full rationale. Per-choice whitespace is
-# stripped by the caller.
-_OPTIONS_RE = OPTIONS_RE_TRAILER
-
 
 def _display_safe(text: str) -> str:
     """Redact against the form Telegram RENDERS, not the bytes we send.
@@ -191,6 +187,63 @@ def _display_safe(text: str) -> str:
     return safe
 
 
+def _utf16_len(text: str) -> int:
+    """Length of *text* in UTF-16 code units — the unit of Telegram's caps.
+
+    Python counts code points; the Bot API counts UTF-16 units, so every
+    astral character (emoji, most notably) costs 2 against Telegram's 4096
+    while costing 1 against ``len``. The entity machinery in
+    ``telegram/client.py`` already measures in these units; message budgets
+    here measure the same way.
+    """
+    return len(text) + sum(1 for ch in text if ord(ch) > 0xFFFF)
+
+
+def _utf16_cut(text: str, limit: int) -> int:
+    """Largest CODE-POINT index whose prefix fits ``limit`` UTF-16 units.
+
+    Returning a code-point index means ``str`` slicing can never bisect a
+    surrogate pair: an astral character either fits whole or is excluded
+    whole. The floor of 2 is load-bearing — at ``limit=1`` a leading astral
+    character (2 units) would cut at index 0, and a caller consuming the
+    text chunk by chunk would stop making progress.
+    """
+    budget = max(2, limit)
+    units = 0
+    for index, ch in enumerate(text):
+        units += 2 if ord(ch) > 0xFFFF else 1
+        if units > budget:
+            return index
+    return len(text)
+
+
+def _utf16_chunks(text: str, limit: int) -> list[str]:
+    """Split ``text`` into pieces of at most ``limit`` UTF-16 units each.
+
+    Prefers newline boundaries so a line (one restored image reference, in
+    the recovery caller) stays whole within one message; a single line
+    larger than the whole budget is hard-cut at a code-point boundary
+    rather than dropped. Boundary newlines are consumed by the split.
+    """
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        candidate = f"{current}\n{line}" if current else line
+        if _utf16_len(candidate) <= max(2, limit):
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        while _utf16_len(line) > max(2, limit):
+            cut = _utf16_cut(line, limit)
+            chunks.append(line[:cut])
+            line = line[cut:]
+        current = line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def md_to_telegram_html_safe(text: str) -> str:
     """Redact against the rendered form, THEN translate markdown to HTML.
 
@@ -214,17 +267,13 @@ def md_to_telegram_html_safe(text: str) -> str:
 
 
 def _extract_options(text: str) -> tuple[str, list[str]]:
-    """Split text into (body, options). Handles the streamed partial too."""
-    m = _OPTIONS_RE.search(text)
-    if m:
-        body = text[: m.start()].rstrip()
-        options = [o.strip() for o in m.group(1).split("|") if o.strip()]
-        return body, options
-    # Hold back an incomplete "[OPTIONS…" fragment mid-stream.
-    idx = text.rfind("[OPTIONS")
-    if idx != -1 and "]" not in text[idx:]:
-        return text[:idx].rstrip(), []
-    return text, []
+    """Split text into ``(body, options)``, holding back a streamed partial.
+
+    ``hide_partial=True`` because this renderer STREAMS: a still-arriving
+    ``[OPTIONS…`` fragment really may be a marker mid-flight, and the next frame
+    re-renders from the full buffer, so hiding it costs nothing permanent.
+    """
+    return split_options_trailer(text, hide_partial=True)
 
 
 # kiro-cli emits an inline "[STEERING steer-<id>: …]" ack marker when it folds a
@@ -285,27 +334,32 @@ def _strip_hr(text: str) -> str:
     return out.strip()
 
 
-def build_inline_keyboard(options: list[str]) -> dict | None:
+def build_inline_keyboard(options: list[str], session_key: str) -> dict | None:
     """Build an InlineKeyboardMarkup from ``[OPTIONS:]`` labels.
 
-    ``callback_data`` is the index only (``opt:<i>``) -- Telegram caps it at
-    64 BYTES, so a multi-byte (CJK/emoji) label there could overflow and make
-    the whole send fail. The label is recovered from the button text at
-    callback time. Two buttons per row (mobile friendly).
+    ``callback_data`` is ``opt:<index>:<session-tag>``. The label stays out of
+    the payload because Telegram caps it at 64 bytes and a multi-byte CJK/emoji
+    label could overflow. The compact deterministic tag binds a later press to
+    the session that posted the keyboard; the label is recovered from the button
+    text at callback time. Two buttons per row keeps the keyboard mobile-friendly.
 
     A label is MODEL-authored text that Telegram renders, so it is a display sink
     like the answer body: the driver's byte-level scan can see a credential as
     broken that the rendered button shows whole. Scanned HERE because this is the
-    one place both callers pass through. Bounded work by construction -- at most
-    ``max_buttons`` labels of at most 64 chars -- so it stays on the loop.
+    one place both callers pass through. Each label is redacted WHOLE and bounded
+    to 64 chars only after the scan — cutting first can split a credential at the
+    boundary into fragments no redaction regex matches. Bounded work by
+    construction — at most ``max_buttons`` single-line labels — so it stays on
+    the loop.
     """
     if not options:
         return None
+    origin_tag = session_provenance_tag(session_key)
     buttons: list[list[dict]] = []
     row: list[dict] = []
     for i, opt in enumerate(options):
-        safe, _ = redact_for_display(opt[:64], _default_redactor)
-        row.append({"text": safe, "callback_data": f"opt:{i}"})
+        safe, _ = redact_for_display(opt, _default_redactor)
+        row.append({"text": safe[:64], "callback_data": f"opt:{i}:{origin_tag}"})
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -795,7 +849,7 @@ class TelegramApprovalDecider:
         finally:
             TelegramApprovalDecider._REGISTRY.pop(k, None)
             # Retire the nonce with the prompt, so a button for a request id the
-            # provider later reuses cannot match a nonce that is no longer live.
+            # provider later reuses cannot match a nonce that is not live.
             TelegramApprovalDecider._NONCES.pop(k, None)
 
     @classmethod
@@ -826,7 +880,7 @@ class TelegramApprovalDecider:
         Asked BEFORE a side effect that a press should only be able to cause
         while its prompt is still live. The registry is empty after a gateway
         restart, so every approval button still sitting in a chat's scrollback
-        would otherwise take effect against a session that no longer exists.
+        would otherwise take effect against a session that does not exist.
 
         *nonce* is checked when supplied, so a caller asking "may this PRESS act"
         gets the prompt-identity answer rather than the weaker key-identity one.
@@ -1049,7 +1103,7 @@ class TelegramRenderer(Renderer):
         await self._rotate_on_length()
         # A trailing [OPTIONS:] block belongs to the visible PRE-STEER answer,
         # but the steering marker sits after it in the raw buffer, so the
-        # end-of-buffer anchor no longer sees it. Extract it here -- BEFORE the
+        # end-of-buffer anchor cannot see it. Extract it here -- BEFORE the
         # seal -- so the choices ship as a keyboard on the sealed message instead of
         # being frozen as literal protocol text the user cannot act on.
         body_raw, opts = _extract_options("".join(self._buf))
@@ -1059,7 +1113,7 @@ class TelegramRenderer(Renderer):
         # the rotation above ran before that expansion -- re-check, or a
         # near-limit answer with over-cap options seals past the transport cap.
         await self._rotate_on_length()
-        keyboard = build_inline_keyboard(opts) if opts else None
+        keyboard = build_inline_keyboard(opts, self._session_key) if opts else None
         sealed = bool(self._segment_text().strip()) or keyboard is not None
         await self._seal_current(keyboard=keyboard)
         clean_summary = _neutralize_md(summary)
@@ -1467,12 +1521,22 @@ class TelegramRenderer(Renderer):
         restored = _display_safe(
             "\n".join(f"![{item.alt or 'image'}]({item.path})" for item in files)
         )
-        await self._client.send_message(
-            self._chat_id,
-            f"⚠️ Couldn't upload:\n{restored}"[: self._limit()],
-            message_thread_id=self._thread_id,
-            disable_notification=True,
-        )
+        # A single truncated bubble keeps only what fits under the cap, so with
+        # several failed images the LATER references vanish silently. Measuring
+        # the cap in code points also mismatches Telegram's UTF-16 count, so
+        # emoji-dense alt text passes the slice and then bounces at the API.
+        # Chunk the redacted whole by UTF-16 budget instead (redaction
+        # first, so the scanner saw the contiguous text; a chunk is a pure
+        # substring of it). Header rides the first bubble only.
+        header = "⚠️ Couldn't upload:\n"
+        budget = self._limit() - _utf16_len(header)
+        for index, chunk in enumerate(_utf16_chunks(restored, budget)):
+            await self._client.send_message(
+                self._chat_id,
+                f"{header}{chunk}" if index == 0 else chunk,
+                message_thread_id=self._thread_id,
+                disable_notification=True,
+            )
 
     async def _seal_current(
         self,
@@ -1873,7 +1937,7 @@ class TelegramRenderer(Renderer):
         body_raw, opts = _extract_options("".join(self._buf))
         body_raw, opts = apply_options_cap(body_raw, opts, self.capabilities)
         self._buf = [body_raw]
-        keyboard = build_inline_keyboard(opts) if opts else None
+        keyboard = build_inline_keyboard(opts, self._session_key) if opts else None
         # No-rotation fallback: steers were injected but kiro-cli emitted no
         # marker to rotate at — prepend one summary chip so they're still shown.
         # This happens BEFORE length rotation so the summary counts against the

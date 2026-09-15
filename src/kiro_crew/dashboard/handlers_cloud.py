@@ -12,6 +12,9 @@ process carries no ``KIROCREW_SESSION_KEY``, so the destructive verbs
 (stop/start/destroy) are allowed here but blocked from any agent subprocess.
 
 POSIX-only: the deploy engine shells to ``bash``/``aws``; Windows returns 400.
+The exception is the two read-only launch-history routes, which parse a local
+job store and shell to nothing — they answer on every platform so a Windows
+dashboard can still render its Remote Crew list (see :func:`_guard`).
 No new AWS logic lives here — it reuses the tested ``cloud/`` engine.
 """
 
@@ -33,11 +36,12 @@ from kiro_crew.cloud import source as source_mod
 from kiro_crew.cloud import ssm
 from kiro_crew.cloud.aws import AWSError, CloudActionDenied
 from kiro_crew.cloud.launch_engine import RealLaunchEngine
+from kiro_crew.dashboard.handlers._shared import _owner_denial_response
 from kiro_crew.dashboard.handlers.source_providers import (
     is_owner_dashboard_request,
-    stale_owner_session_response,
 )
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.platform.interfaces import BUILTIN_PROVISIONER_ID
 from kiro_crew.sel import sel
 from kiro_crew.validation import ValidationError
 
@@ -61,8 +65,23 @@ def _audit(operation: str, outcome: str, *, request_id: str = "", error: str = "
         logger.debug("SEL audit failed for cloud_%s", operation, exc_info=True)
 
 
-def _guard(request: web.Request, operation: str) -> Optional[web.Response]:
-    """Owner-only (non-Slack) + POSIX. Returns a denial Response or None."""
+def _guard(
+    request: web.Request, operation: str, *, posix_only: bool = True
+) -> Optional[web.Response]:
+    """Owner-only (non-Slack) + POSIX. Returns a denial Response or None.
+
+    ``posix_only=False`` is for the two read-only launch-history routes, which
+    only parse a local job store and shell to nothing. Failing those on Windows
+    is not a harmless "unsupported" answer: the Remote Crew list deliberately
+    waits for BOTH the instances and the launch history before rendering (a
+    row's cloud-vs-manual identity decides what its delete button does), so a
+    400 here replaced the whole list — including hand-added SSH crews that need
+    no cloud provisioning at all — with the POSIX error. Reading the history
+    reports whatever this host has persisted rather than guessing on the
+    client's behalf: normally nothing after Windows-only use, since the write
+    routes below stay POSIX-gated, but a config dir carried over from a POSIX
+    host still answers with its real jobs, which is the honest reply.
+    """
     if request.headers.get("X-Session-Key", "").startswith("slack:"):
         _audit(operation, "denied", error="slack-origin rejected")
         return web.json_response(
@@ -81,34 +100,16 @@ def _guard(request: web.Request, operation: str) -> Optional[web.Response]:
             },
             status=401,
         )
-    # Denying app tokens alone was not enough. token_auth also mints a dashboard
-    # session token for every *allowed Slack user* (`!dashboard`), and that token
-    # carries request["user"] with an EMPTY request["app"] — so the old
-    # `if request.get("app")` check cleared it, admitting a non-owner human to a
-    # control plane that creates, stops and terminates billable AWS resources on the
-    # OWNER's account. "Owner-only" means the human whose dashboard this is: match the
-    # configured owner via the one shared predicate (`is_owner_dashboard_request` —
-    # exact owner_id match, or a signed local bootstrap subject when no owner is
-    # configured), the same definition ask_question and the source-provider routes
-    # use. This also subsumes the app-token case (an app identity is non-empty, so the
-    # predicate returns False), and it does NOT lock out a genuine single-owner setup:
-    # with no owner configured, the owner's own local token still matches.
+    # Owner gate: delegated to the shared helper's predicate + stale relabel.
     if not is_owner_dashboard_request(request):
         _audit(operation, "denied", error="non-owner rejected")
-        # Deny decision made above; only the response label changes for a
-        # signed pre-owner bootstrap subject (see stale_owner_session_response).
-        stale = stale_owner_session_response(request)
-        if stale is not None:
-            return stale
-        return web.json_response(
-            {
-                "error": "cloud provisioning is owner-only (the dashboard owner, "
-                "not an app or an allowed Slack user)",
-                "code": "cloud_owner_only",
-            },
-            status=403,
+        return _owner_denial_response(
+            request,
+            "cloud provisioning is owner-only (the dashboard owner, "
+            "not an app or an allowed Slack user)",
+            "cloud_owner_only",
         )
-    if sys.platform.startswith("win"):
+    if posix_only and sys.platform.startswith("win"):
         _audit(operation, "denied", error="windows unsupported")
         return web.json_response(
             {
@@ -147,9 +148,62 @@ async def _astore(state: "DashboardState") -> lj.LaunchJobStore:
     return store
 
 
-def _engine(state: "DashboardState") -> lj.LaunchEngine:
-    # Tests inject a fake via ``state.cloud_launch_engine``.
-    return getattr(state, "cloud_launch_engine", None) or RealLaunchEngine()
+def _provisioners() -> list:
+    """The deployment's provisioners, from the CPP ``remote_provisioners`` seam.
+
+    ``safe_context_call`` fallback is the built-in descriptor alone: a degraded
+    seam read keeps today's AWS tab working rather than emptying it, which is
+    the fail-safe direction for a listing (nothing here mints or bills). Rows
+    with a blank id or kind are dropped, never shadowed. Synchronous; called via
+    ``_in_executor`` from a handler because context resolution can touch disk.
+    """
+    from kiro_crew.platform.context import current_context, safe_context_call
+    from kiro_crew.platform.defaults import BUILTIN_REMOTE_PROVISIONER
+
+    rows = safe_context_call(
+        lambda: list(current_context().remote_provisioners.provisioners()),
+        fallback_factory=lambda: [BUILTIN_REMOTE_PROVISIONER],
+        log_message="remote_provisioners.provisioners degraded; offering the built-in lane only",
+    )
+    return [r for r in rows if getattr(r, "id", "") and getattr(r, "kind", "")]
+
+
+def _provisioner_dict(p) -> dict:
+    labels = dict(getattr(p, "step_labels", ()) or ())
+    return {
+        "id": p.id,
+        "kind": p.kind,
+        "label": getattr(p, "label", "") or p.id,
+        "posix_only": bool(getattr(p, "posix_only", True)),
+        "steps": [s.to_dict() for s in lj.default_steps(labels)],
+    }
+
+
+def _engine(state: "DashboardState", provider_id: str = BUILTIN_PROVISIONER_ID) -> lj.LaunchEngine:
+    """The engine that drives *provider_id*, from the CPP ``remote_provisioners`` seam.
+
+    Tests inject a fake via ``state.cloud_launch_engine``; that hook outranks the
+    seam so the existing launch-job tests keep exercising the orchestrator
+    without composing a context. Raises ``KeyError`` for an id the provider does
+    not know (the caller answers 400); a degraded seam read falls back to the
+    built-in engine for the built-in id only, never to a guessed engine for an
+    edition's id.
+    """
+    injected = getattr(state, "cloud_launch_engine", None)
+    if injected is not None:
+        return injected
+    from kiro_crew.platform.context import current_context, safe_context_call
+
+    provider = safe_context_call(
+        lambda: current_context().remote_provisioners,
+        fallback_factory=lambda: None,
+        log_message="remote_provisioners seam degraded; only the built-in engine is reachable",
+    )
+    if provider is None:
+        if provider_id != BUILTIN_PROVISIONER_ID:
+            raise KeyError(provider_id)
+        return RealLaunchEngine()
+    return provider.engine_for(provider_id)
 
 
 def _launch_lock(state: "DashboardState") -> LoopBoundLock:
@@ -158,7 +212,7 @@ def _launch_lock(state: "DashboardState") -> LoopBoundLock:
     Without it the guard is check-then-act across an ``await``: two POSTs
     arriving together both see no active job, and each provisions its own
     CloudFormation stack — two billed instances the caller cannot undo.
-    LoopBoundLock, not asyncio.Lock (#4800): the lock is cached on the
+    LoopBoundLock, not asyncio.Lock: the lock is cached on the
     long-lived DashboardState, which outlives any single event loop.
     """
     lock = getattr(state, "cloud_launch_lock", None)
@@ -176,10 +230,17 @@ def _cancels(state: "DashboardState") -> dict:
     return cancels
 
 
-def _start_worker(state: "DashboardState", job: lj.LaunchJob) -> None:
-    """Run the launch on a daemon thread (or inline when ``cloud_launch_sync``)."""
+def _start_worker(
+    state: "DashboardState", job: lj.LaunchJob, engine: Optional[lj.LaunchEngine] = None
+) -> None:
+    """Run the launch on a daemon thread (or inline when ``cloud_launch_sync``).
+
+    ``engine`` is the one already resolved for ``job.provider_id``; resolving it
+    again here would be a second seam read that could disagree with the first.
+    """
     store = _store(state)
-    engine = _engine(state)
+    if engine is None:
+        engine = _engine(state, job.provider_id)
     cancel = threading.Event()
     _cancels(state)[job.id] = cancel
     # Claim the job for this process, so a later reap_orphans() does not mistake
@@ -235,9 +296,28 @@ async def api_cloud_iam_policy(request: web.Request) -> web.Response:
     return web.json_response({"policy": iam.policy_json()})
 
 
+async def api_cloud_provisioners(request: web.Request) -> web.Response:
+    """GET /api/cloud/provisioners — the lanes the Set-up tab may offer.
+
+    Descriptor-only (``{id, kind, label, posix_only, steps}``): which provisioners
+    exist and how to draw them, never how to run one. The list is presentation:
+    ``POST /api/cloud/launch`` re-resolves the requested id against the same seam
+    before persisting a job. Answers on every platform (``posix_only=False``),
+    like the launch-history routes: the tab needs the list to decide WHICH form
+    to draw, and a provisioner that does not shell to ``aws`` may well run on a
+    Windows gateway; the per-descriptor ``posix_only`` flag carries that answer.
+    """
+    denied = _guard(request, "provisioners", posix_only=False)
+    if denied is not None:
+        return denied
+    rows = await _in_executor(_provisioners)
+    _audit("provisioners", "success")
+    return web.json_response({"provisioners": [_provisioner_dict(p) for p in rows]})
+
+
 async def api_cloud_launch_list(request: web.Request) -> web.Response:
     """GET /api/cloud/launch — all launch jobs (newest first)."""
-    denied = _guard(request, "launch_list")
+    denied = _guard(request, "launch_list", posix_only=False)
     if denied is not None:
         return denied
     # list() globs the job dir and parses every file: cheap for a handful, but it
@@ -250,7 +330,7 @@ async def api_cloud_launch_list(request: web.Request) -> web.Response:
 
 async def api_cloud_launch_get(request: web.Request) -> web.Response:
     """GET /api/cloud/launch/{id} — one job's live state (progress + sign-in)."""
-    denied = _guard(request, "launch_get")
+    denied = _guard(request, "launch_get", posix_only=False)
     if denied is not None:
         return denied
     store = await _astore(request.app["state"])
@@ -265,8 +345,16 @@ async def api_cloud_launch_get(request: web.Request) -> web.Response:
 
 
 async def api_cloud_launch_create(request: web.Request) -> web.Response:
-    """POST /api/cloud/launch — start a launch job. Body: {profile, region, size_key}."""
-    denied = _guard(request, "launch_create")
+    """POST /api/cloud/launch — start a launch job.
+
+    Body: ``{provider_id?, profile, region, size_key}``. ``provider_id`` names a
+    row of ``GET /api/cloud/provisioners`` and defaults to the built-in EC2 lane,
+    so a pre-seam client body launches exactly what it always did. The POSIX gate
+    is per descriptor: the built-in shells to ``bash``/``aws`` and needs one, an
+    edition's provisioner says for itself.
+    """
+    # POSIX is decided below, per provisioner, once the body names one.
+    denied = _guard(request, "launch_create", posix_only=False)
     if denied is not None:
         return denied
     state: "DashboardState" = request.app["state"]
@@ -279,6 +367,28 @@ async def api_cloud_launch_create(request: web.Request) -> web.Response:
             {"error": "body must be an object", "code": "invalid_body"}, status=400
         )
     size_key = str(body.get("size_key") or "").strip()
+    provider_id = str(body.get("provider_id") or BUILTIN_PROVISIONER_ID).strip()
+    provisioner = next(
+        (p for p in await _in_executor(_provisioners) if p.id == provider_id), None
+    )
+    if provisioner is None:
+        _audit("launch_create", "denied", error=f"unknown provisioner {provider_id!r}")
+        return web.json_response(
+            {
+                "error": f"no provisioner {provider_id!r} on this deployment",
+                "code": "unknown_provisioner",
+            },
+            status=400,
+        )
+    if provisioner.posix_only and sys.platform.startswith("win"):
+        _audit("launch_create", "denied", error="windows unsupported")
+        return web.json_response(
+            {
+                "error": "cloud provisioning requires a POSIX host (Linux/macOS); use WSL on Windows",
+                "code": "posix_host_required",
+            },
+            status=400,
+        )
     # One launch at a time. Without this a double-click or a retried request
     # creates two jobs with two tags and two CloudFormation stacks — two billed
     # instances, and the client cannot undo that after the fact. The check, the
@@ -298,6 +408,20 @@ async def api_cloud_launch_create(request: web.Request) -> web.Response:
                 },
                 status=409,
             )
+        # Resolve the engine BEFORE the job exists: an id the provider lists but
+        # cannot back must not leave a PENDING job file that a restart then reaps
+        # as "interrupted" for a launch that never started.
+        try:
+            engine = _engine(state, provider_id)
+        except KeyError:
+            _audit("launch_create", "denied", error=f"no engine for {provider_id!r}")
+            return web.json_response(
+                {
+                    "error": f"provisioner {provider_id!r} has no launch engine",
+                    "code": "unknown_provisioner",
+                },
+                status=400,
+            )
         try:
             # create() does mkdir + a temp-write + os.replace; keep it off the event
             # loop like every other store call here (see _astore), so a slow disk
@@ -308,6 +432,8 @@ async def api_cloud_launch_create(request: web.Request) -> web.Response:
                     profile=str(body.get("profile", "")),
                     region=str(body.get("region", "")),
                     size_key=size_key,
+                    provider_id=provider_id,
+                    step_labels=dict(provisioner.step_labels or ()),
                 )
             )
         except KeyError as e:  # unknown size
@@ -315,7 +441,7 @@ async def api_cloud_launch_create(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": str(e).strip("'\""), "code": "invalid_launch_request"}, status=400
             )
-        _start_worker(state, job)
+        _start_worker(state, job, engine)
     _audit("launch_create", "success", request_id=job.id)
     return web.json_response(job.to_dict(), status=202)
 

@@ -22,6 +22,7 @@ from kiro_crew.workflows.registry import (
     STATUS_CANCELLED,
     STATUS_FINISHED,
     STATUS_RUNNING,
+    RunHandle,
     RunRegistry,
 )
 from kiro_crew.workflows.runner import WorkflowRunner
@@ -146,6 +147,101 @@ async def test_list_newest_first_and_running_not_evicted() -> None:
     assert runs[0]["run_id"] == "wf_l2"  # newest first
 
 
+async def test_list_is_compact_no_result_payload() -> None:
+    """The list view never ships result payloads.
+
+    A finished run's result can be hundreds of KB. The payload rides only on
+    the detail snapshot (``status``/``result``), and the ``on_done``
+    completion snapshot keeps it too.
+    """
+    reg = RunRegistry()
+    done_snapshots: list[dict] = []
+    reg.set_on_done(lambda _rid, snap: done_snapshots.append(snap))
+    runner = WorkflowRunner(agent_fn=_echo, audit=lambda *a, **k: None)
+    rid = await runner.run_background(GOOD, registry=reg, run_id="wf_c1", now=NOW, name="d")
+    await _wait_terminal(reg, rid)
+
+    (row,) = reg.list()
+    assert "result" not in row
+
+    # The detail snapshot (compact-or-full) still carries the payload …
+    assert reg.status(rid)["result"] == {"done": True}
+    assert reg.status(rid, include_events=True)["result"] == {"done": True}
+    # … and so does the completion-injection snapshot.
+    assert done_snapshots and done_snapshots[0]["result"] == {"done": True}
+
+
 async def test_cancel_unknown_run_is_false() -> None:
     reg = RunRegistry()
     assert await reg.cancel("nope") is False
+
+
+async def test_async_persistence_serializes_and_discards_superseded_snapshots(
+    monkeypatch,
+) -> None:
+    class RecordingStore:
+        def __init__(self) -> None:
+            self.saved_names: list[str] = []
+
+        def save(self, _run_id: str, payload: dict) -> None:
+            self.saved_names.append(payload["name"])
+
+    store = RecordingStore()
+    registry = RunRegistry(store=store)
+    handle = RunHandle(run_id="wf_serial", name="first")
+    registry.register(handle, persist=False)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def controlled_to_thread(fn, *args):
+        payload = args[1]
+        if payload["name"] == "first":
+            first_started.set()
+            await release_first.wait()
+        return fn(*args)
+
+    monkeypatch.setattr("kiro_crew.workflows.registry.asyncio.to_thread", controlled_to_thread)
+
+    first = asyncio.create_task(registry.persist_async(handle.run_id))
+    await first_started.wait()
+    handle.name = "superseded"
+    superseded = asyncio.create_task(registry.persist_async(handle.run_id))
+    await asyncio.sleep(0)
+    handle.name = "latest"
+    latest = asyncio.create_task(registry.persist_async(handle.run_id))
+    await asyncio.sleep(0)
+
+    release_first.set()
+    await asyncio.gather(first, superseded, latest)
+
+    assert store.saved_names == ["first", "latest"]
+
+
+async def test_pending_work_is_scoped_to_originating_session() -> None:
+    reg = RunRegistry()
+    handle = RunHandle("owned", "owned", session_key="dashboard:chat-a")
+    reg.register(handle)
+    reg.register(RunHandle("ui", "ui"))
+    assert reg.has_pending_work_for("dashboard:chat-a") is True
+    assert reg.has_pending_work_for("dashboard:chat-b") is False
+    assert reg.has_pending_work_for("") is False
+    reg.mark_terminal("owned", STATUS_FINISHED)
+    assert reg.has_pending_work_for("dashboard:chat-a") is False
+
+
+async def test_terminal_handoff_counts_until_driver_exits() -> None:
+    reg = RunRegistry()
+    release = asyncio.Event()
+    task = asyncio.create_task(release.wait())
+    try:
+        handle = RunHandle(
+            "handoff", "handoff", status=STATUS_FINISHED, session_key="dashboard:chat-a", task=task
+        )
+        reg.register(handle)
+        assert reg.has_pending_work_for("dashboard:chat-a") is True
+        release.set()
+        await task
+        assert reg.has_pending_work_for("dashboard:chat-a") is False
+    finally:
+        release.set()
+        await task

@@ -14,15 +14,16 @@
  * the Subagents side panel.
  */
 import { memo } from 'react'
-import { Bot, Loader2, CheckCircle2, AlertCircle, Clock, Square } from 'lucide-react'
+import { Bot, Loader2, CheckCircle2, AlertCircle, Clock, Square, Hand } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { useAppSelector, useAppDispatch } from '../../store'
-import { openActivityToTab, selectSubagent, switchSlot } from '../../store/chatSlice'
+import { openActivityToTab, selectSubagent, switchSlot, isAwaitingSpawnApproval } from '../../store/chatSlice'
 import { sanitizeLlmOutput } from '../../utils/sanitize'
 import type { ChatMessage, SubagentActivity } from '../../types'
 import { SPAWN_LAUNCH_MARKER } from './types'
 
 import { i18nT } from '../../i18n/t'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 /** The `spawn_run` tool result opens with "Spawned N subagent(s)." followed by
  *  one indented "  <id> (<agent>): <task>" line per accepted agent (see the
  *  spawn_run handler in mcp_core.py). Matching the header identifies the call
@@ -130,16 +131,22 @@ const EMPTY_SUBAGENTS: Record<string, SubagentActivity> = {}
 
 /** Terminal statuses, tallied across the launch's own ids only. */
 function tally(agents: (SubagentActivity | undefined)[]) {
-  let running = 0, done = 0, failed = 0, stopped = 0, unknown = 0
+  let running = 0, awaiting = 0, done = 0, failed = 0, stopped = 0, unknown = 0
   for (const a of agents) {
     if (!a) { unknown++; continue }
-    if (a.status === 'running' || a.status === 'tool' || a.status === 'pending') running++
+    // A run parked on an unanswered spawn approval launched no process, so it
+    // is not running — it used to be counted here, which is what made this card
+    // claim "1 agent running" for a wave that was in fact blocked on the user
+    // (#7318). A `'pending'` entry with no approval_id keeps the old treatment:
+    // it is active but not attributable to an approval.
+    if (isAwaitingSpawnApproval(a)) awaiting++
+    else if (a.status === 'running' || a.status === 'tool' || a.status === 'pending') running++
     else if (a.status === 'done') done++
     else if (a.status === 'error') failed++
     else if (a.status === 'stopped') stopped++
     else unknown++
   }
-  return { running, done, failed, stopped, unknown }
+  return { running, awaiting, done, failed, stopped, unknown }
 }
 
 const SubagentRunCard = memo(function SubagentRunCard({
@@ -149,6 +156,7 @@ const SubagentRunCard = memo(function SubagentRunCard({
   launch: SpawnRunLaunch
   slot: string
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const dispatch = useAppDispatch()
   const activeSlot = useAppSelector(s => s.chat.activeSlot)
   const subagents = useAppSelector(s =>
@@ -184,7 +192,7 @@ const SubagentRunCard = memo(function SubagentRunCard({
   const fullyObservable = launch.ids.length >= total && counts.unknown === 0
 
   const label = counts.running > 0
-    ? `${counts.running} agent${counts.running === 1 ? '' : 's'} running`
+    ? i18nT('pages.chat.subagentRunCard.agent_running', { count: counts.running })
     // `chat.subagentQueued` is keyed by SLOT, not by launch, so the queued
     // branch must sit BELOW settled: otherwise a second wave queueing behind
     // the cap makes this (already finished) card report the other wave's queue.
@@ -195,13 +203,13 @@ const SubagentRunCard = memo(function SubagentRunCard({
       // "1 of 3 agents finished" would pin a permanently false statement in
       // scrollback, since the unobservable members can never be tallied.
       ? settled >= total && fullyObservable
-        ? `${total} agent${total === 1 ? '' : 's'} finished`
-        : `${total} agent${total === 1 ? '' : 's'} launched`
+        ? i18nT('pages.chat.subagentRunCard.agent_finished', { count: total })
+        : i18nT('pages.chat.subagentRunCard.agent_launched', { count: total })
       : queued > 0
         // Whole wave still behind the cap: "0 agents running" is technically
         // true and useless — name what is actually happening.
-        ? `${queued} agent${queued === 1 ? '' : 's'} queued`
-        : `${total} agent${total === 1 ? '' : 's'}`
+        ? i18nT('pages.chat.subagentRunCard.agent_queued', { count: queued })
+        : i18nT('pages.chat.subagentRunCard.agent', { count: total })
 
   const open = () => {
     // The Subagents panel is mounted for `activeSlot`, and split view
@@ -211,7 +219,7 @@ const SubagentRunCard = memo(function SubagentRunCard({
     // reads "No subagents running" — the card's own label promising otherwise.
     // Safe inside split view: the auto-enter effect is gated on splitMode being
     // off, so switching does not reseed or leave the grid.
-    if (slot && slot !== activeSlot) dispatch(switchSlot(slot))
+    if (slot && slot !== activeSlot) dispatch(switchSlot({ key: slot, announceOnMissing: true }))
     // Deep-link to the first agent of THIS wave so the panel lands on the
     // transcript the card refers to, not whatever was last selected.
     const first = launch.ids.find(id => subagents[id])
@@ -237,13 +245,18 @@ const SubagentRunCard = memo(function SubagentRunCard({
       <span className="shrink-0 mt-0.5">
         {counts.running > 0
           ? <Loader2 size={15} className="text-accent animate-spin" />
-          : counts.failed > 0
-            ? <AlertCircle size={15} className="text-danger" />
-            : settled > 0
-              ? <CheckCircle2 size={15} className="text-green-500" />
-              : queued > 0
-                ? <Clock size={15} className="text-muted" />
-                : <Bot size={15} className="text-accent/70" />}
+          // Nothing is executing but something is blocked on the user. Ranked
+          // above `failed` deliberately: a failure is history, an unanswered
+          // approval is the one state on this card the user can still act on.
+          : counts.awaiting > 0
+            ? <Hand size={15} className="text-warn" />
+            : counts.failed > 0
+              ? <AlertCircle size={15} className="text-danger" />
+              : settled > 0
+                ? <CheckCircle2 size={15} className="text-green-500" />
+                : queued > 0
+                  ? <Clock size={15} className="text-muted" />
+                  : <Bot size={15} className="text-accent/70" />}
       </span>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2 flex-wrap">
@@ -256,6 +269,15 @@ const SubagentRunCard = memo(function SubagentRunCard({
               title={i18nT('pages.chat.subagentRunCard.waiting_to_start_queued_behind_the_concurrency_l')}
             >
               <Clock size={10} aria-hidden /> {queued} {i18nT('pages.chat.subagentRunCard.waiting')}
+            </span>
+          )}
+          {counts.awaiting > 0 && (
+            <span
+              className="shrink-0 inline-flex items-center gap-1 text-[10px] leading-4 px-1.5 py-0.5 rounded bg-warn-subtle border border-warn/20 text-warn"
+              data-testid="subagent-card-awaiting"
+              title={i18nT('pages.chat.subagentRunCard.waiting_for_your_approval_to_start')}
+            >
+              <Hand size={10} aria-hidden /> {counts.awaiting}
             </span>
           )}
           {counts.done > 0 && (

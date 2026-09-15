@@ -21,7 +21,6 @@ from kiro_crew.dashboard.chat_utils import SYNTHETIC_RECOVERY_KIND, is_synthetic
 from kiro_crew.dashboard.state import (
     HOOK_CONTINUATION_RECOVERY_PREFIX,
     HOOK_HALTED_RECOVERY_PREFIX,
-    STOP_REASON_CANCELLED,
     _ChatSlot,
     parse_hook_continuations,
     should_queue_hook_continuation,
@@ -68,29 +67,43 @@ class TestParseHookContinuations:
 
     def test_deeply_nested_json_does_not_error_the_turn(self) -> None:
         """``json.loads`` raises RecursionError -- a RuntimeError, not a ValueError."""
-        assert parse_hook_continuations(["[" * 20000] + ['{"decision": "block", "reason": "ok"}']) == [
-            "ok"
-        ]
+        assert parse_hook_continuations(
+            ["[" * 20000] + ['{"decision": "block", "reason": "ok"}']
+        ) == ["ok"]
 
     def test_a_valid_decision_survives_a_malformed_sibling(self) -> None:
-        out = parse_hook_continuations(["not json at all", '{"decision": "block", "reason": "go on"}'])
+        out = parse_hook_continuations(
+            ["not json at all", '{"decision": "block", "reason": "go on"}']
+        )
 
         assert out == ["go on"]
 
 
 class TestShouldQueueHookContinuation:
     def test_normal_turn_end_allows_a_continuation(self) -> None:
-        assert should_queue_hook_continuation(False, False, "end_turn") is True
+        assert should_queue_hook_continuation(False, False, user_stopped=False) is True
 
     def test_user_stop_suppresses_it(self) -> None:
         """A hook must never be able to override the Stop button."""
-        assert should_queue_hook_continuation(True, False, "end_turn") is False
+        assert should_queue_hook_continuation(True, False, user_stopped=False) is False
 
     def test_pending_session_reset_suppresses_it(self) -> None:
-        assert should_queue_hook_continuation(False, True, "end_turn") is False
+        assert should_queue_hook_continuation(False, True, user_stopped=False) is False
 
-    def test_cancelled_turn_suppresses_it(self) -> None:
-        assert should_queue_hook_continuation(False, False, STOP_REASON_CANCELLED) is False
+    def test_a_stop_pressed_during_the_turn_suppresses_it(self) -> None:
+        # The Stop may already have resolved (stopping=False again); the
+        # generation-derived signal is what still says it happened.
+        assert should_queue_hook_continuation(False, False, user_stopped=True) is False
+
+    def test_a_backend_abort_alone_does_not_suppress_it(self) -> None:
+        # No wire stop reason is consulted: a backend that aborts a policy-denied
+        # turn (codex) reports "cancelled" with no Stop pressed, and the hook's
+        # continuation is still owed. The gate has no parameter for the stop
+        # reason at all, so this cannot regress by omission.
+        import inspect
+
+        assert "stop_reason" not in inspect.signature(should_queue_hook_continuation).parameters
+        assert should_queue_hook_continuation(False, False, user_stopped=False) is True
 
 
 class TestQueuedContinuationProvenance:
@@ -207,6 +220,9 @@ class TestRunnerWiring:
                 "content": f"{HOOK_CONTINUATION_RECOVERY_PREFIX}\nRead the log first.",
                 "kind": SYNTHETIC_RECOVERY_KIND,
                 "payload": "",
+                # Admission stamp: recovery requeues record the containment
+                # that held at requeue so the drain can re-validate the retry.
+                "meta": slot._queue[0]["meta"],
             }
         ]
         assert is_synthetic_recovery_item(slot._queue[0])
@@ -229,18 +245,14 @@ class TestRunnerWiring:
         assert slot._queue == []
 
     @pytest.mark.asyncio
-    async def test_a_stop_during_the_hook_fire_suppresses_the_continuation(
-        self, tmp_path
-    ) -> None:
+    async def test_a_stop_during_the_hook_fire_suppresses_the_continuation(self, tmp_path) -> None:
         """A user Stop that lands WHILE the Stop hook runs must cancel the
         continuation. The stop handler bumps the stop-request counter, and
         stop_turn() reporting "idle" (no active provider turn during the hook)
         resets _stop_state to idle before the guard reads _stopping — so
         _stopping alone misses it and the counter is the durable signal.
         """
-        state, slot, run_chat = _harness(
-            tmp_path, '{"decision": "block", "reason": "go on"}'
-        )
+        state, slot, run_chat = _harness(tmp_path, '{"decision": "block", "reason": "go on"}')
         real_fire = state._hook_store.fire
 
         async def _fire_with_concurrent_stop(event, *args, **kwargs):
@@ -259,13 +271,9 @@ class TestRunnerWiring:
         assert slot._queue == []
 
     @pytest.mark.asyncio
-    async def test_a_stop_during_pre_turn_await_suppresses_the_continuation(
-        self, tmp_path
-    ) -> None:
+    async def test_a_stop_during_pre_turn_await_suppresses_the_continuation(self, tmp_path) -> None:
         """The generation snapshot must precede the first await in _run_chat."""
-        state, slot, run_chat = _harness(
-            tmp_path, '{"decision": "block", "reason": "go on"}'
-        )
+        state, slot, run_chat = _harness(tmp_path, '{"decision": "block", "reason": "go on"}')
 
         async def _expire_options_then_stop(*args, **kwargs):
             slot._stop_state = "soft_pending"
@@ -280,17 +288,13 @@ class TestRunnerWiring:
         assert slot._queue == []
 
     @pytest.mark.asyncio
-    async def test_a_stop_during_turn_body_suppresses_the_continuation(
-        self, tmp_path
-    ) -> None:
+    async def test_a_stop_during_turn_body_suppresses_the_continuation(self, tmp_path) -> None:
         """A stop initiated mid-turn (during streaming / completion persistence,
         before the Stop hook fires) must also cancel the continuation. Snapshot-
         ting the stop generation just before the hook _fire misses it — the
         generation must be captured at turn entry.
         """
-        state, slot, run_chat = _harness(
-            tmp_path, '{"decision": "block", "reason": "go on"}'
-        )
+        state, slot, run_chat = _harness(tmp_path, '{"decision": "block", "reason": "go on"}')
         from kiro_crew.providers.base import EVENT_TEXT_CHUNK, LLMEvent
 
         client = state.sessions.get_or_create.return_value[0]
@@ -395,9 +399,7 @@ class TestRealHookProcess:
         assert parse_hook_continuations([r.stdout for r in second if r.exit_code == 0]) == []
 
     @pytest.mark.asyncio
-    async def test_a_real_hook_that_only_logs_yields_no_continuation(
-        self, tmp_path, monkeypatch
-    ):
+    async def test_a_real_hook_that_only_logs_yields_no_continuation(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         store = ScriptHookStore(tmp_path)
         script = tmp_path / "noisy.py"
@@ -525,9 +527,7 @@ class TestStopHookContinuationCount:
         assert self._stop_counts(state) == [1, 0]
 
     @pytest.mark.asyncio
-    async def test_a_user_typed_marker_is_not_counted_as_a_continuation(
-        self, tmp_path
-    ) -> None:
+    async def test_a_user_typed_marker_is_not_counted_as_a_continuation(self, tmp_path) -> None:
         """A user whose message literally starts with the marker is ordinary
         user speech (``_synthetic_payload`` False), not a runner-injected
         continuation: it must not inflate the depth the Stop hook is told, or a
@@ -579,9 +579,7 @@ class TestStopHookNudgeCap:
 
     async def _run_blocking_turn(self, tmp_path, cap: int, start_depth: int):
         """One turn whose Stop hook blocks, at ``start_depth`` under ``cap``."""
-        state, slot, run_chat = _harness(
-            tmp_path, '{"decision": "block", "reason": "go on"}'
-        )
+        state, slot, run_chat = _harness(tmp_path, '{"decision": "block", "reason": "go on"}')
         slot._hook_continuation_depth = start_depth
         with (
             patch(
@@ -598,9 +596,7 @@ class TestStopHookNudgeCap:
         return slot
 
     def _halt_rows(self, slot) -> list:
-        return [
-            m for m in slot.messages if m["content"].startswith(HOOK_HALTED_RECOVERY_PREFIX)
-        ]
+        return [m for m in slot.messages if m["content"].startswith(HOOK_HALTED_RECOVERY_PREFIX)]
 
     @pytest.mark.asyncio
     async def test_below_cap_queues_the_continuation(self, tmp_path) -> None:
@@ -613,9 +609,7 @@ class TestStopHookNudgeCap:
     @pytest.mark.asyncio
     async def test_stop_during_cap_load_suppresses_the_continuation(self, tmp_path) -> None:
         """The off-thread config load must not reopen a checked Stop boundary."""
-        state, slot, run_chat = _harness(
-            tmp_path, '{"decision": "block", "reason": "go on"}'
-        )
+        state, slot, run_chat = _harness(tmp_path, '{"decision": "block", "reason": "go on"}')
         capped_load = self._capped_load(5)
 
         def _load_then_stop():
@@ -662,9 +656,7 @@ class TestStopHookNudgeCap:
         would overrun the cap. With room for one, exactly one queues and the
         overflow surfaces a halt card.
         """
-        state, slot, run_chat = _harness(
-            tmp_path, '{"decision": "block", "reason": "first"}'
-        )
+        state, slot, run_chat = _harness(tmp_path, '{"decision": "block", "reason": "first"}')
         state._hook_store.fire = AsyncMock(
             return_value=[
                 _hook_result('{"decision": "block", "reason": "first"}'),
@@ -689,9 +681,7 @@ class TestStopHookNudgeCap:
         assert len(self._halt_rows(slot)) == 1
 
     @pytest.mark.asyncio
-    async def test_pending_queued_continuations_count_against_the_cap(
-        self, tmp_path
-    ) -> None:
+    async def test_pending_queued_continuations_count_against_the_cap(self, tmp_path) -> None:
         """The cap bounds the whole in-flight run, so continuations already
         queued from an earlier multi-reason event must be subtracted from the
         budget. Otherwise each event recomputes room from depth alone (which
@@ -699,9 +689,7 @@ class TestStopHookNudgeCap:
         """
         from kiro_crew.dashboard.chat_utils import SYNTHETIC_RECOVERY_KIND
 
-        state, slot, run_chat = _harness(
-            tmp_path, '{"decision": "block", "reason": "a"}'
-        )
+        state, slot, run_chat = _harness(tmp_path, '{"decision": "block", "reason": "a"}')
         state._hook_store.fire = AsyncMock(
             return_value=[
                 _hook_result('{"decision": "block", "reason": "a"}'),
@@ -738,9 +726,7 @@ class TestStopHookNudgeCap:
         assert len(self._halt_rows(slot)) == 1
 
     @pytest.mark.asyncio
-    async def test_user_marker_in_queue_does_not_count_against_the_cap(
-        self, tmp_path
-    ) -> None:
+    async def test_user_marker_in_queue_does_not_count_against_the_cap(self, tmp_path) -> None:
         """Only machine-authored continuation entries consume the cap budget."""
         state, slot, run_chat = _harness(
             tmp_path, '{"decision": "block", "reason": "new continuation"}'

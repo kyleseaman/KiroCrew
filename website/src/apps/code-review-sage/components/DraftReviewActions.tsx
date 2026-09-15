@@ -11,6 +11,8 @@ import { useEffect, useState } from 'react'
 
 import { api } from '../../../api/client'
 import { i18nT } from '../../../i18n/t'
+import { OWNER_SETTINGS_TARGET, pullRequestErrorDetails } from '../../../utils/pullRequestErrors'
+import { SettingsLink } from '../../../components/SettingsLink'
 
 const PUBLISH_EVENTS = ['COMMENT', 'REQUEST_CHANGES', 'APPROVE'] as const
 type PublishEvent = (typeof PUBLISH_EVENTS)[number]
@@ -76,7 +78,8 @@ export default function DraftReviewActions(
   // Only the PUBLISH failure belongs here. A failed READ is reported by the error
   // branch below in the user's own terms; echoing its raw provider text here too
   // would restate the same failure twice, once unreadably.
-  const err = publishMut.error instanceof Error ? publishMut.error.message : ''
+  const errDetails = publishMut.isError ? pullRequestErrorDetails(publishMut.error) : null
+  const err = errDetails?.message ?? ''
   // Publishing is refused server-side for either reason; mirror it here so the
   // buttons are absent rather than present-and-doomed.
   // Two further grounds, both about publishing findings that are not the ones on
@@ -276,6 +279,14 @@ export default function DraftReviewActions(
             {i18nT('apps.codeReviewSage.components.draftReviewActions.publish_failed')}
           </span>{' '}
           <span className="break-words font-normal opacity-90">{err}</span>
+          {errDetails?.ownerNotConfigured && (
+            <>
+              {' '}
+              <SettingsLink {...OWNER_SETTINGS_TARGET}>
+                {i18nT('components.pullRequestPanel.open_slack_settings')}
+              </SettingsLink>
+            </>
+          )}
         </div>
       )}
     </div>

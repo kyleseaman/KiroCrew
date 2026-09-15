@@ -10,6 +10,11 @@
 PY ?= python3
 VENV := .venv
 PIP := $(VENV)/bin/pip
+# Build the venv under a umask that masks group/other WRITE so bin/kirocrew is
+# born non-group-writable -- `kirocrew service install` refuses to attach its
+# AppArmor profile to a group/world-writable launcher (see cli.sh). Caller umask
+# OR 022: only ever ADDS write-mask bits, a stricter umask is preserved.
+TIGHT_UMASK := umask "$$(printf '%03o' "$$(( $$(umask) | 022 ))")"
 PYTEST := $(VENV)/bin/pytest
 
 all: test
@@ -26,6 +31,12 @@ frontend:
 	# `cat` exits 1. With `&&` chaining that non-zero exit aborts the whole
 	# recipe line, so the target fails before npm is ever reached. An absent
 	# marker must degrade to "use whatever node is on PATH", not stop the build.
+	# website/electron is its own npm package (website/package.json declares no
+	# `workspaces`), so the website/ install in this recipe never reaches it --
+	# and `npm test` / `npm run check` in website/ then die with MODULE_NOT_FOUND
+	# on its missing deps. Install it in the same shell, so it reuses the
+	# node-bin-dir PATH handling, and AFTER `npm run build`, so the desktop-only
+	# dependency tree cannot block building the dashboard itself (#7226).
 	cd website && \
 	  NBD="$$(cat "$${KIROCREW_HOME:-$$HOME/.kiro/crew}/node-bin-dir" 2>/dev/null || true)"; \
 	  { [ -z "$$NBD" ] || export PATH="$$NBD:$$PATH"; }; \
@@ -34,7 +45,9 @@ frontend:
 	    exit 1; \
 	  fi; \
 	  if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi && \
-	  npm run build
+	  npm run build && \
+	  ( cd electron && \
+	    if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi )
 	rm -rf src/kiro_crew/static/dist
 	mkdir -p src/kiro_crew/static
 	cp -R website/dist src/kiro_crew/static/dist
@@ -44,18 +57,20 @@ backend:
 	# Same `|| true` reasoning as the frontend target: an absent marker file must
 	# fall back to $(PY), not abort the recipe.
 	PY="$$(cat "$${KIROCREW_HOME:-$$HOME/.kiro/crew}/python-bin" 2>/dev/null || true)"; [ -n "$$PY" ] || PY="$(PY)"; \
-	  if [ -x $(VENV)/bin/python ] && ! $(VENV)/bin/python -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)'; then \
-	    echo "  → recreating $(VENV) (existing interpreter < 3.10)"; rm -rf $(VENV); fi; \
-	  if ! "$$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then \
-	    echo "ERROR: '$$PY' is not Python >= 3.10 (package requires-python is >=3.10)." >&2; \
+	  if [ -x $(VENV)/bin/python ] && ! $(VENV)/bin/python -c 'import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)'; then \
+	    echo "  → recreating $(VENV) (existing interpreter < 3.12)"; rm -rf $(VENV); fi; \
+	  if ! "$$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)' 2>/dev/null; then \
+	    echo "ERROR: '$$PY' is not Python >= 3.12 (package requires-python is >=3.12)." >&2; \
 	    echo "       Without this gate the venv is built from a too-old interpreter, the" >&2; \
 	    echo "       version guard above deletes it on every run, and the install either" >&2; \
-	    echo "       backtracks forever or crashes at import. Provision 3.10+ first:" >&2; \
+	    echo "       backtracks forever or crashes at import. Provision 3.12+ first:" >&2; \
 	    echo "         bash ensure-python.sh   # or: make backend PY=python3.12" >&2; \
 	    exit 1; \
 	  fi; \
-	  test -x $(VENV)/bin/python || "$$PY" -m venv $(VENV)
-	$(PIP) install --upgrade pip setuptools wheel
+	  if [ -d $(VENV) ] && [ -n "$$(find $(VENV) $(VENV)/bin -prune \( -perm -g+w -o -perm -o+w \) -print 2>/dev/null)" ]; then \
+	    echo "  → recreating $(VENV) (existing tree is group/world-writable)"; rm -rf $(VENV); fi; \
+	  test -x $(VENV)/bin/python || { $(TIGHT_UMASK) && "$$PY" -m venv $(VENV); }
+	$(TIGHT_UMASK) && $(PIP) install --upgrade pip setuptools wheel
 	# --prefer-binary: on hosts below the modern manylinux baseline (e.g. Amazon
 	# Linux 2, glibc 2.26) the newest release of a compiled dep may ship only a
 	# manylinux_2_28 wheel + an sdist. Without this flag pip picks the newest
@@ -63,10 +78,10 @@ backend:
 	# GCC / missing -dev headers). --prefer-binary makes pip take an older
 	# prebuilt wheel instead. No-op where the newest deps already have a usable
 	# wheel (macOS, AL2023).
-	KIROCREW_SKIP_FRONTEND=1 $(PIP) install --prefer-binary -e ".[dev]"
+	$(TIGHT_UMASK) && KIROCREW_SKIP_FRONTEND=1 $(PIP) install --prefer-binary -e ".[dev]"
 	# CI parity: also install the PEP 735 dev dependency-group (pins
 	# jsonschema so the config-validation guard tests actually run).
-	$(PIP) install --group dev
+	$(TIGHT_UMASK) && $(PIP) install --group dev
 	bash packaging/resign-macos-libs.sh $(VENV)/bin/python
 
 test: build
@@ -79,10 +94,10 @@ test: build
 #
 # Runs through the venv the `backend` target provisions rather than a bare
 # `$(PY) -m pip install --upgrade build`: on hosts whose system python3 is older
-# than 3.10 (Amazon Linux 2023 ships 3.9) that bare form installs `build` into
+# than 3.12 (Amazon Linux 2023 ships 3.9) that bare form installs `build` into
 # the *system* interpreter — mutating it without a venv, and tripping PEP 668
 # "externally-managed-environment" where the marker exists. Depending on
-# `backend` guarantees a >= 3.10 venv exists first.
+# `backend` guarantees a >= 3.12 venv exists first.
 wheel: frontend backend
 	$(PIP) install --upgrade build
 	$(VENV)/bin/python -m build --wheel

@@ -38,8 +38,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import BaseTestServer, TestClient, TestServer
 
+from kiro_crew.browser_cli import launch as browser_cli_launch
+from kiro_crew.browser_cli import snapshots as browser_cli_snapshots
+from kiro_crew.browser_cli import token as browser_cli_token
 from kiro_crew.dashboard import server as srv
 
 requires_unix_socket = pytest.mark.skipif(
@@ -258,6 +261,24 @@ async def _start_dashboard(tmp_path: Path, monkeypatch, **kwargs: Any) -> Any:
     # would bind a real socket in the data home.
     monkeypatch.setattr(srv, "_start_unix_site", AsyncMock(return_value=None))
     spies = _neutralise_outside_process_work(monkeypatch)
+    # start_dashboard mutates os.environ directly (browser_cli_snapshots /
+    # browser_cli_token / browser_cli_launch cli_env_overrides()) so descendant
+    # `playwright-cli` invocations inherit them -- real, deliberate production
+    # behavior, not a bug. monkeypatch has no visibility into a raw
+    # os.environ.update(), so snapshot+restore the concrete keys it can touch
+    # here instead. `delenv(raising=False)` on an ABSENT key registers no undo,
+    # so a value production writes afterwards would survive teardown; setenv
+    # to "" first records the absence and restores it, and start_dashboard
+    # overwrites the placeholder before anything reads it.
+    for _leak_key in (
+        browser_cli_snapshots.OUTPUT_DIR_ENV,
+        browser_cli_token.TOKEN_ENV,
+        browser_cli_launch.CONFIG_ENV,
+    ):
+        _prior = os.environ.get(_leak_key)
+        monkeypatch.setenv(_leak_key, "" if _prior is None else _prior)
+        if _prior is None:
+            monkeypatch.delenv(_leak_key, raising=False)
 
     sessions = MagicMock(count=0)
     sessions.remove = AsyncMock()
@@ -277,6 +298,32 @@ async def _start_dashboard(tmp_path: Path, monkeypatch, **kwargs: Any) -> Any:
     return runner, state, spies
 
 
+class _RunningAppServer(BaseTestServer):
+    """A loopback listener over an AppRunner that ``start_dashboard`` ALREADY set up.
+
+    ``TestServer(runner.app)`` would wrap the app in a second ``AppRunner`` and
+    run every ``on_startup`` hook again on the frozen app: a second proxy
+    ``ClientSession`` and knowledge watcher (the first of each is orphaned),
+    plus aiohttp's deprecation warning on each ``app[...]`` write. Serving the
+    runner's existing protocol factory through a ``ServerRunner`` binds a port
+    without touching the application's lifecycle; the app is torn down once,
+    by ``_dashboard``, through the real cleanup path.
+    """
+
+    def __init__(self, runner: web.AppRunner, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._app_runner = runner
+
+    @property
+    def app(self) -> web.Application:
+        return self._app_runner.app
+
+    async def _make_runner(self, **kwargs: Any) -> web.ServerRunner:
+        server = self._app_runner.server
+        assert server is not None, "the dashboard runner has not been set up"
+        return web.ServerRunner(server, **kwargs)
+
+
 @asynccontextmanager
 async def _dashboard(tmp_path: Path, monkeypatch, **kwargs: Any) -> Any:
     """A fully wired dashboard app, torn down through the real cleanup path.
@@ -294,7 +341,9 @@ async def _dashboard(tmp_path: Path, monkeypatch, **kwargs: Any) -> Any:
     channel-slot reconciler, the state flush loop and the chat sweeper — have no
     cleanup hook, because in production the process exits at shutdown. In a test
     they would outlive the case and be reported against whichever one runs next,
-    so they are cancelled here.
+    so they are cancelled here. The same reasoning covers the two process-level
+    handles the startup opens and no cleanup hook closes; see
+    :func:`_release_process_handles`.
     """
     runner, state, spies = await _start_dashboard(tmp_path, monkeypatch, **kwargs)
     try:
@@ -302,6 +351,33 @@ async def _dashboard(tmp_path: Path, monkeypatch, **kwargs: Any) -> Any:
     finally:
         await runner.cleanup()
         await _cancel_stray_tasks()
+        _release_process_handles(state)
+
+
+def _release_process_handles(state: Any) -> None:
+    """Close the file descriptors ``start_dashboard`` opens for the process lifetime.
+
+    Two handles outlive ``runner.cleanup()`` by design, because production closes
+    them by exiting: the loop-stall crash-dump file (a raw ``os.open`` fd held by
+    the watchdog, which no garbage collection ever closes and whose own
+    ``close()`` is a deliberate no-op) and the knowledge store's SQLite
+    connection on this thread (``db`` + ``-wal`` + ``-shm``). In a test they
+    accumulate one set per dashboard start on the worker, so the harness closes
+    them once the real shutdown path has run. The dump fd is closed at the OS
+    level, which is safe only after the watchdog has stopped: ``stop()`` cancels
+    the ``faulthandler`` timer that would otherwise write into it. Only the
+    calling thread's knowledge connection can be closed here; connections that
+    pool threads opened are released when the store itself is collected.
+    """
+    watchdog = getattr(state, "_loop_watchdog", None)
+    if watchdog is not None:
+        watchdog.stop()
+        dump_file = getattr(watchdog, "_dump_file", None)
+        if dump_file is not None and not dump_file.closed:
+            os.close(dump_file.fileno())
+    store = getattr(state, "_knowledge_store", None)
+    if store is not None:
+        store.close()
 
 
 async def _cancel_stray_tasks() -> None:
@@ -325,6 +401,25 @@ class TestStartDashboardWiring:
             assert state.ready is True
             assert runner.app["state"] is state
             assert runner.app["port"] == 0
+            assert state.resume_channel_agents is None
+
+    @pytest.mark.asyncio
+    async def test_gateway_launch_can_defer_restored_channel_agents(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        prepared = asyncio.get_running_loop().create_future()
+        prepared.set_result(None)
+        schedule_memory = MagicMock(return_value=prepared)
+        async with _dashboard(
+            tmp_path,
+            monkeypatch,
+            defer_channel_agent_resume=True,
+            schedule_memory_preparation=schedule_memory,
+        ) as (_runner, state, _spies):
+            assert callable(state.resume_channel_agents)
+            assert state.memory_startup_task is prepared
+            assert state.ready is True
+            schedule_memory.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_the_mcp_and_dashboard_routes_are_both_mounted(
@@ -362,7 +457,9 @@ class TestStartDashboardWiring:
         The ``Host`` barrier must run OUTSIDE the audit middleware: aiohttp runs
         middlewares outermost-first, and a rebinding attempt refused inside the
         audit layer would 403 without ever being recorded (which is why
-        ``_audit_denied`` exists at all).
+        ``_audit_denied`` exists at all). The deny-audit boundary must in turn
+        run outside the ``Host`` barrier: that is what makes the recording
+        positional rather than dependent on every deny site calling the helper.
         """
         async with _dashboard(tmp_path, monkeypatch) as (runner, _state, _spies):
             names = [getattr(mw, "__name__", type(mw).__name__) for mw in runner.app.middlewares]
@@ -370,6 +467,8 @@ class TestStartDashboardWiring:
         assert "host_validation_middleware" in names
         assert "sel_audit_middleware" in names
         assert names.index("host_validation_middleware") < names.index("sel_audit_middleware")
+        assert "deny_audit_middleware" in names, "the pre-audit deny boundary is not installed"
+        assert names.index("deny_audit_middleware") < names.index("host_validation_middleware")
 
     @pytest.mark.asyncio
     async def test_a_disallowed_host_is_refused_by_the_real_chain(
@@ -377,12 +476,12 @@ class TestStartDashboardWiring:
     ) -> None:
         """DNS-rebinding barrier, through the app's own middleware stack.
 
-        Driven in-process (``TestServer``) rather than against the production
-        listener: the same middlewares are installed on the app, and no host
-        port is bound.
+        Driven over the already-running app's handler rather than against the
+        production listener: the same middlewares are installed on the app, and
+        only an ephemeral loopback port is bound.
         """
         async with _dashboard(tmp_path, monkeypatch) as (runner, _state, _spies):
-            async with TestClient(TestServer(runner.app)) as client:
+            async with TestClient(_RunningAppServer(runner)) as client:
                 resp = await client.get("/api/status", headers={"Host": "evil.example.com"})
                 assert resp.status == 403
                 assert "Host header not allowed" in await resp.text()
@@ -398,7 +497,7 @@ class TestStartDashboardWiring:
         calls protects nothing.
         """
         async with _dashboard(tmp_path, monkeypatch) as (runner, _state, _spies):
-            async with TestClient(TestServer(runner.app)) as client:
+            async with TestClient(_RunningAppServer(runner)) as client:
                 resp = await client.get("/api/status")
                 csp = resp.headers["Content-Security-Policy"]
                 assert "frame-ancestors 'self'" in csp
@@ -427,6 +526,7 @@ class TestStartDashboardWiring:
 
         later_hooks = (
             "_instances_shutdown",
+            "_connections_warm_shutdown",
             "_prevent_sleep_shutdown",
             "_status_sink_shutdown",
             "_contrib_shutdown",
@@ -439,8 +539,16 @@ class TestStartDashboardWiring:
         tunnel_at = cleanup.index("_tunnel_shutdown")
         for name in later_hooks:
             assert tunnel_at < cleanup.index(name), f"{name} would starve the tunnel teardown"
-        for name in ("_instances_startup", "_contrib_startup", "_hooks_startup"):
+        for name in (
+            "_instances_startup",
+            "_contrib_startup",
+            "_hooks_startup",
+        ):
             assert name in startup, f"missing on_startup hook: {name}"
+        # The warm scavenge is deliberately ABSENT from on_startup: those hooks run
+        # inside runner.setup(), before the listener binds, so the scavenge is kicked
+        # explicitly after _start_site instead (no-new-work-on-gateway-boot-path).
+        assert "_connections_warm_startup" not in startup
 
     @pytest.mark.asyncio
     async def test_a_cross_origin_post_is_refused(self, tmp_path, monkeypatch) -> None:
@@ -451,7 +559,7 @@ class TestStartDashboardWiring:
         what stands between any local web page and the gateway's own API.
         """
         async with _dashboard(tmp_path, monkeypatch) as (runner, _state, _spies):
-            async with TestClient(TestServer(runner.app)) as client:
+            async with TestClient(_RunningAppServer(runner)) as client:
                 resp = await client.post(
                     "/api/notifications/clear",
                     json={},
@@ -505,5 +613,99 @@ class TestStartDashboardWiring:
         assert state.tunnel_manager is None
         await runner.cleanup()
         await _cancel_stray_tasks()
+        _release_process_handles(state)
 
         provider.stop.assert_awaited()
+
+    @staticmethod
+    def _tunnel_enabled_context(monkeypatch) -> None:
+        """Force the enable gate open so the tunnel setup call is reached.
+
+        Driven through the context provider rather than by writing
+        ``tunnel.enabled`` into the config, because ``start_dashboard`` ORs the
+        two and the provider arm needs no config-cache handling.
+        """
+        monkeypatch.setattr(
+            srv,
+            "current_context",
+            lambda: SimpleNamespace(
+                tunnel=SimpleNamespace(stop=AsyncMock(), enabled=lambda: True),
+                telemetry=SimpleNamespace(record_event=lambda *_a, **_k: None),
+                dashboard=SimpleNamespace(start_services=AsyncMock(), stop_services=AsyncMock()),
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_tunnel_reaches_the_tunnel_gate(self, tmp_path: Path, monkeypatch) -> None:
+        """A ``--no-tunnel`` process must not get a tunnel manager on its state.
+
+        Driven end to end through the REAL ``setup_tunnel`` with the enable gate
+        forced open and token auth irrelevant, because the boot-flag refusal is
+        checked ahead of both. The flag is read from process state rather than
+        passed down here -- ``slack.allowlist`` opens a second door that never
+        reaches this function, so a parameter would have guarded only this one.
+        """
+        from kiro_crew.tunnel import set_publish_disabled
+
+        self._tunnel_enabled_context(monkeypatch)
+        set_publish_disabled(True)
+        try:
+            runner, state, _spies = await _start_dashboard(tmp_path, monkeypatch)
+            try:
+                assert state.tunnel_manager is None
+            finally:
+                await runner.cleanup()
+                await _cancel_stray_tasks()
+                _release_process_handles(state)
+        finally:
+            set_publish_disabled(False)
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_gateway_still_asks_for_its_tunnel(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Without the flag the gate is asked exactly as before, so a normal
+        install's remote access cannot be taken away by this change.
+
+        Asserted at the call rather than on the returned state: ``setup_tunnel``
+        also returns None for an unrelated reason (no token auth in this harness),
+        so a state-only assertion would pass even if the tunnel were never
+        attempted at all.
+        """
+        from kiro_crew.tunnel import set_publish_disabled
+
+        self._tunnel_enabled_context(monkeypatch)
+        set_publish_disabled(False)
+        spy = AsyncMock(return_value=None)
+        monkeypatch.setattr(srv, "setup_tunnel", spy)
+
+        runner, state, _spies = await _start_dashboard(tmp_path, monkeypatch)
+        try:
+            spy.assert_awaited_once()
+        finally:
+            await runner.cleanup()
+            await _cancel_stray_tasks()
+            _release_process_handles(state)
+
+
+class TestGatewayShutdownIsGuaranteed:
+    """A hung/raising reconciler
+    stop must not skip on_gateway_shutdown() -- that sweep tears down app
+    backends, so skipping it strands spawned processes past gateway exit."""
+
+    @pytest.mark.asyncio
+    async def test_on_gateway_shutdown_runs_even_if_stopping_the_poller_raises(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        async def _boom() -> None:
+            raise RuntimeError("reconciler stop blew up")
+
+        monkeypatch.setattr(srv, "stop_hook_reconciler", _boom)
+        runner, state, spies = await _start_dashboard(tmp_path, monkeypatch)
+        try:
+            # cleanup dispatches _hooks_shutdown; the finally must still sweep.
+            await runner.cleanup()
+            spies["on_gateway_shutdown"].assert_awaited_once()
+        finally:
+            await _cancel_stray_tasks()
+            _release_process_handles(state)

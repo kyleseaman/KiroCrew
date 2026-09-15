@@ -29,6 +29,12 @@ from kiro_crew.dashboard.ws_event_scope import (
     ws_event_allowed,
 )
 
+# One xdist worker for the whole module: every test here derives from ONE module-cached
+# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
+# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
+# per full run for this file alone. Grouping keeps the cache single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_ws_event_scoping")
+
 
 @pytest.fixture(autouse=True)
 def _clear_module_caches():
@@ -686,7 +692,7 @@ def test_app_token_path_allowed_implicit_ws() -> None:
     """``/api/ws`` is implicitly allowed for all app tokens without an explicit
     permissions.api declaration: every app that uses KiroCrewClient needs it to
     connect, and the WS layer filters events per-app via ws_event_scope.py so
-    connecting no longer grants full event stream access. ``/api/status`` is
+    connecting does not grant full event stream access. ``/api/status`` is
     NOT implicitly allowed — it has no equivalent response filter. The
     reconnect poll that uses it is the dashboard SPA
     (``useDashboardHealthProbe``), which runs on a dashboard-user token and
@@ -1395,7 +1401,7 @@ class TestLiveScopeNarrowing:
         from kiro_crew.dashboard.handlers import updates as upd
         from kiro_crew.dashboard.state import DashboardState
 
-        # Declaration set no longer contains `log` (revoked).
+        # Declaration set does not contain `log` (revoked).
         mod._declared_cache["mochi-pet"] = (time.monotonic(), True, _allowed("slots:own"))
         ws = MagicMock()
         store = {
@@ -1516,25 +1522,6 @@ class TestLiveScopeNarrowing:
             "the replay gate must test the LIVE set, not the connect snapshot"
         )
 
-    def test_source_guard_every_allowed_events_read_is_narrowed(self):
-        """All three consumers must narrow, not just the gate.
-
-        The payload filters (`slots`, subagent batches) decide with the same set;
-        leaving one on the raw snapshot would keep handing back the rows a
-        revoked scope selected.
-        """
-        src = (
-            Path(__file__).resolve().parents[1]
-            / "src" / "kiro_crew" / "dashboard" / "state.py"
-        ).read_text(encoding="utf-8")
-        raw_reads = src.count('ws.get("_allowed_events", frozenset())')
-        narrowed = src.count("effective_allowed_events(ws_app, snapshot)")
-        assert raw_reads == narrowed == 3, (
-            f"{raw_reads} snapshot reads but {narrowed} narrowed — every read of "
-            "_allowed_events in state.py must go through effective_allowed_events"
-        )
-
-
 # ---------------------------------------------------------------------------
 # Grants are audited, not just denials.
 #
@@ -1548,6 +1535,7 @@ class TestLiveScopeNarrowing:
 # report itself. The per-tier test below is what pins that: it drives one event
 # from EACH tier and asserts all of them produce a record.
 # ---------------------------------------------------------------------------
+
 
 class TestGrantsAreAudited:
     APP = "mochi-pet"
@@ -2213,7 +2201,7 @@ class TestExposeToCacheNeverBlocksTheLoop:
         )
 
     def test_source_guard_connect_refuses_a_disabled_app(self):
-        """The connect read must be USED to refuse, not just to build a snapshot.
+        """The connect read must drive the refusal, not just build a snapshot.
 
         Reading enablement and then ignoring it is the defect this replaced: the
         initial slots push and the log replay both run before any background
@@ -2430,10 +2418,10 @@ class TestEventTableCompleteness:
         declared, which is silent loss of the whole subagent stream rather than a
         loud error.
         """
-        src = (
-            Path(__file__).resolve().parents[1]
-            / "src" / "kiro_crew" / "subagent.py"
-        ).read_text(encoding="utf-8")
+        source_root = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
+        source_paths = [source_root / "subagent.py"]
+        source_paths.extend(sorted((source_root / "subagent_manager").glob("*.py")))
+        src = "\n".join(path.read_text(encoding="utf-8") for path in source_paths)
         # `_fire_event(` then the first string literal, across a line break.
         fired = set(re.findall(r'_fire_event\(\s*\n?\s*"([a-z_]+)"', src))
         assert len(fired) >= 8, f"emitter scan found too few names: {sorted(fired)}"
@@ -2612,7 +2600,7 @@ class TestUntaggedOriginIsNotUser:
     def test_resume_takes_the_persisted_origin_not_the_resumer(self):
         """The resume endpoint must read metadata BEFORE creating the slot.
 
-        It used to create the slot from the request identity and read the history
+        Creating the slot from the request identity and reading the history
         metadata a dozen lines later, so resuming a persisted cron conversation
         from the dashboard produced a USER-tagged slot and `slots:user` handed its
         replayed content to any app holding that scope.
@@ -2687,7 +2675,7 @@ class TestWildcardDeclaration:
 class TestNotificationSourceParsing:
     """The note's field is ``source`` and an app push is ``app:<name>``.
 
-    The gate used to read ``source_app``/``app`` -- keys no emitter writes -- so
+    The gate must not read ``source_app``/``app`` -- keys no emitter writes -- so
     it saw "" for every note and accepted "" as the system stream: one app's
     private push reached any app holding ``notification:system``, and an app
     holding ``notification`` never saw its own.
@@ -2978,7 +2966,11 @@ class TestApprovalResolvedCarriesSlot:
 
         roots = [
             Path(__file__).resolve().parents[1] / "src" / "kiro_crew" / "dashboard" / f
-            for f in ("state.py", "chat_handlers.py", "chat_runner.py")
+            for f in (
+                "interaction_coordinator.py",
+                "chat_handlers.py",
+                "chat_runner.py",
+            )
         ]
         found = 0
         for path in roots:
@@ -3232,7 +3224,7 @@ class TestSubagentBatchFrames:
 
 
 class TestSuppressedDenyCountIsReported:
-    """The dedup comment used to claim suppressed denies were "counted" while
+    """The dedup comment claimed suppressed denies were "counted" while
     the map held only a timestamp — no counter existed. The tally must actually
     reach the trail, so a burst is visible as volume without one SEL write per
     frame (this gate runs per event PER CLIENT on the broadcast hot path)."""
@@ -3331,6 +3323,11 @@ class TestDirectSendGrantsAreAudited:
 
             async def send_json(self, payload: dict) -> None:
                 self.sent.append(payload)
+
+            async def send_str(self, payload: str) -> None:
+                # Connect snapshot sends a pre-dumped string (offender-note
+                # seam); parse back so assertions keep reading dict frames.
+                self.sent.append(json.loads(payload))
 
             def __aiter__(self):
                 return self

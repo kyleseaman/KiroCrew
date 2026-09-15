@@ -40,6 +40,13 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/update/auto", handlers.api_update_auto)
     app.router.add_post("/api/update/channel", handlers.api_update_channel)
     app.router.add_post("/api/update/cancel", handlers.api_update_cancel)
+    # In-app wheel update step-up (RFC OQ7): the SPA arms, only the host
+    # approves. Arm/status are ordinary authenticated routes; approve
+    # additionally requires the nonce written to the data home, which a
+    # remote dashboard bearer cannot read.
+    app.router.add_post("/api/update/arm", handlers.api_update_arm)
+    app.router.add_get("/api/update/arm", handlers.api_update_arm_status)
+    app.router.add_post("/api/update/approve", handlers.api_update_approve)
     # Restart with no update. Sibling of /api/update rather than a mode of it:
     # /api/update refuses every layout that is not a git checkout, while a
     # restart is valid everywhere and is how a wheel install picks up code a
@@ -51,7 +58,6 @@ def register(app: web.Application) -> None:
         app.router.add_post("/api/update/simulate", handlers.api_update_simulate)
     app.router.add_get("/api/sessions", handlers.api_sessions)
     app.router.add_delete("/api/sessions", handlers.api_sessions_clear)
-    app.router.add_get("/api/sessions/context", handlers.api_sessions_context)
     app.router.add_get("/api/sessions/memory", handlers.api_sessions_memory)
     app.router.add_get("/api/sessions/health", handlers.api_sessions_health)
     app.router.add_get("/api/sessions/usage", handlers.api_sessions_usage)
@@ -60,13 +66,17 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/telemetry/startup", handlers.api_telemetry_startup)
     app.router.add_get("/api/telemetry/context-trace", handlers.api_context_trace)
     app.router.add_get("/api/usage/turns", handlers.api_usage_turns)
+    app.router.add_get("/api/wakatime/stats", handlers.api_wakatime_stats)
+    app.router.add_get("/api/wakatime/export", handlers.api_wakatime_export)
     app.router.add_get("/api/telemetry/beacon", handlers.api_beacon_status)
     app.router.add_get("/api/telemetry/collection", handlers.api_collection_status)
     app.router.add_get("/api/tailnet/status", handlers.api_tailnet_status)
     # Mobile access: a LIVE probe (the status route above reports the startup
-    # value) plus the two mutations and the QR mint. Registered here rather than
-    # in a tailnet-specific module because these share the system routes' owner.
+    # value) plus setup/publish/withdraw mutations and the QR mint. Registered
+    # here rather than in a tailnet-specific module because these share the
+    # system routes' owner.
     app.router.add_get("/api/tailnet/mobile", handlers.api_tailnet_mobile_status)
+    app.router.add_post("/api/tailnet/mobile/configure", handlers.api_tailnet_mobile_configure)
     app.router.add_post("/api/tailnet/mobile/publish", handlers.api_tailnet_mobile_publish)
     app.router.add_post("/api/tailnet/mobile/unpublish", handlers.api_tailnet_mobile_unpublish)
     app.router.add_post("/api/tailnet/mobile/qr", handlers.api_tailnet_mobile_qr)
@@ -74,6 +84,9 @@ def register(app: web.Application) -> None:
     # NOTE: /search must be registered before /{key} to avoid the path param catching "search"
     app.router.add_get("/api/sessions/search", handlers.api_sessions_search)
     app.router.add_post("/api/sessions/summarize", handlers.api_sessions_summarize)
+    # Two segments, so /{key} (a single segment) cannot catch it — but registered
+    # ahead of /{key} anyway, matching the ordering discipline the note above sets.
+    app.router.add_get("/api/sessions/clearable/count", handlers.api_sessions_clearable_count)
     app.router.add_get("/api/sessions/{key}", handlers.api_session_detail)
     app.router.add_delete("/api/sessions/{key}", handlers.api_session_delete)
     app.router.add_get("/api/logs", handlers.api_logs)
@@ -122,6 +135,12 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/aws/consent", handlers.api_aws_consent_get)
     app.router.add_post("/api/aws/consent", handlers.api_aws_consent_post)
     app.router.add_delete("/api/aws/consent", handlers.api_aws_consent_delete)
+    # Flagged-file delivery consent. Owner-gated in the handler; deliberately NOT
+    # on the strict-internal list in server.py, because unlike the file_send legs
+    # its only legitimate caller IS the owner's browser.
+    app.router.add_get("/api/file-delivery/consent", handlers.api_file_delivery_consent_get)
+    app.router.add_post("/api/file-delivery/consent", handlers.api_file_delivery_consent_post)
+    app.router.add_delete("/api/file-delivery/consent", handlers.api_file_delivery_consent_delete)
     app.router.add_get("/api/approvals", handlers.api_approvals)
     app.router.add_post("/api/approvals/{id}/{action}", handlers.api_approval_resolve)
 

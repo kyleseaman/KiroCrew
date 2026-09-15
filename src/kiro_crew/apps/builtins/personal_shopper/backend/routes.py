@@ -38,6 +38,7 @@ from aiohttp import web
 from kiro_crew.apps.builtins.personal_shopper.backend.store import PreferenceStore
 from kiro_crew.apps.manager import app_data_dir, is_app_enabled
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.loop_lock import LoopBoundLock
 
 logger = logging.getLogger(__name__)
@@ -103,10 +104,20 @@ async def _json_object(
     array parses fine as JSON but has no ``.get``, so without this check every
     handler would raise ``AttributeError`` and return a 500 to a client that
     merely sent the wrong shape.
+
+    Follows the ``dashboard/handlers/_shared.read_bounded_json`` contract on
+    Q1/Q2 (400 for a non-object, catch spanning the client-input failure set).
+    The deliberate divergence is ``_strict_loads``: ``parse_constant`` rejects
+    ``NaN``/``Infinity``/``-Infinity`` at the boundary (see ``_reject_non_finite``)
+    so a non-finite number can never be persisted into a record the browser's
+    ``JSON.parse`` would then choke on. The catch is widened past
+    ``ValueError`` to include ``LookupError`` (an unknown ``charset=`` codec) and
+    ``RecursionError`` (a deeply nested body) so those become a 400, not a 500,
+    while a mid-read transport error still propagates.
     """
     try:
         body = await request.json(loads=_strict_loads)
-    except ValueError:
+    except (LookupError, RecursionError, ValueError):
         return None, _bad_request("invalid JSON", "invalid_json")
     if not isinstance(body, dict):
         return None, _bad_request("body must be a JSON object", "body_not_object")
@@ -247,7 +258,7 @@ async def _handle_add_preference(request: web.Request) -> web.Response:
         return err
 
     store = await _get_store()
-    entry_id = await asyncio.to_thread(store.add, text, tags=tags or [])
+    entry_id = await run_in_embed_pool(store.add, text, tags=tags or [])
     return web.json_response({"id": entry_id}, status=201)
 
 
@@ -267,7 +278,11 @@ async def _handle_update_preference(request: web.Request) -> web.Response:
         return err
 
     store = await _get_store()
-    await asyncio.to_thread(store.update, entry_id, text=text, tags=tags)
+    # ``store.update`` re-embeds whenever ``text`` is supplied (the store's
+    # UPDATE writes ``_embed(new_text)``), so it belongs on the same bulkhead
+    # as add/search/reembed. A tags-only update does not embed, but routing on
+    # the worst case is what keeps the shared default pool free.
+    await run_in_embed_pool(store.update, entry_id, text=text, tags=tags)
     return web.json_response({"id": entry_id, "updated": True})
 
 
@@ -301,7 +316,7 @@ async def _handle_search_preferences(request: web.Request) -> web.Response:
         return err
 
     store = await _get_store()
-    results = await asyncio.to_thread(
+    results = await run_in_embed_pool(
         store.search, query, top_k=top_k, tag_filter=tag_filter
     )
     return web.json_response(
@@ -334,7 +349,7 @@ async def _handle_reembed_preferences(request: web.Request) -> web.Response:
     everything added in the meantime.
     """
     store = await _get_store()
-    count = await asyncio.to_thread(store.reembed_all)
+    count = await run_in_embed_pool(store.reembed_all)
     return web.json_response({"reembedded": count})
 
 
@@ -507,6 +522,27 @@ async def _handle_put_sites(request: web.Request) -> web.Response:
 # ── Registration ──
 
 
+async def _close_store(_app: web.Application) -> None:
+    """Release the store singleton's sqlite handles at gateway shutdown.
+
+    The connection runs in WAL mode, so leaving it open pins ``preferences.db``
+    plus its ``-wal`` and ``-shm`` siblings for the gateway's whole lifetime.
+    POSIX tolerates that -- an unlinked file with a live handle just disappears
+    later -- but Windows refuses to delete or rename a file that is still open,
+    so disabling, uninstalling or resetting the app afterwards failed with a
+    ``PermissionError`` on files nothing was using any more.
+
+    The singleton is cleared before the blocking close so a request arriving
+    mid-shutdown rebuilds a fresh store instead of reusing a closed connection.
+    ``close`` takes the store's lock and touches the filesystem, so it goes off
+    the event loop like every other store call in this module.
+    """
+    global _store
+    store, _store = _store, None
+    if store is not None:
+        await asyncio.to_thread(store.close)
+
+
 def register_routes(app: web.Application) -> None:
     """Register Personal Shopper routes on the gateway's aiohttp Application."""
     # Preferences
@@ -544,3 +580,5 @@ def register_routes(app: web.Application) -> None:
     # Sites
     app.router.add_get(f"{_PREFIX}/sites", _require_enabled(_handle_get_sites))
     app.router.add_put(f"{_PREFIX}/sites", _require_enabled(_handle_put_sites))
+    # Shutdown: close the sqlite connection so the data directory stays removable.
+    app.on_cleanup.append(_close_store)

@@ -44,12 +44,22 @@ vi.mock('../api/client', async (importOriginal) => {
   }
 })
 
+vi.mock('../apps/file-explorer/api', () => ({
+  fileExplorerApi: {
+    complete: vi.fn().mockResolvedValue({
+      entries: [{ name: 'src', path: '/home/user/src', type: 'dir', size: 0, mtime: 0 }],
+    }),
+  },
+}))
+
 import { api } from '../api/client'
 import TagManagerList from '../components/TagManagerList'
 import ProjectPicker from '../components/ProjectPicker'
 import SearchBar from '../components/SearchBar'
 import BroadcastBar from '../apps/meetings/components/BroadcastBar'
 import { BlockEditor } from '../apps/md-notebook/BlockEditor'
+import PathBar from '../apps/file-explorer/PathBar'
+import { fileExplorerApi } from '../apps/file-explorer/api'
 
 /** Arm the hook's post-composition latch: the WebKit commit-Enter window. */
 function armLatch(el: Element) {
@@ -212,6 +222,39 @@ describe('ProjectPicker path input — rule 2: gate the Enter path only', () => 
     await act(async () => { await vi.advanceTimersByTimeAsync(0) })
     expect(vi.mocked(api.browseDirs)).toHaveBeenCalledWith('/home/u/alpha')
   })
+
+  // The Escape || Tab branch closes the picker and returns focus to the
+  // trigger — the composition-abort harm on a composable free-text path
+  // field: an IME candidate-cycling Tab (or candidate-cancelling Escape)
+  // must not be adopted as "leave the picker".
+  async function openBrowseWithSpy() {
+    const onOpenChange = vi.fn()
+    renderWithProviders(
+      <ProjectPicker open={true} onOpenChange={onOpenChange} anchorRect={rect(100, 50)} onSelect={vi.fn()} />,
+    )
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    return { input: screen.getByPlaceholderText('/path/to/project') as HTMLInputElement, onOpenChange }
+  }
+
+  it('does NOT close the picker on the committing Tab in the post-composition window', async () => {
+    const { input, onOpenChange } = await openBrowseWithSpy()
+    armLatch(input)
+    fireEvent.keyDown(input, { key: 'Tab' })
+    expect(onOpenChange).not.toHaveBeenCalled()
+  })
+
+  it('does NOT close the picker on an Escape that cancels a candidate', async () => {
+    const { input, onOpenChange } = await openBrowseWithSpy()
+    armLatch(input)
+    fireEvent.keyDown(input, { key: 'Escape' })
+    expect(onOpenChange).not.toHaveBeenCalled()
+  })
+
+  it('closes the picker on a plain Tab (positive control)', async () => {
+    const { input, onOpenChange } = await openBrowseWithSpy()
+    fireEvent.keyDown(input, { key: 'Tab' })
+    expect(onOpenChange).toHaveBeenCalledWith(false)
+  })
 })
 
 describe('BroadcastBar input — rule 1 single-line Enter-only site: bindEnter', () => {
@@ -341,5 +384,98 @@ describe('md-notebook BlockEditor — rule 3 textarea: claim before the Enter→
     const { ta, onCommit } = renderEditor()
     fireEvent.keyDown(ta, { key: 'Enter', ctrlKey: true })
     expect(onCommit).toHaveBeenCalledWith('草稿')
+  })
+
+  // The Tab branch of the same textarea, and the OTHER half of the
+  // boundary-Tab shape: it re-indents the list item by rewriting the whole
+  // value, so an IME cycling its candidate list with Tab replaced the text
+  // still being composed. No focus move to anchor on, which is why the source
+  // ratchet needed a second, act-anchored rule to see it.
+  function renderListEditor() {
+    const onCommit = vi.fn()
+    render(<BlockEditor initial="- item" onCommit={onCommit} onCancel={vi.fn()} />)
+    const ta = screen.getByRole('textbox') as HTMLTextAreaElement
+    return { ta, onCommit }
+  }
+
+  it('does NOT re-indent the list item on the committing Tab in the post-composition window', () => {
+    const { ta } = renderListEditor()
+    armLatch(ta)
+    const defaultNotPrevented = fireEvent.keyDown(ta, { key: 'Tab' })
+    expect(ta.value).toBe('- item')
+    // The decline consumes the key: in this window the browser would otherwise
+    // move focus out of the editor, abandoning the composition.
+    expect(defaultNotPrevented).toBe(false)
+  })
+
+  it('leaves a mid-composition Tab to the IME (native flag set)', () => {
+    const { ta } = renderListEditor()
+    fireEvent.compositionStart(ta)
+    const defaultNotPrevented = fireEvent.keyDown(ta, { key: 'Tab', isComposing: true })
+    expect(ta.value).toBe('- item')
+    expect(defaultNotPrevented).toBe(true)
+  })
+
+  it('re-indents the list item on a plain Tab (positive control)', () => {
+    const { ta } = renderListEditor()
+    fireEvent.keyDown(ta, { key: 'Tab' })
+    expect(ta.value).toBe('\t- item')
+  })
+})
+
+describe('file-explorer PathBar — Tab accepts a suggestion INTO the draft', () => {
+  // The path bar recorded its Tab as a deliberate exemption ("arrow/Tab
+  // navigation stays untouched"), which held only while Tab did nothing to the
+  // text. It accepts the highlighted suggestion into the draft, so with the
+  // latch armed the accept overwrote the composing path.
+  async function openEditor() {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <PathBar rootPath="/home/user" gitInfo={null} onChangeRoot={vi.fn()} onNavigate={vi.fn()} />
+      </QueryClientProvider>,
+    )
+    fireEvent.click(screen.getByTitle('Click to edit path'))
+    const input = screen.getByPlaceholderText('/path/to/folder') as HTMLInputElement
+    fireEvent.change(input, { target: { value: '/home/user/s' } })
+    // Establish the state Tab is asserted against, not merely "a row is showing".
+    // The `complete` mock answers every key with the same entry, so the row
+    // first renders for the PRE-debounce key (`/home/user`, fetched on focus).
+    // 150ms later the debounced draft flips the query key, `data` resets to
+    // undefined and the list is EMPTY for a tick until the new fetch resolves --
+    // and a Tab that lands in that tick finds no suggestions, so neither the
+    // accept nor the latch branch runs (both PathBar cases red in one of four
+    // loaded runs, with the draft untouched and default not prevented). Wait for
+    // the debounced key's fetch to have been issued, THEN for its row: a row seen
+    // after that call can only be the settled list.
+    const complete = vi.mocked(fileExplorerApi.complete)
+    await waitFor(() => expect(complete).toHaveBeenCalledWith('/home/user/s', 'dir', 30), { timeout: 5000 })
+    // The fetch itself is a debounced (150ms) query, so the row can still arrive
+    // after the default waitFor timeout (1000ms) under a loaded, concurrent run --
+    // a named ceiling for that chain (same class as DiffBlock.streaming.test.tsx /
+    // PierreWorkspaceTree.lazy.test.tsx).
+    await waitFor(() => expect(screen.getByText('/home/user/src')).toBeInTheDocument(), { timeout: 5000 })
+    return input
+  }
+
+  it('does NOT replace the draft on the committing Tab in the post-composition window', async () => {
+    const input = await openEditor()
+    armLatch(input)
+    const defaultNotPrevented = fireEvent.keyDown(input, { key: 'Tab' })
+    expect(input.value).toBe('/home/user/s')
+    expect(defaultNotPrevented).toBe(false)
+  })
+
+  it('accepts the highlighted suggestion on a plain Tab (positive control)', async () => {
+    const input = await openEditor()
+    fireEvent.keyDown(input, { key: 'Tab' })
+    expect(input.value).toBe('/home/user/src')
+  })
+
+  it('keeps arrow-key list navigation working while the latch is armed', async () => {
+    const input = await openEditor()
+    armLatch(input)
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    expect(screen.getByRole('option')).toHaveAttribute('aria-selected', 'true')
   })
 })

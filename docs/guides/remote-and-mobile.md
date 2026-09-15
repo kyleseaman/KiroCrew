@@ -23,7 +23,7 @@ Four parts, in the order you will need them:
 - **OS**: any modern Linux distribution (Ubuntu 22.04+, Debian 12+, Fedora,
   CentOS Stream / RHEL 8+, CentOS 7, Amazon Linux 2 / 2023). macOS works too,
   with launchd instead of systemd.
-- **Python**: 3.10 or newer (`setup.cfg` sets `python_requires = >=3.10`).
+- **Python**: 3.12 or newer (`setup.cfg` sets `python_requires = >=3.12`).
 - **Node.js**: needed to build the dashboard bundle. `website/package.json`
   declares `"node": ">=22"`; `kirocrew doctor` warns below Node 22.
 - **RAM**: there is no single published floor, because the footprint scales with
@@ -377,8 +377,8 @@ terraform -chdir=deploy/coder-aws/control-plane destroy \
 sudo apt-get update && sudo apt-get install -y git tmux python3 python3-pip python3-venv
 
 # Fedora / CentOS Stream / RHEL 8+ / Amazon Linux 2023 (python3 may be 3.9;
-# python3.11 gives the 3.10+ the backend needs)
-sudo dnf install -y git tmux python3.11 python3.11-pip
+# python3.12 gives the 3.12+ the backend needs)
+sudo dnf install -y git tmux python3.12 python3.12-pip
 
 # CentOS 7 / RHEL 7 (yum; base repos ship only Python 3.6, which is too old —
 # install a newer interpreter yourself first, e.g. mise; see below)
@@ -387,7 +387,7 @@ curl https://mise.run | sh && mise use -g python@3.12
 ```
 
 The `curl … | sh` installer performs this distro Python bootstrap for you. On
-CentOS 7 and older Ubuntu, where no base-repo package supplies Python 3.10+, it
+CentOS 7 and older Ubuntu, where no base-repo package supplies Python 3.12+, it
 uses an already-installed [mise](https://mise.jdx.dev/) if you have one and
 otherwise stops with instructions — the signed installer does not pipe an
 unsigned script into a shell, so install mise yourself first
@@ -619,13 +619,45 @@ the same and the difference is the whole security story:
 - [`tailscale serve`](https://tailscale.com/kb/1242/tailscale-serve) publishes the
   dashboard **only inside your tailnet** — nothing is reachable from the public
   internet, you get TLS and a stable MagicDNS hostname, and who can reach it is
-  governed by your tailnet ACLs. This is the better answer for the phone case:
+  governed by your tailnet ACLs. This is the better answer for the phone case.
+
+  The guided path is in **Settings → Overview → Phone access**. It supports
+  Windows, macOS, and Linux gateway hosts, but it does not pretend that
+  tailnet-wide administrator consent is a local setting. Before the one-click
+  action appears, Tailscale must be installed and signed in, MagicDNS must be on,
+  and the current MagicDNS name must appear in Tailscale's `CertDomains`. On a
+  new tailnet the card links to the Tailscale HTTPS settings for the one-time
+  administrator approval, then waits for **Re-check**.
+
+  Once those prerequisites hold, click **Set up & show QR** once. The dashboard
+  enables its daemon-derived origin, restarts through the gateway's formal
+  single-flight restart path, waits for the replacement listener to prove the
+  new startup boundary is active, publishes through Tailscale Serve, verifies
+  the 443 mapping, and only then displays a short-lived sign-in QR. Tailscale
+  creates and renews the private certificate after HTTPS is enabled; there is no
+  certificate file to create or install manually. The action still refuses to
+  replace a different service already mounted at `443/`.
+
+  The same click enrolls this machine's daemon-reported Tailscale login in the
+  explicit allowlist and makes the phone session survive gateway restarts and
+  application updates. Each request still has to resolve through the local
+  Tailscale daemon as that allowed identity; persistence does not turn the QR
+  into a tailnet-wide bearer session. Users who set up phone access on an older
+  build migrate when they next choose **Show QR code** on the desktop. A session
+  already invalidated by the update that installed this migration cannot be
+  revived, so that upgrade requires one final scan; later updates do not.
+
+  The basic CLI equivalent is:
   ```bash
   kirocrew config set dashboard.tailscale.enabled true   # once per machine
-  kirocrew tailnet up
   kirocrew restart
+  kirocrew tailnet up
   kirocrew token                                         # the link to open on the phone
   ```
+  This manual sequence keeps the config's selected session policy. The guided
+  card is the path that safely discovers the local login and atomically enables
+  identity-bound restart persistence without asking you to hand-edit an
+  allowlist.
   `kirocrew tailnet up` runs `tailscale serve` for you — HTTPS on 443 in front of
   the dashboard's loopback port — and prints the URL to open on your phone. That is
   the half that used to be an undocumented command you had to know and type.
@@ -658,10 +690,12 @@ the same and the difference is the whole security story:
   hold the configured port, because `tailscale serve` will expose an unrelated local
   service to every device on your tailnet just as readily as the dashboard.
 
-  Changing serve configuration is daemon state, so on Linux it usually needs root
-  or a one-time grant: `sudo tailscale set --operator=$USER`. If the publish is
-  refused, the command prints what Tailscale itself said rather than a generic
-  failure.
+  Changing serve configuration is daemon state. On Linux it usually needs root
+  or a one-time grant (`sudo tailscale set --operator=$USER`); on Windows the
+  Tailscale CLI may need an Administrator terminal. These operating-system
+  permissions cannot be silently escalated by the dashboard. If the publish is
+  refused, the card and command print what Tailscale itself said rather than a
+  generic failure.
 
   `kirocrew tailnet status` shows the three things that are independently
   required — whether the setting is on, whether a MagicDNS name resolves right
@@ -675,14 +709,24 @@ the same and the difference is the whole security story:
   something else there by hand, `up` and `down` both stop and print the command
   instead of overwriting or deleting your mapping.
 
-  The setting reads your own MagicDNS name from the local Tailscale daemon once at
-  startup and trusts `https://<that name>` as an origin, so you do **not** have to
-  look the name up and hand-write `dashboard.url`. Because it is resolved once, a
-  restart is needed after publishing — and if the daemon comes up *after* the
-  gateway, nothing is trusted until you restart again. If Tailscale is absent,
-  stopped, or MagicDNS is off it contributes nothing and the dashboard starts
-  exactly as before. It does not widen the network bind and does not change
-  authentication — every request still needs a dashboard session.
+  A serve configuration that sits entirely on **other** ports — another project
+  on this machine published on port 80 or 8443, say — blocks neither direction.
+  Publishing touches only `443/`, so when Tailscale's own status shows every
+  mapping on some other port, the card and `tailnet up` treat 443 as free and
+  proceed, and `down` leaves the other mappings alone. Only a serve entry
+  naming port 443, or a status this build cannot read or attribute, triggers
+  the refusal.
+
+  At startup the setting reads your own MagicDNS name from the local Tailscale
+  daemon and trusts `https://<that name>` as an origin, so you do **not** have to
+  look the name up and hand-write `dashboard.url`. The Overview one-click flow
+  performs and waits for the restart required when it turns the setting on. If
+  Tailscale is absent, stopped, or MagicDNS is off during a later gateway start,
+  the dashboard starts exactly as before and retries in the background, with a
+  delay that grows to one minute. Once the daemon returns a validated name, the
+  running gateway accepts it without another restart. This does not widen the
+  network bind or change authentication — every request still needs a dashboard
+  session.
 
   If you would rather do it by hand, the equivalent is:
   ```bash
@@ -691,11 +735,12 @@ the same and the difference is the whole security story:
   kirocrew restart
   ```
   `dashboard.tailscale.enabled` reads your own MagicDNS name from the local
-  Tailscale daemon once at startup and trusts `https://<that name>` as an origin,
-  so you do **not** have to look the name up and hand-write `dashboard.url`. If
-  Tailscale is absent, stopped, or MagicDNS is off it contributes nothing and the
-  dashboard starts exactly as before. It does not widen the network bind and does
-  not change authentication — every request still needs a dashboard session.
+  Tailscale daemon and trusts `https://<that name>` as an origin, so you do **not**
+  have to look the name up and hand-write `dashboard.url`. A failed startup read
+  contributes nothing initially and is retried in the background; the validated
+  origin is added to the running gateway when Tailscale becomes ready. It does
+  not widen the network bind or change authentication — every request still
+  needs a dashboard session.
 
   Optionally, opt in to **identity-pinned sessions** so the session pin binds to
   your device's daemon-verified tailnet identity instead of the tunnel's shared
@@ -851,7 +896,7 @@ an error. `kirocrew token` defaults straight to `20h`. The 5-minute click window
 is not the session length: it only means a link left sitting in a DM overnight is
 dead and you need a fresh one.
 
-**When you do need a fresh link.** Four things end a refresh chain:
+**When you do need a fresh link.** Five things end a refresh chain:
 
 - **30 days idle** — nothing opened the dashboard inside the window.
 - **Signing out in the dashboard** (`POST /api/auth/logout`) — revokes that
@@ -865,9 +910,25 @@ dead and you need a fresh one.
   (RFC 6819 §5.2.2.3). The frontend reports `refresh_chain_revoked` and stops
   scheduling refreshes; the mint screen appears once the remaining access session
   runs out.
+- **Turning tailnet identity trust off**, for a chain that was opened under it.
+  See device binding below; the chain is refused rather than revoked, so one
+  fresh link restores you.
 
-Chains persist in `~/.kiro/crew/refresh_chains.json` (mode `0600`), so they
-survive a gateway restart. On a gateway old enough to predate the feature,
+**Device binding (tailnet identity trust only).** With
+`dashboard.tailscale.trust_identity` on, a chain is bound to the tailnet peer
+that opened it and only that peer can renew it, so a stolen refresh cookie
+cannot be replayed from another one of your allowed machines. What counts as
+"that peer" is `pin_scope`: at the default `node` it is the one device, at
+`login` it is your Tailscale identity, so one session follows you between your
+own devices. If you need one session to roam between devices at `node` scope, set
+`dashboard.tailscale.bind_refresh_chains: false` — the tradeoff is that a stolen
+refresh cookie then renews from any allowed node, which is what the binding
+exists to stop. Sessions that already exist keep whatever binding they were
+opened with; a chain bound this way stops renewing if you later turn identity
+trust off, and a fresh `kirocrew token` link gets you going again.
+
+Chains persist in `~/.kiro/crew/refresh_chains.json` (mode `0600`) — including
+the device binding above — so they survive a gateway restart. On a gateway old enough to predate the feature,
 `GET /api/auth/me` returns 404; the frontend logs once and falls back to the
 20-hour URL-mint behaviour.
 
@@ -924,9 +985,19 @@ bugs:
   `ServiceWorkerRegistration.showNotification()`. Tracked in
   [issue #2267](https://github.com/kirodotdev/KiroCrew/issues/2267); the Android
   symptom is [issue #1828](https://github.com/kirodotdev/KiroCrew/issues/1828).
-- **Not edge-to-edge.** The shell sets neither `viewport-fit=cover` nor any
-  `env(safe-area-inset-*)` padding, so on a notched device the installed app
-  renders inside the safe area rather than filling the screen.
+- **Pinch zoom is off.** The installed app behaves like an application, not a
+  web page: two-finger pinch and double-tap no longer scale the shell. **To
+  magnify, use the OS display-zoom setting** (iOS: Settings → Display &
+  Brightness → Display Zoom; Android: Settings → Display → Display size and
+  text), which still enlarges everything; in a browser tab Safari's Aa
+  text-size control works too, but it is **not** reachable from the
+  installed app, which has no Safari toolbar. Pinch is off because magnifying a
+  fixed-height layout whose scrollers are all inner leaves no way to reach the
+  topbar and composer it pushes off-screen. The surfaces that need magnifying
+  keep it — the image viewer and the diagram viewer both zoom on their own pinch,
+  the diagram viewer also on a double-tap, and code blocks scroll sideways. On a
+  laptop or desktop those two viewers also zoom on a **trackpad pinch**, and on
+  **`ctrl`+scroll** with a mouse; a plain scroll still scrolls.
 
 Installing changes nothing about authentication: the app carries the same cookies
 the browser holds, on the same clocks as [Session duration](#session-duration).
@@ -934,7 +1005,18 @@ the browser holds, on the same clocks as [Session duration](#session-duration).
 ### Persistent SSH tunnel on macOS (LaunchAgent)
 
 A terminal-held tunnel dies with the terminal. A LaunchAgent survives reboots
-and reconnects after sleep. A ready-made plist is at
+and reconnects after sleep.
+
+If the desktop app should act only as a client for this remote gateway, turn off
+**Settings → Developer → Gateway → Run a local gateway**, then quit the app so
+its supervised gateway releases port 5476. Start the tunnel, verify the health
+probe below, and only then reopen the app. Turning the switch off does not create
+or supervise a tunnel; on the next launch the app expects a gateway to already
+answer on port 5476. A connected entry on the Instances page does not satisfy
+this requirement because those tunnels are supervised by the local gateway
+itself and use separate loopback ports.
+
+A ready-made plist is at
 [`assets/com.kirocrew.tunnel.plist`](assets/com.kirocrew.tunnel.plist):
 
 ```bash
@@ -1150,7 +1232,7 @@ StartLimitIntervalSec=300
 Type=simple
 User=$(whoami)
 ExecStart=$KIROCREW_BIN gateway
-Restart=on-failure
+Restart=always
 RestartSec=10
 LimitNOFILE=65536
 WorkingDirectory=$HOME
@@ -1196,5 +1278,5 @@ servers and tool calls fail with ENOENT.
 - [install.md](install.md): all build and install methods
 - [docker.md](docker.md): container deployment, including `KIROCREW_BIND`
 - [slack-setup.md](slack-setup.md): chat app creation and configuration
-- [../system-specs/features/dashboard-token-auth.md](../system-specs/features/dashboard-token-auth.md): the full access + refresh cookie design
+- [../system-specs/modules/dashboard-token-auth.md](../system-specs/modules/dashboard-token-auth.md): the full access + refresh cookie design
 - [../architecture/security-deep-dive.md](../architecture/security-deep-dive.md): token auth, origin checks, the local-request gate

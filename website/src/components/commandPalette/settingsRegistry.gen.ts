@@ -6,6 +6,39 @@ import type { SettingEntry } from './settingsTypes'
 export const SETTINGS_REGISTRY: SettingEntry[] = 
 [
   {
+    "id": "about.auto-update-on-restart",
+    "label": "Auto-update on restart",
+    "labelKey": "pages.settings.aboutPanel.auto_update_on_restart",
+    "tab": "about",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "about.update-notifications",
+    "labelKey": "pages.settings.aboutPanel.notify_when_an_update_is_available",
+    "tab": "about",
+    "type": "toggle",
+    "occurrence": 1,
+    "configKey": "auto_update",
+    "label": "Notify when an update is available"
+  },
+  {
+    "id": "about.update-channel",
+    "labelKey": "pages.settings.aboutPanel.update_channel",
+    "tab": "about",
+    "type": "buttonGroup",
+    "occurrence": 1,
+    "label": "Update channel"
+  },
+  {
+    "id": "browser.attach-token",
+    "labelKey": "pages.settings.browserPanel.token_label",
+    "tab": "browser",
+    "type": "input",
+    "occurrence": 1,
+    "label": "Extension token (optional)"
+  },
+  {
     "id": "browser.use-the-built-in-browser",
     "label": "Use the built-in browser",
     "labelKey": "pages.settings.browserPanel.use_builtin_label",
@@ -13,6 +46,146 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "type": "toggle",
     "occurrence": 1,
     "configKey": "dashboard.use_builtin_browser"
+  },
+  {
+    "id": "channels.allowed-emails-webex",
+    "label": "Allowed emails (Webex)",
+    "labelKey": "pages.settings.webexPanel.allowed_emails",
+    "labelSuffix": "Webex",
+    "description": "Webex account emails permitted to DM the bot. Empty = nobody (fail closed) — anyone in an org can message a Webex bot, so add only your own.",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "webex"
+    }
+  },
+  {
+    "id": "channels.allowed-enterprise-orgs-slack",
+    "label": "Allowed enterprise orgs (Slack)",
+    "labelKey": "pages.settings.slackPanel.allowed_enterprise_orgs",
+    "labelSuffix": "Slack",
+    "description": "Enterprise Grid org IDs to allow (starts with E or T). Leave empty to allow all orgs.",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "slack"
+    }
+  },
+  {
+    "id": "channels.allowed-handles-imessage",
+    "label": "Allowed handles (iMessage)",
+    "labelKey": "pages.settings.iMessagePanel.allowed_handles",
+    "labelSuffix": "iMessage",
+    "description": "Phone numbers or Apple Account emails allowed to message the agent. Empty denies everyone — anyone who knows this Mac's handle can send to it, so there is no safe default. Formatting is ignored.",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "imessage"
+    }
+  },
+  {
+    "id": "channels.allowed-numbers-whatsapp",
+    "label": "Allowed numbers (WhatsApp)",
+    "labelKey": "pages.settings.whatsAppPanel.allowed_wa_ids",
+    "labelSuffix": "WhatsApp",
+    "description": "Phone numbers (digits with country code, no plus sign) that may also chat with the agent. Empty adds nobody beyond you.",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "whatsapp"
+    }
+  },
+  {
+    "id": "channels.allowed-space-ids-webex",
+    "label": "Allowed space IDs (Webex)",
+    "labelKey": "pages.settings.webexPanel.allowed_room_ids",
+    "labelSuffix": "Webex",
+    "description": "Empty means no space is answered, so turning the switch on alone grants nothing. The sender must also be on the allowed-emails list. A space ID is an opaque string — list yours with:\ncurl -H \"Authorization: Bearer $WEBEX_BOT_TOKEN\" https://webexapis.com/v1/rooms",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "webex"
+    }
+  },
+  {
+    "id": "channels.allowed-user-ids-discord",
+    "label": "Allowed user IDs (Discord)",
+    "labelKey": "pages.settings.botChannelPanel.allowed_user_ids",
+    "labelSuffix": "Discord",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "discord"
+    }
+  },
+  {
+    "id": "channels.allowed-user-ids-telegram",
+    "label": "Allowed user IDs (Telegram)",
+    "labelKey": "pages.settings.botChannelPanel.allowed_user_ids",
+    "labelSuffix": "Telegram",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "telegram"
+    }
+  },
+  {
+    "id": "channels.allowed-user-ids-wechat",
+    "label": "Allowed user IDs (WeChat)",
+    "labelKey": "pages.settings.weixinPanel.allowed_user_ids",
+    "labelSuffix": "WeChat",
+    "description": "Allowed WeChat user IDs. Empty = deny all (fail closed).",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "weixin"
+    }
+  },
+  {
+    "id": "channels.allowed-user-ids-wecom",
+    "label": "Allowed user IDs (WeCom)",
+    "labelKey": "pages.settings.botChannelPanel.allowed_user_ids",
+    "labelSuffix": "WeCom",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "wecom"
+    }
+  },
+  {
+    "id": "channels.allowed-users-email-or-aad-object-id-teams",
+    "label": "Allowed users (email or AAD object id) (Teams)",
+    "labelKey": "pages.settings.teamsPanel.allowed_users_email_or_aad_object_id",
+    "labelSuffix": "Teams",
+    "description": "Azure AD UPNs/emails OR object ids permitted to DM the bot. Teams activities reliably carry the object id (email is often absent), so object ids work out of the box. Empty = nobody (fail closed).",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "teams"
+    }
+  },
+  {
+    "id": "channels.answer-in-group-spaces-webex",
+    "label": "Answer in group spaces (Webex)",
+    "labelKey": "pages.settings.webexPanel.allow_group_spaces",
+    "labelSuffix": "Webex",
+    "description": "Off by default. A reply in a space is visible to everyone in it, including people not on the allowed-emails list.",
+    "tab": "channels",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "channel": "webex"
+    }
   },
   {
     "id": "channels.app-client-id-teams",
@@ -26,6 +199,19 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
       "channel": "teams"
     },
     "configKey": "teams.app_id"
+  },
+  {
+    "id": "channels.app-password-client-secret-teams",
+    "label": "App password (client secret) (Teams)",
+    "labelKey": "pages.settings.teamsPanel.app_password_client_secret",
+    "labelSuffix": "Teams",
+    "description": "Azure Bot client secret. Stored only in .env (never config.json).",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "teams"
+    }
   },
   {
     "id": "channels.enable-imessage-channel-imessage",
@@ -63,6 +249,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1,
     "params": {
       "channel": "weixin"
+    }
+  },
+  {
+    "id": "channels.enable-the-whatsapp-channel-whatsapp",
+    "label": "Enable the WhatsApp channel (WhatsApp)",
+    "labelKey": "pages.settings.whatsAppPanel.enable_the_whatsapp_channel",
+    "labelSuffix": "WhatsApp",
+    "tab": "channels",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "channel": "whatsapp"
     }
   },
   {
@@ -175,6 +373,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "channels.file-sessions-in-a-folder-whatsapp",
+    "label": "File sessions in a folder (WhatsApp)",
+    "labelKey": "pages.settings.botChannelPanel.file_sessions_in_folder",
+    "labelSuffix": "WhatsApp",
+    "tab": "channels",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "channel": "whatsapp"
+    }
+  },
+  {
     "id": "channels.folder-name-discord",
     "label": "Folder name (Discord)",
     "labelKey": "pages.settings.botChannelPanel.session_folder_name",
@@ -279,6 +489,19 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "channels.folder-name-whatsapp",
+    "label": "Folder name (WhatsApp)",
+    "labelKey": "pages.settings.botChannelPanel.session_folder_name",
+    "labelSuffix": "WhatsApp",
+    "description": "Created for you when you turn this on, if it does not already exist.",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "whatsapp"
+    }
+  },
+  {
     "id": "channels.hard-context-threshold-teams",
     "label": "Hard context threshold % (Teams)",
     "labelKey": "pages.settings.channels.hard_threshold_label",
@@ -291,6 +514,31 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
       "channel": "teams"
     },
     "configKey": "teams.hard_threshold_pct"
+  },
+  {
+    "id": "channels.hard-context-threshold-webex",
+    "label": "Hard context threshold % (Webex)",
+    "labelKey": "pages.settings.webexPanel.hard_context_threshold",
+    "labelSuffix": "Webex",
+    "description": "Compact automatically at this point, even without a decision, so the context window never overflows.",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "webex"
+    }
+  },
+  {
+    "id": "channels.how-the-agent-joins-in-whatsapp",
+    "label": "How the agent joins in (WhatsApp)",
+    "labelKey": "pages.settings.whatsAppPanel.how_the_agent_joins_in",
+    "labelSuffix": "WhatsApp",
+    "tab": "channels",
+    "type": "select",
+    "occurrence": 1,
+    "params": {
+      "channel": "whatsapp"
+    }
   },
   {
     "id": "channels.messages-database-path-imessage",
@@ -332,6 +580,31 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "channels.reply-in-thread-webex",
+    "label": "Reply in thread (Webex)",
+    "labelKey": "pages.settings.webexPanel.reply_in_thread",
+    "labelSuffix": "Webex",
+    "description": "Reply under the message's own thread when it has one, which keeps a busy space readable.",
+    "tab": "channels",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "channel": "webex"
+    }
+  },
+  {
+    "id": "channels.seconds-between-unprompted-replies-whatsapp",
+    "label": "Seconds between unprompted replies (WhatsApp)",
+    "labelKey": "pages.settings.whatsAppPanel.seconds_between_unprompted_replies",
+    "labelSuffix": "WhatsApp",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "whatsapp"
+    }
+  },
+  {
     "id": "channels.send-replies-over-imessage",
     "label": "Send replies over (iMessage)",
     "labelKey": "pages.settings.iMessagePanel.service",
@@ -352,6 +625,32 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Post the model's reasoning as a thread reply. Disable to keep responses concise.",
     "tab": "channels",
     "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "channel": "slack"
+    }
+  },
+  {
+    "id": "channels.slack-app-token-slack",
+    "label": "Slack app token (Slack)",
+    "labelKey": "pages.settings.slackPanel.slack_app_token",
+    "labelSuffix": "Slack",
+    "description": "App-level token required for Socket Mode (starts with xapp-).",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "slack"
+    }
+  },
+  {
+    "id": "channels.slack-bot-token-slack",
+    "label": "Slack bot token (Slack)",
+    "labelKey": "pages.settings.slackPanel.slack_bot_token",
+    "labelSuffix": "Slack",
+    "description": "From OAuth & Permissions after installing your Slack app (starts with xoxb-).",
+    "tab": "channels",
+    "type": "input",
     "occurrence": 1,
     "params": {
       "channel": "slack"
@@ -408,6 +707,19 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "channels.soft-context-threshold-webex",
+    "label": "Soft context threshold % (Webex)",
+    "labelKey": "pages.settings.webexPanel.soft_context_threshold",
+    "labelSuffix": "Webex",
+    "description": "When a conversation's context passes this, suggest /compact or /new instead of compacting automatically.",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "webex"
+    }
+  },
+  {
     "id": "channels.soft-context-threshold-wecom",
     "label": "Soft context threshold % (WeCom)",
     "labelKey": "pages.settings.botChannelPanel.soft_context_threshold",
@@ -432,6 +744,55 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
       "channel": "teams"
     },
     "configKey": "teams.tenant_id"
+  },
+  {
+    "id": "channels.webex-bot-token-webex",
+    "label": "Webex bot token (Webex)",
+    "labelKey": "pages.settings.webexPanel.webex_bot_token",
+    "labelSuffix": "Webex",
+    "description": "Bot access token from developer.webex.com (My Webex Apps).",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "webex"
+    }
+  },
+  {
+    "id": "channels.when-the-agent-may-speak-whatsapp",
+    "label": "When the agent may speak (WhatsApp)",
+    "labelKey": "pages.settings.whatsAppPanel.when_the_agent_may_speak",
+    "labelSuffix": "WhatsApp",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "whatsapp"
+    }
+  },
+  {
+    "id": "channels.who-can-message-the-agent-whatsapp",
+    "label": "Who can message the agent (WhatsApp)",
+    "labelKey": "pages.settings.whatsAppPanel.who_can_message_the_bot",
+    "labelSuffix": "WhatsApp",
+    "tab": "channels",
+    "type": "select",
+    "occurrence": 1,
+    "params": {
+      "channel": "whatsapp"
+    }
+  },
+  {
+    "id": "channels.who-can-message-the-bot-wechat",
+    "label": "Who can message the bot (WeChat)",
+    "labelKey": "pages.settings.weixinPanel.who_can_message_the_bot",
+    "labelSuffix": "WeChat",
+    "tab": "channels",
+    "type": "select",
+    "occurrence": 1,
+    "params": {
+      "channel": "weixin"
+    }
   },
   {
     "id": "chat.auto-compact-threshold",
@@ -466,6 +827,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.chatPanel.background_model",
     "tab": "chat",
     "type": "select",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.compact-empty-folders",
+    "label": "Compact Empty Folders",
+    "labelKey": "pages.settings.chatPanel.compact_empty_folders",
+    "description": "A folder with no chats takes one row instead of two, and its New chat button moves onto the folder's own row",
+    "tab": "chat",
+    "type": "toggle",
     "occurrence": 1
   },
   {
@@ -504,6 +874,16 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.default-memory-mode",
+    "label": "Default Memory Mode",
+    "labelKey": "settings.chat.defaultMemoryMode.label",
+    "description": "Persistent uses what it knows and saves new memory. Incognito uses what it knows but saves no new memory. Temporary starts blank and saves no new memory. Every chat still appears in History. You can change the mode for any chat.",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1,
+    "configKey": "dashboard.default_memory_mode"
+  },
+  {
     "id": "chat.default-model",
     "label": "Default Model",
     "labelKey": "pages.settings.chatPanel.default_model",
@@ -538,6 +918,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "chat",
     "type": "input",
     "occurrence": 1
+  },
+  {
+    "id": "chat.fallback-model",
+    "label": "Fallback model",
+    "labelKey": "pages.settings.chatPanel.fallback_model",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1,
+    "configKey": "agent.fallback_model"
   },
   {
     "id": "chat.feature-tips",
@@ -620,6 +1009,24 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.plain-diffs",
+    "label": "Plain diffs",
+    "labelKey": "settings.chat.plainDiff.label",
+    "description": "Render diffs as plain unified-diff text instead of syntax-highlighted colour. Uses less memory on large diffs.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.pr-and-issue-chips-on-session-cards",
+    "label": "PR and Issue Chips on Session Cards",
+    "labelKey": "pages.settings.chatPanel.session_card_source_links",
+    "description": "Show a chip on each session's sidebar card for every pull request, merge request and issue mentioned in that session. Turning it off also stops the periodic provider calls that keep those chips up to date.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "chat.prevent-sleep-while-running",
     "label": "Prevent sleep while running",
     "labelKey": "pages.settings.chatPanel.prevent_sleep_while_running",
@@ -641,7 +1048,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.response-verbosity",
     "label": "Response Verbosity",
     "labelKey": "pages.settings.chatPanel.response_verbosity",
-    "description": "How terse the agent's prose is. Ultra-concise keeps the whole reply short: answer first, bullets over paragraphs, no filler. Code, commands, and error strings stay verbatim at every level, and security warnings and multi-step instructions keep full detail.",
+    "description": "How terse the agent's prose is. Ultra-concise keeps the whole reply short: answer first, bullets over paragraphs, no filler. Code, commands, and error strings stay verbatim at every level; security warnings always appear but stay brief, and multi-step instructions stay complete. Answer-only goes further and drops explanation entirely: one sentence at most, and detail only when you ask for it — or when a decision is consequential enough (security, exposure, data loss, spend, anything hard to undo) that you need the reasoning to choose correctly.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1
@@ -663,6 +1070,17 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "chat",
     "type": "select",
     "occurrence": 1
+  },
+  {
+    "id": "chat.selectable-models",
+    "label": "Selectable Models",
+    "labelKey": "pages.settings.chatPanel.selectable_models",
+    "description": "Choose which advertised models appear in Chat model pickers. Auto and an active session model always remain visible.",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1,
+    "configKey": "dashboard.model_picker_hidden_models",
+    "settingId": "chat.selectable-models"
   },
   {
     "id": "chat.send-shortcut",
@@ -735,6 +1153,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.split-side-by-side-diffs",
+    "label": "Split (side-by-side) diffs",
+    "labelKey": "settings.chat.diffLayout.label",
+    "description": "Show old and new code in two columns; off shows one unified column. Changing it here or on any diff sets it everywhere.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "chat.split-view-session-grid",
     "label": "Split View (Session Grid)",
     "labelKey": "pages.settings.chatPanel.split_view_session_grid",
@@ -777,10 +1204,27 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.text-link-patterns",
+    "label": "Text Link Patterns",
+    "labelKey": "pages.settings.chatPanel.link_patterns",
+    "tab": "chat",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "dashboard.link_patterns"
+  },
+  {
     "id": "chat.text-streaming-style",
     "label": "Text Streaming Style",
     "labelKey": "pages.settings.chatPanel.text_streaming_style",
     "description": "Immediate mode shows raw chunks as they arrive. Smooth mode buffers and fades text in at a steady pace.",
+    "tab": "chat",
+    "type": "buttonGroup",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.what-enter-does-while-the-agent-is-working",
+    "label": "What Enter does while the agent is working",
+    "labelKey": "pages.settings.chatPanel.what_enter_does_while_the_agent_is_working",
     "tab": "chat",
     "type": "buttonGroup",
     "occurrence": 1
@@ -849,10 +1293,83 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "connections.client-id",
+    "label": "Client ID",
+    "labelKey": "pages.settings.connectionsPanel.client_id",
+    "tab": "connections",
+    "type": "input",
+    "occurrence": 1
+  },
+  {
+    "id": "connections.client-secret",
+    "label": "Client secret",
+    "labelKey": "pages.settings.connectionsPanel.client_secret",
+    "tab": "connections",
+    "type": "input",
+    "occurrence": 1
+  },
+  {
+    "id": "connections.client-secret-2",
+    "label": "Client secret",
+    "labelKey": "pages.settings.connectionsPanel.client_secret",
+    "tab": "connections",
+    "type": "input",
+    "occurrence": 2
+  },
+  {
+    "id": "connections.oauth-client-github",
+    "labelKey": "pages.settings.connectionsPanel.oauth_app",
+    "labelSuffix": "GitHub",
+    "tab": "connections",
+    "type": "input",
+    "occurrence": 1,
+    "settingId": "connections-oauth-client-github",
+    "label": "OAuth app",
+    "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
+  },
+  {
+    "id": "connections.oauth-client-asana",
+    "labelKey": "pages.settings.connectionsPanel.oauth_app",
+    "labelSuffix": "Asana",
+    "tab": "connections",
+    "type": "input",
+    "occurrence": 1,
+    "settingId": "connections-oauth-client-asana",
+    "label": "OAuth app",
+    "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
+  },
+  {
+    "id": "developer.chat-on-a-crew",
+    "label": "Chat on a crew",
+    "labelKey": "pages.developer.featurePreviewsTab.chat_on_a_crew",
+    "description": "Adds “New chat on crew” to the create menu, which starts a session on a remote instance — another machine you have connected under Settings > Remote Instances. Unfinished: the session opens in that instance’s own pane and is not listed in this dashboard’s sessions yet, so to return to it later, switch to that instance’s pane.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "developer.crew-members",
+    "label": "Crew Members",
+    "labelKey": "pages.developer.featurePreviewsTab.crew_members",
+    "description": "The Crew Members page: every agent you have, each with its own thread. Still being built, so it is not offered until you turn this on.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "developer.developer-mode",
     "label": "Developer Mode",
     "labelKey": "pages.settings.developerPanel.developer_mode",
     "description": "Show Developer page in sidebar with Logs, System metrics, and Memory internals",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "developer.remote-instance-sessions",
+    "label": "Remote instance sessions",
+    "labelKey": "pages.developer.featurePreviewsTab.remote_instance_sessions",
+    "description": "Merge a connected remote instance's live sessions into the Sessions list, each marked with a server badge. Functional, but not finished.",
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1
@@ -865,6 +1382,34 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1
+  },
+  {
+    "id": "developer.webhooks",
+    "label": "Webhooks",
+    "labelKey": "pages.developer.featurePreviewsTab.webhooks",
+    "description": "Inbound webhook tokens, registered contexts, and run history. The API works; the page is not finished.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "display.command-completion",
+    "label": "Command completion",
+    "labelKey": "pages.settings.displayPanel.terminal_completion",
+    "description": "Show the completion popup while typing in the Terminal. Enter runs the line you typed; to take a suggestion, press ↑/↓ then Enter, or Tab. Off hides the popup; your shell's own Tab completion still works.",
+    "tab": "display",
+    "type": "toggle",
+    "occurrence": 1,
+    "configKey": "dashboard.terminal.completion.enabled"
+  },
+  {
+    "id": "display.default-for-new-sessions",
+    "labelKey": "pages.settings.displayPanel.default_for_new_sessions",
+    "tab": "display",
+    "type": "buttonGroup",
+    "occurrence": 1,
+    "label": "Default for New Sessions",
+    "description": "None, auto-cycle, or pick a fixed color."
   },
   {
     "id": "display.default-shell",
@@ -984,12 +1529,146 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "instances.auto-connect-crews",
+    "label": "Auto-connect crews",
+    "labelKey": "pages.settings.remoteCrewPanel.auto_connect",
+    "description": "When on, opening the web app connects every crew automatically, and reconnects them when you come back to the tab. Turn off to connect a crew only when you switch to it.",
+    "tab": "instances",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "instances.enable-remote-crew-management",
+    "labelKey": "pages.settings.instancesPanel.enable_remote_crew_management",
+    "tab": "instances",
+    "type": "toggle",
+    "occurrence": 1,
+    "configKey": "instances.enabled",
+    "label": "Enable remote instance management"
+  },
+  {
+    "id": "notifications.sound-category-approval",
+    "labelKey": "pages.settings.notificationsPanel.category_approval",
+    "tab": "notifications",
+    "type": "select",
+    "occurrence": 1,
+    "label": "Approvals and questions",
+    "description": "When the agent needs a tool approval or an answer"
+  },
+  {
+    "id": "notifications.sound-category-turn",
+    "labelKey": "pages.settings.notificationsPanel.category_turn",
+    "tab": "notifications",
+    "type": "select",
+    "occurrence": 1,
+    "label": "Conversation handoffs",
+    "description": "When a conversation finishes or pauses for your input"
+  },
+  {
+    "id": "notifications.sound-category-cron",
+    "labelKey": "pages.settings.notificationsPanel.category_cron",
+    "tab": "notifications",
+    "type": "select",
+    "occurrence": 1,
+    "label": "Cron",
+    "description": "Scheduled job completions"
+  },
+  {
+    "id": "notifications.sound-category-all",
+    "labelKey": "pages.settings.notificationsPanel.category_all",
+    "tab": "notifications",
+    "type": "select",
+    "occurrence": 1,
+    "label": "Default (all categories)",
+    "description": "Fallback sound when no category-specific override is set"
+  },
+  {
+    "id": "notifications.sound-category-heartbeat",
+    "labelKey": "pages.settings.notificationsPanel.category_heartbeat",
+    "tab": "notifications",
+    "type": "select",
+    "occurrence": 1,
+    "label": "Heartbeat",
+    "description": "Heartbeat task results"
+  },
+  {
+    "id": "notifications.notify-when-a-background-chat-finishes",
+    "label": "Notify when a background chat finishes",
+    "labelKey": "pages.settings.notificationsPanel.notify_when_a_background_chat_finishes",
+    "description": "Shows a system notification naming the chat that finished, but only while this window is minimized or behind another app.",
+    "tab": "notifications",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "notifications.play-sound-on-new-notifications",
     "label": "Play sound on new notifications",
     "labelKey": "pages.settings.notificationsPanel.play_sound_on_new_notifications",
     "tab": "notifications",
     "type": "toggle",
     "occurrence": 1
+  },
+  {
+    "id": "notifications.sound-category-agent",
+    "labelKey": "pages.settings.notificationsPanel.category_agent",
+    "tab": "notifications",
+    "type": "select",
+    "occurrence": 1,
+    "label": "Proactive agent messages",
+    "description": "When the agent proactively messages you outside a chat"
+  },
+  {
+    "id": "notifications.sound-category-skills",
+    "labelKey": "pages.settings.notificationsPanel.category_skills",
+    "tab": "notifications",
+    "type": "select",
+    "occurrence": 1,
+    "label": "Skills",
+    "description": "New skill candidates awaiting your approval"
+  },
+  {
+    "id": "notifications.sources",
+    "labelKey": "pages.settings.notificationsPanel.sources",
+    "tab": "notifications",
+    "type": "toggle",
+    "occurrence": 1,
+    "label": "Sources",
+    "description": "Mute notification sources or override their priority. Muted notifications stay in history but never badge, sound, or banner."
+  },
+  {
+    "id": "notifications.sound-category-subagent",
+    "labelKey": "pages.settings.notificationsPanel.category_subagent",
+    "tab": "notifications",
+    "type": "select",
+    "occurrence": 1,
+    "label": "Subagent",
+    "description": "Background subagent completions"
+  },
+  {
+    "id": "notifications.sound-category-taskrunner",
+    "labelKey": "pages.settings.notificationsPanel.category_taskrunner",
+    "tab": "notifications",
+    "type": "select",
+    "occurrence": 1,
+    "label": "Tasks",
+    "description": "Task Runner completions"
+  },
+  {
+    "id": "notifications.volume",
+    "labelKey": "pages.settings.notificationsPanel.volume",
+    "tab": "notifications",
+    "type": "stepper",
+    "occurrence": 1,
+    "label": "Volume"
+  },
+  {
+    "id": "notifications.sound-category-hook",
+    "labelKey": "pages.settings.notificationsPanel.category_hook",
+    "tab": "notifications",
+    "type": "select",
+    "occurrence": 1,
+    "label": "Webhook",
+    "description": "External hook triggers"
   },
   {
     "id": "privacy.record-metrics",
@@ -1009,6 +1688,24 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "type": "toggle",
     "occurrence": 1,
     "configKey": "telemetry.beacon_enabled"
+  },
+  {
+    "id": "secrets.jira-api-token",
+    "labelKey": "settings.secrets.jira_api_token_label",
+    "tab": "secrets",
+    "type": "input",
+    "occurrence": 1,
+    "label": "Jira API token",
+    "description": "Authenticates Jira issue lookups for the configured instance."
+  },
+  {
+    "id": "secrets.wakatime-api-key",
+    "labelKey": "settings.secrets.wakatime_api_key_label",
+    "tab": "secrets",
+    "type": "input",
+    "occurrence": 1,
+    "label": "WakaTime API key",
+    "description": "Authenticates coding-activity sync when WakaTime is enabled."
   },
   {
     "id": "security.denied-commands",
@@ -1077,6 +1774,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
       "section": "tailnet"
     },
     "label": "Trust this machine's tailnet name"
+  },
+  {
+    "id": "security.your-custom-denies",
+    "labelKey": "pages.settings.securityPanel.your_custom_denies",
+    "tab": "security",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "section": "rules"
+    },
+    "label": "Your custom denies",
+    "description": "Add your own deny patterns (Python-compatible regex). These are enforced at {{productName}}'s PreToolUse gate alongside the built-in rules."
   },
   {
     "id": "session-environments.autostop-after-inactive-minutes",
@@ -1249,7 +1958,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Use a fast model to detect when you've finished a complete request and send it automatically. Streaming providers only.",
     "tab": "voice",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "configKey": "stt.endpointing"
   },
   {
     "id": "voice.aws-profile-amazon-polly",
@@ -1328,7 +2038,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.sttSettings.language",
     "tab": "voice",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "configKey": "stt.language_code"
+  },
+  {
+    "id": "voice.live-transcript-refresh-ms",
+    "label": "Live transcript refresh (ms)",
+    "labelKey": "pages.settings.sttSettings.partial_interval_ms",
+    "description": "How often the transcript is redrawn while you speak. Lower feels more immediate and costs more processing.",
+    "tab": "voice",
+    "type": "stepper",
+    "occurrence": 1,
+    "configKey": "stt.partial_interval_ms"
   },
   {
     "id": "voice.microphone",
@@ -1340,27 +2061,30 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
-    "id": "voice.mlx-model",
-    "label": "MLX Model",
-    "labelKey": "pages.settings.sttSettings.mlx_model",
-    "tab": "voice",
-    "type": "select",
-    "occurrence": 1
-  },
-  {
     "id": "voice.model",
     "label": "Model",
     "labelKey": "pages.settings.sttSettings.model",
-    "description": "Larger models are more accurate but slower to run. A model downloads on first use, so the first dictation after switching models may appear to hang or time out while the download completes.",
+    "description": "Models download on demand. Select one and click Download now; the desktop app already includes every other runtime dependency.",
     "tab": "voice",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "configKey": "stt.model"
+  },
+  {
+    "id": "voice.pause-that-ends-a-phrase-ms",
+    "label": "Pause that ends a phrase (ms)",
+    "labelKey": "pages.settings.sttSettings.silence_ms",
+    "description": "How much silence commits what you just said. Lower reacts sooner; higher tolerates thinking pauses.",
+    "tab": "voice",
+    "type": "stepper",
+    "occurrence": 1,
+    "configKey": "stt.silence_ms"
   },
   {
     "id": "voice.piper-binary",
     "label": "Piper Binary",
     "labelKey": "pages.settings.voicePanel.piper_binary",
-    "description": "Path to the piper executable. Leave blank to auto-detect on PATH or ~/piper-venv/bin/piper",
+    "description": "Path to the piper executable. Leave blank to auto-detect on PATH or in a ~/piper-venv install",
     "tab": "voice",
     "type": "input",
     "occurrence": 1
@@ -1369,7 +2093,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.piper-model",
     "label": "Piper Model",
     "labelKey": "pages.settings.voicePanel.piper_model",
-    "description": "Path to the Piper voice model (.onnx). Required — download from github.com/rhasspy/piper",
+    "description": "Path to the Piper voice model (.onnx). Required — download from huggingface.co/rhasspy/piper-voices",
     "tab": "voice",
     "type": "input",
     "occurrence": 1
@@ -1378,25 +2102,35 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.provider",
     "label": "Provider",
     "labelKey": "pages.settings.sttSettings.provider",
-    "description": "Whisper, MLX and Apple Speech run locally; Transcribe calls AWS",
+    "description": "Local speech recognition runs on this machine and sends nothing anywhere. Transcribe uploads your audio to AWS.",
     "tab": "voice",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "configKey": "stt.provider"
   },
   {
     "id": "voice.provider-2",
     "label": "Provider",
     "labelKey": "pages.settings.voicePanel.provider",
-    "description": "Piper runs locally and offline; Amazon Polly uses AWS credentials + network",
+    "description": "The built-in engine needs no setup; Piper is offline with better quality; Amazon Polly uses AWS credentials + network",
     "tab": "voice",
     "type": "select",
-    "occurrence": 2
+    "occurrence": 2,
+    "settingId": "voice.provider-2"
+  },
+  {
+    "id": "voice.shortcut-key",
+    "label": "Shortcut key",
+    "labelKey": "pages.settings.sttSettings.ptt_key",
+    "tab": "voice",
+    "type": "select",
+    "occurrence": 1
   },
   {
     "id": "voice.speed",
     "label": "Speed",
     "labelKey": "pages.settings.voicePanel.speed",
-    "description": "Speech rate",
+    "description": "Speech rate for spoken replies (built-in engine)",
     "tab": "voice",
     "type": "select",
     "occurrence": 1
@@ -1405,19 +2139,29 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.speed-2",
     "label": "Speed",
     "labelKey": "pages.settings.voicePanel.speed",
-    "description": "Piper speech speed (length scale)",
+    "description": "Speech rate for spoken replies (Amazon Polly)",
     "tab": "voice",
     "type": "select",
     "occurrence": 2
   },
   {
+    "id": "voice.speed-3",
+    "label": "Speed",
+    "labelKey": "pages.settings.voicePanel.speed",
+    "description": "Piper speech speed (length scale)",
+    "tab": "voice",
+    "type": "select",
+    "occurrence": 3
+  },
+  {
     "id": "voice.streaming",
     "label": "Streaming",
     "labelKey": "pages.settings.sttSettings.streaming",
-    "description": "Stream live partial transcripts into the input box as you speak. Supported by Transcribe (AWS) and Apple Speech (on-device).",
+    "description": "Show the transcript in the input box as you speak, instead of only when you stop.",
     "tab": "voice",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "configKey": "stt.streaming"
   },
   {
     "id": "voice.tap-vs-hold-cutoff",
@@ -1432,9 +2176,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.voice",
     "label": "Voice",
     "labelKey": "pages.settings.voicePanel.voice",
-    "description": "Amazon Polly voice for TTS",
+    "description": "Voice from the host's built-in speech engine",
     "tab": "voice",
     "type": "select",
     "occurrence": 1
+  },
+  {
+    "id": "voice.voice-2",
+    "label": "Voice",
+    "labelKey": "pages.settings.voicePanel.voice",
+    "description": "Amazon Polly voice for TTS",
+    "tab": "voice",
+    "type": "select",
+    "occurrence": 2
   }
 ]

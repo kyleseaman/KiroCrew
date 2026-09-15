@@ -253,7 +253,7 @@ def _dir_fingerprint(directory: Path) -> Tuple:
 
     Per file: ``st_mtime_ns + st_size + st_ctime_ns`` plus the name set, so a
     create / edit / truncate / delete all change the fingerprint. ``st_ctime_ns``
-    is included specifically so a ``chmod`` that makes a previously-UNREADABLE
+    is included specifically so a ``chmod`` that makes an unreadable
     profile readable busts the cache: chmod/chown/rename-in-place bump ctime but
     NOT mtime/size, so without ctime the unreadable fallback would stay cached
     forever after a permission fix and the profile's restrictions would remain
@@ -322,27 +322,140 @@ def _fallback_profile(name: str) -> Profile:
     return deny_all_profile(name)
 
 
-def _fallback_token() -> bool:
-    """Whether a declared fallback profile is currently available on the ceiling.
+# Monotonic counter of profile-layer RECOMPOSES, bumped by ``ProfileStore._ensure_fresh``
+# whenever the directory fingerprint missed and a reload actually published a new
+# snapshot.  Deliberately a MODULE global rather than instance state, for two reasons:
+#
+#   * ``reset_store()`` replaces the store, and an instance counter would restart at 0.
+#     A consumer comparing a combined token could then see it move BACKWARD, or — worse
+#     — not move at all when a ceiling bump and a profile reset cancel out.
+#   * it mirrors ``context._GOVERNANCE_GENERATION``, which is the sibling this pairs
+#     with and is a process-global for the same reason.
+#
+# NOT folded into ``_ceiling_token()``.  That is load-bearing, not an oversight: the
+# ceiling token is an INPUT to the store's own freshness key, so feeding this counter
+# back into it would make every reload invalidate the fingerprint it just committed
+# (``_ensure_fresh`` computes ``fp`` BEFORE ``_reload``, so the committed value is
+# pre-bump) and the store would reload on every single access forever — on the event
+# loop, since the synchronous PreToolUse gate reaches this path.  This counter is an
+# OUTPUT of the store and must never become an input to it.
+_PROFILE_GENERATION = 0
+_PROFILE_GENERATION_LOCK = threading.Lock()
 
-    Folded into the profile-store freshness key (:meth:`ProfileStore._ensure_fresh`)
-    so a snapshot baked BEFORE governance composed — when :func:`_fallback_profile`
-    could only return deny-all — is reloaded ONCE the declared fallback becomes
-    available. Without this, a store first-touched on the pre-governance boot path
-    would bake deny-all for an unusable profile and keep serving it until a file
-    mtime changed, silently ignoring the operator's declared fallback (a boot-order
-    race that reproduces the very background-plane outage the fallback prevents).
-    The ceiling is boot-frozen, so this transitions False→True at most once and
-    never thrashes; when no fallback is declared it stays False and deny-all (the
-    correct answer) needs no reload.
+
+def _profile_generation() -> int:
+    """Monotonic counter of how many profile snapshots have been published.
+
+    Opaque and comparison-only, exactly like ``context.governance_generation()``:
+    callers may test it for equality with a value they stored, never interpret its
+    magnitude.  Module-private on purpose: the public contract is the combined
+    :func:`governance_answer_generation`, and a bare generation accessor with no
+    consumer outside this module would be surface to honor forever.
+    """
+    with _PROFILE_GENERATION_LOCK:
+        return _PROFILE_GENERATION
+
+
+def _bump_profile_generation() -> None:
+    """The single writer of ``_PROFILE_GENERATION``."""
+    global _PROFILE_GENERATION
+    with _PROFILE_GENERATION_LOCK:
+        _PROFILE_GENERATION += 1
+
+
+def poll_profiles_fresh() -> None:
+    """Re-stat the profiles directory and reload if it changed.  MAY BLOCK.
+
+    This is the filesystem half of the notification edge, kept SEPARATE from
+    :func:`governance_answer_generation` so the read is never accidentally coupled to
+    a directory walk.  ``_dir_fingerprint`` runs ``iterdir`` plus a ``stat`` per file,
+    which is exactly the "large synchronous file IO or filesystem walks" that
+    AUTOSDE's ``no-blocking-call-on-event-loop`` prohibits, so an async caller MUST
+    offload it::
+
+        await asyncio.to_thread(poll_profiles_fresh)
+
+    Measured on one host: 57us at 5 profile files, 107us at 15, 303us at 50, 1.12ms
+    at 200.  Small at a realistic count and unbounded in principle, which is why it
+    is offloaded rather than defended by the measurement.
+
+    Best-effort: a failure here leaves the last published snapshot and its generation
+    in place, so a consumer sees a stale-but-coherent token rather than an exception
+    on a status tick.
     """
     try:
-        from kiro_crew.platform.context import current_context
+        _STORE._ensure_fresh()
+    except Exception:  # pragma: no cover - defensive; freshness is best-effort here
+        logger.debug("profile freshness poll failed; serving last token", exc_info=True)
+
+
+def governance_answer_generation() -> int:
+    """One opaque token covering BOTH layers that can change a governance answer.
+
+    ``GET /api/dashboard/config`` derives fields (``social_share_enabled``) from the
+    ceiling ∩ profile intersection, so a consumer watching for "the answer may have
+    changed" has to watch both layers.  Watching the ceiling counter alone is a bug:
+    a profile-layer tightening is enforced on the next decision but never
+    reaches the dashboard's cache invalidation, so the UI keeps offering an entry
+    policy has withdrawn.
+
+    Both components are monotonic non-decreasing for the life of the process, so
+    their sum is too, and the sum therefore changes if and only if at least one
+    component changed.  That is all a consumer needs: the wire field is documented
+    opaque and comparison-only, so combining is not a change of meaning.
+
+    PURE READ - two locked integer reads, NO filesystem access, safe to call on the
+    event loop.  Detecting a profile edit needs :func:`poll_profiles_fresh`, which is
+    the caller's job precisely because only the caller knows whether it can block;
+    the periodic watcher offloads that to a thread, while the synchronous slots
+    broadcast does not poll at all and simply reads what has been published.
+
+    Re-entrancy: a bump can cause the watcher to call ``push_slots_update()``, whose
+    broadcast reads this token again.  That read touches no filesystem and cannot
+    bump anything, so the cycle terminates immediately.  No listener writes profiles
+    on notify either: the only consumer is a client-side ``dashboardConfig``
+    invalidation, which issues a GET.
+    """
+    from kiro_crew.platform.context import governance_generation
+
+    return governance_generation() + _profile_generation()
+
+
+def _ceiling_token() -> Tuple[bool, int]:
+    """The active ceiling's identity, as far as the profile store needs to know it.
+
+    Folded into the profile-store freshness key (:meth:`ProfileStore._ensure_fresh`)
+    so a snapshot composed against one ceiling is never served under another. Two
+    components, and **neither subsumes the other**:
+
+    * **Is a declared fallback available?** A snapshot baked BEFORE governance
+      composed — when :func:`_fallback_profile` could only return deny-all — must be
+      reloaded once the declared fallback becomes available. Otherwise a store
+      first-touched on the pre-governance boot path bakes deny-all for an unusable
+      profile and keeps serving it until a file mtime changes, silently ignoring the
+      operator's declared fallback: the boot-order race that reproduces the very
+      background-plane outage the fallback prevents. This half reads the ceiling
+      DIRECTLY, so it holds for any caller that changes the answer, including one
+      that swaps the ceiling without installing a context.
+    * **Which ceiling is installed?** ``context.governance_generation()`` changes on
+      every context install, including the mid-session one central policy
+      distribution performs (``policy_distribution.apply_ceiling``). The boolean
+      cannot carry this: replacing one declared fallback with a DIFFERENT one leaves
+      it True on both sides, so the store would keep serving profiles composed
+      against the retired ceiling.
+
+    A wrong answer here costs a stale reload, so both components fail toward
+    ``(False, 0)``, which differs from any real installed ceiling's token and
+    therefore errs toward reloading rather than toward serving a stale snapshot.
+    """
+    try:
+        from kiro_crew.platform.context import current_context, governance_generation
 
         ceiling = getattr(current_context(), "governance", None)
-        return ceiling is not None and getattr(ceiling, "fallback_profile", None) is not None
+        declared = ceiling is not None and getattr(ceiling, "fallback_profile", None) is not None
+        return (declared, governance_generation())
     except Exception:
-        return False
+        return (False, 0)
 
 
 class ProfileStore:
@@ -414,7 +527,7 @@ class ProfileStore:
         directory = _profiles_dir()
         fp: Optional[Tuple] = None
         if self._snap.loaded:
-            fp = (_dir_fingerprint(directory), _fallback_token())
+            fp = (_dir_fingerprint(directory), _ceiling_token())
             if fp == self._fingerprint:
                 return True
         # NEVER block: this is reachable on the event loop (the synchronous PreToolUse
@@ -444,10 +557,18 @@ class ProfileStore:
             # used for the freshness test is the one committed below, so the committed
             # fingerprint always describes the snapshot actually published.
             if fp is None:
-                fp = (_dir_fingerprint(directory), _fallback_token())
+                fp = (_dir_fingerprint(directory), _ceiling_token())
             if self._snap.loaded and fp == self._fingerprint:
                 return True  # already fresh (another thread reloaded, or unchanged)
             self._reload(directory)
+            # A new snapshot is published as of the line above, so the generation
+            # describes PUBLISHED snapshots rather than attempted reloads. This is
+            # the notification edge the ceiling counter lacks: enforcement
+            # observes the new profiles (the authorization path calls this method),
+            # but without it nothing tells a cache-invalidation consumer that the
+            # governance answer may have moved. Bumped INSIDE the reload lock, so
+            # two threads cannot publish two snapshots and record one bump.
+            _bump_profile_generation()
             # Commit the fingerprint. An unreadable/malformed file is a
             # bind-preserving deny-all (fail-closed), so the cached state is the SAFE
             # (denying) state; a metadata change (fix/delete/chmod — all bump the
@@ -921,19 +1042,48 @@ def all_profile_pinned_commands() -> "tuple[str, ...]":
     return tuple(dict.fromkeys(pins))
 
 
-def assert_profiles_within_ceiling(ceiling: "object") -> None:
-    """Boot-time floor gate: every loaded profile must be ≥ as strict as the ceiling.
+def assert_profile_floor(ceiling: "object") -> None:
+    """Every loaded profile must be ≥ as strict as *ceiling* on every ordinal.
 
     Implements Validation rules 3 & 7 and the Combined-order "app/profile ≥
     ceiling for every control? no → ABORT fail-closed" step: a profile whose
     ordinal (approval_mode / sandbox.min_level) is LOOSER than the policy mark
-    raises ``PlatformCompositionError`` and aborts boot, rather than being
-    silently re-tightened only at runtime.  No-op when no ceiling is present
-    (standalone, ungoverned).  Called once at boot from ``bootstrap_context``.
+    raises ``PlatformCompositionError``, rather than being silently re-tightened
+    only at runtime.  No-op when no ceiling is present (standalone, ungoverned).
+
+    This is the half that answers "would this host run correctly UNDER this
+    ceiling", so it is the half a CANDIDATE ceiling can be judged by —
+    ``policy_distribution.apply_ceiling`` calls it before installing a
+    centrally-fetched document mid-session.  It deliberately does NOT carry the
+    unrecoverable-profile refusal that :func:`assert_profiles_within_ceiling` adds,
+    because that one is about the store's own state rather than about the ceiling,
+    and it is boot-only by design: a profile file that becomes unreadable AFTER boot
+    is made loud and observable rather than turned into a global deny, since one
+    stray file must not take down every working surface.  Refusing an
+    administrator's pushed ceiling would be that same global effect wearing a
+    different hat — one unreadable local file blocking every future fleet policy
+    change on the host, including a tightening.
     """
     if ceiling is None:
         return
     from kiro_crew.platform.governance import GovernanceCeiling, assert_governance_floor
+
+    if not isinstance(ceiling, GovernanceCeiling):
+        return
+    for profile in _STORE.all_profiles():
+        assert_governance_floor(ceiling, profile)  # raises PlatformCompositionError on weakening
+
+
+def assert_profiles_within_ceiling(ceiling: "object") -> None:
+    """The BOOT gate: :func:`assert_profile_floor` plus the unrecoverable-file refusal.
+
+    Called once at boot from ``bootstrap_context``.  A mid-session caller wants
+    ``assert_profile_floor`` instead — see its docstring for why the extra refusal is
+    boot-only.
+    """
+    if ceiling is None:
+        return
+    from kiro_crew.platform.governance import GovernanceCeiling
 
     if not isinstance(ceiling, GovernanceCeiling):
         return
@@ -957,8 +1107,7 @@ def assert_profiles_within_ceiling(ceiling: "object") -> None:
             "Refusing to boot with a silently-dropped restrictive profile "
             "(fail-closed). Fix or remove the file(s)."
         )
-    for profile in _STORE.all_profiles():
-        assert_governance_floor(ceiling, profile)  # raises PlatformCompositionError on weakening
+    assert_profile_floor(ceiling)
 
 
 def governance_permits(

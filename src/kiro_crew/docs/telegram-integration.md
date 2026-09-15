@@ -43,7 +43,7 @@ Send your bot a message and it answers. If it stays quiet, check that your ID is
 in `allowed_user_ids` and look for `Telegram channel started` in the gateway
 log.
 
-## Who can reach it
+## Access control
 
 > **Kiro Crew runs on your machine, with your files and credentials.** So it only
 > talks to people you name — and only in private chats.
@@ -58,18 +58,19 @@ log.
 
 ## Commands
 
-The bot publishes this list through `setMyCommands` at startup, so typing `/`
-in Telegram offers them as autocomplete — `COMMAND_SPEC` in
-`telegram/commands.py` is the single source behind both that menu and `/help`.
+At startup the bot publishes the menu commands from `COMMAND_SPEC` through `setMyCommands`, so typing `/` in Telegram offers autocomplete. `COMMAND_SPEC` also drives `/help`; commands that need an argument appear in the help footer instead of the menu.
 
 - `/new` (or `/start`) — start a fresh conversation
 - `/compact` — free up room when the context fills
-- `/model` — pick the model from an inline-button list. Button-only on purpose:
+- `/model` (or `/models`) — pick the model from an inline-button list. Button-only on purpose:
   the choices are what this account's backend actually advertised, so there is
   no model name to guess and no typo to reject mid-conversation. The pick is
-  applied to the running session in place when one is idle, and is remembered
-  for the conversation's later sessions (it outlives `/new`, and is held in
-  memory, so a gateway restart returns to the configured default).
+  applied to the running session in place when one is idle. In a native Telegram
+  conversation it is also remembered for later sessions (it outlives `/new`, and
+  is held in memory, so a gateway restart returns to the configured default). In
+  a resumed dashboard session it changes only that session, and the button is
+  refused if `/new`, `/unlink`, or another binding change moved the chat before
+  the press.
 - `/yolo [on|off|renew]` — report or change the auto-approve grant. This is the
   SAME process-wide grant the dashboard toggle and Slack's `/kirocrew yolo`
   drive, so it expires on one clock everywhere. There is deliberately no
@@ -86,7 +87,7 @@ in Telegram offers them as autocomplete — `COMMAND_SPEC` in
   (overrides `queue_mode` for this message)
 - `/queue <msg>` — while a reply is generating, hold this message and answer
   it after the current turn (overrides `queue_mode` for this message)
-- `/agent` — pick the agent from an inline-button list of the specs installed on
+- `/agent` (or `/agents`) — pick the agent from an inline-button list of the specs installed on
   this machine. Button-only for the same reason `/model` is. Unlike a model, an
   agent cannot be swapped inside a running session — the spec decides which MCP
   servers and skills that process loaded at spawn — so a pick opens a fresh
@@ -94,23 +95,38 @@ in Telegram offers them as autocomplete — `COMMAND_SPEC` in
 - `/status` — uptime, message counts, tool decisions, sessions
 - `/ping` — answers `pong`. Answered by the gateway itself, never by the model,
   so it still works when the thing that is wedged is the model.
-- `/sessions` — the ten most recent conversations, newest first, with a mark for
-  whichever is live. Read-only: opening one is `/kirocrew dashboard`. **Direct
-  message only**, like `/kirocrew dashboard`: the listing names every conversation
-  on the host, and a forum Topic is readable by the whole supergroup, so answering
-  there would show your conversation titles to members who are not on
-  `allowed_user_ids` at all. In a Topic it refuses and points you to a DM.
+- `/session [search words]` (or `/sessions [search words]`) — with no words,
+  show the ten most recent eligible conversations; with words, use the same ranked
+  title-and-message-content search as dashboard history. Results are inline buttons:
+  tap one and ordinary messages in this DM immediately continue it. Eligible rows are
+  dashboard conversations plus generations from this exact Telegram DM bucket; native
+  sessions belonging to another user, agent, forum Topic, or messaging channel are
+  excluded. The bot replaces its outbound-only native mirror automatically, so no
+  preparatory `/unlink` is required. `/new` leaves the resumed session, durably
+  records the fresh Telegram generation before replying, and starts that conversation;
+  its first real turn adds it to `/sessions`. `/unlink` returns to the existing Telegram
+  conversation. Incognito and temporary transcripts stay excluded. **Direct message only**: a forum Topic is readable by the
+  whole supergroup, so listing or resuming there would expose host-wide titles to
+  members outside `allowed_user_ids`. It also refuses when `allowed_user_ids` contains
+  several people, because the bot cannot tell which one owns the host-wide history.
 - `/title <text>` — rename this conversation, so its dashboard sidebar row reads
-  as something other than the first forty characters you happened to type.
-- `/cron list | pause <id> | resume <id> | remove <id>|all` — manage scheduled
+  as something other than the first forty characters you happened to type. On a
+  resumed dashboard session the live sidebar row and durable metadata change
+  together, so a later dashboard save cannot restore the old name.
+- `/cron` (or `/crons`) `list | pause <id> | resume <id> | remove <id>|all` — manage scheduled
   jobs. The same jobs the dashboard and Slack see.
 - `/spawn <task>` (or `/bg`) — run a task in a background subagent.
   `/spawn list` shows what is running.
-- `/task run <spec> | status | cancel` — drive the unattended task runner.
+- `/task` (or `/tasks`) `run <spec> | status | cancel` — drive the unattended task runner.
+- `/kirocrew dashboard [<N>h|<N>m]` — get a dashboard login link (DM only).
 - `/temporary` — this conversation reads and saves no memory: no memories or
   lessons are added to the prompt, and nothing is written to the transcript. A bare
   `/temporary` just marks the conversation; `/temporary <question>` marks it and
-  answers, the same as Slack's `!temporary`.
+  answers, the same as Slack's `!temporary`. While a dashboard session is resumed,
+  `/temporary` and `/incognito` are refused and any attached question is **not
+  processed**: the dashboard slot owns its memory mode, so changing only Telegram's
+  channel state would claim privacy while the persistent slot kept recording. Use
+  `/unlink` or `/new` first.
 - `/incognito` — this conversation MAY read memory but saves nothing. That is the
   whole difference from `/temporary`, and it is the reason for two commands:
   incognito keeps the context you have built up and leaves no trace, temporary does
@@ -151,6 +167,13 @@ cannot approve a later tool even if the agent restarts and reuses the same
 internal request number: pressing an old one reports that it expired.
 Neither weakens the security gate — a denied-by-policy tool is still refused.
 
+Answer-choice buttons are tied to the conversation that created them. If you
+start a new conversation, switch agents, or press an old button after that
+conversation moved, the choice is refused instead of being sent somewhere else.
+A choice such as `/new` is always treated as answer text for the agent, never as
+the command itself; if the target conversation is busy, type the choice after it
+finishes rather than queueing a button press whose origin could go stale.
+
 ## Pictures, and what else comes back
 
 When the agent produces an image — a chart, a screenshot, a rendered diagram —
@@ -174,7 +197,7 @@ including on the turn where the context warning finally matters.
 Scheduled jobs report back **here**. A cron you create from Telegram delivers its
 result to this conversation, not only to the dashboard bell.
 
-## Settings & reference
+## Settings reference
 
 Everything lives in the `telegram` section of `config.json`:
 
@@ -190,6 +213,7 @@ Everything lives in the `telegram` section of `config.json`:
 | `forum_activation` | `"always"` | When to answer inside an allow-listed Topic: `always`, `mention` (only when `@YourBot` is used or one of its own messages is replied to), or `off`. Slack's channel equivalent defaults to `mention`; this defaults to `always` so an existing forum keeps working after an upgrade. A value that is present but unrecognized falls back to `mention`, not `always`, so a typo cannot widen who the bot answers in a shared Topic. Never applies to a 1:1 DM, which is always served |
 | `session_folder` | `""` | Sidebar folder these conversations are filed into |
 | `bot_token` | `""` | Token fallback if `TELEGRAM_BOT_TOKEN` isn't set |
+| `accounts` | `{}` | Deprecated compatibility map for former named bots; it is parsed but starts no channel |
 
 Prefer the `TELEGRAM_BOT_TOKEN` env var over `bot_token` — it keeps your secret
 out of `config.json`.
@@ -202,12 +226,13 @@ gateway. In a group, check `allow_forum` AND that the supergroup's negative
 bot is in the Topic and still silent, check `forum_activation`: on `mention` it
 answers only when addressed, and on `off` it answers nothing.
 
-A restart no longer replays your last few messages: the `getUpdates` cursor is
-kept in `~/.kiro/crew/telegram_offset.json`. Delete that file only if you want a
-deliberate replay of whatever Telegram still holds.
+A restart no longer replays your last few messages: the `getUpdates` cursor is kept in `~/.kiro/crew/routing/telegram_offset.json`. Delete that file only if you want a deliberate replay of whatever Telegram still holds.
+
+Transport capabilities: streaming, edits, reactions, inbound and outbound files, rich blocks, forum-topic threads, native tables, and proactive sends are enabled. Text chunks are capped at 4,000 characters and interactive prompts at 25 buttons; excess choices become numbered text.
 
 ## Related docs
 
+- [Channel capabilities](channel-capabilities.md): the ten-channel matrix — streaming, buttons, uploads, reply length, approval timeout
 - [Slack Integration](slack-integration.md)
 - [WeCom Integration](wecom-integration.md)
 - [Getting Started](getting-started.md)

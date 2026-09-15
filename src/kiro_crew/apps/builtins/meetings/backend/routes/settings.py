@@ -28,6 +28,7 @@ from kiro_crew.apps.builtins.meetings.backend.providers import tasks as taskprov
 from kiro_crew.apps.builtins.meetings.backend.routes._common import (
     BadRequest,
     data_root,
+    field_bool,
     field_int,
     field_str,
     field_str_list,
@@ -118,6 +119,13 @@ async def handle_get_config(request: web.Request) -> web.Response:
             "task_providers": taskprov.available_task_providers(),
             "calendar_providers": cal.available_calendar_providers(),
             "stt_providers": [{"id": k.STT_PROVIDER_KIROCREW, "label": "Kiro Crew speech-to-text"}],
+            # Served from here rather than hardcoded in the frontend, for the same
+            # reason the provider registries are: the backend is what validates the
+            # saved value, so it must also be what publishes the accepted set.
+            # Labels are endonyms and deliberately not translated.
+            "translation_languages": [
+                {"id": code, "label": label} for code, label in k.TRANSLATION_LANGS
+            ],
         }
     )
 
@@ -170,6 +178,12 @@ async def handle_put_config(request: web.Request) -> web.Response:
     if default_preset and default_preset not in presets:
         default_preset = ""
 
+    translation_language = field_str(
+        incoming, "translation_language", default=k.DEFAULT_TRANSLATION_LANG, max_len=16
+    )
+    if translation_language not in k.TRANSLATION_LANG_CODES:
+        translation_language = k.DEFAULT_TRANSLATION_LANG
+
     config = {
         "meeting_agents": agents,
         "stt_provider": k.STT_PROVIDER_KIROCREW,  # the only provider; not client-settable
@@ -180,6 +194,23 @@ async def handle_put_config(request: web.Request) -> web.Response:
             # private-address refusal in providers/calendar.py), not here: the
             # check needs DNS and must not run on the loop during a settings save.
             "source": field_str(calendar_raw, "source", max_len=2000),
+            # The background poller's knobs (calendar_poller.py). Bounded here so
+            # a client cannot set a one-second cadence against a calendar host.
+            "auto_sync": field_bool(calendar_raw, "auto_sync", default=True),
+            "poll_interval_secs": field_int(
+                calendar_raw,
+                "poll_interval_secs",
+                default=k.CALENDAR_POLL_INTERVAL_SECS,
+                low=k.CALENDAR_POLL_MIN_SECS,
+                high=k.CALENDAR_POLL_MAX_SECS,
+            ),
+            "precreate_lead_minutes": field_int(
+                calendar_raw,
+                "precreate_lead_minutes",
+                default=k.CALENDAR_PRECREATE_LEAD_MINUTES,
+                low=0,
+                high=k.CALENDAR_PRECREATE_LEAD_MAX_MINUTES,
+            ),
         },
         "presets": presets,
         "default_preset": default_preset,
@@ -189,6 +220,10 @@ async def handle_put_config(request: web.Request) -> web.Response:
         "poll_interval_idle": field_int(
             incoming, "poll_interval_idle", default=30_000, low=5000, high=600_000
         ),
+        # Validated against the published set, with anything unrecognised meaning
+        # OFF rather than falling back to a language nobody chose — this decides
+        # whether the app makes a model call per spoken line.
+        "translation_language": translation_language,
     }
     # A single write, wrapped inline: the replacement config is built entirely from
     # the validated request body, so there is nothing read from disk to keep it

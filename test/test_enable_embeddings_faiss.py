@@ -1,6 +1,6 @@
 """Tests for faiss-cpu installation block in enable-embeddings handler.
 
-The enable flow no longer boots Ollama: when the GGUF is absent it kicks (or
+The enable flow does not boot Ollama: when the GGUF is absent it kicks (or
 adopts) a background ``ensure_model`` download task and returns 200
 "downloading" immediately; when the model file is present it pip-installs
 faiss-cpu (flow unchanged), wires ``make_sync_embed_fn()`` onto the vector
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -53,6 +54,21 @@ def _reset_status():
     mem_mod._embedding_setup_status = {"step": "idle", "error": ""}
     yield
     mem_mod._embedding_setup_status = {"step": "idle", "error": ""}
+
+
+@pytest.fixture(autouse=True)
+def _pin_active_embedder():
+    """Pin the ACTIVE vector width the handler persists.
+
+    The handler reads it off the shared embedder rather than writing a literal, and
+    resolving that singleton for real would construct a process-wide backend that
+    outlives the test. 1024 is the bundled model's width, so every persisted-config
+    assertion below reads the same as it would on an unpatched install.
+    """
+    embedder = MagicMock()
+    embedder.dim = 1024
+    with patch(f"{_MOD}.get_shared_embedder", return_value=embedder):
+        yield embedder
 
 
 def _common_patches(cfg_path, faiss_available=False, proc_rc=0, proc_stderr=b"",
@@ -286,6 +302,76 @@ class TestLoadFaissIndexCalled:
         assert data["memory"]["migrated"] is True
 
 
+class TestPersistedEmbeddingDim:
+    """``memory.embedding_dim`` must be the LIVE width, never a literal.
+
+    ``_load_model`` refuses a model whose own ``n_embd`` disagrees with the persisted
+    width, so writing 1024 while a 768- or 1536-wide model is active leaves that model
+    unloadable on every later restart until config.json is hand-edited.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_non_bundled_active_width_is_what_gets_persisted(
+        self, tmp_path: Path, _pin_active_embedder
+    ) -> None:
+        cfg_path = tmp_path / "kirocrew.json"
+        cfg_path.write_text("{}", encoding="utf-8")
+        _pin_active_embedder.dim = 768
+        patches, store, proc, mgr = _common_patches(cfg_path, faiss_available=True)
+
+        with patches["mgr"], patches["model_present"], patches["cfg_load"], \
+             patches["cfg_path"], patches["subprocess"], patches["embed_fn"], \
+             patches["faiss"], patches["store"], patches["wrap_argv"]:
+            async with TestClient(TestServer(_make_app())) as c:
+                assert (await c.post("/api/memory/enable-embeddings")).status == 200
+
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        assert data["memory"]["embedding_dim"] == 768
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_width_fails_loudly_and_persists_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        cfg_path = tmp_path / "kirocrew.json"
+        cfg_path.write_text("{}", encoding="utf-8")
+        patches, store, proc, mgr = _common_patches(cfg_path, faiss_available=True)
+
+        class _DimlessEmbedder:
+            @property
+            def dim(self) -> int:
+                raise RuntimeError("backend never settled on a width")
+
+        with patches["mgr"], patches["model_present"], patches["cfg_load"], \
+             patches["cfg_path"], patches["subprocess"], patches["embed_fn"], \
+             patches["faiss"], patches["store"], patches["wrap_argv"], \
+             patch(f"{_MOD}.get_shared_embedder", return_value=_DimlessEmbedder()):
+            async with TestClient(TestServer(_make_app())) as c:
+                resp = await c.post("/api/memory/enable-embeddings")
+                assert resp.status == 500
+                assert (await resp.json())["code"] == "embedding_dim_unreadable"
+
+        assert json.loads(cfg_path.read_text(encoding="utf-8")) == {}
+
+    @pytest.mark.asyncio
+    async def test_a_non_positive_width_fails_loudly_and_persists_nothing(
+        self, tmp_path: Path, _pin_active_embedder
+    ) -> None:
+        cfg_path = tmp_path / "kirocrew.json"
+        cfg_path.write_text("{}", encoding="utf-8")
+        _pin_active_embedder.dim = 0
+        patches, store, proc, mgr = _common_patches(cfg_path, faiss_available=True)
+
+        with patches["mgr"], patches["model_present"], patches["cfg_load"], \
+             patches["cfg_path"], patches["subprocess"], patches["embed_fn"], \
+             patches["faiss"], patches["store"], patches["wrap_argv"]:
+            async with TestClient(TestServer(_make_app())) as c:
+                resp = await c.post("/api/memory/enable-embeddings")
+                assert resp.status == 500
+                assert (await resp.json())["code"] == "embedding_dim_unreadable"
+
+        assert json.loads(cfg_path.read_text(encoding="utf-8")) == {}
+
+
 class TestLoadFaissIndexFailure:
     @pytest.mark.asyncio
     async def test_returns_500_when_load_faiss_raises(self, tmp_path: Path) -> None:
@@ -331,6 +417,11 @@ class TestFaissInstallTimeout:
                 assert "timed out" in body["error"]
 
         proc.kill.assert_called_once()
+        # The critical pin: the reap drains pipes via a SECOND communicate();
+        # a bare wait() on a killed pip blocked writing into a full stderr
+        # pipe would hang the handler forever.
+        assert proc.communicate.call_count == 2
+        proc.wait.assert_not_awaited()
         assert mem_mod._embedding_setup_status["step"] == "idle"
         assert "timed out" in str(mem_mod._embedding_setup_status["error"])
 
@@ -518,3 +609,112 @@ class TestSetMigratedFailClosed:
             await mem_mod._set_migrated(True)
         data = json.loads(cfg_path.read_text(encoding="utf-8"))
         assert data["memory"]["migrated"] is True
+
+
+class TestPipStderrRedaction:
+    """pip/ensurepip stderr must not reach the gateway log
+    unredacted. A private index configured with userinfo credentials leaks the
+    token into pip's stderr on an auth failure; both warning sites must route
+    the decoded stderr through ``redact_and_truncate`` (redact the FULL text
+    first, then bound) so the token never lands in the log."""
+
+    _SECRET = "LEAKY7279TOKEN"
+    _MASK = "[REDACTED: credential]"
+
+    def _auth_failure_stderr(self) -> bytes:
+        return (
+            "ERROR: HTTP error 401 while getting "
+            "https://ci-bot:" + self._SECRET + "@pypi.corp.example/simple/faiss-cpu/\n"
+            "ERROR: Could not install requirement faiss-cpu"
+        ).encode()
+
+    @pytest.mark.asyncio
+    async def test_faiss_install_failure_log_masks_userinfo_credential(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        cfg_path = tmp_path / "kirocrew.json"
+        cfg_path.write_text("{}", encoding="utf-8")
+        patches, store, proc, mgr = _common_patches(
+            cfg_path, faiss_available=False, proc_rc=1, proc_stderr=self._auth_failure_stderr()
+        )
+
+        with patches["mgr"], patches["model_present"], patches["cfg_load"], \
+             patches["cfg_path"], patches["subprocess"], patches["faiss"], \
+             patches["store"], patches["wrap_argv"], \
+             caplog.at_level(logging.WARNING, logger=_MOD):
+            async with TestClient(TestServer(_make_app())) as c:
+                resp = await c.post("/api/memory/enable-embeddings")
+                assert resp.status == 500
+
+        messages = [r.getMessage() for r in caplog.records if "faiss-cpu install failed" in r.getMessage()]
+        assert messages, "expected the faiss-cpu install-failed warning to be logged"
+        for msg in messages:
+            assert self._SECRET not in msg
+            assert self._MASK in msg
+
+    @pytest.mark.asyncio
+    async def test_ensurepip_failure_log_masks_userinfo_credential(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        proc = _mock_proc(rc=1, stderr=self._auth_failure_stderr())
+        with patch.dict("sys.modules", {"pip": None}), \
+             patch(f"{_MOD}.wrap_argv", side_effect=lambda argv, **kw: (argv, None)), \
+             patch("asyncio.create_subprocess_exec", return_value=proc), \
+             caplog.at_level(logging.WARNING, logger=_MOD):
+            ok, err = await mem_mod._ensure_pip_available()
+
+        assert ok is False
+        messages = [r.getMessage() for r in caplog.records if "ensurepip bootstrap failed" in r.getMessage()]
+        assert messages, "expected the ensurepip bootstrap-failed warning to be logged"
+        for msg in messages:
+            assert self._SECRET not in msg
+            assert self._MASK in msg
+
+    @pytest.mark.asyncio
+    async def test_non_utf8_stderr_does_not_raise(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A pip failure on a non-UTF-8 console (Windows codepage, mangled index
+        # response) must not raise UnicodeDecodeError on the failure path:
+        # decode(errors="replace") keeps the warning best-effort.
+        proc = _mock_proc(rc=1, stderr=b"\xff\xfe broken " + self._auth_failure_stderr())
+        with patch.dict("sys.modules", {"pip": None}), \
+             patch(f"{_MOD}.wrap_argv", side_effect=lambda argv, **kw: (argv, None)), \
+             patch("asyncio.create_subprocess_exec", return_value=proc), \
+             caplog.at_level(logging.WARNING, logger=_MOD):
+            ok, err = await mem_mod._ensure_pip_available()
+
+        assert ok is False
+        assert "ensurepip" in err
+        messages = [r.getMessage() for r in caplog.records if "ensurepip bootstrap failed" in r.getMessage()]
+        assert messages
+        for msg in messages:
+            assert self._SECRET not in msg
+
+    @pytest.mark.asyncio
+    async def test_credential_straddling_log_bound_does_not_leak_fragment(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Redact-before-bound invariant: plant the credential so it straddles
+        # the log bound. The old ``stderr.decode()[:500]`` head slice
+        # would have emitted a raw unredacted prefix of the token; redacting the
+        # full text first means no fragment of the secret can survive.
+        bound = mem_mod._PIP_STDERR_LOG_CHARS
+        prefix = "E" * (bound - len("https://ci-bot:") - 5)  # token crosses the bound
+        stderr = (
+            prefix + "https://ci-bot:" + self._SECRET + "@pypi.corp.example/simple/\n"
+        ).encode()
+        proc = _mock_proc(rc=1, stderr=stderr)
+        with patch.dict("sys.modules", {"pip": None}), \
+             patch(f"{_MOD}.wrap_argv", side_effect=lambda argv, **kw: (argv, None)), \
+             patch("asyncio.create_subprocess_exec", return_value=proc), \
+             caplog.at_level(logging.WARNING, logger=_MOD):
+            ok, _ = await mem_mod._ensure_pip_available()
+
+        assert ok is False
+        messages = [r.getMessage() for r in caplog.records if "ensurepip bootstrap failed" in r.getMessage()]
+        assert messages
+        for msg in messages:
+            # No prefix of the token may appear (the old slice leaked one).
+            for n in range(3, len(self._SECRET) + 1):
+                assert self._SECRET[:n] not in msg
