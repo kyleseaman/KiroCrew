@@ -12507,6 +12507,20 @@
         "title_named_resolved": "{{who}} perguntou a você",
         "title_resolved": "Uma ferramenta perguntou a você",
         "url_hint": "Abra o link, conclua lá e volte para clicar em “Terminei”."
+      },
+      "sessionHoverCard": {
+        "status_needs_approval": "Precisa de aprovação",
+        "status_agent_asked": "{{agent}} perguntou",
+        "status_needs_answer": "Precisa da sua resposta",
+        "status_interrupted": "Turno interrompido",
+        "status_working": "Trabalhando…",
+        "status_no_activity": "Sem atividade ainda",
+        "reply_to_agent": "Responder a {{agent}}…",
+        "reply_placeholder": "Responder…",
+        "send": "Enviar",
+        "sent": "Enviado",
+        "queued": "Na fila",
+        "send_failed": "Não entregue"
       }
     },
     "chatPage": {

@@ -12139,6 +12139,20 @@
         "title_named_resolved": "{{who}}이(가) 질문했어요",
         "title_resolved": "도구가 질문했어요",
         "url_hint": "링크를 열어 거기서 마친 뒤 돌아와 “끝냈어요”를 누르세요."
+      },
+      "sessionHoverCard": {
+        "status_needs_approval": "승인 필요",
+        "status_agent_asked": "{{agent}} 질문함",
+        "status_needs_answer": "답변이 필요함",
+        "status_interrupted": "턴 중단됨",
+        "status_working": "작업 중…",
+        "status_no_activity": "아직 활동 없음",
+        "reply_to_agent": "{{agent}}에게 답장…",
+        "reply_placeholder": "답장…",
+        "send": "보내기",
+        "sent": "보냄",
+        "queued": "대기열 추가",
+        "send_failed": "전달 안 됨"
       }
     },
     "chatPage": {

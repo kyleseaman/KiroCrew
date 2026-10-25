@@ -12139,6 +12139,20 @@
         "title_named_resolved": "{{who}} 问过你",
         "title_resolved": "工具问过你",
         "url_hint": "打开链接，在那边完成后回来点“我已完成”。"
+      },
+      "sessionHoverCard": {
+        "status_needs_approval": "需要批准",
+        "status_agent_asked": "{{agent}} 提问",
+        "status_needs_answer": "需要你的回答",
+        "status_interrupted": "回合中断",
+        "status_working": "处理中…",
+        "status_no_activity": "暂无活动",
+        "reply_to_agent": "回复 {{agent}}…",
+        "reply_placeholder": "回复…",
+        "send": "发送",
+        "sent": "已发送",
+        "queued": "已排队",
+        "send_failed": "未送达"
       }
     },
     "chatPage": {

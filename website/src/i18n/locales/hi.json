@@ -12323,6 +12323,20 @@
         "title_named_resolved": "{{who}} ने तुमसे पूछा था",
         "title_resolved": "एक टूल ने तुमसे पूछा था",
         "url_hint": "लिंक खोलो, वहाँ पूरा करो, फिर वापस आकर “मैंने पूरा कर लिया” दबाओ।"
+      },
+      "sessionHoverCard": {
+        "status_needs_approval": "स्वीकृति आवश्यक",
+        "status_agent_asked": "{{agent}} ने पूछा",
+        "status_needs_answer": "आपका उत्तर चाहिए",
+        "status_interrupted": "टर्न बाधित",
+        "status_working": "कार्य जारी…",
+        "status_no_activity": "अभी कोई गतिविधि नहीं",
+        "reply_to_agent": "{{agent}} को उत्तर दें…",
+        "reply_placeholder": "उत्तर दें…",
+        "send": "भेजें",
+        "sent": "भेजा गया",
+        "queued": "कतार में",
+        "send_failed": "नहीं भेजा गया"
       }
     },
     "chatPage": {

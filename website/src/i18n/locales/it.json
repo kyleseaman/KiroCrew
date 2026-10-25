@@ -12507,6 +12507,20 @@
         "title_named_resolved": "{{who}} ti ha chiesto",
         "title_resolved": "Uno strumento ti ha chiesto",
         "url_hint": "Apri il link, completa lì e torna a premere “Ho finito”."
+      },
+      "sessionHoverCard": {
+        "status_needs_approval": "Richiede approvazione",
+        "status_agent_asked": "{{agent}} ha chiesto",
+        "status_needs_answer": "Attende una risposta",
+        "status_interrupted": "Turno interrotto",
+        "status_working": "In corso…",
+        "status_no_activity": "Ancora nessuna attività",
+        "reply_to_agent": "Rispondi a {{agent}}…",
+        "reply_placeholder": "Rispondi…",
+        "send": "Invia",
+        "sent": "Inviato",
+        "queued": "In coda",
+        "send_failed": "Non inviato"
       }
     },
     "chatPage": {

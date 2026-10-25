@@ -6910,6 +6910,20 @@
         "title_named_resolved": "{{who}} asked you",
         "title_resolved": "A tool asked you",
         "url_hint": "Open the link, finish there, then come back and press “I've finished”."
+      },
+      "sessionHoverCard": {
+        "status_needs_approval": "Needs approval",
+        "status_agent_asked": "{{agent}} asked",
+        "status_needs_answer": "Needs your answer",
+        "status_interrupted": "Turn interrupted",
+        "status_working": "Working…",
+        "status_no_activity": "No activity yet",
+        "reply_to_agent": "Reply to {{agent}}…",
+        "reply_placeholder": "Reply…",
+        "send": "Send",
+        "sent": "Sent",
+        "queued": "Queued",
+        "send_failed": "Not delivered"
       }
     },
     "chatPage": {

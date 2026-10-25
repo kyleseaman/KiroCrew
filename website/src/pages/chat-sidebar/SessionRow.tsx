@@ -2,7 +2,7 @@
  *  ordered state resolver, the slot-scoped live state it subscribes to, its
  *  menus and its drag and keyboard gestures. The shell builds the row's `view`
  *  (./rows) and its one `actions` object; the row's memo compares both. */
-import { useRef, useEffect, memo, useMemo, useContext } from 'react'
+import { useRef, useState, useEffect, memo, useMemo, useContext } from 'react'
 import { motion } from 'framer-motion'
 import { X, Pin, VolumeX, EyeOff, VenetianMask, MoreVertical, CornerDownRight, GitFork, Loader, Loader2, Bot, ExternalLink, Workflow, TriangleAlert, Goal, MessageCircleQuestionMark, ShieldCheck, Hourglass, GripVertical, Moon } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
@@ -47,6 +47,8 @@ import { CrewOfflineContext } from './CrewGroups'
 import { useSlotTitleGenerating } from '../../hooks/slotTitleGeneration'
 import { DisclosureChevron, isOpenInTabModifierClick } from './chrome'
 import { SessionSourceChips } from './SessionSourceChips'
+import SessionHoverCard from '../chat/SessionHoverCard'
+import { useHoverIntent } from '../chat/useHoverIntent'
 
 /**
  * Session-row type scale, quantized to a 4px baseline grid.
@@ -508,6 +510,39 @@ export const SessionRow = memo(function SessionRow({ view, actions }: SessionRow
     const isPackageAgent = agentMeta?.source === 'package'
     const isBuiltin = agentMeta?.source === 'builtin'
     const agentColor = isPackageAgent ? 'text-[var(--aim)]' : isBuiltin ? 'text-muted' : 'text-muted'
+
+    // ── Sidebar hover card ───────────────────────────────────────────────────
+    // Hovering (or focus-visiting) a row reveals a card that lets the user read
+    // what the session is waiting on and reply to it without opening it. The card
+    // is a floating overlay anchored BESIDE the row (Radix popover) — never a new
+    // stacked line inside the row, which the session-row-fixed-height rule forbids.
+    //
+    // It is suppressed, not merely closed, while anything makes a hover preview
+    // the wrong thing to show: a drag in flight, the row's own context menu open,
+    // the active row (already on screen), while renaming (the row holds an input),
+    // and on touch (no hover state to speak of). `foreignRow` rows still get the
+    // card to READ status, but with no reply input (the slot is not ours to send
+    // to from here).
+    // The anchor lives in a REF, not state: hovering or focus-roving the row
+    // must not re-render it (a per-event setState on every row the pointer or
+    // arrow keys cross is exactly the memo-boundary cost this file guards, and
+    // a re-render mid-rove can drop the focused row out of the virtualized
+    // window and strand focus on <body>). Only the hook's own open/close flips
+    // state, and the card reads the ref lazily once it mounts.
+    const hoverAnchorRef = useRef<HTMLElement | null>(null)
+    const [contextMenuOpen, setContextMenuOpen] = useState(false)
+    const hoverSuppressed = dragInFlight || isActive || isRenaming || isMobile || contextMenuOpen
+    const hover = useHoverIntent(hoverSuppressed)
+    // Open on real keyboard focus only (`:focus-visible`), so a mouse click that
+    // also focuses the row never trips the card a second way, and arrow-key
+    // roving (which focuses each row programmatically, NOT focus-visible) never
+    // arms it.
+    const onRowFocus = (e: React.FocusEvent<HTMLElement>) => {
+      if (e.target !== e.currentTarget) return
+      hoverAnchorRef.current = e.currentTarget
+      if (e.currentTarget.matches(':focus-visible')) hover.onFocusVisible()
+    }
+    const sendableHere = !foreignRow && !isRenaming
     // The meta line's second slot shows the session's TAGS, not a value derived
     // from the project path. The auto-tagger already labels each session with its
     // project, so those tags ARE the context the row needs; deriving a label
@@ -1120,7 +1155,7 @@ export const SessionRow = memo(function SessionRow({ view, actions }: SessionRow
           disabled={!dndRow || isRenaming}
         >
           {({ setNodeRef, listeners, isDragging }) => (
-        <ContextMenu>
+        <ContextMenu onOpenChange={open => { setContextMenuOpen(open); if (open) hover.close() }}>
           <ContextMenuTrigger asChild>
         <div ref={dndRow ? setNodeRef : undefined} {...(dndRow ? listeners : {})}
           data-draggable={(!isRenaming && !foreignRow).toString()}
@@ -1281,7 +1316,22 @@ export const SessionRow = memo(function SessionRow({ view, actions }: SessionRow
             e.preventDefault()
             e.stopPropagation()
             onRenameStart(s.key, scope, s.title && s.title !== s.key ? s.title : '', false)
-          }}>
+          }}
+          // Sidebar hover card: a mouse/pen hovering the row arms the delayed
+          // open; focus-visible opens it for keyboard users. Touch has no hover
+          // and is suppressed upstream. The pointer handlers filter to
+          // hovering devices so a touch tap never arms it.
+          onPointerEnter={e => {
+            if (e.pointerType !== 'mouse' && e.pointerType !== 'pen') return
+            hoverAnchorRef.current = e.currentTarget
+            hover.onPointerEnter()
+          }}
+          onPointerLeave={e => {
+            if (e.pointerType !== 'mouse' && e.pointerType !== 'pen') return
+            hover.onPointerLeave()
+          }}
+          onFocus={onRowFocus}
+          onBlur={hover.onBlur}>
           {isPinnedDropOver && activeDraggedKey !== null && activeDraggedKey !== s.key && (
             <span
               data-testid={isPinned ? 'pinned-session-insertion' : 'manual-session-insertion'}
@@ -1683,6 +1733,25 @@ export const SessionRow = memo(function SessionRow({ view, actions }: SessionRow
         </ContextMenu>
           )}
         </DndDraggable>
+        {/* Mounted only while open, so a quiet row carries no Radix popover
+         *  machinery (and no focus guards that could interfere with the list's
+         *  own arrow-key roving). The anchor is always set before the open
+         *  timer fires, so the card has a rect to point at the instant it mounts. */}
+        {hover.open && hoverAnchorRef.current && (
+          <SessionHoverCard
+            slot={s}
+            title={shownTitle}
+            agentName={agentName}
+            open
+            anchorEl={hoverAnchorRef.current}
+            viaKeyboard={hover.viaKeyboard}
+            connected={connected}
+            sendable={sendableHere}
+            onCardEnter={hover.onCardEnter}
+            onCardLeave={hover.onCardLeave}
+            onClose={hover.close}
+          />
+        )}
         {/* The divider starts at the CONTENT x, not the row's edge, so it
          *  underlines the text block rather than boxing the whole row — the row's
          *  left pad reads as a margin, and a rule running through it would box

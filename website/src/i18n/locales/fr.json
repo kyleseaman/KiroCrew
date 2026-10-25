@@ -12507,6 +12507,20 @@
         "title_named_resolved": "{{who}} t'a posé une question",
         "title_resolved": "Un outil t'a posé une question",
         "url_hint": "Ouvre le lien, termine là-bas, puis reviens appuyer sur « J'ai terminé »."
+      },
+      "sessionHoverCard": {
+        "status_needs_approval": "Approbation requise",
+        "status_agent_asked": "{{agent}} a demandé",
+        "status_needs_answer": "Attend votre réponse",
+        "status_interrupted": "Tour interrompu",
+        "status_working": "En cours…",
+        "status_no_activity": "Aucune activité",
+        "reply_to_agent": "Répondre à {{agent}}…",
+        "reply_placeholder": "Répondre…",
+        "send": "Envoyer",
+        "sent": "Envoyé",
+        "queued": "En file d'attente",
+        "send_failed": "Non envoyé"
       }
     },
     "chatPage": {
