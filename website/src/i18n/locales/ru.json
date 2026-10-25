@@ -12691,6 +12691,20 @@
         "title_named_resolved": "{{who}} задавал тебе вопрос",
         "title_resolved": "Инструмент задавал тебе вопрос",
         "url_hint": "Открой ссылку, заверши там и вернись, чтобы нажать «Я закончил»."
+      },
+      "sessionHoverCard": {
+        "status_needs_approval": "Требуется одобрение",
+        "status_agent_asked": "{{agent}} спросил",
+        "status_needs_answer": "Нужен ваш ответ",
+        "status_interrupted": "Ход прерван",
+        "status_working": "В работе…",
+        "status_no_activity": "Пока нет активности",
+        "reply_to_agent": "Ответить {{agent}}…",
+        "reply_placeholder": "Ответить…",
+        "send": "Отправить",
+        "sent": "Отправлено",
+        "queued": "В очереди",
+        "send_failed": "Не доставлено"
       }
     },
     "chatPage": {

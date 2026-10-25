@@ -12323,6 +12323,20 @@
         "title_named_resolved": "{{who}} hat dich gefragt",
         "title_resolved": "Ein Tool hat dich gefragt",
         "url_hint": "Öffne den Link, erledige es dort und drücke dann hier „Ich bin fertig“."
+      },
+      "sessionHoverCard": {
+        "status_needs_approval": "Genehmigung nötig",
+        "status_agent_asked": "{{agent}} fragte",
+        "status_needs_answer": "Braucht Ihre Antwort",
+        "status_interrupted": "Zug unterbrochen",
+        "status_working": "Arbeitet…",
+        "status_no_activity": "Noch keine Aktivität",
+        "reply_to_agent": "An {{agent}} antworten…",
+        "reply_placeholder": "Antworten…",
+        "send": "Senden",
+        "sent": "Gesendet",
+        "queued": "Eingereiht",
+        "send_failed": "Nicht zugestellt"
       }
     },
     "chatPage": {

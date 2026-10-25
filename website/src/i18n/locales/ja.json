@@ -12139,6 +12139,20 @@
         "title_named_resolved": "{{who}} からの質問でした",
         "title_resolved": "ツールからの質問でした",
         "url_hint": "リンクを開いてそこで完了し、戻ってきて「完了しました」を押してください。"
+      },
+      "sessionHoverCard": {
+        "status_needs_approval": "承認が必要",
+        "status_agent_asked": "{{agent}} が質問",
+        "status_needs_answer": "回答が必要",
+        "status_interrupted": "ターンが中断",
+        "status_working": "処理中…",
+        "status_no_activity": "まだ活動なし",
+        "reply_to_agent": "{{agent}} に返信…",
+        "reply_placeholder": "返信…",
+        "send": "送信",
+        "sent": "送信済み",
+        "queued": "キュー追加",
+        "send_failed": "未送信"
       }
     },
     "chatPage": {

@@ -12323,6 +12323,20 @@
         "title_named_resolved": "{{who}} তোমাকে জিজ্ঞাসা করেছিল",
         "title_resolved": "একটি টুল তোমাকে জিজ্ঞাসা করেছিল",
         "url_hint": "লিঙ্কটি খোলো, সেখানে শেষ করো, তারপর ফিরে এসে “আমি শেষ করেছি” চাপো।"
+      },
+      "sessionHoverCard": {
+        "status_needs_approval": "অনুমোদন প্রয়োজন",
+        "status_agent_asked": "{{agent}} জিজ্ঞাসা করেছে",
+        "status_needs_answer": "আপনার উত্তর প্রয়োজন",
+        "status_interrupted": "টার্ন বিঘ্নিত",
+        "status_working": "কাজ চলছে…",
+        "status_no_activity": "এখনও কোনো কার্যকলাপ নেই",
+        "reply_to_agent": "{{agent}} কে উত্তর দিন…",
+        "reply_placeholder": "উত্তর দিন…",
+        "send": "পাঠান",
+        "sent": "পাঠানো হয়েছে",
+        "queued": "সারিবদ্ধ",
+        "send_failed": "পৌঁছায়নি"
       }
     },
     "chatPage": {
