@@ -1,9 +1,9 @@
 """A rejected MCP sign-in banner is shown once per server per sign-in state.
 
 kiro-cli retries a signed-out server's OAuth on every turn, and the ACP layer's
-dedupe is cleared by the server's init failure, so every user turn and every
-auto-nudge cycle used to post the same "authentication failed" banner again.
-These tests drive the dashboard's two real entry points (the session-init drain
+dedupe is cleared by the server's init failure, so without the chat's own check
+every user turn and every auto-nudge cycle posts the same "authentication
+failed" banner again. These tests drive the dashboard's two real entry points (the session-init drain
 and the mid-turn ``mcp_oauth`` arm) and check what changes do and do not bring
 the banner back.
 """
@@ -85,12 +85,13 @@ def _rejections(slot: _ChatSlot, server: str | None = None) -> list[dict]:
 
 
 @pytest.fixture(autouse=True)
-def _isolated(tmp_path, monkeypatch):
+def _isolated(tmp_path, _floor_monkeypatch):
     # No server is Connections-owned, and every test starts with no retry rounds.
-    monkeypatch.setattr(mcp_discovery, "_MCP_JSON_PATHS", (tmp_path / "absent.json",))
-    monkeypatch.setattr(mcp_banner_dedupe, "_sign_in_rounds", {})
-    monkeypatch.setattr(mcp_banner_dedupe, "_generation", 0)
-    monkeypatch.setattr(mcp_banner_dedupe, "_evicted_floor", 0)
+    patch = _floor_monkeypatch
+    patch.setattr(mcp_discovery, "_MCP_JSON_PATHS", (tmp_path / "absent.json",))
+    patch.setattr(mcp_banner_dedupe, "_sign_in_rounds", {})
+    patch.setattr(mcp_banner_dedupe, "_generation", 0)
+    patch.setattr(mcp_banner_dedupe, "_evicted_floor", 0)
     assert oauth_url_contains_credential(POSTHOG_URL), "fixture must trip the gate"
     assert oauth_url_contains_credential(OTHER_IDP_URL), "fixture must trip the gate"
 
